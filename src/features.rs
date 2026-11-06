@@ -6,7 +6,7 @@
 //! `DOT_AGENT_DECK_EXPERIMENTAL` env var (env wins, OQ3). Both the TUI and
 //! the daemon call [`init_and_watch`] and each resolves the flag from the
 //! same on-disk source, but as of fork issue #303's Phase 1 investigation
-//! this is NOT a live cross-process guarantee: every consumer
+//! this is NOT a live cross-process guarantee: every TUI-side consumer
 //! (`show_experimental_footer`, `show_issue_dispatch_authoring`) lives in
 //! `src/ui.rs`, so the daemon's call
 //! installs a value into the daemon process's own `SHARED` that nothing
@@ -15,7 +15,8 @@
 //! meaningful — it would need a real daemon-side (or pane-scoped) consumer
 //! to become one. If such a consumer is ever added, this premise breaks and
 //! per-surface resolution needs reconsidering (see the PRD/issue #303
-//! findings for the fuller argument).
+//! findings for the fuller argument). The desktop app reads the flag from its
+//! own environment and resolves no project; see [`init_from_process_env`].
 //!
 //! ## Gating convention (CLAUDE.md #9 / PRD #139 M3.2)
 //!
@@ -105,6 +106,68 @@ pub fn show_experimental_footer() -> bool {
 /// `issue_dispatch` task runs unconditionally — nor config parsing nor the
 /// `schedule add --repo` CLI; those are flag-free.
 pub fn show_issue_dispatch_authoring() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **deck** screen — the multi-pane
+/// terminal workspace (issue #1198). One wrapper per surface (CLAUDE.md #9) so
+/// `grep show_desktop_deck` finds every gate at graduation — see the
+/// `graduate-desktop-deck` issue.
+///
+/// A *presentation* switch read in the desktop process and handed to the
+/// webview through the desktop crate's `desktop_features` command; the webview
+/// gates its render and navigation seams on it. With the flag OFF the agent
+/// overview is the landing screen and the full-screen agent overlay is how a
+/// terminal is seen. Nothing in the daemon, the protocol or the TUI reads it.
+pub fn show_desktop_deck() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Projects** surface (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_projects` finds every gate at graduation — see the
+/// `graduate-desktop-projects` issue. A presentation switch, carried to the
+/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
+pub fn show_desktop_projects() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Prompts** library (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_prompts` finds every gate at graduation — see the
+/// `graduate-desktop-prompts` issue. A presentation switch, carried to the
+/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
+pub fn show_desktop_prompts() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Orchestrations** surface (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_orchestrations` finds every gate at graduation — see the
+/// `graduate-desktop-workflows` issue. A presentation switch, carried to the
+/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
+pub fn show_desktop_orchestrations() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Agent Profiles** surface (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_agent_profiles` finds every gate at graduation — see the
+/// `graduate-desktop-agent-profiles` issue. A presentation switch, carried to
+/// the webview by `desktop_features`, exactly like [`show_desktop_deck`].
+pub fn show_desktop_agent_profiles() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop agent screen's **unwired details**
+/// (issue #1400): the Diff, Checks, Delegations and Artifacts tabs and the
+/// ATT, MODEL and USAGE fields, none of which a live daemon supplies today.
+/// One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_agent_details` finds every gate — see PRD #1399, which decides
+/// per tab and field whether each is kept, fixed or removed. A presentation
+/// switch, carried to the webview by `desktop_features`, exactly like
+/// [`show_desktop_deck`].
+pub fn show_desktop_agent_details() -> bool {
     experimental_enabled()
 }
 
@@ -285,6 +348,58 @@ pub fn init_and_watch(project_dir: &std::path::Path) -> Vec<String> {
     });
     warnings
 }
+
+/// Initialize the process-global `Features` for the **desktop app** (issue
+/// #1198) from this process's own environment alone: the file named outright
+/// by `DOT_AGENT_DECK_FEATURES_CONFIG`, if it is set, and then the
+/// `DOT_AGENT_DECK_EXPERIMENTAL` override, which wins exactly as it does for
+/// [`init_and_watch`]. Neither set is the default, OFF.
+///
+/// **It takes no project directory and resolves none**, and that is the whole
+/// reason it is not [`init_and_watch`]. The TUI and the daemon run in a
+/// project and walk up from their launch directory to find it; the desktop
+/// does not — PRD #819 removed its client-side project guesses, and the
+/// desktop crate's linkage-check rule 12 forbids `std::env::current_dir` there
+/// — because the project an agent runs in lives on the daemon's filesystem,
+/// which for a remote deck is another machine, and a Finder-launched app's
+/// working directory is `/` anyway. The named file is read with the same
+/// guards as every other features read ([`crate::config::load_features_file`]:
+/// a regular file, at most 64 KiB, parse errors keep the default) and is never
+/// used as a starting point for a walk.
+///
+/// **Read once, with no watcher.** The webview asks for the surfaces once at
+/// startup, so a live reload would change a value nothing reads again; the
+/// flag changes when the app restarts. Shares [`init_and_watch`]'s `Once`, so
+/// whichever runs first wins and the other is a no-op — a process calls one or
+/// the other, never both.
+pub fn init_from_process_env() {
+    INIT.call_once(|| {
+        // `var`, not `var_os`, to read the variable exactly as
+        // `config::features_config_path` does for the TUI and the daemon.
+        let named = std::env::var(FEATURES_CONFIG_ENV)
+            .ok()
+            .map(std::path::PathBuf::from);
+        let from_file = named.as_deref().map_or_else(Features::default, |path| {
+            crate::config::load_features_file(path, Features::default())
+        });
+        let resolved = crate::config::resolve_features(from_file);
+        install(resolved);
+        tracing::info!(
+            "experimental flag: {} (from {})",
+            if resolved.experimental { "ON" } else { "OFF" },
+            named.as_deref().map_or_else(
+                || format!("the environment; {FEATURES_CONFIG_ENV} is not set"),
+                |path| path.display().to_string()
+            )
+        );
+    });
+}
+
+/// The variable naming the `.dot-agent-deck.toml` whose `[features]` table the
+/// flag is read from, outright. [`crate::config::features_config_path`] honours
+/// it for the TUI and the daemon; [`init_from_process_env`] is the desktop's
+/// only file source.
+const FEATURES_CONFIG_ENV: &str = "DOT_AGENT_DECK_FEATURES_CONFIG";
 
 /// Periodic re-read watcher (OQ1). The deck has no existing config-reload
 /// file watcher and `notify` is not a dependency, so — per the PRD's

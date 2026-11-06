@@ -347,8 +347,7 @@ pub fn resolve_remover_identity(cwd: &Path) -> String {
 /// which is exactly why anchoring on this rather than `cwd` verbatim fixes
 /// `issue/claim/017`.
 fn resolve_worktree_root(cwd: &Path) -> Result<std::path::PathBuf, String> {
-    let out = Command::new("git")
-        .current_dir(cwd)
+    let out = crate::git_env::git_at(cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|e| format!("failed to run `git rev-parse --show-toplevel`: {e}"))?;
@@ -375,8 +374,7 @@ fn resolve_worktree_root(cwd: &Path) -> Result<std::path::PathBuf, String> {
 /// when there is no branch to name) — the anchor needs a real branch name,
 /// and rule 1's worktrees are always created with `-b <branch>`.
 fn resolve_branch(cwd: &Path) -> Result<String, String> {
-    let out = Command::new("git")
-        .current_dir(cwd)
+    let out = crate::git_env::git_at(cwd)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .map_err(|e| format!("failed to run `git rev-parse --abbrev-ref HEAD`: {e}"))?;

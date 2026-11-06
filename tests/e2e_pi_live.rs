@@ -11,18 +11,20 @@
 //!   Claude-Code hook installed (fork-only: Pi carries no agent-type badge,
 //!   so the card's identity is its pane-id fallback, not a Pi-specific one).
 //! * `pi/live/002` — GAP #1 / PRD #201: proves a REAL `pi` orchestrator receives
-//!   its seed NATIVELY (the restore path stashes it via `StartAgent.seed`; pi's
-//!   extension pulls it with `get-seed` → `pi.sendUserMessage` — NOT a CLI arg,
-//!   NOT PTY injection) and drives a full orchestration LIVE (pi → native
+//!   its seed through the inbox (`StartAgent.seed` and the bundled extension's
+//!   `pi.sendUserMessage`) and drives a full orchestration LIVE (pi → native
 //!   `delegate` → real `claude` Haiku worker → sentinel + work-done). See its own
 //!   section below.
+//! * `pi/live/003` — issue #1385: the extension shells the deck that spawned it
+//!   (`DOT_AGENT_DECK_EXE`), not a decoy `dot-agent-deck` placed first on PATH.
+//!   No prompt, so no model call and no credential.
 //!
 //! ## Why this is separate from `e2e_pi_orchestrator.rs`
 //! The `chain-smoke/pi/001` + `scheduler/pi/001` tests are HEADLESS: an
 //! in-process daemon / `daemon serve` with real pi PTYs, asserting on
 //! files/events/broadcasts. They are functionally correct but record NO cast
 //! (only PTY-attached `TuiDeck` runs record a `full-stream.cast`, PRD #180) and
-//! never exercise the live-in-the-pane, rendered-grid surface rule 4 requires.
+//! never exercise the live-in-the-pane, rendered-grid surface CLAUDE.md rule 4 requires.
 //! This test closes that gap: it drives the real binary through the vt100
 //! harness (mirroring `e2e_issue_dispatch_real.rs` / `e2e_chain_smoke_claude.rs`
 //! and the catalog reference `scheduler/dispatch/013`), so the Pi surface a user
@@ -30,11 +32,11 @@
 //!
 //! ## `pi/live/001` scenario: a single live Pi pane (deterministic status)
 //! A reliable single live Pi pane with a visible real status fully satisfies
-//! rule 4 on its own. A single directive-prompted Pi pane's lifecycle
+//! CLAUDE.md rule 4 on its own. A single directive-prompted Pi pane's lifecycle
 //! (`session_start`→Idle, `agent_start`→running/Thinking) is the deterministic
 //! part — it fires regardless of what the model decides — so the status
 //! transition there does not hinge on a multi-agent LLM chain. The heavier orchestrator
-//! route is pinned headless by `chain-smoke/pi/001` and, LIVE + injection-seeded,
+//! route is pinned headless by `chain-smoke/pi/001` and live through the inbox
 //! by `pi/live/002` below.
 //!
 //! ## What makes the rendered assertion genuine (not a plumbing stand-in)
@@ -59,16 +61,18 @@
 //!   is touched — a Pi pane is hook-safe by construction.
 //!
 //! ## Credentials (Design Decision #5, harness caveat)
-//! pi authenticates to Anthropic via `ANTHROPIC_API_KEY`. The harness scrubs the
-//! spawned deck's env to a pinned set, so the key + the freshly-built
-//! binary dir on PATH are threaded in explicitly via `with_env`; the deck's
-//! lazy-spawned daemon inherits them, and so does the pi child. The key is NEVER
-//! printed (only checked non-empty for the runtime-skip).
+//! pi runs on `common::pi_test_model()` — by default `openai-codex/gpt-5.6-luna`
+//! (PRD #1666), overridable with `DOT_AGENT_DECK_PI_TEST_MODEL` — and
+//! authenticates from the host's stored login for that provider, which
+//! `with_imported_pi_credentials` copies (that entry only) into the per-test
+//! HOME's `.pi/agent`; the deck's lazy-spawned daemon and the pi child inherit
+//! that HOME. The freshly-built binary dir on PATH is threaded in explicitly via
+//! `with_env`. No credential is printed.
 //!
-//! Tier: e2e (`#[cfg(feature = "e2e")]`) — spawns a real agent, hits a real
-//! model. Flaky-tolerant pre-PR tier (real LLM), run once, not looped (rule
-//! 4/5). Runtime-skipped (Decision 26) when `pi` / `ANTHROPIC_API_KEY` is
-//! absent.
+//! Tier: lane 2 — spawns a real agent, hits a real model. Flaky-tolerant (real
+//! LLM), run once, not looped (CLAUDE.md rules 4/5). Runtime-skipped (Decision 26) when
+//! `pi` or its credential is absent; a model the credential refuses fails
+//! instead (`common::check_pi_available`).
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -79,13 +83,6 @@ use common::TuiDeck;
 use dot_agent_deck::config;
 use spec::spec;
 
-/// Cheapest tier in pi's Anthropic catalog, and enough to run a directive
-/// turn (same model `chain-smoke/pi/001` / `scheduler/pi/001` pin).
-///
-/// TEMPORARY: the pi tier runs on Anthropic Haiku while the GPT accounts are
-/// without credit. The tier itself is provider-agnostic — moving it back is
-/// this constant plus the `--provider` flag and the key name below.
-const PI_MODEL: &str = "claude-haiku-4-5";
 /// The sentinel the pi pane is directed to create. Distinctive + lands in the
 /// per-test fixture cwd, so it is unique by construction — a concrete
 /// secondary signal that the real model actually ran the directed work (the
@@ -94,39 +91,45 @@ const PI_MODEL: &str = "claude-haiku-4-5";
 const SENTINEL_NAME: &str = "pi_live_sentinel_4b1a.txt";
 const SENTINEL_CONTENT: &str = "PI_LIVE_SENTINEL_OK";
 
-/// `pi` on PATH AND a non-empty `ANTHROPIC_API_KEY`. The key is only checked
-/// for presence — never printed or logged (it is a secret). Mirrors
-/// `e2e_pi_orchestrator.rs::check_pi_available`.
-fn check_pi_available() -> Result<(), String> {
-    let ok = std::process::Command::new("pi")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return Err("pi CLI not installed (could not invoke `pi --version`)".into());
+/// The text of the Pi card's own rectangle on `grid` — every row from the one
+/// carrying its `Pi ·` title down to its bottom border, cut at the card's
+/// right edge — or `None` while no complete card is drawn. Issue #622: the
+/// live pi pane renders to the right of the card on the same rows and prints
+/// its own tool calls, so a whole-grid search could not tell the card's tool
+/// line from pi's.
+fn pi_card_text(grid: &str) -> Option<String> {
+    let rows: Vec<Vec<char>> = grid.lines().map(|l| l.chars().collect()).collect();
+    let (top, title_col) = rows.iter().enumerate().find_map(|(i, row)| {
+        let text: String = row.iter().collect();
+        let byte = text.find("Pi ·")?;
+        Some((i, text[..byte].chars().count()))
+    })?;
+    let border = common::BORDER_WEIGHTS
+        .iter()
+        .find(|w| rows[top][..title_col].contains(&w.top_left))?;
+    let right = (title_col..rows[top].len()).find(|&c| rows[top][c] == border.top_right)?;
+    let mut card = Vec::new();
+    for row in &rows[top..] {
+        let edge = *row.get(right)?;
+        card.push(row[..=right].iter().collect::<String>());
+        if edge == border.bottom_right {
+            return Some(card.join("\n"));
+        }
+        if edge != border.vertical && edge != border.top_right {
+            return None;
+        }
     }
-    match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => Ok(()),
-        _ => Err("ANTHROPIC_API_KEY not set — real-pi live-pane e2e needs Anthropic auth".into()),
-    }
+    None
 }
 
-/// PATH for the spawned deck (→ daemon → pi child) with the freshly-built
-/// `dot-agent-deck` binary's dir prepended to the host PATH, so the extension's
-/// `dot-agent-deck agent-event` resolves. `CARGO_BIN_EXE_dot-agent-deck` is set
-/// by Cargo at integration-test build time to the binary under test.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = std::path::Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("bin dir is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
+/// The completed-tool count on a card's bottom border (`Tools: N`).
+fn card_tool_count(card: &str) -> Option<u32> {
+    let (_, rest) = card.split_once("Tools: ")?;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 /// Scenario: Launch the REAL `dot-agent-deck` binary (via the vt100 `TuiDeck`
@@ -135,10 +138,10 @@ fn path_with_binary_dir() -> String {
 /// WITHOUT the extension and the deck's daemon-startup auto-materialize (the real
 /// `daemon serve` entry the lazy-spawned daemon runs) puts the bundled Pi
 /// orchestrator extension into that HOME before pi boots. The pane runs `pi`
-/// (`--provider anthropic --model claude-haiku-4-5 --approve`) with a directive initial
+/// (`common::pi_test_model()`, `--approve`) with a directive initial
 /// prompt to create the uniquely-named sentinel
-/// `pi_live_sentinel_4b1a.txt`. The `ANTHROPIC_API_KEY` + the built-binary PATH
-/// are threaded into the deck (inherited by the lazy-spawned daemon and the pi
+/// `pi_live_sentinel_4b1a.txt`. Pi's login is seeded into the per-test HOME and
+/// the built-binary PATH is threaded into the deck (inherited by the lazy-spawned daemon and the pi
 /// child). The pane auto-focuses on restore (the cast captures pi booting +
 /// working live in the pane); detach to the dashboard with Ctrl+D so the Pi
 /// pane's CARD renders. Assert on the rendered vt100 grid that, driven ONLY by
@@ -148,9 +151,11 @@ fn path_with_binary_dir() -> String {
 /// produces on its own for a hook-less Pi pane, then a settle back to `Idle`
 /// (extension `agent_settled`→finished, the mapping this fix changed — a
 /// regression to "Needs Input" would show here) — and the card keeps its
-/// pane-id identity throughout (fork-only: Pi carries no agent-type badge).
-/// Best-effort (logged, not gating): the directed sentinel file appears in
-/// the pane cwd. PTY-attached, so
+/// pane-id identity throughout (fork-only: Pi carries no agent-type badge). The
+/// settled card also carries the detail every other native integration's card
+/// does (issue #622): `Dir:`, the submitted prompt (`Prmt:`), the `bash —
+/// <command>` call Pi ran, and `Tools: N` with N > 0. Best-effort (logged, not
+/// gating): the directed sentinel file appears in the pane cwd. PTY-attached, so
 /// it records a `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant
 /// (real LLM) — run once, not looped.
 #[spec("pi/live/001")]
@@ -158,7 +163,7 @@ fn path_with_binary_dir() -> String {
 fn pi_live_001_live_pane_shows_identity_and_status() {
     // Decision 26 runtime-skip: a missing CLI / credential is an environmental
     // condition, not a broken test.
-    skip_unless!(check_pi_available());
+    skip_unless!(common::check_pi_available());
 
     // The pi child inherits the deck's env. Directive prompt: instruct pi to do
     // ONE simple, reliable task (create the distinctive sentinel) so the real
@@ -166,11 +171,14 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
     // command; contains no apostrophes, double-quotes, or backticks (a backtick
     // would trigger shell command substitution before pi ever saw it).
     let directive = format!(
-        "Use the shell tool to create a file named {SENTINEL_NAME} in the current directory \
-         whose entire contents are exactly the text {SENTINEL_CONTENT}. Do that one task, then \
-         stop."
+        "Use the shell tool to run pwd, then create a file named {SENTINEL_NAME} in exactly the \
+         directory it prints, whose entire contents are exactly the text {SENTINEL_CONTENT}. Do \
+         that one task, then stop."
     );
-    let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve '{directive}'");
+    let pi_command = format!(
+        "pi {} --approve '{directive}'",
+        common::pi_test_model().cli_args()
+    );
 
     let deck = TuiDeck::builder()
         // 200 cols so the dashboard renders the card (left) AND the live pi pane
@@ -181,27 +189,17 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         // rule 9); not load-bearing for Pi identity — `features::show_pi_agent`
         // no longer exists, so nothing here is gated by this flag.
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
-        // pi authenticates to Anthropic with this (never printed); the deck's
-        // daemon and the pi child inherit it.
-        //
-        // Issue #502/#785 made `inherit_pass` forward ANTHROPIC_API_KEY into
-        // every harness-spawned deck, so this override is now belt-and-braces
-        // rather than the only source. Kept deliberately: it states the
-        // dependency at the call site, and without it these tests would take
-        // their credential from a list they do not name and would lose it —
-        // as a PTY timeout, not a compile error — if that list were ever
-        // narrowed.
-        .with_env(
-            "ANTHROPIC_API_KEY",
-            std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),
-        )
+        // pi's login for `common::pi_test_model()`'s provider, seeded into the
+        // per-test HOME the deck's daemon and the pi child inherit (never
+        // printed).
+        .with_imported_pi_credentials()
         // Put the freshly-built binary's dir on PATH so the extension resolves
         // `dot-agent-deck agent-event`; preserves the host PATH so `pi` still
         // resolves. Wins over the harness env scrub. (This PATH — inherited by
         // the deck's lazy-spawned daemon — is also where the daemon-startup
         // auto-materialize finds `pi`, so the detector fires; no manual
         // `with_pi_extension`.)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         // NOTE: no `with_pi_extension()` — the per-test HOME starts WITHOUT the
         // extension. The deck's lazy-spawned daemon runs the real `daemon serve`
         // entry, whose daemon-startup auto-materialize (PRD #201) writes the
@@ -308,6 +306,42 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
          Final grid:\n{grid}"
     );
 
+    // --- Issue #622: the SETTLED card carries the same detail every other
+    // native integration's card does — its directory, the submitted prompt
+    // (`Prmt:`), the tool Pi ran (`bash — <command>`), and a completed-tool
+    // count above zero — beside the Pi identity and the final `Idle`. Before
+    // the fix the extension reported lifecycle only, so the card kept `Dir:`
+    // from the spawn placeholder, had no `Prmt:` row and read `Tools: 0` even
+    // though Pi visibly ran its shell tool in the pane. Read off the CARD's
+    // own rectangle, not the whole grid, because the live pi pane renders on
+    // the right of the same grid and prints its own tool calls. The directive
+    // names the shell tool, so a turn that never calls one is the model
+    // ignoring a directive, not a deck defect — the panic says which.
+    let settled = std::cell::RefCell::new(String::new());
+    let complete = deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| {
+        let Some(card) = pi_card_text(grid) else {
+            return false;
+        };
+        let ok = card.contains("Dir:")
+            && card.contains("Prmt:")
+            && card.contains("bash —")
+            && card.contains("Idle")
+            && card_tool_count(&card).is_some_and(|n| n > 0);
+        settled.replace(card);
+        ok
+    });
+    assert!(
+        complete,
+        "the settled Pi card does not carry the prompt and tool detail every other native \
+         integration's card does: expected `Dir:`, `Prmt:`, a `bash — …` tool line, `Idle` and \
+         `Tools: N` with N > 0 on the card. sentinel_created={} (false means the model never ran \
+         the directed shell tool, so a missing tool line is not evidence against the extension).\n\
+         Card:\n{}\nFinal grid:\n{}",
+        deck.workdir().join(SENTINEL_NAME).exists(),
+        settled.borrow(),
+        deck.snapshot_grid()
+    );
+
     // --- Best-effort (logged, not gating): the directed sentinel appears in the
     // pane cwd (the fixture root the continue-session pane runs in). Too
     // LLM/tool-variance-dependent to hard-gate; the rendered status transition
@@ -318,7 +352,7 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
 }
 
 // ---------------------------------------------------------------------------
-// pi/live/002 — GAP #1: pi AUTO-SUBMITS a daemon-INJECTED seed, driven LIVE
+// pi/live/002 — Pi receives its restored inbox seed, driven live.
 // through a full orchestration reel clip (PRD #201, phase-5 parity gap).
 // ---------------------------------------------------------------------------
 
@@ -340,7 +374,7 @@ const ORCH_SENTINEL_CONTENT: &str = "PI_INJECT_ORCH_OK";
 /// restore path re-resolves: `orchestrator` (the START role, a REAL idle `pi`)
 /// and `coder` (a REAL idle `claude` Haiku worker). Neither role command
 /// carries the seed as a CLI arg — the orchestrator is spawned IDLE and seeded
-/// only via the daemon injection path. `clear = false` on the worker so the
+/// through the daemon inbox. `clear = false` on the worker so the
 /// pre-booted (already-trusted) claude receives the delegated task in place
 /// rather than being respawned mid-orchestration.
 fn orchestration_config_toml(pi_command: &str, worker_command: &str) -> String {
@@ -362,13 +396,9 @@ fn orchestration_config_toml(pi_command: &str, worker_command: &str) -> String {
 /// two-role orchestration rooted at `project_dir`, with `directive` as the
 /// snapshot's `orchestrator_prompt`. On the daemon-empty restore path the deck
 /// re-resolves the config from `project_dir` + `config_name` and spawns both
-/// role panes IDLE. Because the START role is a Pi pane, the deck delivers
-/// `orchestrator_prompt` NATIVELY (PRD #201): it stashes it as the pane's seed at
-/// spawn (`StartAgent.seed` → daemon `set_pending_seed`) and DROPS the tab's
-/// `orchestrator_prompt`, so the render-loop `write_and_submit_to_pane` injection
-/// site is skipped for this pane. pi's extension pulls the seed on `session_start`
-/// via `get-seed` → `pi.sendUserMessage`. Built from the real `config` types (not
-/// hand-rolled TOML) so it can never drift from the struct the deck deserializes.
+/// role panes IDLE. The deck posts `orchestrator_prompt` as the first inbox
+/// message through `StartAgent.seed`; Pi's extension receives it through its
+/// native stream. Built from the real `config` types the deck deserializes.
 fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &str) -> String {
     let session = config::SavedSession {
         panes: vec![config::SavedPane {
@@ -400,44 +430,14 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
     toml::to_string_pretty(&session).expect("serialize orchestration session.toml")
 }
 
-/// Scenario: Stage a two-role orchestration (`.dot-agent-deck.toml`: an
-/// `orchestrator` START role running a REAL idle `pi`
-/// (`--provider anthropic --model claude-haiku-4-5 --approve`, NO CLI-arg prompt) + a
-/// `coder` role running a REAL idle `claude` Haiku worker) and a
-/// `session.toml` whose `OrchestrationSnapshot.orchestrator_prompt` is a
-/// directive telling pi to call the native `delegate` tool once, handing the
-/// `coder` role a task to create the uniquely-named sentinel
-/// `pi_inject_orch_sentinel_5e8c.txt`. Launch the REAL `dot-agent-deck` binary
-/// through the vt100 `TuiDeck` harness with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the
-/// per-test HOME starts WITHOUT the extension — the deck's daemon-startup
-/// auto-materialize puts the bundled Pi extension there before pi boots),
-/// imported Claude credentials + project-trust for the orchestration cwd,
-/// `ANTHROPIC_API_KEY` + the built-binary PATH threaded in (the key is never
-/// printed), and `DOT_AGENT_DECK_SEED_FALLBACK_SECS=600` so the daemon's
-/// PTY-injection safety net can't fire in-window. On the daemon-empty restore the
-/// deck spawns both role panes IDLE and delivers the directive to the pi START
-/// role NATIVELY (PRD #201): it stashes the directive as the pane's seed at spawn
-/// (`StartAgent.seed`) and SKIPS the render-loop `write_and_submit_to_pane`
-/// injection for the Pi pane; pi's extension pulls it on `session_start` via
-/// `get-seed` → `pi.sendUserMessage`. NOT a CLI arg, NOT PTY keystroke injection.
-/// AUTO-SUBMIT CHECKPOINT (load-bearing): the daemon writes
-/// `.dot-agent-deck/worker-task-coder.md` only inside `handle_delegate`, so —
-/// with the CLI arg absent, the TUI injection skipped for pi, and the daemon
-/// fallback deferred 600s — its appearance is the isolated proof that pi received
-/// its seed NATIVELY (`get-seed` → `sendUserMessage`) and called `delegate`. Then
-/// assert the user-visible reality on the rendered grid (the delegate pointer
-/// `worker-task-coder` rendered live in the worker pane) and confirm the full
-/// chain landed: the worker created the sentinel (contents `PI_INJECT_ORCH_OK`)
-/// and signalled work-done (`.dot-agent-deck/work-done-coder-<pane digest>.md`). PTY-attached,
-/// so it records a `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant
-/// (real LLM) — run once, not looped.
+/// Scenario: Restore a real Pi orchestrator and Claude Haiku worker into a PTY-attached deck, with the directive posted to Pi's inbox. Pi must delegate natively, the worker card must visibly label its inbox task with the envelope, and the worker must create the sentinel and signal work-done.
 #[spec("pi/live/002")]
 #[test]
 fn pi_live_002_native_seeded_orchestration_delegates_live() {
     // Decision 26 runtime-skip: a missing CLI / credential is an environmental
     // condition, not a broken test. Needs BOTH a real pi (orchestrator) and a
     // real claude (worker).
-    skip_unless!(check_pi_available());
+    skip_unless!(common::check_pi_available());
     skip_unless!(common::check_claude_available());
 
     // A held tempdir carrying the orchestration project dir (`.dot-agent-deck.toml`
@@ -457,27 +457,22 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         .to_string();
     // Some agent paths probe `.git`; a git repo makes the cwd look like a real
     // project. Best-effort — the orchestration does not depend on it.
-    let _ = std::process::Command::new("git")
+    let _ = common::fixture_git(&project_dir, &project_dir)
         .arg("init")
         .arg("--quiet")
-        .current_dir(&project_dir)
         .status();
 
-    // The idle role commands — NO CLI-arg prompt on the orchestrator (the whole
-    // point: pi is seeded ONLY by injection). Same real-agent tiers as
+    // Idle role commands leave delivery to the inbox. Same real-agent tiers as
     // `chain-smoke/pi/001`.
-    let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve");
+    let pi_command = format!("pi {} --approve", common::pi_test_model().cli_args());
     let worker_command = format!("claude --model {WORKER_MODEL} --allowedTools Bash Read Write");
 
-    // The injected seed. Single line (the injection encodes single-line text +
-    // SUBMIT_DELAY + CR, no bracketed paste). Directive + literal sentinel
-    // tokens so the assertion survives LLM phrasing variance; no quotes /
-    // backslashes / apostrophes to keep it TOML- and shell-safe.
+    // The inbox directive carries literal sentinel tokens so the assertion
+    // survives variation in the model's phrasing.
     let directive = format!(
         "You are the orchestrator in a dot-agent-deck orchestration. A worker role named \
          {ORCH_WORKER_ROLE} is available. Call the delegate tool EXACTLY ONCE with role \
-         {ORCH_WORKER_ROLE} and this task text: Create a file named {ORCH_SENTINEL_NAME} in the \
-         current working directory whose entire contents are exactly the text \
+         {ORCH_WORKER_ROLE} and this task text: Create the file {project_str}/{ORCH_SENTINEL_NAME} whose entire contents are exactly the text \
          {ORCH_SENTINEL_CONTENT}. Use the Bash tool to create it. Do NOT do the work yourself - \
          only call the delegate tool, then stop."
     );
@@ -503,26 +498,13 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         // rule 9); not load-bearing for Pi identity — `features::show_pi_agent`
         // no longer exists, so nothing here is gated by this flag.
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
-        // pi authenticates to Anthropic with this (never printed); the deck's
-        // daemon and the pi child inherit it. Belt-and-braces since issue
-        // #502/#785 — see the note on `pi_live_001` above.
-        .with_env(
-            "ANTHROPIC_API_KEY",
-            std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),
-        )
+        // pi's login, as for `pi_live_001` above.
+        .with_imported_pi_credentials()
         // Put the freshly-built binary's dir on PATH so the pi extension resolves
-        // `dot-agent-deck agent-event`/`delegate`/`get-seed` and the claude worker
+        // `dot-agent-deck agent-event`/`delegate`/`inbox wait` and the claude worker
         // resolves `dot-agent-deck work-done`; preserves the host PATH so `pi` /
         // `claude` still resolve. Wins over the harness env scrub.
-        .with_env("PATH", path_with_binary_dir())
-        // PRD #201 native-path proof: defer the daemon's PTY-injection safety net
-        // far past the test window (inherited by the deck's lazy-spawned daemon),
-        // so the ONLY route the orchestrator seed can reach pi in-window is the
-        // native `get-seed` pull. Combined with the TUI-loop injection being
-        // SKIPPED for a Pi start role and NO CLI-arg prompt, a delegate can only
-        // happen if native delivery ran — making the AUTO-SUBMIT CHECKPOINT below
-        // a clean native-vs-injection discriminator.
-        .with_env("DOT_AGENT_DECK_SEED_FALLBACK_SECS", "600")
+        .with_env("PATH", common::path_with_binary_dir())
         // Point the deck's saved-session reader at our staged orchestration
         // snapshot so the daemon-empty restore rebuilds exactly this
         // orchestration (and nothing from the developer's real session.toml).
@@ -534,8 +516,8 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         // authenticates.
         .with_imported_claude_credentials()
         // Pre-trust the orchestration cwd (shared by both roles) so the worker's
-        // claude clears its first-run onboarding + trust gates and auto-submits
-        // the daemon-injected task pointer without a human keystroke.
+        // Claude clears its first-run onboarding and trust gates before its
+        // inbox task arrives.
         .with_claude_project_trust(project_str.clone())
         // NOTE: no `with_pi_extension()` — the per-test HOME starts WITHOUT the
         // extension. The deck's lazy-spawned daemon runs the real `daemon serve`
@@ -568,51 +550,22 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
             .any(|k| lower.contains(k))
     };
 
-    let worker_task = project_dir
-        .join(".dot-agent-deck")
-        .join(format!("worker-task-{ORCH_WORKER_ROLE}.md"));
-
-    // ================== NATIVE-SEED CHECKPOINT (PRD #201 / GAP #1) ==================
-    // The daemon writes `worker-task-coder.md` ONLY inside `handle_delegate` —
-    // i.e. only AFTER the pi orchestrator RECEIVED its seed and called the native
-    // `delegate` tool. Here the seed can reach pi by exactly ONE route: the
-    // extension's `get-seed` pull → `pi.sendUserMessage`. There is NO CLI-arg
-    // prompt, the render-loop `write_and_submit_to_pane` injection is SKIPPED for
-    // a Pi start role, and the daemon's PTY-injection fallback is deferred 600s
-    // out of this window. So this file appearing is the isolated proof that pi
-    // received its seed NATIVELY and acted on it. If it never appears, native
-    // delivery did NOT run (or pi chose not to delegate). Ceiling sized to
-    // confidence (Design Decision #7): pi boot + extension load + get-seed pull +
-    // a model round-trip + the delegate tool call.
-    let delegated = common::wait_for_path(&worker_task, Duration::from_secs(150));
-    if !delegated {
-        let grid = deck.snapshot_grid();
-        let seed_on_grid = grid.contains(ORCH_SENTINEL_NAME)
-            || grid.to_lowercase().contains("delegate")
-            || grid.contains(ORCH_WORKER_ROLE);
-        panic!(
-            "NATIVE-SEED CHECKPOINT FAILED (PRD #201 GAP #1): the daemon never wrote \
-             {worker_task:?} within 150s — the pi orchestrator did not receive its seed \
-             NATIVELY (get-seed → sendUserMessage) and delegate. seed_visible_on_grid={seed_on_grid} \
-             (if true, the seed reached pi's pane but pi did not delegate). \
-             api_error_on_grid={} (if true, an account/quota is the blocker, not native \
-             delivery).\nFinal grid:\n{grid}",
-            api_errored(&grid)
-        );
-    }
-
-    // The delegation is VISIBLE on the rendered orchestration grid: the daemon
-    // injected the single-line pointer `Read .dot-agent-deck/worker-task-coder.md
-    // for your task.` into the worker (coder) role pane, which renders it live
-    // (and it persists on the worker card's `Prmt:` field). This is the
-    // user-visible "delegation happening + worker" reality. Scanned on the
-    // RECONSTRUCTED grid so styled card chrome is matched on its rendered text.
+    // Receipt is observable in the worker pane as the framed task, rather
+    // than the retired fixed worker-task-coder.md file.
     assert!(
-        deck.wait_for_grid_string_within("worker-task-coder", Duration::from_secs(60)),
-        "the delegate pointer `worker-task-coder` never rendered in the worker pane/card on the \
-         orchestration grid, even though the daemon wrote the task file — the delegation did not \
-         reach the worker pane visibly. api_error_on_grid={}.\nFinal grid:\n{}",
+        deck.wait_for_grid_string_within(ORCH_SENTINEL_NAME, Duration::from_secs(150)),
+        "Pi never delegated its inbox directive to the worker; api_error_on_grid={}. Final grid:\n{}",
         api_errored(&deck.snapshot_grid()),
+        deck.snapshot_grid()
+    );
+
+    // The worker card labels the framed inbox task while its real agent works.
+    assert!(
+        deck.wait_for_grid_string_within(
+            "✉ task from the orchestrator for coder",
+            Duration::from_secs(60)
+        ),
+        "the worker card never labelled its inbox delegation. Final grid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -627,8 +580,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     {
         panic!(
             "the delegated claude worker never created the sentinel {ORCH_SENTINEL_NAME:?} with \
-             {ORCH_SENTINEL_CONTENT:?} within 90s. The delegation reached the worker (task file \
-             written), so the worker ran but did not complete the task. observed: {observed}; \
+             {ORCH_SENTINEL_CONTENT:?} within 90s. The inbox task was visible to the worker, so the worker ran but did not complete the task. observed: {observed}; \
              api_error_on_grid={}.\nFinal grid:\n{}",
             api_errored(&deck.snapshot_grid()),
             deck.snapshot_grid()
@@ -646,7 +598,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         common::find_work_done_file(&work_done_dir, ORCH_WORKER_ROLE, Duration::from_secs(60));
     assert!(
         work_done.is_some(),
-        "the worker never signalled work-done (no work-done-{ORCH_WORKER_ROLE}-*.md under \
+        "the worker never signalled work-done (no work-done-{ORCH_WORKER_ROLE}.md under \
          {work_done_dir:?}). The sentinel was created, so the worker ran, but the work-done CLI \
          did not reach the daemon.\nFinal grid:\n{}",
         deck.snapshot_grid()
@@ -659,5 +611,123 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         deck.wait_for_stream_string_within(ORCH_SENTINEL_NAME, Duration::from_secs(20));
     eprintln!(
         "pi-inject-orch soft signal: sentinel {ORCH_SENTINEL_NAME:?} seen live on grid = {saw_sentinel_grid}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// pi/live/003 — the extension shells the deck that spawned it, not whatever
+// `dot-agent-deck` Pi's own PATH resolves (issue #1385, following #549).
+// ---------------------------------------------------------------------------
+
+/// `pi` on PATH, nothing else: `pi/live/003` sends no prompt, so pi makes no
+/// model call and needs no credential — its `session_start` fires at boot
+/// whether or not it is authenticated. Unix-only, like the one test using it.
+#[cfg(unix)]
+fn check_pi_installed() -> Result<(), String> {
+    let ok = std::process::Command::new("pi")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err("pi CLI not installed (could not invoke `pi --version`)".into())
+    }
+}
+
+/// Scenario: Put a DECOY `dot-agent-deck` first on the deck's PATH — a script
+/// that only appends its arguments to a log and exits 0, standing in for an
+/// older or unrelated install an agent's shell could find first — and leave
+/// the freshly built binary OFF the PATH. Launch the real deck with
+/// `DOT_AGENT_DECK_EXPERIMENTAL=1` and a restored pane running a bare `pi`
+/// with no prompt, then detach to the dashboard. Pi's `session_start` makes the
+/// bundled extension report status and open its inbox stream; because the deck exports
+/// its own absolute path in `DOT_AGENT_DECK_EXE`, those calls reach the real
+/// deck, so the card takes the `Pi ·` identity that only an `agent-event` from
+/// the extension can give it, and the decoy is never run.
+#[spec("pi/live/003")]
+#[cfg(unix)]
+#[test]
+fn pi_live_003_extension_shells_the_spawning_deck_not_the_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    skip_unless!(check_pi_installed());
+
+    let decoy_root = common::harness_tempdir().expect("create decoy dir");
+    let decoy_bin = decoy_root.path().join("bin");
+    std::fs::create_dir_all(&decoy_bin).expect("create decoy bin dir");
+    let decoy_log = decoy_root.path().join("decoy-invocations.log");
+    let decoy = decoy_bin.join("dot-agent-deck");
+    std::fs::write(
+        &decoy,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            decoy_log.display()
+        ),
+    )
+    .expect("write decoy dot-agent-deck");
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))
+        .expect("make decoy executable");
+
+    // The decoy first, then the host PATH (so `pi` resolves) with the built
+    // binary's directory deliberately NOT added — unlike `pi/live/001`, which
+    // prepends it and so could not tell the two lookups apart.
+    let path = format!(
+        "{}:{}",
+        decoy_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 50)
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_env("PATH", path)
+        // Empty pane name, so the card title is the agent-type identity.
+        .with_continue_session("", "pi")
+        .launch_with_fixture("minimal");
+
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    // Subscribe as soon as the pane exists (so the daemon's attach socket does
+    // too) and before pi has finished booting — its Node start and extension
+    // load take seconds — so the extension's first report is not missed.
+    let events = deck.subscribe_events();
+    deck.send_bytes(b"\x04"); // Ctrl+D → dashboard
+    deck.wait_for_string("Dir:");
+
+    // What only the extension's `agent-event` can put on the daemon's wire: a
+    // Pi frame carrying the daemon-provided agent id under the CLI's `<pane>-session`
+    // key. The card-surfacing `SessionStart` the daemon emits at spawn is also
+    // typed Pi (from the command), but keys on the bare pane id and carries no
+    // agent id, so it cannot satisfy this.
+    let from_extension = events.try_wait_for(
+        |e| {
+            e.agent_type == dot_agent_deck::event::AgentType::Pi
+                && e.agent_id.is_some()
+                && e.session_id.ends_with("-session")
+        },
+        Duration::from_secs(120),
+    );
+    let decoy_calls = std::fs::read_to_string(&decoy_log).unwrap_or_default();
+    assert!(
+        decoy_calls.is_empty(),
+        "the Pi extension ran the `dot-agent-deck` on PATH instead of the deck that spawned it \
+         (DOT_AGENT_DECK_EXE); the decoy received:\n{decoy_calls}"
+    );
+    assert!(
+        from_extension.is_some(),
+        "no `agent-event` from the Pi extension reached the deck within 120s, so it did not \
+         shell the deck named by DOT_AGENT_DECK_EXE. Broadcast so far: {:?}\nFinal grid:\n{}",
+        events.snapshot(),
+        deck.snapshot_grid()
+    );
+    // The user-visible half: the card carries the first-class Pi identity.
+    assert!(
+        deck.wait_for_grid_string_within("Pi ·", Duration::from_secs(30)),
+        "the Pi pane's card never showed the `Pi ·` identity.\nFinal grid:\n{}",
+        deck.snapshot_grid()
     );
 }

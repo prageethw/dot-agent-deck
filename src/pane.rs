@@ -3,6 +3,7 @@ use std::any::Any;
 use thiserror::Error;
 
 use crate::agent_pty::TabMembership;
+use crate::daemon_client::Incarnation;
 use crate::event::AgentType;
 
 #[derive(Debug, Error)]
@@ -15,6 +16,10 @@ pub enum PaneError {
     ParseError(String),
     #[error("Pane control not available")]
     NotAvailable,
+    /// PRD #1666 part 2 (G-fix7): the action was refused, and the card it was
+    /// aimed at stays as it is. The message is the sentence to show.
+    #[error("{0}")]
+    Refused(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,14 +38,13 @@ pub struct PaneInfo {
     pub command: Option<String>,
 }
 
-/// PRD #92 F4: per-pane result of a multi-pane close operation (a mode
-/// tab teardown via [`crate::tab::TabManager::close_tab`], or a mode
-/// deactivation via [`crate::mode_manager::ModeManager::deactivate_mode`]).
+/// PRD #92 F4: per-pane result of a multi-pane close operation (a tab
+/// teardown via [`crate::tab::TabManager::close_tab`]).
 ///
 /// Pre-F4 the same operations returned `Result<Vec<String>, _>` and
 /// silently dropped any [`PaneController::close_pane`] errors. That
 /// produced the user-visible bug where pressing `Ctrl+W` on an
-/// unhealthy mode-tab destroyed the dashboard cards while the underlying
+/// unhealthy tab destroyed the dashboard cards while the underlying
 /// agent processes survived in the daemon registry — the TUI thought
 /// they were gone.
 ///
@@ -279,6 +283,17 @@ pub struct AgentSpawnOptions<'a> {
     /// isolated clone (`src/tab.rs`'s
     /// `open_orchestration_tab_with_isolated_clone_origin`).
     pub isolated_clone_origin: Option<String>,
+    /// Issue #1540: this start was submitted from the New agent form, so the
+    /// deck may remember its command as the form's next pre-fill. `false` for
+    /// every other start — orchestration roles, restores and anything else —
+    /// so none of them ever becomes the deck's last command.
+    pub remember_command: bool,
+    /// Issue #1496: the authoring kind of a New agent form start whose seed
+    /// the TUI delivers itself (a `schedule`, `schedule: issues` or
+    /// `dispatcher` card), so the daemon records it on the agent. Read only
+    /// with `remember_command`, the form start it belongs to; `None` for every
+    /// other start.
+    pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -295,7 +310,44 @@ impl Default for AgentSpawnOptions<'_> {
             seed: None,
             owner: None,
             isolated_clone_origin: None,
+            remember_command: false,
+            authoring_kind: None,
         }
+    }
+}
+
+/// PRD #1666 part 2 (G-fix6): a pane id as the UI holds it, together with the
+/// daemon process ([`Incarnation`]) of the response that produced it — the
+/// event stream that painted the card, or the listing or attach that named it.
+///
+/// A pane id is not an agent identity: a restarted daemon, the same build
+/// included, can hold an unrelated agent under the same pane id. So every
+/// controller call that turns a held pane id into a daemon request takes this
+/// pair, and the request reaches the process the id came from or nothing. A
+/// controller that attached the pane itself binds to the process it attached
+/// on, which is the same process for a card it learned from that daemon; an
+/// [`Incarnation::UNNAMED`] stamp — a card learned from no named process —
+/// sends nothing on a gated controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundPane {
+    pub pane_id: String,
+    pub incarnation: Incarnation,
+}
+
+impl BoundPane {
+    pub fn new(pane_id: impl Into<String>, incarnation: Incarnation) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            incarnation,
+        }
+    }
+
+    /// A pane id the controller produced itself — a role pane it started or
+    /// attached — which no card stamp speaks for. The controller's own record
+    /// of the attach binds it; with no record, a gated controller sends
+    /// nothing.
+    pub fn held_by_controller(pane_id: impl Into<String>) -> Self {
+        Self::new(pane_id, Incarnation::UNNAMED)
     }
 }
 
@@ -330,7 +382,12 @@ pub trait PaneController: Send + Sync {
     /// impossible to cover in a fast-tier test. The default returns `false`
     /// ("nothing to attach"), preserving the old behaviour for render-only
     /// fixtures and local-PTY mocks.
-    fn try_hydrate_pane(&self, _pane_id: &str) -> bool {
+    ///
+    /// PRD #1666 part 2 (G-fix6): `card` carries the daemon process the card
+    /// was learned from; the agent is looked up and attached on that process
+    /// only, so a restarted daemon's agent under the same pane id is never
+    /// adopted.
+    fn try_hydrate_pane(&self, _card: &BoundPane) -> bool {
         false
     }
     /// PRD #76 M2.15 fixup pass 2 G1 — legacy single-call entry point.
@@ -340,7 +397,6 @@ pub trait PaneController: Send + Sync {
     /// this method**: every production spawn now goes through
     /// `create_pane_with_options` with real dims computed via the
     /// `*_pane_dims` SSOT helpers in `ui.rs` (`dashboard_pane_dims`,
-    /// `mode_agent_pane_dims`, `mode_side_pane_dims`,
     /// `orchestration_role_pane_dims`). After the M2.15 fixup pass 2,
     /// the legacy `EmbeddedPaneController::create_pane` override was
     /// deleted so no production controller can hit the 24×80 fallback —
@@ -430,7 +486,51 @@ pub trait PaneController: Send + Sync {
     fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
         None
     }
+    /// PRD #1223: drop this controller's LOCAL attachment to `pane_id` without
+    /// telling the daemon anything — for a pane whose agent another client
+    /// already stopped. Unlike [`Self::close_pane`] it sends no `stop-agent`
+    /// (there is nothing left to stop), and unlike a detach it sends no frame.
+    /// Returns whether a local attachment existed. The default holds none.
+    fn forget_pane(&self, _pane_id: &str) -> bool {
+        false
+    }
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError>;
+    /// PRD #1666 part 2 (G-fix6): close the pane behind a dashboard card. Like
+    /// [`Self::close_pane`], except that a card with no local pane stops its
+    /// agent only on the daemon process the card was learned from. The default
+    /// is `close_pane`, for controllers with no daemon behind them.
+    fn close_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.close_pane(&card.pane_id)
+    }
+    /// PRD #1666 part 2 (G-fix7): focus the local pane behind a dashboard
+    /// card, only when it is the card's — attached on the daemon process the
+    /// card was learned from. The default is [`Self::focus_pane`], for
+    /// controllers with no daemon behind them.
+    fn focus_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.focus_pane(&card.pane_id)
+    }
+    /// PRD #1666 part 2 (G-fix7c): whether the local pane under `card`'s pane
+    /// id is the card's, so a focus on that pane may select the card: attached
+    /// on the daemon process the card was learned from. The default is `true`,
+    /// for controllers with no daemon behind them, where a pane id names one
+    /// pane.
+    fn local_pane_is_cards(&self, _card: &BoundPane) -> bool {
+        true
+    }
+    /// PRD #1666 part 2 (G-fix7): the daemon process this controller attached
+    /// `pane_id` on, for a card it draws for a pane it started or attached
+    /// itself. `None` when it holds no such pane or learned no process — the
+    /// default, for controllers with no daemon behind them.
+    fn pane_incarnation(&self, _pane_id: &str) -> Option<crate::daemon_client::Incarnation> {
+        None
+    }
+    /// PRD #1666 part 2 (G-fix7c): the local panes whose agent a deck restart
+    /// took — the reattach found another daemon process answering — each with
+    /// the process it was attached on, for the render loop to drop with the
+    /// restart's notice. The default holds none.
+    fn panes_lost_to_restart(&self) -> Vec<(String, Option<crate::daemon_client::Incarnation>)> {
+        Vec::new()
+    }
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;
     fn resize_pane(
         &self,
@@ -447,69 +547,33 @@ pub trait PaneController: Send + Sync {
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError>;
     fn toggle_layout(&self) -> Result<(), PaneError>;
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError>;
-    /// PRD #100: write `text` to `pane_id` and submit atomically — the
-    /// daemon side holds its per-agent writer mutex across the full
-    /// `payload → SUBMIT_DELAY → CR` sequence, matching the contract
-    /// `AgentPtyRegistry::write_and_submit_guarded` provides to
-    /// daemon-initiated callers (orchestration delegate / work-done
-    /// feedback). The default impl forwards to [`Self::write_to_pane`],
-    /// which is the historical two-`STREAM_IN`-frames-with-gap pattern
-    /// — fine for test mocks and any caller whose pane has no
-    /// concurrent same-pane writer in production. The
-    /// `EmbeddedPaneController` impl overrides this with the atomic
-    /// `WriteAndSubmit` RPC; the orchestrator spawn-time role-prompt
-    /// injection in `ui.rs` uses the override because it shares its
-    /// pane with daemon-initiated writes.
+    /// Issue #1445: tell the daemon that the orchestrator in `pane_id` has just
+    /// been re-armed from `context_path`, so the context file it records for
+    /// that orchestration — the one a TUI attaching later is handed, and the
+    /// ones it deletes when the orchestration ends — follows the re-arm.
     ///
-    /// PRD #20 M3: returns the honest [`crate::event::SendResult`] the atomic
-    /// submit path produced, so a caller can surface feedback when input was
-    /// NOT delivered to a live target (a history-only / view-only session)
-    /// instead of assuming a fire-and-forget success. The default impl forwards
-    /// to [`Self::write_to_pane`] (the raw keystroke path, which has no
-    /// send-result of its own) and reports [`crate::event::SendResult::Applied`]
-    /// on success — correct for the local-PTY mocks that use the default, since
-    /// they always target a live pane.
-    fn write_and_submit_to_pane(
+    /// Fire-and-forget, for a caller on the TUI's render thread: nothing the
+    /// tab holds depends on the answer, since the tab already points at the
+    /// file it published. The default does nothing — correct for controllers
+    /// with no daemon behind them. The daemon-backed `EmbeddedPaneController`
+    /// overrides it to send the report on its runtime.
+    fn report_orchestrator_context(&self, _pane_id: &str, _context_path: &std::path::Path) {}
+    /// PRD #1666 S5: post a deck-generated message — a seed, an orchestrator's
+    /// role context, the configuration request — to `pane`'s inbox, bound to
+    /// the agent the pane holds now. Answers the message id. The default has no
+    /// inbox behind it and refuses; the daemon-backed `EmbeddedPaneController`
+    /// overrides it.
+    ///
+    /// PRD #1666 part 2 (G-fix6): posted only on the daemon process `pane` was
+    /// learned from ([`BoundPane`]).
+    fn post_message(
         &self,
-        pane_id: &str,
-        text: &str,
-    ) -> Result<crate::event::SendResult, PaneError> {
-        self.write_to_pane(pane_id, text)
-            .map(|()| crate::event::SendResult::Applied)
-    }
-    /// PRD #20 R20-003/R20-004: identity-bearing, idempotent counterpart of
-    /// [`Self::write_and_submit_to_pane`]. Carries the agent identity + session
-    /// the automatic prompt was queued for and a stable delivery id so the daemon
-    /// can (a) refuse delivery to a replacement agent on a rebind
-    /// (`stale`/`wrong-session`) and (b) dedup a retry after a lost response.
-    ///
-    /// The default impl DROPS the identity and forwards to
-    /// [`Self::write_and_submit_to_pane`] — correct for local-PTY test mocks
-    /// (which always target a live pane and don't talk to a daemon). The
-    /// daemon-backed `EmbeddedPaneController` overrides it to carry the identity
-    /// over the wire via `DaemonClient::write_and_submit_with_identity`.
-    ///
-    /// Issue #608 audit, finding 5: what the daemon refuses is the identity-less
-    /// WIRE SHAPE — a paned `write-and-submit` carrying no `expected_agent_id`
-    /// answers `no-live-target` with nothing written. It does not follow that the
-    /// identity-less METHOD is dead, and this comment used to say a daemon-backed
-    /// caller "must" come through here. It does not have to.
-    /// `EmbeddedPaneController`'s override of [`Self::write_and_submit_to_pane`]
-    /// deliberately remains a working fallback: it resolves the pane's current
-    /// owner itself and puts that agent id on the wire, so what it sends is a
-    /// shape the daemon accepts. What that override cannot supply is the SESSION
-    /// generation — daemon-side state the controller does not track — so a caller
-    /// that knows one (both production prompt-delivery paths in `ui.rs`) should
-    /// use THIS method, which can name the conversation as well as the agent.
-    fn write_and_submit_to_pane_with_identity(
-        &self,
-        pane_id: &str,
-        text: &str,
-        _expected_agent_id: Option<&str>,
-        _expected_session_id: Option<&str>,
-        _delivery_id: Option<&str>,
-    ) -> Result<crate::event::SendResult, PaneError> {
-        self.write_and_submit_to_pane(pane_id, text)
+        _pane: &BoundPane,
+        _subject: &str,
+        _body: &str,
+        _origin: crate::inbox_hub::PostOrigin,
+    ) -> Result<String, PaneError> {
+        Err(PaneError::NotAvailable)
     }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;

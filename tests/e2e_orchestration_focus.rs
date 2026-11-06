@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 end-to-end coverage for the lock-governed focus contract — the
 //! real-binary proof that focus follows the command-entry lock.
@@ -38,7 +38,7 @@ use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
-/// `orch-focus-lifecycle` fixture. With no `[[modes]]` defined the Mode chip
+/// `orch-focus-lifecycle` fixture. The Mode chip
 /// row is `[No mode] [Orch: focus-lifecycle] [schedule]`, so ONE Right selects
 /// the orchestration; selecting an orchestration hides the Command field, so a
 /// second Enter submits the form. Lands with the orchestrator (start) role
@@ -133,6 +133,8 @@ fn inject_role_status(
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
     common::write_hook_line(deck.hook_socket_path(), &line)
@@ -160,10 +162,11 @@ fn focus_007_lock_governed_focus_contract_on_real_binary() {
     const BETA_STICK_SENTINEL: &str = "FOCUS007_BETA_STICK_6d4e";
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(160, 45)
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("orch-focus-lifecycle");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The orchestration opened below needs isolated-clone provisioning,
     // which needs a ref to branch from — an unborn HEAD (the harness's own
@@ -191,7 +194,7 @@ fn focus_007_lock_governed_focus_contract_on_real_binary() {
         ],
     );
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
 
     let socket = deck.attach_socket_path().to_path_buf();
     let alpha_record = role_agent_record(&socket, "alpha");

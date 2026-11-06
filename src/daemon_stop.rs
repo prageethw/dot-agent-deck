@@ -35,14 +35,17 @@
 use std::io;
 use std::time::Duration;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::agent_pty::{AgentPtyRegistry, AgentRecord};
 use crate::build_version_handshake::{HandshakeError, TerminateOutcome, terminate_daemon_graceful};
 use crate::daemon_client::{LocalEndpoint, issue_command};
-use crate::daemon_protocol::AttachRequest;
+use crate::daemon_protocol::{
+    AttachRequest, CAP_STOP_DAEMON, StopDaemonRefusal, StopRefusalReason,
+};
 use crate::platform::ipc::IpcStream;
 use crate::platform::peercred::peer_pid;
-use crate::state::OrchestrationRoleRecord;
+use crate::state::{OrchestrationRoleRecord, SharedState};
 
 /// SIGTERM grace before reporting "daemon did not exit cleanly". PRD #103
 /// M3.2: 5 s.
@@ -90,6 +93,56 @@ pub enum StopError {
     /// ESRCH if the daemon already exited between probe and signal),
     /// `OpenProcess`/`TerminateProcess` on Windows.
     KillFailed(io::Error),
+    /// Issue #1049, wire path only: the daemon refused, and said why in a shape
+    /// this side did not have to reconstruct.
+    ///
+    /// Distinct from [`Self::LiveAgents`] / [`Self::LiveOrchestrations`] rather
+    /// than folded into them, because the two say different things about where
+    /// the verdict came from. Those two are *this* process deciding, from a
+    /// `ListAgents` reply it read itself; this one is the daemon's own verdict,
+    /// arriving already rendered. Folding them would mean re-deriving a message
+    /// the daemon already sent, and a remote client cannot check the daemon's
+    /// reasoning anyway — it has no view of the pane list except this reply.
+    Refused(StopDaemonRefusal),
+    /// Issue #1049, wire path only: the daemon answered `ok = false` with no
+    /// structured refusal. Either a genuine unrelated error, or — the case worth
+    /// naming — a daemon predating [`AttachRequest::StopDaemon`], whose serde
+    /// decode fails with `unknown variant`.
+    ///
+    /// There is no fallback to offer a remote caller here: the PID path needs a
+    /// [`LocalEndpoint`], which is exactly what a remote caller does not have.
+    /// Read [`CAP_STOP_DAEMON`] off a `Hello` first if you want to tell the two
+    /// apart before spending a round trip on it.
+    WireRejected(String),
+    /// Issue #1049, wire path only: the daemon accepted the connection but never
+    /// answered within [`WIRE_STOP_REQUEST_TIMEOUT`].
+    ///
+    /// Its own variant because the recovery differs from every other error here:
+    /// this side does **not** know whether the daemon saw the request, so the
+    /// honest report is "unknown", not "failed". Retrying is safe — if the first
+    /// attempt landed and the daemon stopped, the retry answers
+    /// [`WireStopOutcome::NoDaemonRunning`]; if it was refused, the retry is
+    /// refused the same way.
+    ///
+    /// Reachable specifically over a forwarded socket, which is the transport
+    /// this verb exists for: `ssh -L` accepts locally whether or not anything
+    /// upstream is healthy, so a stalled remote produces a connection that is
+    /// open and permanently silent. Without this bound the call would block
+    /// forever and the confirmation budget below would never be reached
+    /// (Greptile P1 on PR #1113).
+    WireTimedOut,
+}
+
+/// Does `capabilities`, as advertised on a `Hello` reply, include the wire stop?
+///
+/// `None` means the daemon withheld the field entirely, which per
+/// [`crate::daemon_protocol::AttachResponse::capabilities`] a client reads as
+/// "withhold", not as "everything". So a daemon too old to advertise anything
+/// answers `false` here, which is the safe direction: the caller reports that
+/// the deck cannot be stopped over the wire instead of sending a frame that
+/// will come back as `unknown variant`.
+pub fn supports_wire_stop(capabilities: Option<&[String]>) -> bool {
+    capabilities.is_some_and(|caps| caps.iter().any(|c| c == CAP_STOP_DAEMON))
 }
 
 impl std::fmt::Display for StopError {
@@ -121,6 +174,15 @@ impl std::fmt::Display for StopError {
                 )
             }
             Self::KillFailed(e) => write!(f, "kill syscall failed: {e}"),
+            // The daemon already rendered this; re-wording it here would give
+            // the operator a second, subtly different account of one refusal.
+            Self::Refused(refusal) => write!(f, "{}", refusal.summary),
+            Self::WireRejected(msg) => write!(f, "daemon refused stop-daemon: {msg}"),
+            Self::WireTimedOut => write!(
+                f,
+                "daemon accepted the connection but did not answer stop-daemon within {}s;                  whether it saw the request is unknown — retrying is safe",
+                WIRE_STOP_REQUEST_TIMEOUT.as_secs()
+            ),
         }
     }
 }
@@ -359,21 +421,7 @@ pub fn format_live_orchestrations_refusal(roles: &[OrchestrationRoleRecord]) -> 
         n = roles.len()
     );
     for role in roles {
-        let marker = if role.is_orchestrator {
-            " (orchestrator)"
-        } else {
-            ""
-        };
-        let orchestration = if role.orchestration.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", role.orchestration)
-        };
-        let _ = writeln!(
-            out,
-            "  {} {}{marker}{orchestration}",
-            role.pane_id, role.role
-        );
+        let _ = writeln!(out, "  {}", orchestration_role_line(role));
     }
     let _ = writeln!(
         out,
@@ -383,6 +431,593 @@ pub fn format_live_orchestrations_refusal(roles: &[OrchestrationRoleRecord]) -> 
     );
     let _ = writeln!(out, "pass --force to stop anyway");
     out
+}
+
+/// Render ONE orchestration-role registration as a human-readable line, shared
+/// by [`format_live_orchestrations_refusal`] and
+/// [`format_teardown_inventory`] (issue #1109).
+///
+/// Shared rather than spelled twice because the two describe the SAME
+/// registration from opposite sides of one decision — the refusal says what a
+/// guarded stop would destroy, the inventory says what an unguarded one just
+/// did — and an operator correlating a refusal they read on Monday with a log
+/// line they grep on Friday should not have to notice that the two renderings
+/// drifted. The same reasoning already shapes `wire_stop_refusal`, which
+/// delegates to the formatters rather than re-deriving a second wording.
+///
+/// No leading indent: the refusal adds its own two spaces, the inventory packs
+/// these into a bracketed list on one line.
+fn orchestration_role_line(role: &OrchestrationRoleRecord) -> String {
+    let marker = if role.is_orchestrator {
+        " (orchestrator)"
+    } else {
+        ""
+    };
+    let orchestration = if role.orchestration.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", role.orchestration)
+    };
+    format!("{} {}{marker}{orchestration}", role.pane_id, role.role)
+}
+
+/// Render ONE live agent as a human-readable entry for
+/// [`format_teardown_inventory`].
+///
+/// `id` is the registry's own agent id — the handle every other daemon log line
+/// about this agent carries — and `pane` is the key the role maps are indexed
+/// by, so the two together let a reader join this line to both. `label` and
+/// `cwd` are what say *whose work* was running; `cwd` in particular is the only
+/// field here that distinguishes two panes of different dispatched units when
+/// neither holds an orchestration role.
+///
+/// PRD #1589 (auditor S5): every value but the registry-minted `id` is escaped
+/// and bounded on its own — a directory name may legally carry a newline, an
+/// ESC or a bidi control, and this line lands in the daemon's log and in
+/// `close`'s disclosure. Per value rather than over the whole line, so a long
+/// path cannot push another pane out of the inventory. A pane id the registry
+/// retains is at most [`crate::agent_pty::PANE_ID_ENV_MAX_LEN`] plain
+/// characters, so escaping leaves it exactly as it was.
+pub(crate) fn teardown_agent_line(agent: &AgentRecord) -> String {
+    let shown = |v: Option<&str>, max: usize| match v.filter(|s| !s.is_empty()) {
+        Some(v) => crate::config_validation::escape_field_for_log(v, max),
+        None => "-".to_string(),
+    };
+    format!(
+        "{} pane={} label={} cwd={}",
+        agent.id,
+        shown(
+            agent.pane_id_env.as_deref(),
+            crate::config_validation::MAX_QUOTED_VALUE_CHARS
+        ),
+        shown(
+            agent.display_name.as_deref(),
+            crate::config_validation::MAX_QUOTED_VALUE_CHARS
+        ),
+        shown(agent.cwd.as_deref(), MAX_LOGGED_PATH_CHARS),
+    )
+}
+
+/// The most characters of a path [`teardown_agent_line`] and the worktree
+/// cleanup log keep. Longer than an identifier's bound because a real worktree
+/// path is.
+pub(crate) const MAX_LOGGED_PATH_CHARS: usize = 512;
+
+/// Issue #1109: render what an UNGUARDED teardown is destroying, for the
+/// daemon's own log. `None` when there is nothing to name.
+///
+/// # Why this exists beside a refusal rather than as one
+///
+/// Three paths tear this daemon down. `dot-agent-deck daemon stop` and the
+/// [`crate::daemon_protocol::AttachRequest::StopDaemon`] wire verb are guarded
+/// — they run [`stop_refusal`] and refuse without `--force`. The other two are
+/// not: a termination SIGNAL (issue #1109) and the header-only
+/// [`crate::daemon_protocol::KIND_SHUTDOWN`] frame both drain the registry
+/// unconditionally.
+///
+/// Issue #1109 asked whether those two should refuse as well, and the answer
+/// recorded in `docs/develop/daemon-teardown-paths.md` is no: a SIGTERM is how
+/// a service manager, a container runtime or a session logout asks a daemon to
+/// stop, and a daemon that argues back is escalated to SIGKILL on the
+/// supervisor's clock — which loses the graceful drain AND the disclosure, so it
+/// is strictly worse than obeying. What those paths can do instead is SAY what
+/// they are taking down, which is the half the guarded path was really
+/// providing: #428's occurrence #5 needed log archaeology to establish that a
+/// stray `pkill -f "daemon serve"` had stopped nine panes across three
+/// dispatched units, because the shutdown line named none of them.
+///
+/// # Shape
+///
+/// One line, because it is read by `grep` after the fact rather than by a human
+/// watching a terminal — the guarded path's refusal is the multi-line one, and
+/// it is read live. The list is bounded by the number of live panes one deck
+/// holds, and is deliberately uncapped for the same reason
+/// [`format_live_orchestrations_refusal`] is: a truncated forensic list is the
+/// one thing worse than no list.
+///
+/// `roles` is an `Option` rather than a slice so that "could not find out" and
+/// "there were none" stay distinguishable. They read identically as an empty
+/// slice, and the difference is the whole point of the line.
+pub fn format_teardown_inventory(
+    roles: Option<&[OrchestrationRoleRecord]>,
+    agents: &[AgentRecord],
+) -> Option<String> {
+    if agents.is_empty() && roles.is_some_and(<[OrchestrationRoleRecord]>::is_empty) {
+        return None;
+    }
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = write!(out, "terminating {} managed agent(s) and ", agents.len());
+    match roles {
+        Some(roles) => {
+            let _ = write!(
+                out,
+                "destroying {} orchestration role registration(s)",
+                roles.len()
+            );
+        }
+        // Greptile P1 on the first draft, and it was right. There was no `None`
+        // arm: [`log_teardown_inventory`] handed this an empty slice when the
+        // state lock missed its budget, so a teardown that could not find out
+        // printed "destroying 0 orchestration role registration(s)" and dropped
+        // the permanence sentence below. The `warn!` beside it did say
+        // "UNLISTED" — one incident report contradicting another, with the wrong
+        // one louder, in the contended moment the record exists for. An unknown
+        // says it is unknown.
+        None => {
+            let _ = write!(
+                out,
+                "destroying an UNKNOWN number of orchestration role registration(s) \
+                 (the daemon's state could not be read in time — see the line above)"
+            );
+        }
+    }
+    if !agents.is_empty() {
+        let list: Vec<String> = agents.iter().map(teardown_agent_line).collect();
+        let _ = write!(out, "; agents: [{}]", list.join(", "));
+    }
+    if let Some(roles) = roles
+        && !roles.is_empty()
+    {
+        let list: Vec<String> = roles.iter().map(orchestration_role_line).collect();
+        let _ = write!(out, "; roles: [{}]", list.join(", "));
+    }
+    // The same permanence sentence `format_live_orchestrations_refusal` ends on.
+    // It is the part that is NOT obvious from the agent list: the processes are
+    // merely stopped, while these registrations have no persistence path of any
+    // kind and are gone with this process. Carried whenever roles were held OR
+    // could not be read — withheld only on a confirmed empty set, where it would
+    // be a false claim about what this teardown cost.
+    if roles.is_none_or(|roles| !roles.is_empty()) {
+        let _ = write!(
+            out,
+            "; role registrations are held in memory only, so any agent that survives this \
+             teardown keeps running but can never delegate again"
+        );
+    }
+    Some(out)
+}
+
+/// The budget [`log_teardown_inventory`] gives the state lock before giving up
+/// on naming the orchestration roles.
+///
+/// The disclosure is diagnostic, so it must not be able to delay the teardown it
+/// describes. Two clocks bound it, and the tighter one is ours rather than the
+/// operating system's:
+///
+/// - **An external sender's.** On the signal path the sender is frequently a
+///   service manager running its own `TimeoutStopSec`, and spending that budget
+///   waiting for a lock trades a graceful drain for a `SIGKILL`. Those windows
+///   are measured in tens of seconds, so they are not what sets this number.
+/// - **Our own stop clients'**, which is what does. `daemon stop` sends the very
+///   SIGTERM this fires on and then polls
+///   [`crate::agent_pty::DAEMON_STOP_POLL_BUDGET`] for the daemon to go away,
+///   and the teardown that follows this call can already spend
+///   [`crate::agent_pty::AGENT_TERMINATE_GRACE`] plus
+///   [`crate::agent_pty::FORCE_REAP_DEADLINE`] of it. This is charged to the
+///   same window, ahead of both, so it comes out of the headroom that pays for
+///   unwinding, dropping the registry, exiting, and a client that samples only
+///   every 100 ms.
+///
+/// 200 ms is twice that sampling interval and far above any contention this
+/// lock sees in practice — every other holder takes it for one snapshot — while
+/// leaving the great majority of the headroom alone. The assertion below pins
+/// the relationship rather than leaving it to this comment, exactly as
+/// `FORCE_REAP_DEADLINE`'s own assertions do.
+const TEARDOWN_INVENTORY_LOCK_BUDGET: Duration = Duration::from_millis(200);
+
+// The arithmetic above is load-bearing, not stylistic: a disclosure that pushes
+// the teardown past what `daemon stop` waits for turns a clean stop into a
+// `TimedOut` (or, with `--force`, a SIGKILL mid-teardown) — and it would do it
+// on the exact path the disclosure exists to serve.
+const _: () = assert!(
+    TEARDOWN_INVENTORY_LOCK_BUDGET.as_millis()
+        + crate::agent_pty::AGENT_TERMINATE_GRACE.as_millis()
+        + crate::agent_pty::FORCE_REAP_DEADLINE.as_millis()
+        < crate::agent_pty::DAEMON_STOP_POLL_BUDGET.as_millis(),
+    "the teardown disclosure plus the SIGTERM grace plus the reap must finish strictly inside \
+     the window a stop client polls for, or naming what was destroyed is what destroyed the \
+     clean stop"
+);
+
+/// Issue #1109: log what this teardown is destroying, on the paths that do not
+/// refuse.
+///
+/// Call this BEFORE draining the registry. `AgentPtyRegistry::agent_records`
+/// filters to live agents and `shutdown_all_graceful` drains the map, so after
+/// the drain both halves of this inventory read empty and the disclosure is a
+/// line saying nothing was lost.
+///
+/// `path` names which teardown produced the line (`"signal"`,
+/// `"shutdown-frame"`) so a reader does not have to correlate it against the
+/// line above by timestamp.
+///
+/// Best-effort by construction, in two ways that are named here rather than
+/// left for a reader to discover in an incident.
+///
+/// **A state lock it cannot take inside [`TEARDOWN_INVENTORY_LOCK_BUDGET`] costs
+/// the ROLE half**, and that is reported as UNKNOWN in both the `warn!` below
+/// and the inventory itself — never as a zero. The agent half comes off the
+/// registry's own mutex and does not depend on that read.
+///
+/// **The two halves are two snapshots, not one** (Greptile P1). They come from
+/// different locks, and the daemon is still serving when this runs: spawn
+/// admission closes only when the drain that follows latches
+/// `AgentPtyRegistry::shutting_down`, so a `StartAgent` accepted in between can
+/// land in one list and not the other. It is not closed, for two reasons. An
+/// atomic snapshot would mean holding the state lock and the registry mutex
+/// together on the teardown path, introducing a lock ordering where there is
+/// none today, for a log line. And pre-latching `shutting_down` to close
+/// admission first — the obvious alternative — would make the drain that
+/// follows return *immediately without draining anything*, because
+/// [`AgentPtyRegistry::shutdown_all_graceful`] early-returns on exactly that
+/// latch: it would trade a cosmetic inconsistency in a record for every managed
+/// agent losing its SIGTERM grace.
+///
+/// What is done instead is to order the reads so the window is as small as it
+/// can be: the SLOW read (the state lock, up to the budget) goes first and the
+/// fast registry read immediately after, so the gap between the two snapshots is
+/// one mutex acquisition rather than the whole lock wait.
+pub async fn log_teardown_inventory(
+    state: &SharedState,
+    registry: &AgentPtyRegistry,
+    path: &'static str,
+) {
+    // PRD #1741: every path that drains passes here first, so this is when the
+    // teardown began, which sizes telemetry's final flush.
+    crate::telemetry::teardown_began(registry.telemetry(), path);
+    let roles = match tokio::time::timeout(TEARDOWN_INVENTORY_LOCK_BUDGET, state.read()).await {
+        Ok(guard) => Some(guard.live_orchestration_roles(registry)),
+        Err(_) => {
+            warn!(
+                path,
+                budget_ms = TEARDOWN_INVENTORY_LOCK_BUDGET.as_millis() as u64,
+                "could not read daemon state within the budget; this teardown's orchestration \
+                 roles are UNLISTED, which is not the same as none being at stake"
+            );
+            None
+        }
+    };
+    let agents = registry.agent_records();
+    if let Some(inventory) = format_teardown_inventory(roles.as_deref(), &agents) {
+        warn!(
+            path,
+            agent_count = agents.len(),
+            // `None` rather than `0` when the read timed out: a structured
+            // consumer must be able to tell the two apart for the same reason
+            // the message must.
+            role_count = roles.as_ref().map(Vec::len),
+            "{inventory}"
+        );
+    }
+}
+
+/// Issue #1049: the wire form of [`stop_refusal`], for
+/// [`crate::daemon_protocol::AttachRequest::StopDaemon`].
+///
+/// A thin adapter on purpose. The *policy* is `stop_refusal` and the *wording*
+/// is [`format_live_orchestrations_refusal`] / [`format_live_agents_refusal`],
+/// both unchanged and both still what the CLI uses — so the wire stop and the
+/// CLI stop cannot reach different verdicts or describe the same verdict
+/// differently. That mattered enough to shape the function: the obvious
+/// alternative, deciding the refusal again from the two slices, is how the two
+/// paths would have drifted the first time either policy was touched.
+///
+/// `None` means nothing stands in the way of the stop.
+pub fn wire_stop_refusal(
+    orchestration_roles: &[OrchestrationRoleRecord],
+    agent_ids: &[String],
+    force: bool,
+) -> Option<StopDaemonRefusal> {
+    let err = stop_refusal(orchestration_roles, agent_ids, force)?;
+    let summary = err.to_string();
+    let (reason, message) = match &err {
+        StopError::LiveOrchestrations { roles } => (
+            StopRefusalReason::LiveOrchestrations,
+            format_live_orchestrations_refusal(roles),
+        ),
+        StopError::LiveAgents { ids } => (
+            StopRefusalReason::LiveAgents,
+            format_live_agents_refusal(ids),
+        ),
+        // `stop_refusal` returns only those two, and its signature is the whole
+        // reason this is unreachable rather than defensive. If a third guard is
+        // ever added there, this arm is what stops it reaching the wire as a
+        // silent "nothing in the way" — the daemon refuses, generically, rather
+        // than stopping a deck whose new guard this function did not understand.
+        other => (StopRefusalReason::Unknown, format!("{other}\n")),
+    };
+    Some(StopDaemonRefusal {
+        reason,
+        roles: orchestration_roles.to_vec(),
+        agent_ids: agent_ids.to_vec(),
+        message,
+        summary,
+    })
+}
+
+/// How long to wait for a wire-stopped daemon to actually stop answering.
+///
+/// The same 5 s the PID path gives SIGTERM ([`STOP_GRACE_TIMEOUT`]), for the
+/// same reason: the daemon's own drain gives each agent
+/// `AGENT_TERMINATE_GRACE` before escalating, and the teardown follows.
+const WIRE_STOP_CONFIRM_TIMEOUT: Duration = STOP_GRACE_TIMEOUT;
+
+/// Gap between confirmation probes. Matches the PID path's poll cadence.
+const WIRE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Bound on the `StopDaemon` round trip itself.
+///
+/// The daemon answers this verb *before* it drains anything — a refusal is
+/// immediate and an accept is written ahead of the teardown — so a healthy peer
+/// replies in well under a second plus the transport's round trip. Ten seconds
+/// is slack for a loaded host or a slow tunnel, not a budget anything is
+/// expected to use. Exceeding it yields [`StopError::WireTimedOut`].
+const WIRE_STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on one confirmation probe.
+///
+/// Tighter than the request bound because a probe is only ever a `Hello`, and
+/// because several of them have to fit inside
+/// [`WIRE_STOP_CONFIRM_TIMEOUT`].
+const WIRE_STOP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many CONSECUTIVE unreachable probes confirm the daemon is gone.
+///
+/// Not one. A single failed probe used to be treated as proof the daemon had
+/// exited, which over a forwarded socket meant a momentary tunnel hiccup could
+/// return [`WireStopOutcome::Stopped`] for a daemon that was still running
+/// (Greptile P1 on PR #1113) — a **false success**, and false successes on the
+/// stop path are the specific defect issue #1049 was filed about: over `ssh -L`
+/// the old PID path reported "Daemon stopped gracefully (pid N)" having killed
+/// the tunnel. Requiring the absence to persist across three probes costs
+/// ~200 ms on the ordinary path and removes that class of report.
+const WIRE_STOP_GONE_CONFIRMATIONS: u32 = 3;
+
+/// Issue #1049: what a wire stop can end as.
+///
+/// Deliberately NOT [`StopOutcome`], whose two success variants both carry a
+/// pid. A wire caller has no pid — that is the entire point of the verb — and
+/// inventing one to reuse the type would put a number in front of an operator
+/// that names nothing they can act on. `ForceKilled` has no meaning here
+/// either: escalating past a graceful stop needs a signal, and a caller on
+/// another machine has nothing to signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireStopOutcome {
+    /// Nothing was listening. Idempotent, exactly like
+    /// [`StopOutcome::NoDaemonRunning`].
+    NoDaemonRunning,
+    /// The daemon accepted the stop AND stopped answering within
+    /// [`WIRE_STOP_CONFIRM_TIMEOUT`].
+    Stopped,
+    /// The daemon accepted the stop and had not demonstrably gone when the
+    /// confirmation budget ran out.
+    ///
+    /// Not an error, and reported separately rather than as one: the daemon
+    /// said yes and began its drain, which can legitimately outlast the budget
+    /// with slow-exiting agents, and over a tunnel every probe carries the
+    /// round trip too. What the caller must not do is *report* it as stopped —
+    /// PRD #741's own cautionary case is a stop path that printed success for a
+    /// daemon it had not touched.
+    AcceptedNotConfirmed,
+}
+
+/// Issue #1049: stop a deck over the wire, from a client that need not be on
+/// its machine.
+///
+/// `address` is what the caller already holds for every other request —
+/// [`crate::remote_tunnel::EndpointConnection::connect_address`] — so this is
+/// the same address a remote `ListAgents` goes to, and for a remote deck that is
+/// the local end of an `ssh -L` tunnel.
+///
+/// **The whole difference from [`run_daemon_stop`] is who does the terminating.**
+/// That function reads the daemon's pid off the socket with `SO_PEERCRED` and
+/// signals it, which needs a kernel-level view of a peer on this machine; over a
+/// tunnel the credential names the local `ssh` client, so it would signal the
+/// tunnel and report the daemon stopped. Here the daemon stops itself, and
+/// nothing in the path consults a pid, a credential, or a signal. That is why it
+/// works remotely — and also why it is strictly weaker: there is no `--force`
+/// escalation, because a caller on another machine has nothing to escalate with.
+/// A wedged daemon is reported as [`WireStopOutcome::AcceptedNotConfirmed`] and
+/// has to be dealt with where it runs.
+///
+/// **The refusal is carried, not re-derived.** The daemon runs
+/// [`stop_refusal`] itself and answers with
+/// [`crate::daemon_protocol::StopDaemonRefusal`], which arrives here as
+/// [`StopError::Refused`] with the panes, the roles and both renderings. A
+/// remote caller has no other view of that pane list, so a refusal that crossed
+/// as a bare string would leave it unable to present the choice #770 exists to
+/// present.
+pub async fn run_daemon_stop_over_wire(
+    address: &std::path::Path,
+    force: bool,
+) -> Result<WireStopOutcome, StopError> {
+    run_daemon_stop_over_wire_with(
+        address,
+        force,
+        WIRE_STOP_REQUEST_TIMEOUT,
+        WIRE_STOP_CONFIRM_TIMEOUT,
+    )
+    .await
+}
+
+/// [`run_daemon_stop_over_wire`] with its two budgets spelled out.
+///
+/// Public because a caller with its own latency expectations has a legitimate
+/// reason to choose them — a GUI that wants to surface "still stopping" sooner
+/// than [`WIRE_STOP_CONFIRM_TIMEOUT`] would, say — and because the timeout and
+/// confirmation behaviour has to be testable in the fast tier, where spending
+/// the production 10 s and 5 s would not be acceptable. Every decision other
+/// than the two budgets is shared with the wrapper, so a test through this
+/// exercises the real path.
+pub async fn run_daemon_stop_over_wire_with(
+    address: &std::path::Path,
+    force: bool,
+    request_timeout: Duration,
+    confirm_timeout: Duration,
+) -> Result<WireStopOutcome, StopError> {
+    let stream = match IpcStream::connect(address).await {
+        Ok(s) => s,
+        Err(e)
+            if e.kind() == io::ErrorKind::ConnectionRefused
+                || e.kind() == io::ErrorKind::NotFound =>
+        {
+            // Same idempotent reading as `run_daemon_stop`'s connect arm.
+            debug!(
+                target: "daemon_stop",
+                path = %address.display(),
+                err = %e,
+                "no daemon answering (connect failed)"
+            );
+            return Ok(WireStopOutcome::NoDaemonRunning);
+        }
+        Err(e) => return Err(StopError::ConnectFailed(e)),
+    };
+
+    let (mut rd, mut wr) = stream.into_split();
+    // Bounded: `issue_command` has no timeout of its own, and over a forwarded
+    // socket a stalled upstream yields a connection that is open and silent
+    // forever. See `StopError::WireTimedOut`.
+    let resp = match tokio::time::timeout(
+        request_timeout,
+        issue_command(&mut rd, &mut wr, &AttachRequest::StopDaemon { force }),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return Err(StopError::WireRejected(e.to_string())),
+        Err(_) => return Err(StopError::WireTimedOut),
+    };
+    drop(rd);
+    drop(wr);
+
+    if !resp.ok {
+        // The structured refusal when the daemon sent one; otherwise whatever it
+        // said, which for a daemon predating the verb is serde's `unknown
+        // variant` — see `StopError::WireRejected`.
+        return Err(match resp.stop_refusal {
+            Some(refusal) => StopError::Refused(refusal),
+            None => StopError::WireRejected(
+                resp.error
+                    .unwrap_or_else(|| "stop-daemon failed with no reason given".into()),
+            ),
+        });
+    }
+
+    debug!(
+        target: "daemon_stop",
+        path = %address.display(),
+        force,
+        "daemon acknowledged stop-daemon; confirming it stops answering"
+    );
+    if poll_daemon_gone_over_wire(address, confirm_timeout).await {
+        Ok(WireStopOutcome::Stopped)
+    } else {
+        Ok(WireStopOutcome::AcceptedNotConfirmed)
+    }
+}
+
+/// What one confirmation probe established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// The daemon answered. It is still up.
+    Answered,
+    /// Nothing is there: the connect was refused, or the connection produced an
+    /// EOF or transport error instead of a reply. Over `ssh -L` a dead remote
+    /// daemon looks exactly like this — the tunnel accepts, then the forward
+    /// collapses — which is why this and not `Stalled` is the evidence of death.
+    Unreachable,
+    /// The connection is open and silent: no reply, and no EOF either, within
+    /// [`WIRE_STOP_PROBE_TIMEOUT`].
+    ///
+    /// **Deliberately not evidence of death.** A daemon that exits closes its
+    /// socket, so its peer sees EOF rather than silence; silence is a peer that
+    /// is stalled or a forward that is wedged. Counting it as gone is how a hung
+    /// tunnel would be reported as a successful stop.
+    Stalled,
+}
+
+/// Poll until `address` has demonstrably stopped answering, or `budget` elapses.
+///
+/// **Not** `build_version_handshake`'s `poll_daemon_gone`, and the difference is
+/// the point. That one short-circuits on the endpoint's filesystem presence,
+/// which its own comment scopes to a local endpoint — for a remote deck the
+/// socket being polled belongs to the *tunnel*, so presence says nothing about
+/// the daemon. A connect is no better for the same reason: `ssh -L` keeps
+/// accepting locally after the remote daemon has gone, and only the forward
+/// behind it fails.
+///
+/// So this spends a real round trip, and requires
+/// [`WIRE_STOP_GONE_CONFIRMATIONS`] CONSECUTIVE unreachable probes before it
+/// says gone. Anything else — an answer, or a stall — resets the count, so a
+/// momentary hiccup cannot be reported as a completed stop.
+async fn poll_daemon_gone_over_wire(address: &std::path::Path, budget: Duration) -> bool {
+    let start = std::time::Instant::now();
+    let mut consecutive_unreachable = 0u32;
+    loop {
+        match probe_daemon(address).await {
+            Probe::Unreachable => {
+                consecutive_unreachable += 1;
+                if consecutive_unreachable >= WIRE_STOP_GONE_CONFIRMATIONS {
+                    return true;
+                }
+            }
+            // Both reset. `Answered` is proof it is up; `Stalled` proves nothing
+            // either way, and treating "proves nothing" as progress toward "gone"
+            // is exactly the false success this counter exists to stop.
+            Probe::Answered | Probe::Stalled => consecutive_unreachable = 0,
+        }
+        if start.elapsed() >= budget {
+            return false;
+        }
+        tokio::time::sleep(WIRE_STOP_POLL_INTERVAL).await;
+    }
+}
+
+/// One `Hello` round trip, classified. `Hello` is the cheapest request every
+/// daemon answers and it mutates nothing.
+async fn probe_daemon(address: &std::path::Path) -> Probe {
+    let Ok(stream) = IpcStream::connect(address).await else {
+        return Probe::Unreachable;
+    };
+    let (mut rd, mut wr) = stream.into_split();
+    let req = AttachRequest::Hello {
+        client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+        client_build_version: None,
+        follow_on: false,
+    };
+    match tokio::time::timeout(
+        WIRE_STOP_PROBE_TIMEOUT,
+        issue_command(&mut rd, &mut wr, &req),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Probe::Answered,
+        // An EOF or transport error on an established connection is what a dead
+        // daemon behind a live tunnel looks like.
+        Ok(Err(_)) => Probe::Unreachable,
+        Err(_) => Probe::Stalled,
+    }
 }
 
 /// `daemon restart`: PRD #103 M3.3 — same logic as `daemon stop`. The
@@ -429,6 +1064,208 @@ mod tests {
             orchestration: "issue-work".to_string(),
             is_orchestrator,
         }
+    }
+
+    /// A live `AgentRecord` as [`AgentPtyRegistry::agent_records`] yields one,
+    /// with only the four fields [`teardown_agent_line`] reads carrying values.
+    /// Built exhaustively rather than through serde so a new field forces a
+    /// deliberate look at whether the teardown inventory should name it.
+    fn agent(id: &str, pane: Option<&str>, label: Option<&str>, cwd: Option<&str>) -> AgentRecord {
+        AgentRecord {
+            id: id.to_string(),
+            pane_id_env: pane.map(str::to_string),
+            display_name: label.map(str::to_string),
+            cwd: cwd.map(str::to_string),
+            tab_membership: None,
+            agent_type: None,
+            rows: 24,
+            cols: 80,
+            live: None,
+            spawned_at_ms: None,
+            cli_name: None,
+            prompt_keys: None,
+            crashed: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            inbox: None,
+            delegation_commission: None,
+            outstanding_delegation: None,
+        }
+    }
+
+    /// Issue #1109: the disclosure the UNGUARDED teardown paths emit. It is the
+    /// whole deliverable of that issue — the signal path and `KIND_SHUTDOWN`
+    /// keep destroying what they destroy, and what changed is that they now say
+    /// what it was — so it must name every pane, every role, and the permanence.
+    #[test]
+    fn teardown_inventory_names_every_agent_every_role_and_the_permanence() {
+        let roles = vec![
+            role("sched-issue-work-1-r0", "orchestrator", true),
+            role("sched-issue-work-1-r1", "coder", false),
+        ];
+        let agents = vec![
+            agent(
+                "12",
+                Some("sched-issue-work-1-r0"),
+                Some("orchestrator"),
+                Some("/home/u/code/repo"),
+            ),
+            agent(
+                "13",
+                Some("sched-issue-work-1-r1"),
+                Some("coder"),
+                Some("/home/u/code/repo-worker"),
+            ),
+        ];
+        let msg = format_teardown_inventory(Some(&roles), &agents)
+            .expect("a daemon with live agents and roles has something to disclose");
+        for expected in [
+            "terminating 2 managed agent(s)",
+            "destroying 2 orchestration role registration(s)",
+            "12",
+            "13",
+            "sched-issue-work-1-r0",
+            "sched-issue-work-1-r1",
+            "label=orchestrator",
+            "label=coder",
+            "/home/u/code/repo-worker",
+            "(orchestrator)",
+            "[issue-work]",
+        ] {
+            assert!(
+                msg.contains(expected),
+                "inventory must name {expected:?}, got: {msg:?}"
+            );
+        }
+        assert!(
+            msg.contains("can never delegate again"),
+            "the inventory must carry the same permanence sentence the #770 \
+             refusal carries — the processes are merely stopped, the role \
+             registrations are gone for good; got: {msg:?}"
+        );
+        assert!(
+            !msg.contains('\n'),
+            "the inventory is grepped out of a log after the fact, so it must be \
+             ONE line; got: {msg:?}"
+        );
+    }
+
+    /// The inventory and the #770 refusal describe the same registration, and a
+    /// reader correlating a refusal with a log line should not have to notice a
+    /// drift. Pinned by rendering both from one role set and requiring the
+    /// refusal's own per-role rendering to appear verbatim inside the inventory.
+    #[test]
+    fn teardown_inventory_renders_roles_exactly_as_the_refusal_does() {
+        let roles = vec![role("sched-issue-work-1-r0", "orchestrator", true)];
+        let line = orchestration_role_line(&roles[0]);
+        assert!(
+            format_live_orchestrations_refusal(&roles).contains(&line),
+            "the refusal must render the role through the shared helper"
+        );
+        assert!(
+            format_teardown_inventory(Some(&roles), &[])
+                .expect("roles alone are worth disclosing")
+                .contains(&line),
+            "the inventory must render the role through the same helper"
+        );
+    }
+
+    /// An idle daemon discloses nothing: a teardown that destroys no agent and
+    /// no registration has nothing to say, and a line saying so on every clean
+    /// `daemon stop` is noise that trains readers to skip the one that matters.
+    #[test]
+    fn teardown_inventory_is_absent_when_nothing_is_at_stake() {
+        assert!(format_teardown_inventory(Some(&[]), &[]).is_none());
+    }
+
+    /// Greptile P1 on PR #1161: a state read that misses its budget must report
+    /// the role inventory as UNKNOWN, never as zero. The first draft handed this
+    /// an empty slice, so a contended lock printed "destroying 0 orchestration
+    /// role registration(s)" and dropped the permanence sentence — a confident
+    /// zero over an unknown, in the one record an incident has to rely on.
+    #[test]
+    fn teardown_inventory_reports_an_unreadable_role_map_as_unknown_not_zero() {
+        let agents = vec![agent("12", Some("sched-issue-work-1-r0"), None, None)];
+        let msg = format_teardown_inventory(None, &agents)
+            .expect("an unreadable role map is precisely when the record matters");
+        assert!(
+            msg.contains("UNKNOWN number of orchestration role registration(s)"),
+            "an unread role map must say so, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("destroying 0 "),
+            "reporting an unknown as a zero is the defect this test exists for, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("can never delegate again"),
+            "the permanence sentence is carried when roles MIGHT have been held — \
+             withholding it here would understate an unknown, got: {msg:?}"
+        );
+    }
+
+    /// The other side of the same rule: a role map that WAS read and was empty
+    /// must not carry the permanence sentence, or every clean single-agent stop
+    /// claims a loss it did not cause.
+    /// Scenario: an agent whose working directory carries a newline, a CR, an
+    /// ESC and a bidi override, and runs far past any real path, is named in
+    /// the teardown line on one line with each of those escaped and the path
+    /// bounded — and its agent and pane ids exactly as they were.
+    #[test]
+    fn teardown_line_escapes_and_bounds_each_producer_value() {
+        let hostile =
+            String::from("/home/u/repo\nINFO forged line\r\u{1b}[2J\u{202e}") + &"x".repeat(2000);
+        let line = teardown_agent_line(&agent("42", Some("pane-7"), None, Some(&hostile)));
+        assert!(line.starts_with("42 pane=pane-7 label=- cwd="), "{line}");
+        for raw in ['\n', '\r', '\u{1b}', '\u{202e}'] {
+            assert!(!line.contains(raw), "{raw:?} must be escaped: {line:?}");
+        }
+        assert!(line.contains("repo\\nINFO"), "{line}");
+        assert!(
+            line.chars().count() < MAX_LOGGED_PATH_CHARS + 200,
+            "the path is bounded: {} chars",
+            line.chars().count()
+        );
+    }
+
+    #[test]
+    fn teardown_inventory_distinguishes_an_unknown_role_map_from_an_empty_one() {
+        let agents = vec![agent("12", Some("pane-12"), None, None)];
+        let unknown = format_teardown_inventory(None, &agents).expect("unknown discloses");
+        let empty = format_teardown_inventory(Some(&[]), &agents).expect("empty discloses");
+        assert_ne!(
+            unknown, empty,
+            "\"could not find out\" and \"there were none\" must not render the same"
+        );
+        assert!(empty.contains("destroying 0 orchestration role registration(s)"));
+        assert!(!empty.contains("can never delegate again"));
+    }
+
+    /// The half that is reachable on its own: `live_orchestration_roles`
+    /// filters to panes with a live agent, so roles imply agents — but agents
+    /// do NOT imply roles. An ordinary single-agent deck must still be named,
+    /// and must NOT be told its registrations are gone for good when it held
+    /// none.
+    #[test]
+    fn teardown_inventory_without_roles_names_the_agents_and_claims_no_role_loss() {
+        let agents = vec![agent("7", Some("pane-7"), None, None)];
+        let msg =
+            format_teardown_inventory(Some(&[]), &agents).expect("a live agent is worth naming");
+        assert!(
+            msg.contains("terminating 1 managed agent(s)")
+                && msg.contains("destroying 0 orchestration role registration(s)")
+                && msg.contains("pane=pane-7"),
+            "got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("can never delegate again"),
+            "the permanence sentence is about role registrations; with none held \
+             it would be a false claim about what this teardown cost, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("label=-") && msg.contains("cwd=-"),
+            "an unlabelled agent must still render a total entry rather than a \
+             ragged one, got: {msg:?}"
+        );
     }
 
     /// Issue #770: the force matrix, over the pure policy so no socket (and no
@@ -518,6 +1355,126 @@ mod tests {
                 .to_string()
                 .contains("--force")
         );
+    }
+
+    /// Issue #1049: the wire refusal is the CLI refusal, not a second opinion.
+    /// If these ever diverge, a deck is safe to stop from one path and not the
+    /// other — the single worst outcome for a guard that exists to be trusted.
+    #[test]
+    fn wire_stop_refusal_agrees_with_the_cli_refusal() {
+        let roles = vec![role("sched-issue-work-1-r0", "orchestrator", true)];
+        let agents = vec!["7".to_string()];
+
+        for (rs, ids) in [
+            (roles.clone(), vec![]),
+            (vec![], agents.clone()),
+            (roles.clone(), agents.clone()),
+            (vec![], vec![]),
+        ] {
+            for force in [false, true] {
+                assert_eq!(
+                    stop_refusal(&rs, &ids, force).is_some(),
+                    wire_stop_refusal(&rs, &ids, force).is_some(),
+                    "the wire and CLI paths must agree on WHETHER to refuse                      (roles={}, agents={}, force={force})",
+                    rs.len(),
+                    ids.len()
+                );
+            }
+        }
+
+        // …and on WHICH guard, including the ordering when both apply.
+        let both = wire_stop_refusal(&roles, &agents, false).expect("both guards apply");
+        assert_eq!(
+            both.reason,
+            StopRefusalReason::LiveOrchestrations,
+            "with both present the orchestration refusal wins on the wire too — it is the one              that says the survivors are STRANDED, not merely killed"
+        );
+        assert_eq!(
+            both.message,
+            format_live_orchestrations_refusal(&roles),
+            "one rendering, shared with the CLI"
+        );
+        assert_eq!(
+            both.summary,
+            StopError::LiveOrchestrations {
+                roles: roles.clone()
+            }
+            .to_string(),
+            "the one-line form is StopError's Display, so the wire and the terminal say the              same sentence"
+        );
+        // Both lists cross regardless of which guard tripped: a caller
+        // presenting the orchestration refusal still wants to know how many
+        // agents go down with it.
+        assert_eq!(both.roles, roles);
+        assert_eq!(both.agent_ids, agents);
+
+        let agents_only = wire_stop_refusal(&[], &agents, false).expect("agents guard applies");
+        assert_eq!(agents_only.reason, StopRefusalReason::LiveAgents);
+        assert_eq!(
+            agents_only.message,
+            format_live_agents_refusal(&agents),
+            "the agents refusal keeps its own wording"
+        );
+        assert!(
+            agents_only.roles.is_empty(),
+            "no roles registered, so none may be claimed"
+        );
+    }
+
+    /// Issue #1049: a withheld capability set means "withhold", never
+    /// "everything". Getting this backwards would have a remote client send a
+    /// verb an old daemon answers with `unknown variant`, and report the
+    /// resulting error as though the deck had refused.
+    #[test]
+    fn wire_stop_capability_is_read_conservatively() {
+        assert!(
+            !supports_wire_stop(None),
+            "a daemon that advertises nothing cannot be assumed to speak this verb"
+        );
+        assert!(
+            !supports_wire_stop(Some(&[])),
+            "an empty set is an explicit no"
+        );
+        assert!(!supports_wire_stop(Some(&["list-projects".to_string()])));
+        assert!(supports_wire_stop(Some(&[
+            "list-projects".to_string(),
+            CAP_STOP_DAEMON.to_string(),
+        ])));
+        // The advertised set must actually contain it, or the check above is
+        // pinning a string no daemon sends.
+        assert!(
+            crate::daemon_protocol::DAEMON_CAPABILITIES.contains(&CAP_STOP_DAEMON),
+            "this build must advertise the verb it answers"
+        );
+    }
+
+    /// Issue #1049: the refusal survives a serde round trip with its structure
+    /// intact. It crosses a socket in production, and a remote caller has no
+    /// other view of the panes it names.
+    #[test]
+    fn wire_stop_refusal_round_trips_over_serde() {
+        let roles = vec![
+            role("sched-issue-work-1-r0", "orchestrator", true),
+            role("sched-issue-work-1-r1", "coder", false),
+        ];
+        let refusal = wire_stop_refusal(&roles, &["7".to_string()], false).expect("refusal");
+        let wire = serde_json::to_string(&refusal).expect("serialize");
+        let back: StopDaemonRefusal = serde_json::from_str(&wire).expect("deserialize");
+        assert_eq!(back, refusal);
+
+        // A newer daemon's unknown reason must not fail an older client's whole
+        // decode — it still gets the message and the lists, which is enough to
+        // present the choice, and loses only the ability to branch on the kind.
+        let forward = wire.replace(
+            "\"reason\":\"live-orchestrations\"",
+            "\"reason\":\"some-future-guard\"",
+        );
+        assert_ne!(forward, wire, "the rename_all spelling must be what ships");
+        let tolerated: StopDaemonRefusal =
+            serde_json::from_str(&forward).expect("an unknown reason must not fail the decode");
+        assert_eq!(tolerated.reason, StopRefusalReason::Unknown);
+        assert_eq!(tolerated.roles, refusal.roles);
+        assert_eq!(tolerated.message, refusal.message);
     }
 
     #[test]

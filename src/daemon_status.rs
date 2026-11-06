@@ -30,6 +30,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::agent_pty::{AgentRecord, OutstandingDelegationEntry, TabMembership};
+use crate::inbox_hub::InboxSummary;
 use crate::state::{
     ActiveTool, SessionStatus, observes_own_delegations, observing_orchestrator_panes,
 };
@@ -122,14 +123,15 @@ pub struct StatusAgent {
     /// this pane. Purely additive — see [`SCHEMA_VERSION`]'s doc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outstanding_delegation: Option<crate::agent_pty::WatchSnapshot>,
-    /// Issue #586 M1/M2: PRD #249's delegate silent-worker watch, if
-    /// currently armed for this pane.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub silence_watch: Option<crate::agent_pty::WatchSnapshot>,
     /// Issue #586 M1/M2: issue #448's commission ledger entry for this pane,
     /// if any delegation is still unanswered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_commission: Option<crate::agent_pty::CommissionSnapshot>,
+    /// PRD #1666 S3: the agent's inbox — counts, last acknowledgement and how a
+    /// new message would reach it. Carried as the daemon reports it: none of
+    /// its fields is private content. Additive, so [`SCHEMA_VERSION`] stays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<InboxSummary>,
 }
 
 /// Top-level `--json` document: a [`SCHEMA_VERSION`] and the `agents` array,
@@ -221,6 +223,7 @@ pub fn build_status_agents_with_delegations(
             let observing_delegations = live.as_ref().is_some_and(|s| {
                 observes_own_delegations(&s.status, record.pane_id_env.as_deref(), &observing_panes)
             });
+            let inbox = record.inbox;
             StatusAgent {
                 agent_id: record.id,
                 pane_id: record.pane_id_env,
@@ -247,8 +250,8 @@ pub fn build_status_agents_with_delegations(
                     .and_then(|s| s.active_tool)
                     .map(|tool: ActiveTool| StatusTool { name: tool.name }),
                 outstanding_delegation: record.outstanding_delegation,
-                silence_watch: record.silence_watch,
                 delegation_commission: record.delegation_commission,
+                inbox,
             }
         })
         .collect()
@@ -260,6 +263,15 @@ fn cell(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or(DASH)
 }
 
+/// The INBOX cell: `2q 1f` for two queued and one fetched message, a dash when
+/// nothing is pending.
+fn inbox_cell(inbox: Option<&InboxSummary>) -> String {
+    match inbox {
+        Some(i) if i.queued > 0 || i.fetched > 0 => format!("{}q {}f", i.queued, i.fetched),
+        _ => DASH.to_string(),
+    }
+}
+
 /// Render the concise, one-row-per-agent human table. Never includes prompt
 /// text or scrollback (see the module docs for why) — only the diagnostic
 /// fields on [`StatusAgent`] are candidates for a column here, and the TOOL
@@ -269,7 +281,7 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
         return "no managed agents\n".to_string();
     }
     let mut out = String::new();
-    out.push_str("PANE\tAGENT\tROLE\tSTATUS\tTOOL\tLABEL\tCWD\n");
+    out.push_str("PANE\tAGENT\tROLE\tSTATUS\tTOOL\tINBOX\tWAKE\tLABEL\tCWD\n");
     for a in agents {
         let status = a
             .status
@@ -319,13 +331,16 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
             .as_ref()
             .map(|t| t.name.as_str())
             .unwrap_or(DASH);
+        let wake = a.inbox.as_ref().map_or(DASH, |i| i.wake.label());
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             cell(&a.pane_id),
             a.agent_id,
             cell(&a.role),
             status,
             tool,
+            inbox_cell(a.inbox.as_ref()),
+            wake,
             cell(&a.label),
             cell(&a.cwd),
         ));
@@ -350,18 +365,21 @@ mod tests {
             cols: 0,
             live,
             spawned_at_ms: None,
-            daemon_boot_id: None,
-            registration_generation: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             outstanding_delegation: None,
-            silence_watch: None,
             delegation_commission: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            inbox: None,
         }
     }
 
     fn snapshot(status: SessionStatus) -> SessionSnapshot {
         SessionSnapshot {
+            output_set_status: false,
+            subagent_wait: None,
             status,
             agent_type: None,
             active_tool: None,
@@ -377,6 +395,14 @@ mod tests {
             wait_deferred_revert: false,
             model: None,
             agent_report_activity_seen: false,
+            blocked: None,
+            hook_generation: None,
+            delivery_notice: None,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -407,19 +433,18 @@ mod tests {
         assert_ne!(driven_norm, control_norm);
     }
 
-    /// Issue #586 M1/M2: `build_status_agents` must carry the three new
+    /// Issue #586 M1/M2: `build_status_agents` must carry the two
     /// delegation-watch fields straight through from `AgentRecord` onto
     /// `StatusAgent` when the registry has them populated, and leave them
-    /// absent (not `null`) on the wire when it doesn't.
+    /// absent (not `null`) on the wire when it doesn't. (The third field of
+    /// that issue, `silence_watch`, reported PRD #249's silent-worker watch,
+    /// which upstream deleted with typed delivery: the assertions on it went
+    /// with it, sync ruling 34.)
     #[test]
     fn build_status_agents_carries_delegation_watch_fields() {
         let armed = crate::agent_pty::AgentRecord {
             outstanding_delegation: Some(crate::agent_pty::WatchSnapshot {
                 armed_secs_ago: 12,
-                orchestrator_pane_id: "orch".to_string(),
-            }),
-            silence_watch: Some(crate::agent_pty::WatchSnapshot {
-                armed_secs_ago: 3,
                 orchestrator_pane_id: "orch".to_string(),
             }),
             delegation_commission: Some(crate::agent_pty::CommissionSnapshot {
@@ -445,10 +470,6 @@ mod tests {
             12
         );
         assert_eq!(
-            armed_status.silence_watch.as_ref().unwrap().armed_secs_ago,
-            3
-        );
-        assert_eq!(
             armed_status
                 .delegation_commission
                 .as_ref()
@@ -462,7 +483,6 @@ mod tests {
             .find(|a| a.pane_id.as_deref() == Some("unarmed"))
             .unwrap();
         assert!(unarmed_status.outstanding_delegation.is_none());
-        assert!(unarmed_status.silence_watch.is_none());
         assert!(unarmed_status.delegation_commission.is_none());
 
         let json = serde_json::to_string(&StatusDocument::new(agents)).unwrap();
@@ -473,11 +493,7 @@ mod tests {
             .iter()
             .find(|a| a["pane_id"] == "unarmed")
             .unwrap();
-        for key in [
-            "outstanding_delegation",
-            "silence_watch",
-            "delegation_commission",
-        ] {
+        for key in ["outstanding_delegation", "delegation_commission"] {
             assert!(
                 unarmed_json.as_object().unwrap().get(key).is_none(),
                 "{key} must be absent, not null, when the watch isn't armed"
@@ -537,6 +553,95 @@ mod tests {
             "`active_tool.detail` must be gone from the document, not merely \
              empty; got {tool:?}"
         );
+    }
+
+    /// The public `status` string for every [`SessionStatus`] variant.
+    ///
+    /// Issue #456: `StatusAgent::status` serializes state.rs's `SessionStatus`
+    /// directly, so a variant rename or a serde attribute there changes the
+    /// `--json` document with nothing in this module touched. The match has no
+    /// wildcard arm on purpose — adding a variant stops this module compiling
+    /// until someone writes the string that variant will publish (and decides
+    /// whether it owes a [`SCHEMA_VERSION`] bump), then adds it to
+    /// [`ALL_STATUSES`].
+    fn published_status(status: &SessionStatus) -> &'static str {
+        match status {
+            SessionStatus::Thinking => "Thinking",
+            SessionStatus::Working => "Working",
+            SessionStatus::Compacting => "Compacting",
+            SessionStatus::WaitingForInput => "WaitingForInput",
+            SessionStatus::Idle => "Idle",
+            SessionStatus::Error => "Error",
+            // Issue #714. No `SCHEMA_VERSION` bump, deliberately: the value is
+            // additive, and a consumer of this document already has to tolerate
+            // a status string it does not know (`"Unknown"` below is exactly
+            // that case re-emitted), so no existing reader's contract moves.
+            SessionStatus::Blocked => "Blocked",
+            // Deserialize-side catch-all for a status string a newer daemon
+            // sends that this build does not know. The CLI still re-emits it,
+            // so it is part of what a script can read.
+            SessionStatus::Unknown => "Unknown",
+        }
+    }
+
+    const ALL_STATUSES: [SessionStatus; 8] = [
+        SessionStatus::Thinking,
+        SessionStatus::Working,
+        SessionStatus::Compacting,
+        SessionStatus::WaitingForInput,
+        SessionStatus::Idle,
+        SessionStatus::Error,
+        SessionStatus::Blocked,
+        SessionStatus::Unknown,
+    ];
+
+    /// Scenario: for every `SessionStatus` variant, build a fully populated
+    /// status row plus a row with no optional fields, serialize the whole
+    /// `--json` document, and compare it to a literal. A renamed field, a
+    /// changed status string, a dropped `skip_serializing_if`, or a reshaped
+    /// `active_tool` fails here (issue #456).
+    #[test]
+    fn json_document_pins_field_names_and_every_status_string() {
+        for status in ALL_STATUSES {
+            let expected_status = published_status(&status);
+            let mut snap = snapshot(status.clone());
+            snap.active_tool = Some(ActiveTool {
+                name: "Bash".to_string(),
+                detail: Some("cargo test".to_string()),
+            });
+            let mut populated = record("agent-1", "pane-1", Some(snap));
+            populated.display_name = Some("api".to_string());
+            populated.tab_membership = Some(TabMembership::Mode {
+                name: "review".to_string(),
+            });
+            let mut bare = record("agent-2", "unused", None);
+            bare.pane_id_env = None;
+            bare.cwd = None;
+
+            let document = StatusDocument::new(build_status_agents(vec![populated, bare]));
+            let json = serde_json::to_value(&document).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "schema_version": 2,
+                    "agents": [
+                        {
+                            "agent_id": "agent-1",
+                            "pane_id": "pane-1",
+                            "label": "api",
+                            "cwd": "/tmp/x",
+                            "role": "mode:review",
+                            "status": expected_status,
+                            "active_tool": { "name": "Bash" },
+                        },
+                        { "agent_id": "agent-2" },
+                    ],
+                }),
+                "the public `daemon status --json` shape moved for {status:?}; if that is \
+                 deliberate, bump SCHEMA_VERSION for a removal or meaning change and \
+                 update this literal"
+            );
+        }
     }
 
     #[test]
@@ -1175,5 +1280,30 @@ mod tests {
             &[entry("orch-pane")],
         );
         assert_eq!(status_cell(&format_human(&agents), "orch-pane"), "Working");
+    }
+
+    /// PRD #1666 S3: INBOX shows queued and fetched counts, a dash when both
+    /// are zero or the daemon reported no inbox; WAKE a dash for no inbox.
+    #[test]
+    fn inbox_and_wake_cells() {
+        use crate::inbox_hub::{InboxSummary, WakePath};
+        let summary = |queued, fetched, wake| InboxSummary {
+            queued,
+            fetched,
+            claimed: 0,
+            undeliverable: 3,
+            last_acked_at: None,
+            wake,
+            component: None,
+            wake_stalled: false,
+            notices: Default::default(),
+        };
+        assert_eq!(inbox_cell(Some(&summary(2, 1, WakePath::Native))), "2q 1f");
+        assert_eq!(inbox_cell(Some(&summary(0, 2, WakePath::Native))), "0q 2f");
+        assert_eq!(inbox_cell(Some(&summary(0, 0, WakePath::Native))), "-");
+        assert_eq!(inbox_cell(None), "-");
+        let table = format_human(&build_status_agents(vec![record("1", "p", None)]));
+        let row: Vec<&str> = table.lines().nth(1).unwrap().split('\t').collect();
+        assert_eq!((row[5], row[6]), ("-", "-"));
     }
 }

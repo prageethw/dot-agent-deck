@@ -40,27 +40,51 @@ pub enum EventType {
     /// [`MonitoredWaitStart`](Self::MonitoredWaitStart) and
     /// [`crate::state::AppState::clear_monitored_wait`].
     MonitoredWaitDone,
+    /// Issue #714: the agent's provider refused it for an exhausted usage limit
+    /// or credit pool. Reported by a producer from a structured signal — the
+    /// Claude Code `StopFailure` hook, OpenCode's `session.error` fields — or by
+    /// the daemon's Codex rollout tailer (`crate::codex_rollout_tail`). Its
+    /// kind, reset time and display detail ride the `quota_blocked_*` metadata
+    /// keys in [`crate::quota_block`], which the daemon normalises on arrival
+    /// and strips from every other event type. An older reader decodes it as
+    /// [`EventType::Unknown`], a no-op.
+    QuotaBlocked,
+    /// PRD #1401: the DAEMON's report of the pull request a session's branch
+    /// has — or, with no [`PULL_REQUEST_METADATA_KEY`], that it has none any
+    /// more. Synthesized only by [`crate::pull_request`]'s monitor and
+    /// broadcast straight onto the fan-out; the hook socket drops a producer's
+    /// copy (`daemon::admit_producer_event`), so the URL a client opens is
+    /// always one the daemon resolved.
+    ///
+    /// Status-neutral: it sets [`crate::state::SessionState::pull_request`] on
+    /// the card it names and nothing else ([`crate::state::AppState::apply_event`]).
+    /// An older reader decodes it as [`EventType::Unknown`], the `QuotaBlocked`
+    /// precedent, so no `PROTOCOL_VERSION` bump; the daemon stamps it at the
+    /// session's current `last_activity`, so even that reader's activity clock
+    /// does not move.
+    PullRequest,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
-    /// without another `PROTOCOL_VERSION` bump. Treated as a no-op wherever
-    /// `EventType` is matched (never proof of agent activity, never changes
-    /// `SessionStatus`).
+    /// without another `PROTOCOL_VERSION` bump. The daemon's question release
+    /// ([`QUESTION_RELEASED_BY_DECK_METADATA_KEY`]) is chosen precisely because
+    /// every build reads this as a no-op.
     ///
-    /// Issue #652: no longer deserialize-only. `wrap.rs`'s `classify_and_emit`
-    /// now deliberately CONSTRUCTS this variant as a status-neutral carrier —
-    /// a way to send `AgentEvent.model` (out-of-band data unrelated to
-    /// status) without asserting any status, exploiting the exact "no-op,
-    /// never proof of activity" property this catch-all already had for its
-    /// original forward-compat purpose. Both uses share the same wire value
-    /// and the same neutral handling; nothing distinguishes a genuinely
-    /// unrecognized future event type from a deliberate model-only carrier,
-    /// and nothing needs to.
+    /// Issue #652: `wrap.rs`'s `classify_and_emit` also deliberately CONSTRUCTS
+    /// this variant as a status-neutral carrier — a way to send
+    /// `AgentEvent.model` (out-of-band data unrelated to status) without
+    /// asserting any status, exploiting the same "no-op, never proof of
+    /// activity" property. A genuinely unrecognized future event type and a
+    /// deliberate model-only carrier share the wire value and the neutral
+    /// handling; nothing distinguishes them and nothing needs to.
+    ///
+    /// Treated as a no-op wherever `EventType` is matched (never proof of agent
+    /// activity, never changes `SessionStatus`).
     #[serde(other)]
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentType {
     ClaudeCode,
@@ -261,7 +285,7 @@ fn is_shell_command_flag(arg: &str) -> bool {
 /// (e.g. `FOO=1`) rather than a program or path. Conservative: `NAME` must be a
 /// shell-identifier-shaped run before the first `=`, so a path that merely
 /// contains `=` isn't misread as an assignment.
-fn is_env_assignment(token: &str) -> bool {
+pub(crate) fn is_env_assignment(token: &str) -> bool {
     match token.split_once('=') {
         Some((name, _)) => {
             !name.is_empty()
@@ -483,69 +507,44 @@ pub struct LiveTarget {
     pub writable: Writable,
 }
 
-/// PRD #20 M3: the honest outcome of delivering input to a session, returned
-/// instead of a fire-and-forget `Result<(), _>`. Serializes kebab-case; every
-/// variant keeps a distinct public wire value so a caller can tell accepted
-/// input apart from a stale, wrong, or unwritable target.
-///
-/// Rides the daemon wire on [`crate::daemon_protocol::AttachResponse::send_result`]
-/// as an additive, optional field (a missing value decodes to `None`), so it is
-/// forward-compatible and needs no `PROTOCOL_VERSION` bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SendResult {
-    /// Delivered to the live target.
-    Applied,
-    /// Accepted, not yet confirmed applied.
-    Queued,
-    /// Target moved on / our view was behind.
-    Stale,
-    /// The handle no longer maps to the session we meant.
-    WrongSession,
-    /// No live target — only history resume is possible.
-    HistoryOnly,
-    /// Nothing to write to.
-    NoLiveTarget,
-    /// PRD #20 R20-004 (finding #3): a write STARTED reaching the target but the
-    /// full payload+submit sequence did not complete (a partial write followed
-    /// by a writer error). Some bytes MAY already have been delivered, so this is
-    /// neither a clean success nor a safely-retryable failure: the daemon caches
-    /// it against the `delivery_id` so a retry REPLAYS this (does not blind-submit
-    /// again, which could duplicate the partial input), and the UI surfaces it as
-    /// a terminal non-delivery rather than looping a retry. Older clients decode
-    /// the unknown `"ambiguous"` value to [`SendResult::Unknown`] (also treated as
-    /// a non-delivered, conservative outcome), so it stays forward-compatible.
-    Ambiguous,
-    /// PRD #20 R20-011: forward-compat catch-all. A future daemon may report an
-    /// honest outcome this build does not know; a pre-`serde(other)` reader would
-    /// reject the whole [`crate::daemon_protocol::AttachResponse`] as malformed
-    /// (`unknown variant`) rather than degrade gracefully. Deserializing an
-    /// unknown value here — the SAFE, non-delivered outcome — keeps the response
-    /// decodable and forces every UI match to treat it conservatively (never as a
-    /// delivered success). Deserialize-only in practice: this build never
-    /// constructs `Unknown`, so it is never sent on the wire.
-    #[serde(other)]
-    Unknown,
-}
-
 /// PRD #201 M1.2 (test-plan row 3): map a lifecycle **state** string an agent's
 /// extension reports via `dot-agent-deck agent-event --type <state>` to the
 /// [`EventType`] that drives the target pane's card status. This is the single
 /// production seam the CLI subcommand and the fast-tier status tests share.
 ///
-/// The canonical `--type` vocabulary is exactly three states — `running`,
-/// `waiting`, `finished`. Anything else returns `None` so the subcommand can
-/// reject an unknown `--type` with a clear non-zero error instead of silently
-/// emitting a wrong (or default) status. The Phase 2 extension and the docs
-/// MUST use the same three strings.
+/// The canonical `--type` vocabulary is three lifecycle states — `running`,
+/// `waiting`, `finished` — plus, since issue #622, three detail reports that
+/// give a card what every other native integration's card shows: `prompt` (a
+/// submitted prompt, [`EventType::Thinking`] carrying `user_prompt`),
+/// `tool-start` and `tool-end` ([`EventType::ToolStart`] / [`EventType::ToolEnd`]
+/// carrying the tool name and detail). All six land on variants the
+/// [`AgentEvent`] schema already has, so the wire is unchanged. Anything else
+/// returns `None` so the subcommand can reject an unknown `--type` with a clear
+/// non-zero error instead of silently emitting a wrong (or default) status.
+/// The bundled Pi extension (`pi-extension/src/orchestrator.ts`,
+/// `AGENT_EVENT_TYPES`) and the docs MUST use the same six strings.
 pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
     match state {
         "running" => Some(EventType::Thinking),
         "waiting" => Some(EventType::WaitingForInput),
         "finished" => Some(EventType::Idle),
+        "prompt" => Some(EventType::Thinking),
+        "tool-start" => Some(EventType::ToolStart),
+        "tool-end" => Some(EventType::ToolEnd),
         _ => None,
     }
 }
+
+/// Every `--type` [`agent_event_type_from_state`] accepts, in the order the
+/// CLI's error message lists them.
+pub const AGENT_EVENT_TYPES: [&str; 6] = [
+    "running",
+    "waiting",
+    "finished",
+    "prompt",
+    "tool-start",
+    "tool-end",
+];
 
 /// `AgentEvent.metadata` key carrying a human-friendly card title (PRD #127
 /// finding #2). The daemon's live-surface path (`surface_spawned_pane`) sets
@@ -554,6 +553,43 @@ pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
 /// already renders from the daemon registry's `display_name`. Real agent hooks
 /// don't emit it; consumers treat its absence as "no friendly name known".
 pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
+
+/// `AgentEvent.metadata` key carrying the daemon registry id of the agent a
+/// card-surfacing `SessionStart` draws (issue #1507), so an already-attached
+/// TUI can place the live card in creation order before the agent's first real
+/// hook — and at all for a pane that never sends one (a shell, `cat`).
+///
+/// Not the SESSION's identity: the event's own `agent_id` stays `None` so the
+/// agent's real `SessionStart` still supersedes the placeholder (see
+/// `surface_spawned_pane`). For the card it is order only. PRD #1666 §2.8 adds
+/// one identity use: it names the agent generation the start's
+/// [`SURFACED_INBOX_METADATA_KEY`] summary belongs to, which becomes the
+/// pane's inbox owner. The key is producer-writable, so a hook can forge it to
+/// reorder a card, but not that inbox use: the hook ingress strips the
+/// companion summary from producer frames, and without one this key
+/// establishes no inbox. Additive on the wire: an older daemon sends no key
+/// and the card falls back to the pane-id order, and an older TUI ignores it.
+pub const SURFACED_AGENT_ID_METADATA_KEY: &str = "surfaced_agent_id";
+
+/// `AgentEvent.metadata` key carrying, as JSON, the inbox summary
+/// ([`crate::inbox_hub::InboxSummary`]) of the agent a card-surfacing
+/// `SessionStart` draws (PRD #1666 §2.8), the agent named by
+/// [`SURFACED_AGENT_ID_METADATA_KEY`].
+///
+/// The daemon reads the summary and broadcasts the start under the inbox's
+/// lock ([`crate::inbox_hub::InboxHub::with_summary`]), the lock every
+/// [`BroadcastMsg::Inbox`] notice is sent under, so on the ordered event
+/// stream the summary includes every notice for the pane before the start and
+/// none after it. A client takes it as the pane's inbox at that point and
+/// applies the later notices on top; notices for a pane it neither manages nor
+/// has had such an account of are dropped. The notices the daemon raises while it spawns an
+/// agent — a failed integration refresh among them — therefore reach the card
+/// through this start, whether or not the agent ever sends a hook.
+///
+/// **Daemon-authoritative**: the hook socket strips it from every producer
+/// frame (`daemon::admit_producer_event`), and a client reads it only from a
+/// card-surfacing start. Additive on the wire: an older client ignores it.
+pub const SURFACED_INBOX_METADATA_KEY: &str = "surfaced_inbox";
 
 /// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that an
 /// automatic prompt delivery failed on this pane (issue #424).
@@ -569,6 +605,19 @@ pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 /// controls is interpolated into it — the same rule that governed the in-pane
 /// notice this replaced, kept because the text still reaches a human.
 pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
+
+/// `AgentEvent.metadata` key marking the `Thinking` event the DAEMON authors
+/// when a message it reported not delivered ([`DELIVERY_NOTICE_METADATA_KEY`])
+/// was acknowledged after all (PRD #1666 long-turn delivery). It lifts the
+/// card's not-delivered `Error` to `Thinking` — the agent has just taken the
+/// message into its context — and moves no other status
+/// ([`AgentEvent::is_delivery_notice_cleared`]). Daemon-owned: the hook loop
+/// strips it from every producer frame, and [`AgentEvent::is_daemon_synthetic`]
+/// keys on it.
+pub const DELIVERY_NOTICE_CLEARED_METADATA_KEY: &str = "delivery_notice_cleared";
+
+/// The one [`DELIVERY_NOTICE_CLEARED_METADATA_KEY`] value.
+pub const DELIVERY_NOTICE_CLEARED_METADATA_VALUE: &str = "1";
 
 /// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that the pane
 /// this event came from is an ORPHANED orchestration role pane (issue #770) —
@@ -599,6 +648,222 @@ pub const ORCHESTRATION_ORPHANED_METADATA_KEY: &str = "orchestration_orphaned";
 /// becomes a channel for text the daemon did not author.
 pub const ORCHESTRATION_ORPHANED_METADATA_VALUE: &str = "1";
 
+/// `AgentEvent.metadata` key marking a `SessionEnd` the DAEMON authored to say
+/// "this pane's agent was stopped and the pane is gone" (PRD #1223).
+///
+/// The removal half of the live-surface broadcast. `StopAgent` removed an agent
+/// from the registry and told only the client that sent it, so a TUI already
+/// attached when the DESKTOP stopped an agent kept its card — and, for an
+/// orchestration, its now-empty tab — indefinitely
+/// (`newagent/visibility/003` / `004`). The daemon now announces every
+/// successful `StopAgent` that gave the pane up
+/// ([`crate::spawn::surface_attach_stopped_agent`]), and an attached TUI applies
+/// the same cleanup a native close performs
+/// ([`crate::state::AppState::apply_daemon_pane_closed`]).
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]: the
+/// event is broadcast straight onto the fan-out and never ingested, and
+/// `ingest_event` REMOVES the key from every inbound hook event, so a producer on
+/// the unauthenticated same-uid hook socket cannot make a TUI drop a live pane.
+///
+/// Additive on the wire in both directions, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: an older TUI reads it as
+/// an ordinary `SessionEnd` for the pane's placeholder key, which restores the
+/// same placeholder it removes (today's stale card, unchanged), and the desktop
+/// reads any `SessionEnd` as "refetch the agent list now".
+pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
+
+/// `AgentEvent.metadata` key carrying the JSON of the
+/// [`crate::pull_request_info::PullRequestInfo`] an [`EventType::PullRequest`]
+/// reports (PRD #1401). Absent on that event means "no pull request".
+///
+/// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the hook
+/// socket removes it from every producer frame and drops a producer's
+/// `pull_request` event outright, so a producer on the unauthenticated same-uid
+/// socket cannot put a URL of its choosing behind a card's badge.
+pub const PULL_REQUEST_METADATA_KEY: &str = "pull_request";
+
+/// `AgentEvent.metadata` key carrying, in decimal, the revision of the pull
+/// request an [`EventType::PullRequest`] reports — present on a report of none
+/// too (PRD #1401). It orders the report against a `ListAgents` reply, see
+/// [`crate::state::SessionState::pull_request_revision`]. Daemon-authoritative
+/// like [`PULL_REQUEST_METADATA_KEY`], and removed from producer frames with it.
+pub const PULL_REQUEST_REVISION_METADATA_KEY: &str = "pull_request_revision";
+
+/// The [`DAEMON_PANE_CLOSED_METADATA_KEY`] value meaning "yes". Fixed for the
+/// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
+pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
+
+/// `AgentEvent.metadata` key marking the DAEMON's report that a spawn's process
+/// is gone, so the background work its card showed is over (issue #1678). It
+/// rides a [`EventType::ShellIdle`] naming the departed agent, its card's
+/// session key and its pane, stamped at the card's own last activity, carrying
+/// the explicit-zero aggregate with the advanced revision and the Displaced
+/// generation verdict ([`AgentEvent::is_background_retirement`]).
+///
+/// An attached client applies it to that agent's existing card on that pane
+/// and to nothing else: it creates, adopts, retires and re-keys no card and
+/// moves no status, so a successor on the same pane is out of its reach
+/// (`crate::state::AppState::apply_background_retirement`).
+///
+/// **Daemon-authoritative**, like [`DAEMON_PANE_CLOSED_METADATA_KEY`]: the
+/// event is broadcast straight onto the fan-out and never ingested, and
+/// `ingest_event` removes the key from every inbound hook event. Additive on the
+/// wire: an older client reads a plain `ShellIdle` stamped Displaced, which
+/// v0.46.0's generation gate refuses before any status or card logic — read
+/// from that release's source, not observed in a running released binary
+/// (`status/background/015` models the gate).
+pub const BACKGROUND_RETIRED_METADATA_KEY: &str = "background_retired";
+
+/// The one [`BACKGROUND_RETIRED_METADATA_KEY`] value.
+pub const BACKGROUND_RETIRED_METADATA_VALUE: &str = "spawn_exited";
+
+/// `AgentEvent.metadata` key carrying the DAEMON's verdict that a hook event is
+/// UNPROVEN (issues #601, #697): the hook-provenance gate admitted it for a pane
+/// (or a paneless agent) this daemon never issued a hook capability token for,
+/// so it comes from an agent this daemon did not spawn: an outside agent, or
+/// one a previous daemon spawned that survived a restart.
+///
+/// An attached client reads it to file the event's card as an outside agent's
+/// ([`crate::state::AppState::apply_event`]): such a card never makes its pane
+/// one of the client's own (`managed_pane_ids`), and it counts against
+/// [`crate::state::MAX_UNPROVEN_SESSIONS`]. On a pane the client registered
+/// itself it is refused, except that a report also stamped
+/// [`DAEMON_NO_LIVE_AGENT_METADATA_KEY`] or
+/// [`ORCHESTRATION_ORPHANED_METADATA_KEY`] may update the bounded reporting
+/// state (and, with the latter, the badge) of the restart survivor's own card
+/// there, with no structural, per-pane or per-agent write.
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value and sets it only from the gate's
+/// own verdict.
+///
+/// Additive on the wire, so no [`crate::daemon_protocol::PROTOCOL_VERSION`]
+/// bump: an older client ignores the key and files the card as it always did.
+pub const UNPROVEN_METADATA_KEY: &str = "daemon_unproven";
+
+/// `AgentEvent.metadata` key marking the DAEMON's announcement that it evicted
+/// an unproven card to stay within [`crate::state::MAX_UNPROVEN_SESSIONS`]
+/// (issue #697). Carried on a `SessionEnd` for the evicted session, so an
+/// attached client that holds the card drops it too
+/// ([`crate::state::AppState::apply_event`]).
+///
+/// **Daemon-authoritative**: `ingest_event` REMOVES any incoming value, and the
+/// daemon broadcasts the announcement directly rather than ingesting it.
+///
+/// Additive on the wire: an older client reads it as an ordinary `SessionEnd`
+/// for the evicted session. That removes the same card, but an older client
+/// registered the outside pane as its own when the card was drawn, so it then
+/// restores an empty placeholder card for that pane as it does for any ended
+/// session.
+pub const UNPROVEN_EVICTED_METADATA_KEY: &str = "daemon_unproven_evicted";
+
+/// `AgentEvent.metadata` key carrying the DAEMON's verdict, on an UNPROVEN
+/// report naming a pane, that it holds no live agent on that pane (issue #318,
+/// round 3). Decided under the daemon's state lock, at the same point as
+/// [`ORCHESTRATION_ORPHANED_METADATA_KEY`], whose "no live agent" half it is
+/// without the role-pane half.
+///
+/// It is what lets a client that stayed attached across a daemon restart keep
+/// a PLAIN pane's restart survivor reporting: the new daemon never issued that
+/// pane a token, so its reports arrive unproven, and a client refuses an
+/// unproven report on a pane it registered. A report carrying this marker may
+/// update the bounded reporting state of the ONE card the client holds on that
+/// pane, and only when it names that card's agent
+/// ([`crate::state::AppState::apply_event`]); it confers nothing else, and the
+/// orphan badge still needs [`ORCHESTRATION_ORPHANED_METADATA_KEY`].
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value and sets it only on a report it
+/// also marks [`UNPROVEN_METADATA_KEY`].
+///
+/// Additive on the wire, so no [`crate::daemon_protocol::PROTOCOL_VERSION`]
+/// bump: an older client ignores the key.
+pub const DAEMON_NO_LIVE_AGENT_METADATA_KEY: &str = "daemon_no_live_agent";
+
+/// `AgentEvent.metadata` key carrying the agent the DAEMON's hook provenance
+/// gate attested a frame to — the spawn its hook capability token was minted
+/// for (issue #318, Greptile on PR #1559).
+///
+/// The daemon re-checks, under its state lock, that a frame naming no agent
+/// still comes from its pane's current generation, but a respawn is not
+/// ordered against that check, so a successor can claim the pane between the
+/// check and the broadcast. An attached client has no registry to judge the
+/// frame by, and would land it on the pane's card, which may by then be the
+/// successor's. With this marker it refuses a frame that names no agent when
+/// the card it would land on carries a different agent id
+/// ([`crate::state::AppState::apply_event`]); the frame's own absent
+/// `agent_id` is left as it is, so the rules for untagged status are
+/// unchanged.
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value and sets it only from the gate's
+/// own verdict.
+///
+/// Additive on the wire, so no [`crate::daemon_protocol::PROTOCOL_VERSION`]
+/// bump: an older client ignores the key, and a frame an older daemon relays
+/// carries none, which a client reads as it did before this key existed.
+pub const ATTESTED_OWNER_METADATA_KEY: &str = "daemon_attested_owner";
+
+/// The value of [`UNPROVEN_METADATA_KEY`], [`UNPROVEN_EVICTED_METADATA_KEY`]
+/// and [`DAEMON_NO_LIVE_AGENT_METADATA_KEY`] meaning "yes".
+pub const UNPROVEN_METADATA_VALUE: &str = "1";
+
+/// `AgentEvent.metadata` key carrying the DAEMON's verdict on which generation
+/// of its pane a frame comes from (issue #320) — see [`GenerationVerdict`].
+///
+/// The daemon's `AgentPtyRegistry` knows each pane's current generation: the
+/// spawn reserving it, else the record no successor has taken it from. An
+/// attached TUI has no registry, so before this it ordered a takeover by the
+/// only evidence a frame carries — its type and its PRODUCER-supplied
+/// timestamp — and a late `SessionStart`, or a late frame stamped newer, from
+/// the OUTGOING generation retired the live card. The daemon now asks its
+/// registry in `ingest_event` and stamps the answer here, before the fan-out,
+/// so both sides order generations by the registry and neither by a clock.
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value before deciding. Absent when the
+/// frame names no pane or no agent id, when the registry holds no generation
+/// for the pane or has never published the frame's agent on it, and when it
+/// cannot answer — and absent on every frame an OLDER daemon relays, which a
+/// consumer reads exactly as it did before this key existed.
+///
+/// Additive on the wire in both directions, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: an older TUI ignores the
+/// key and keeps the timestamp rule it always had.
+pub const PANE_GENERATION_METADATA_KEY: &str = "pane_generation";
+
+/// The [`PANE_GENERATION_METADATA_KEY`] value for [`GenerationVerdict::Current`].
+pub const PANE_GENERATION_CURRENT: &str = "current";
+
+/// The [`PANE_GENERATION_METADATA_KEY`] value for [`GenerationVerdict::Displaced`].
+pub const PANE_GENERATION_DISPLACED: &str = "displaced";
+
+/// Issue #320: the daemon registry's answer to "is the generation this frame
+/// names its pane's CURRENT one?", for a frame naming both a pane and an agent
+/// id on a pane the registry holds a generation for. See
+/// [`PANE_GENERATION_METADATA_KEY`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationVerdict {
+    /// The frame's agent id is the pane's current generation.
+    Current,
+    /// The frame's agent id is a generation the registry itself published on
+    /// this pane earlier, and a different one is current now: it has been
+    /// replaced. An id the registry never published on the pane gets no
+    /// verdict at all rather than this one.
+    Displaced,
+}
+
+impl GenerationVerdict {
+    /// The fixed metadata value for this verdict.
+    pub fn metadata_value(self) -> &'static str {
+        match self {
+            GenerationVerdict::Current => PANE_GENERATION_CURRENT,
+            GenerationVerdict::Displaced => PANE_GENERATION_DISPLACED,
+        }
+    }
+}
+
 /// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
 /// #225 M3). The wrapper adapter is the only INTENDED producer, with one of the
 /// three values [`WRAPPER_FORK_SESSION_START_ORIGIN`] /
@@ -626,8 +891,7 @@ pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 /// was emitted by `dot-agent-deck wrap` right after `fork`/`exec`, purely to
 /// surface the dashboard card for a slow-booting agent" (PRD #225 M3). It does
 /// NOT mean the wrapped agent can accept input yet — for Codex the real TUI is
-/// still seconds away — so readiness gates
-/// ([`crate::state::wait_for_session_start`]) must not treat it as proof of
+/// still seconds away — so a reader must not treat it as proof of
 /// interactivity for an agent that will emit a genuine native `SessionStart`
 /// later.
 pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
@@ -661,42 +925,38 @@ pub const CARD_SURFACE_SESSION_START_ORIGIN: &str = "daemon_card_surface";
 /// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "`dot-agent-deck wrap`
 /// watched the wrapped child take the inner PTY OUT OF COOKED MODE" (issue #243).
 ///
-/// This is the pre-prompt readiness signal the delegate and scheduler gates were
-/// missing. Codex posts its own native `SessionStart` when the first *turn*
-/// starts — i.e. as a consequence of the very prompt the gate is withholding —
-/// so before this the gate had nothing to release on and paid
-/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] in full on every `clear = true`
-/// delegate.
+/// It is the wrapper's pre-prompt signal for an agent such as Codex, whose own
+/// native `SessionStart` arrives only when its first turn starts. The daemon
+/// reads it, and [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] the same
+/// way, as a wrapper-authored `SessionStart`: its `Idle` stands in for the
+/// agent's own until the agent's hooks report, which is what lets the doorbell
+/// ring for a wrapped Codex before its first prompt
+/// ([`crate::state::AppState::agent_doorbell_idle`]). The fork-time
+/// [`WRAPPER_FORK_SESSION_START_ORIGIN`] does not, because it is sent before
+/// the agent has drawn anything.
 ///
 /// **One fact, not two.** The wrapper observes the child two ways
-/// (`InterfaceWatch` in [`crate::wrap`]) and they carry DIFFERENT values, because
-/// they are not equally strong. This value is fact 1 — the child cleared
-/// `ICANON`/`ECHO`, a genuine observation that the child consumes keystrokes
-/// rather than echoing them. Fact 2 — output went quiet for a while — carries
-/// [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] instead and buys strictly
-/// less; see that constant for why.
+/// (`InterfaceWatch` in [`crate::wrap`]) and labels them with different values,
+/// because they are not equally strong. This value is fact 1 — the child
+/// cleared `ICANON`/`ECHO`, a genuine observation that the child consumes
+/// keystrokes rather than echoing them. Fact 2 — output went quiet for a while
+/// — carries [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`]; see that
+/// constant for why it is the weaker one.
 ///
 /// **What this fact does NOT establish: that the child will accept a submit.**
-/// It was read that way for two rounds of this issue — as the exact inverse of
-/// the PRD #225 defect where a prompt was echoed away by a still-canonical line
-/// discipline, and therefore as proof that no blind interval was left to pay.
-/// Measurement retracts that. A full-screen TUI enables raw mode at INIT, before
-/// it paints: real codex-cli 0.149.0 does it 85 ms after a direct exec, and
-/// `orchestration/delegate/009` recorded fork + 100 ms on both the original
-/// worker and its `clear = true` replacement, then lost the pointer into an
-/// unsubmitted composer. Raw mode is NECESSARY for input-readiness and not
-/// SUFFICIENT — it says the AGENT owns the terminal, not that the composer is
-/// listening — so this value RELEASES the readiness gate (it is the best release
-/// signal the deck has) and still owes a post-readiness buffer, sized against the
-/// initialisation it announces the start of. See
-/// [`crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`].
+/// A full-screen TUI enables raw mode at INIT, before it paints: real codex-cli
+/// 0.149.0 does it 85 ms after a direct exec. Raw mode is NECESSARY for
+/// input-readiness and not SUFFICIENT — it says the AGENT owns the terminal,
+/// not that the composer is listening — which is why, until Codex's own hooks
+/// report, the doorbell's writer also waits for Codex's composer before it
+/// types (PRD #1666 S7).
 ///
 /// It is still WRAPPER PROVENANCE rather than an agent conversation: the session
 /// id on it is the wrapper's own, not the agent's, so it must never bind a
-/// delivery's generation or move a pane's hook session. That is what
+/// pane's generation or move a pane's hook session. That is what
 /// [`AgentEvent::is_wrapper_session_start`] separates from
 /// [`AgentEvent::is_wrapper_fork_session_start`], which stays fork-only so the
-/// readiness gate can still tell the wrapper's events apart.
+/// doorbell can still tell the wrapper's fork-time start apart.
 ///
 /// **What carrying this value does NOT establish: that a wrapper wrote it.**
 /// `dot-agent-deck hook` refuses to forward it (`crate::hook` narrows that
@@ -705,17 +965,16 @@ pub const CARD_SURFACE_SESSION_START_ORIGIN: &str = "daemon_card_surface";
 /// raw [`AgentEvent`] JSON line whose `metadata` map is free-form and
 /// unvalidated. Any same-uid process can therefore post an event carrying this
 /// value; it was reproduced during issue #243's audit from a bare `python3` with
-/// no deck environment at all. Provenance is established by the DAEMON, at the
-/// site that acts on it — `crate::state::dispatch_one_owned` prices this value as
-/// a real TUI's initialisation only for an agent this daemon itself spawned as a
-/// Wrapper-strategy agent
-/// (`crate::agent_pty::AgentPtyRegistry::agent_spawned_as_wrapper_host`, read
-/// from the frozen launch-shape record no hook path can write). What a forgery
-/// can buy is bounded by what this value grants, and since it no longer
-/// suppresses a buffer the answer is a gate release that a bare unmarked
-/// `SessionStart` already bought before this issue. Do not add a new privilege
-/// keyed on this value without going through that check too — and do not
-/// reintroduce one that a blind interval no longer covers.
+/// no deck environment at all. What a forgery can buy is bounded by what the
+/// daemon grants this value, and today that is nothing an unmarked event does
+/// not already buy: a wrapper-authored start LOSES generation standing, and its
+/// `Idle` counts for the doorbell only while the agent's own hooks have not
+/// reported, which an unmarked `Idle` would count for anyway. Do not add a
+/// privilege keyed on this value without first establishing, at the site that
+/// acts on it, that this daemon spawned the named agent as a Wrapper-strategy
+/// agent — from the launch type the registry froze at spawn
+/// (`crate::agent_pty::RunningAgent::spawn_agent_type`), which no hook path can
+/// write.
 pub const WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN: &str = "wrapper_interface_ready";
 
 /// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "`dot-agent-deck wrap`
@@ -733,28 +992,11 @@ pub const WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN: &str = "wrapper_interfac
 /// fact while the pty is still in cooked mode, which is PRD #225 Defect 1
 /// exactly.
 ///
-/// **It is therefore PROVISIONAL, not a release.** That distinction was learned
-/// the expensive way. The two facts do not arrive in order of strength: measured
-/// over 13 launcher probes and 8 wrapper spawns, this one fired 21/21 and the
-/// strong observation never fired first, arriving 2005–3370 ms later. A gate that
-/// released here and paid the 1000 ms buffer still wrote at +1.85 s into the
-/// launcher's own line discipline, and 3/3 production runs left the pointer
-/// parked unsubmitted in Codex's composer with no turn ever starting. So for a
-/// Wrapper-strategy agent the gate holds this fact for
-/// [`crate::state::INTERFACE_UPGRADE_WINDOW`] to see whether
-/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] is still coming, and releases
-/// on it only when the window expires — with the post-readiness buffer
-/// ([`crate::state::DELEGATE_READINESS_BUFFER`]) still on, since it never skips
-/// that. A settled launcher and a settled REPL stay indistinguishable at this
-/// seam; what the window buys is the later evidence that tells them apart, and
-/// what the buffer covers is the case where none arrives.
-///
-/// Waiting forever is still worse than releasing on a guess, which is why the
-/// window is a bound and not a condition. The bound is
-/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] itself, so a wrapped agent whose
-/// strong fact never arrives reaches its prompt at the same instant it did
-/// before this issue: the fallback costs the wait this issue opened on, and
-/// never a second more.
+/// The daemon reads both interface values the same way today (see
+/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]), so the split is kept for
+/// what it records: which fact the wrapper actually saw, in the event and in
+/// the wrapper's log line. Anything that would grant more to an interface
+/// start must key on the strong value, never on this one.
 ///
 /// Everything said about provenance on
 /// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] applies to this value too.
@@ -785,20 +1027,157 @@ pub const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
 /// was caused by the user running `/clear`".
 pub const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
 
-/// `AgentEvent.metadata` key carrying `codex_spawn_prep`'s (`src/wrap.rs`) REAL
-/// native hook install/trust outcome for the invocation that produced this
-/// `SessionStart` (PRD #254). Only the wrapper sets it, and only on a
-/// Codex-identity event — every other producer and agent type omit it. Value
-/// is the `bool`'s `Display` form (`"true"`/`"false"`); an absent key means
-/// "no outcome reported" (an old wrapper build, a non-Codex identity, or a
-/// non-wrapper producer), which consumers must read as unknown, not as
-/// success — see [`AgentEvent::codex_hook_trust_outcome`].
+/// Issue #714: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on every
+/// event its stdout line classifier emits (value
+/// [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE`]).
 ///
-/// Additive on the wire in both directions, same as
-/// [`SESSION_START_ORIGIN_METADATA_KEY`]: an old wrapper omits the key and a
-/// new daemon reads `None`; a new wrapper's key is ignored by an old daemon.
-/// Not a [`crate::daemon_protocol::PROTOCOL_VERSION`] bump.
-pub const CODEX_HOOK_TRUST_METADATA_KEY: &str = "codex_hook_trust_confirmed";
+/// That classifier reads EVERY non-blank line as `Working` (→ `Thinking`),
+/// including Codex's own rendering of a provider's quota error and its idle
+/// redraws, so an event it emits proves the child printed something, not that it
+/// did any work. A `Blocked` card must not be cleared by it: without the mark,
+/// [`crate::quota_block::is_work_evidence`] would count those events and lift a
+/// rollout-reported Codex block the moment Codex drew the error. Marked rather
+/// than inferred so nothing else about those events changes. Forging the key can
+/// only make an event count for LESS as work evidence — it can keep a `Blocked`
+/// card blocked until the agent's next genuine work hook — so it is not, and
+/// must not be treated as, an authentication marker.
+pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY: &str = "wrapper_output_classified";
+
+/// The [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`] value.
+pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
+
+/// Issue #559: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on EVERY
+/// event it emits — the fork-time and interface `SessionStart`s, each classified
+/// line, the exit-time `Idle`/`Error` — when it knows the wrapped agent's own
+/// submitted-prompt channel is not wired (value
+/// [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE`]).
+///
+/// The wrapper never reports a submitted prompt itself: its emitter hardcodes
+/// `user_prompt: None`. A wrapped Codex pane's prompt reports come from Codex's
+/// NATIVE `UserPromptSubmit` hook, which runs only once the wrapper has recorded
+/// trust for it and while the user has not switched it off in Codex's `/hooks`
+/// browser (`crate::wrap`'s `codex_spawn_prep`). That step is best-effort,
+/// and it fails on an ordinary launcher configuration — `codex` reachable only
+/// inside `devbox run codex-big`, so the wrapper's own `codex app-server` is
+/// `NotFound`. Nothing will then announce a turn, so the deck reads the
+/// wrapper's classified output as the pane's status (issue #1493).
+///
+/// Read by [`AgentEvent::declares_prompt_reports_unavailable`]. Any value
+/// counts. It is not, and must not be treated as, an authentication marker: its
+/// ABSENCE proves nothing.
+pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY: &str =
+    "wrapper_prompt_reports_unavailable";
+
+/// The [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] value the wrapper
+/// writes. Readers accept any value; see the key's docs.
+pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
+
+/// Issue #1354: the [`AgentEvent::metadata`] key naming the SUBAGENT an event
+/// came from, when the agent's hook payload says it came from one.
+///
+/// Claude Code stamps an `agent_id` on its hook input "only when the hook
+/// fires from within a subagent … Absent for the main thread, even in --agent
+/// sessions" (the schema description in 2.1.283), and Codex does the same for
+/// a thread-spawned subagent (`thread_spawn_subagent_hook_context` in
+/// `codex-rs/core/src/hook_runtime.rs`). Both keep the PARENT's `session_id`
+/// on those hooks, so without this key a subagent's tool call is
+/// indistinguishable from the main thread's and drives the one card both
+/// share — which is how a background agent's `PreToolUse` after the turn's
+/// `Stop` left a card on Working for fifteen hours. See the `ToolStart` arm of
+/// `crate::state::AppState::apply_event` for what the key changes.
+///
+/// A distinct name, not `agent_id`, because [`AgentEvent::agent_id`] already
+/// means something else entirely: the deck's own id for the spawned agent
+/// process (`DOT_AGENT_DECK_AGENT_ID`).
+///
+/// Additive on the wire in both directions, like
+/// [`CLEAR_SESSION_START_METADATA_KEY`]: it rides the free-form `metadata`
+/// map, an older daemon ignores it (and keeps today's behaviour), and an older
+/// hook CLI never sets it, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump is needed. Nor is it a
+/// privilege: an event carrying it is kept from moving a card's status, with
+/// two exceptions that grant nothing a plain event lacks — a `SubagentStop`
+/// ends a `WaitingForInput` that only subagents of the same id raised (issue
+/// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too,
+/// and so does that subagent's answered permission prompt (issue #1678,
+/// [`AgentEvent::is_subagent_permission_reply`]), which a plain `Thinking`
+/// would end too.
+pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
+
+/// PRD #1631: the question an event raises, as a JSON-encoded
+/// [`crate::question::PendingQuestion`] riding the free-form `metadata` map.
+///
+/// A metadata key rather than a new [`AgentEvent`] field, deliberately: the
+/// map is already on every producer's wire and every reader's decode, so the
+/// question moves no wire at all — an older daemon or TUI ignores an unknown
+/// key — and the dozens of places that build an `AgentEvent` stay as they are.
+/// Every reader decodes it through [`AgentEvent::question`], which sanitizes
+/// it ([`crate::question::PendingQuestion::sanitized`]); the daemon also
+/// rewrites it sanitized, or drops it, on arrival.
+pub const QUESTION_METADATA_KEY: &str = "pending_question";
+
+/// PRD #1631 (PR #1698 review): a fingerprint of a tool call's `tool_input`
+/// ([`tool_input_digest`]), stamped by the Claude-shaped hook on a `PreToolUse`
+/// (`ToolStart`) and a `PermissionRequest`. Claude Code's and Codex's
+/// `PermissionRequest` payloads carry no `tool_use_id`, but the call's own
+/// `PreToolUse` does, and carries the same input, so the state ties a question
+/// to the one call in flight whose input it was raised for
+/// ([`crate::state`]'s `question_call`). Additive like
+/// [`SUBAGENT_ID_METADATA_KEY`]: an older daemon ignores it, an older hook
+/// never sets it, and a question left untied clears by tool name as before.
+pub const TOOL_INPUT_DIGEST_METADATA_KEY: &str = "tool_input_digest";
+
+/// PRD #1631 (PR #1698 review): the [`TOOL_INPUT_DIGEST_METADATA_KEY`] value
+/// for `input` — SHA-256, in hex, of its JSON. `serde_json` keeps an object's
+/// keys sorted in this build (no `preserve_order`), so the same input digests
+/// alike whatever order the producer wrote its keys in.
+pub fn tool_input_digest(input: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.to_string().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// PRD #1631: the id of a question the AGENT reports answered — OpenCode's
+/// `permission.replied` / `question.replied` / `question.rejected` name their
+/// request id here. An event carrying it clears that question if it is the
+/// pending one. It can only take a question away, never raise one, so a forged
+/// value costs nothing a plain `Idle` would not.
+pub const QUESTION_RESOLVED_METADATA_KEY: &str = "question_resolved_id";
+
+/// PRD #1631: the daemon's marker on the event it ingests after answering a
+/// question itself. The daemon's alone: stripped from every producer frame,
+/// and [`AgentEvent::is_daemon_synthetic`] counts it.
+pub const QUESTION_ANSWERED_BY_DECK_METADATA_KEY: &str = "question_answered_by_deck";
+
+/// The value of [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`] and
+/// [`QUESTION_RELEASED_BY_DECK_METADATA_KEY`] — only the key is read.
+pub const QUESTION_ANSWERED_BY_DECK_METADATA_VALUE: &str = "1";
+
+/// PRD #1631: the daemon's marker on the event it ingests when a held
+/// question's producer stopped waiting without an answer (Claude Code kills its
+/// hook on a keyboard No or Esc [observed]). The event is an
+/// [`EventType::Unknown`] carrying [`QUESTION_RESOLVED_METADATA_KEY`], so a
+/// reader that knows the key drops the question and every reader leaves the
+/// status alone — an older client decodes `unknown` as the no-op it has always
+/// been. The daemon's alone, like [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`].
+pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_deck";
+
+/// Issue #1981 M8 (PR #2010 review): when the daemon received a producer's
+/// event, in Unix nanoseconds, set on every event admitted from a producer
+/// (`crate::daemon::admit_producer_event`) over any copy the producer sent.
+/// The daemon's alone: an event the daemon builds itself never carries it,
+/// which is how telemetry tells an agent's hook from the daemon's own events
+/// when it counts hook latency. Nothing outside telemetry reads it.
+pub const RECEIVED_BY_DECK_AT_METADATA_KEY: &str = "received_by_deck_at_ns";
+
+/// Where a permission prompt stands, on the events the OpenCode hook builds
+/// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
+/// PRD #1631: a question form's answer or dismissal is marked replied too.
+pub const PERMISSION_STATE_METADATA_KEY: &str = "permission_state";
+
+/// [`PERMISSION_STATE_METADATA_KEY`]'s value on an answered permission prompt
+/// or question form.
+pub const PERMISSION_STATE_REPLIED: &str = "replied";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
@@ -892,6 +1271,15 @@ pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 1;
 ///   `agent_version` is. `None` (the default, omitted from the wire) means
 ///   "model not reported"; a later event carrying a different model
 ///   overwrites a previously-known one.
+/// - **`background`** · object (`{ "commands": u32, "subagents": u32,
+///   "since_ms": i64 | null }`) · optional (**issue #1678**, added additively) ·
+///   the DAEMON's post-transition [`BackgroundWork`] for the card this event
+///   changed. Daemon-authored only: a producer's copy is stripped on arrival.
+///   `Some` with both counts zero is an explicit clear; absent means the event
+///   supplies no aggregate (a legacy event), not a clear.
+/// - **`background_revision`** · integer · optional (**issue #1678**) · the
+///   per-spawn revision of `background`; a client ignores an aggregate older
+///   than the one it holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,
@@ -915,13 +1303,12 @@ pub struct AgentEvent {
     /// script from the `DOT_AGENT_DECK_AGENT_ID` env var the daemon
     /// injects at spawn time (same pattern as
     /// [`crate::agent_pty::DOT_AGENT_DECK_PANE_ID`]). Lets the
-    /// post-respawn dispatch task scope its `SessionStart` wait to
-    /// the NEW agent's id, so a late `SessionStart` from the OLD
-    /// agent — emitted in the subscribe→kill window — can't be
-    /// mis-accepted as the NEW agent's readiness signal. Optional
-    /// because hook payloads from external agents (or test forgers)
-    /// may omit it; events with `None` simply won't match
-    /// agent-id-scoped filters.
+    /// daemon attribute an event to one agent generation on a pane,
+    /// so a late event from an agent a `clear = true` respawn
+    /// replaced is not read as the replacement's
+    /// ([`Self::pane_generation_verdict`]). Optional because hook
+    /// payloads from external agents (or test forgers) may omit it;
+    /// events with `None` simply won't match agent-id-scoped filters.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// PRD #20 M1: self-reported version of the agent binary/integration that
@@ -965,6 +1352,46 @@ pub struct AgentEvent {
     /// old/new peers stay compatible. `None` means "model not reported".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Issue #1678: the daemon's post-transition background-work aggregate for
+    /// the card this event changed — see [`BackgroundWork`]. Additive optional
+    /// (`#[serde(default)]` + `skip_serializing_if`), so no `PROTOCOL_VERSION`
+    /// bump: an older reader ignores the key and a newer one reads its absence
+    /// as "no aggregate supplied". Daemon-authored only; a producer's copy is
+    /// stripped before admission (`crate::daemon::admit_producer_event`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundWork>,
+    /// Issue #1678: the revision of [`Self::background`] — a checked monotonic
+    /// per-spawn counter the daemon advances on every aggregate change, so a
+    /// client can refuse a replayed older aggregate. Same additive optional
+    /// shape as `background`, and stripped from producer frames the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_revision: Option<u64>,
+}
+
+/// Issue #1678: background work an agent left running after its turn ended —
+/// detached commands the shell-activity scan still sees, and subagents that
+/// started and have not stopped — as the DAEMON counts it. Clients copy it from
+/// snapshots and events and never reconstruct it from raw hook frames.
+///
+/// Counts are reported only while the agent's turn is over and the agent
+/// reports its own turn boundaries; while a turn is live both are zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BackgroundWork {
+    /// Distinct qualifying POSIX sessions below the pane's agent.
+    pub commands: u32,
+    /// Subagents started and not yet stopped.
+    pub subagents: u32,
+    /// When the oldest item still counted started, in epoch milliseconds on
+    /// the daemon's clock. `None` when the daemon has no start for any of them.
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+}
+
+impl BackgroundWork {
+    /// Whether there is anything to show: at least one counted item.
+    pub fn is_empty(&self) -> bool {
+        self.commands == 0 && self.subagents == 0
+    }
 }
 
 impl AgentEvent {
@@ -977,6 +1404,31 @@ impl AgentEvent {
         self.metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
+    }
+
+    /// Issue #1354: did the agent's hook say this event came from a subagent
+    /// (see [`SUBAGENT_ID_METADATA_KEY`])? `false` for every event without the
+    /// key — the main thread, an older hook CLI, and every agent whose hook
+    /// payload has no such field — so the absent-key default is today's
+    /// behaviour.
+    pub fn is_from_subagent(&self) -> bool {
+        self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
+    }
+
+    /// Issue #1678: is this a subagent's answered permission prompt — a
+    /// `Thinking` carrying both [`SUBAGENT_ID_METADATA_KEY`] and
+    /// [`PERMISSION_STATE_METADATA_KEY`] = [`PERMISSION_STATE_REPLIED`], which
+    /// the OpenCode hook builds from a child session's `permission.replied`
+    /// (and, PRD #1631, its `question.replied` or `question.rejected`)?
+    /// It ends that subagent's share of a wait and says nothing about the main
+    /// thread. `false` for every event an older hook CLI builds.
+    pub fn is_subagent_permission_reply(&self) -> bool {
+        self.event_type == EventType::Thinking
+            && self.is_from_subagent()
+            && self
+                .metadata
+                .get(PERMISSION_STATE_METADATA_KEY)
+                .is_some_and(|state| state == PERMISSION_STATE_REPLIED)
     }
 
     /// Issue #684: was this `SessionStart` authored by the DAEMON to draw a
@@ -992,6 +1444,98 @@ impl AgentEvent {
             .is_some_and(|origin| origin == CARD_SURFACE_SESSION_START_ORIGIN)
     }
 
+    /// PRD #1223: is this the daemon's pane-closed `SessionEnd` (see
+    /// [`DAEMON_PANE_CLOSED_METADATA_KEY`])? Requires the event type and a pane
+    /// id as well as the marker, so a malformed frame is never read as a
+    /// removal of nothing in particular.
+    pub fn is_daemon_pane_closed(&self) -> bool {
+        self.event_type == EventType::SessionEnd
+            && self.pane_id.is_some()
+            && self
+                .metadata
+                .get(DAEMON_PANE_CLOSED_METADATA_KEY)
+                .is_some_and(|v| v == DAEMON_PANE_CLOSED_METADATA_VALUE)
+    }
+
+    /// PRD #1401: the pull request an [`EventType::PullRequest`] reports —
+    /// `Some(None)` when it reports none, `None` when this is not such an
+    /// event. A value that does not decode reads as "none": the badge is
+    /// dropped rather than left showing something the daemon no longer says.
+    pub fn pull_request_report(&self) -> Option<Option<crate::pull_request_info::PullRequestInfo>> {
+        if self.event_type != EventType::PullRequest {
+            return None;
+        }
+        Some(
+            self.metadata
+                .get(PULL_REQUEST_METADATA_KEY)
+                .and_then(|json| serde_json::from_str(json).ok()),
+        )
+    }
+
+    /// PRD #1401: the revision an [`EventType::PullRequest`] carries under
+    /// [`PULL_REQUEST_REVISION_METADATA_KEY`], or `None` when it carries none
+    /// that decodes — a daemon that sends none, or a different event.
+    pub fn pull_request_revision(&self) -> Option<u64> {
+        if self.event_type != EventType::PullRequest {
+            return None;
+        }
+        self.metadata
+            .get(PULL_REQUEST_REVISION_METADATA_KEY)
+            .and_then(|revision| revision.parse().ok())
+    }
+
+    /// Issue #1678: is this the daemon's report that the named spawn's
+    /// background work is over (see [`BACKGROUND_RETIRED_METADATA_KEY`])?
+    /// Requires the shell event type and both identities, so a malformed frame
+    /// is never read as a statement about no card in particular.
+    pub fn is_background_retirement(&self) -> bool {
+        self.event_type == EventType::ShellIdle
+            && self.pane_id.is_some()
+            && self.agent_id.is_some()
+            && self
+                .metadata
+                .get(BACKGROUND_RETIRED_METADATA_KEY)
+                .is_some_and(|v| v == BACKGROUND_RETIRED_METADATA_VALUE)
+    }
+
+    /// Issue #601: does this event carry the daemon's UNPROVEN marker (see
+    /// [`UNPROVEN_METADATA_KEY`])? `false` for every event without it, which
+    /// includes every event an older daemon relays.
+    pub fn is_unproven(&self) -> bool {
+        self.metadata
+            .get(UNPROVEN_METADATA_KEY)
+            .is_some_and(|v| v == UNPROVEN_METADATA_VALUE)
+    }
+
+    /// Issue #318: does this unproven event carry the daemon's verdict that it
+    /// holds no live agent on the event's pane (see
+    /// [`DAEMON_NO_LIVE_AGENT_METADATA_KEY`])? `false` for every event without
+    /// it, which includes every event an older daemon relays.
+    pub fn is_daemon_no_live_agent(&self) -> bool {
+        self.metadata
+            .get(DAEMON_NO_LIVE_AGENT_METADATA_KEY)
+            .is_some_and(|v| v == UNPROVEN_METADATA_VALUE)
+    }
+
+    /// Issue #318: the agent the daemon's hook provenance gate attested this
+    /// frame to (see [`ATTESTED_OWNER_METADATA_KEY`]), or `None` for a frame
+    /// without the marker, which includes every frame an older daemon relays.
+    pub fn attested_owner(&self) -> Option<&str> {
+        self.metadata
+            .get(ATTESTED_OWNER_METADATA_KEY)
+            .map(String::as_str)
+    }
+
+    /// Issue #697: is this the daemon's announcement that it evicted an
+    /// unproven card (see [`UNPROVEN_EVICTED_METADATA_KEY`])?
+    pub fn is_unproven_eviction(&self) -> bool {
+        self.event_type == EventType::SessionEnd
+            && self
+                .metadata
+                .get(UNPROVEN_EVICTED_METADATA_KEY)
+                .is_some_and(|v| v == UNPROVEN_METADATA_VALUE)
+    }
+
     /// Issue #770: does this event carry the daemon's ORPHANED-ROLE marker (see
     /// [`ORCHESTRATION_ORPHANED_METADATA_KEY`])? `false` for every event
     /// without it, which is every event an older daemon relays and every event
@@ -1002,19 +1546,29 @@ impl AgentEvent {
             .is_some_and(|v| v == ORCHESTRATION_ORPHANED_METADATA_VALUE)
     }
 
+    /// Issue #320: the daemon's generation verdict for this frame (see
+    /// [`PANE_GENERATION_METADATA_KEY`]). `None` for every frame without one,
+    /// which includes every frame an older daemon relays; an unrecognised value
+    /// is also `None`, never a guess.
+    pub fn pane_generation_verdict(&self) -> Option<GenerationVerdict> {
+        match self.metadata.get(PANE_GENERATION_METADATA_KEY)?.as_str() {
+            PANE_GENERATION_CURRENT => Some(GenerationVerdict::Current),
+            PANE_GENERATION_DISPLACED => Some(GenerationVerdict::Displaced),
+            _ => None,
+        }
+    }
+
     /// Issue #243: does this event carry the wrapper's INTERFACE-READY origin
     /// marker (see [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`])?
     ///
-    /// The strongest readiness marker in the system: the wrapper watched this
-    /// child clear `ICANON`/`ECHO` on the inner PTY, as opposed to "a session
-    /// object exists". It is the only marker for which a readiness gate may drop
-    /// the blind post-signal buffer — and even then only after the gate has
-    /// established that the agent it names is one THIS daemon spawned as a
-    /// wrapper, because the marker itself is producer-writable (see the
-    /// constant).
+    /// The stronger of the wrapper's two interface facts: the wrapper watched
+    /// this child clear `ICANON`/`ECHO` on the inner PTY, as opposed to "a
+    /// session object exists". The marker is producer-writable (see the
+    /// constant), so nothing may be granted on it without establishing that
+    /// this daemon spawned the agent as a wrapper.
     ///
-    /// Narrower than the question most callers want. "Did the wrapper observe
-    /// the interface at all" — either fact, which is what RELEASES the gate — is
+    /// Narrower than the question the daemon asks today. "Did the wrapper
+    /// observe the interface at all" — either fact — is
     /// [`Self::is_wrapper_interface_session_start`].
     pub fn is_wrapper_interface_ready_session_start(&self) -> bool {
         self.metadata
@@ -1025,11 +1579,9 @@ impl AgentEvent {
     /// Issue #243 (review): does this event carry the wrapper's OUTPUT-SETTLED
     /// origin marker (see [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`])?
     ///
-    /// The weaker interface fact — the child wrote something and then went quiet.
-    /// Enough to release a readiness gate that would otherwise wait 30 s for a
-    /// signal that never comes; NOT enough to drop the post-readiness buffer,
-    /// because a stalled launcher settles exactly like a REPL waiting at its
-    /// prompt.
+    /// The weaker interface fact — the child wrote something and then went
+    /// quiet — because a stalled launcher settles exactly like a REPL waiting
+    /// at its prompt.
     pub fn is_wrapper_interface_settled_session_start(&self) -> bool {
         self.metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
@@ -1039,11 +1591,10 @@ impl AgentEvent {
     /// Issue #243: did the wrapper observe this child's interface AT ALL —
     /// either fact?
     ///
-    /// This is the READINESS question, and it is the one the gate asks: both
-    /// facts mean the wrapper saw something happen to the child that a bare
-    /// fork-time event does not, so both release the wait. What they do not share
-    /// is how much they prove, which is why the buffer keys on the narrower
-    /// [`Self::is_wrapper_interface_ready_session_start`] instead.
+    /// Both facts mean the wrapper saw something happen to the child that a
+    /// bare fork-time event does not. What they do not share is how much they
+    /// prove, which is why anything that needs the stronger fact must ask the
+    /// narrower [`Self::is_wrapper_interface_ready_session_start`] instead.
     pub fn is_wrapper_interface_session_start(&self) -> bool {
         self.is_wrapper_interface_ready_session_start()
             || self.is_wrapper_interface_settled_session_start()
@@ -1053,14 +1604,13 @@ impl AgentEvent {
     /// ABOUT ITS OWN CHILD — any of its origins — rather than by an initialized
     /// agent session announcing itself?
     ///
-    /// This is the "is it a conversation" question, and it is NOT the same as the
-    /// readiness question. Every wrapper event carries the wrapper's own session
-    /// id, so none may bind a delivery's generation, move a pane's hook session,
-    /// or arm a re-submission — while the interface ones *do* satisfy the
-    /// readiness gate and the fork-time one usually does not. Every
-    /// site that previously asked `!is_wrapper_fork_session_start()` to mean
-    /// "genuine conversation" asks this instead; the two sites that genuinely
-    /// mean "fork-time boot provenance" keep asking the narrower question.
+    /// This is the "is it a conversation" question. Every wrapper event carries
+    /// the wrapper's own session id, so none may bind a pane's generation or
+    /// move a pane's hook session, and none counts as the agent's own hooks
+    /// having reported. The sites that genuinely mean "fork-time boot
+    /// provenance" — the doorbell refusing to treat a fork-time `Idle` as the
+    /// agent's — keep asking the narrower
+    /// [`Self::is_wrapper_fork_session_start`].
     ///
     /// `false` for every event without the key — including everything an older
     /// wrapper, a native hook or a future producer emits — so the absent-key
@@ -1069,27 +1619,43 @@ impl AgentEvent {
         self.is_wrapper_fork_session_start() || self.is_wrapper_interface_session_start()
     }
 
-    /// PRD #254: this event's stamped Codex native-hook install/trust outcome
-    /// (see [`CODEX_HOOK_TRUST_METADATA_KEY`]), if any. `None` when the key is
-    /// absent — an old wrapper build, a non-Codex-identity spawn, or any
-    /// non-wrapper producer, none of which report anything about hook trust,
-    /// and none of which should be read as either a success or a failure.
-    /// `Some(false)` (auditor I2) when the key IS present but its value is
-    /// neither `"true"` nor `"false"` — a future format, a typo, a corrupted
-    /// write. A present-but-garbled value is evidence something went wrong
-    /// and must not be read the same as an absent key, or it silently
-    /// restores the pre-fix `Reports` behaviour H1 exists to close.
-    pub fn codex_hook_trust_outcome(&self) -> Option<bool> {
-        match self
-            .metadata
-            .get(CODEX_HOOK_TRUST_METADATA_KEY)
-            .map(String::as_str)
-        {
-            Some("true") => Some(true),
-            Some("false") => Some(false),
-            Some(_) => Some(false),
-            None => None,
-        }
+    /// PRD #1666 long-turn delivery: is this the daemon's "delivered after
+    /// all" event ([`DELIVERY_NOTICE_CLEARED_METADATA_KEY`])?
+    pub fn is_delivery_notice_cleared(&self) -> bool {
+        self.event_type == EventType::Thinking
+            && self
+                .metadata
+                .get(DELIVERY_NOTICE_CLEARED_METADATA_KEY)
+                .is_some_and(|v| v == DELIVERY_NOTICE_CLEARED_METADATA_VALUE)
+    }
+
+    /// Issue #714: is this the daemon's `Idle` that lifts a `Blocked` card whose
+    /// agent a pane restart replaced
+    /// ([`crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY`])? The hook loop
+    /// strips the key from every producer frame, so only the daemon sends it.
+    pub fn is_quota_block_lift(&self) -> bool {
+        self.event_type == EventType::Idle
+            && self
+                .metadata
+                .get(crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY)
+                .is_some_and(|v| v == crate::quota_block::QUOTA_BLOCKED_LIFTED_BY_PANE_RESTART)
+    }
+
+    /// Issue #714: was this event emitted by `dot-agent-deck wrap`'s stdout line
+    /// classifier (see [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`])?
+    pub fn is_wrapper_output_classified(&self) -> bool {
+        self.metadata
+            .get(WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY)
+            .is_some_and(|v| v == WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE)
+    }
+
+    /// Issue #559: did this event's producer declare that no submitted-prompt
+    /// report will come from it (see
+    /// [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`])? Presence of the
+    /// key, whatever its value.
+    pub fn declares_prompt_reports_unavailable(&self) -> bool {
+        self.metadata
+            .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
     }
 
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
@@ -1099,10 +1665,16 @@ impl AgentEvent {
     /// events take — [`EventType::ShellBusy`]/[`EventType::ShellIdle`] from the
     /// shell-activity monitor (PRD #370/#386), the delivery-notice
     /// [`EventType::Error`] (issue #424), the card-surfacing `SessionStart`
-    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]), and the flat
+    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]), the flat
     /// live-surface `SessionStart` [`crate::spawn`]'s `surface_spawned_pane`
     /// forges to paint an already-attached TUI's card for a freshly-spawned
-    /// scheduled pane (issue #549 fix round 2, reviewer H1 follow-up). Each
+    /// scheduled pane (issue #549 fix round 2, reviewer H1 follow-up), and the
+    /// Codex rollout tailer's [`EventType::QuotaBlocked`] (issue #714), marked
+    /// with [`crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY`], which the
+    /// hook loop strips from every producer frame, and the `Idle` that lifts a
+    /// replaced agent's block after a pane restart
+    /// ([`Self::is_quota_block_lift`]). A producer's own `QuotaBlocked` (Claude
+    /// Code, OpenCode) is the agent reporting, and is not synthetic. Each
     /// hazards `crate::ui::evidence_channel_is_unidentified` a different way,
     /// so excluding all of them closes several distinct gaps rather than one:
     ///
@@ -1163,12 +1735,100 @@ impl AgentEvent {
                 | EventType::ShellIdle
                 | EventType::MonitoredWaitStart
                 | EventType::MonitoredWaitDone
+                | EventType::PullRequest
         ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(DELIVERY_NOTICE_CLEARED_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY)
             || self.is_card_surface_session_start()
             || (self.event_type == EventType::SessionStart
                 && self.metadata.contains_key(DISPLAY_NAME_METADATA_KEY))
             || self.is_wrapper_session_start()
+            || self.is_daemon_pane_closed()
+            || self.is_unproven_eviction()
+            // PRD #1666: a card's inbox state, held in its journal by the
+            // client itself and never sent by anyone.
+            || self
+                .metadata
+                .contains_key(crate::inbox_display::CARD_INBOX_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(QUESTION_RELEASED_BY_DECK_METADATA_KEY)
     }
+
+    /// PRD #1631: the question this event raises, sanitized — `None` when it
+    /// carries none, or one that does not decode or does not survive
+    /// [`crate::question::PendingQuestion::sanitized`].
+    pub fn question(&self) -> Option<crate::question::PendingQuestion> {
+        let raw = self.metadata.get(QUESTION_METADATA_KEY)?;
+        serde_json::from_str::<crate::question::PendingQuestion>(raw)
+            .ok()?
+            .sanitized()
+    }
+
+    /// PRD #1631: put `question` on this event.
+    pub fn set_question(&mut self, question: &crate::question::PendingQuestion) {
+        if let Ok(json) = serde_json::to_string(question) {
+            self.metadata
+                .insert(QUESTION_METADATA_KEY.to_string(), json);
+        }
+    }
+
+    /// PRD #1631: the question id this event reports the agent answered, if
+    /// any ([`QUESTION_RESOLVED_METADATA_KEY`]).
+    pub fn resolved_question_id(&self) -> Option<&str> {
+        self.metadata
+            .get(QUESTION_RESOLVED_METADATA_KEY)
+            .map(String::as_str)
+    }
+}
+
+/// Issue #318: the hook capability token a raw [`AgentEvent`] line presents.
+///
+/// The token rides the same JSON object as the event under the key `token`, the
+/// name every [`DaemonMessage`] verb uses, but it is deliberately NOT a field of
+/// [`AgentEvent`]: the daemon reads it off the line with this struct and the
+/// event it keeps, journals and broadcasts never carries it, so no fan-out path
+/// has to remember to strip a capability. Every other key is ignored.
+#[derive(Debug, Default, Deserialize)]
+pub struct PresentedToken {
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Issue #318: serialize `event` as the one-line JSON a producer writes to the
+/// hook socket, with `token` added when there is one.
+///
+/// The token is added beside the event's own keys; an older daemon ignores it
+/// because [`AgentEvent`] does not deny unknown fields. Issue #1637 adds the
+/// sender's stamp the same way, on every line
+/// ([`crate::hook_binary::stamp_hook_line`]): `deck_build` and `deck_exe`, which
+/// an older daemon ignores for the same reason.
+pub fn agent_event_line(event: &AgentEvent, token: Option<&str>) -> serde_json::Result<String> {
+    let mut value = serde_json::to_value(event)?;
+    if let serde_json::Value::Object(map) = &mut value {
+        if let Some(token) = token {
+            map.insert(
+                "token".to_string(),
+                serde_json::Value::String(token.to_string()),
+            );
+        }
+        // Issue #1637: which deck sent this, so the daemon can tell when an
+        // agent's hooks run an older copy than itself.
+        if !crate::inbox_oneshot::stands_in_for_pre_inbox_hooks() {
+            crate::hook_binary::stamp_hook_line(map);
+        }
+    }
+    serde_json::to_string(&value)
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.
@@ -1186,12 +1846,25 @@ pub enum DaemonMessage {
     /// Worker (or orchestrator with `done`) reports task completion.
     #[serde(rename = "work_done")]
     WorkDone(WorkDoneSignal),
+    /// PRD #1666 part 3, round 5 (plan D1): which hook verbs this daemon
+    /// serves, answered with a [`HookCapabilitiesReply`] on the same
+    /// connection, which then carries the mutation.
+    #[serde(rename = "hook_capabilities")]
+    HookCapabilities(HookCapabilitiesRequest),
+    /// PRD #1666 part 3, round 5 (plan D1): a task-scoped `work-done`,
+    /// answered with a [`WorkDoneTaskReply`] once the deck kept the report.
+    #[serde(rename = "work_done_task")]
+    WorkDoneTask(WorkDoneTaskRequest),
     /// PRD #201 native prompt delivery: a READ-ONLY request for the seed the
     /// daemon prepared for a pane, so the pane's extension can deliver it
     /// NATIVELY (`pi.sendUserMessage`) instead of the daemon typing it into the
-    /// PTY. Unlike the two fire-and-forget signals above, this one gets a
-    /// reply: the daemon writes a [`GetSeedResponse`] JSON line back on the
-    /// same connection, then the seed is cleared (delivered exactly once). An
+    /// PTY. The daemon writes a [`GetSeedResponse`] JSON line back on the
+    /// same connection, then the seed is cleared (delivered exactly once).
+    /// (Every verb on this socket now answers something — `work_done` and
+    /// `dispatch` got a [`SignalAck`] in issue #1129 — so this is no longer the
+    /// distinguishing property it was when this was written; what still sets
+    /// those two apart is that their answer comes from the provenance gate
+    /// rather than from a handler.) An
     /// older daemon that doesn't know this variant fails to parse it and sends
     /// no reply — the `get-seed` CLI then reports an empty seed, the extension
     /// no-sends, and the daemon's PTY-injection safety net still delivers. So
@@ -1208,8 +1881,12 @@ pub enum DaemonMessage {
     Dispatch(DispatchSignal),
     /// PRD #220: read-only request for the spawn targets available to a pane's
     /// repo. Like [`Self::GetSeed`], the daemon writes a
-    /// [`ListTargetsResponse`] JSON line back on the same connection; every other
-    /// message on this socket is fire-and-forget.
+    /// [`ListTargetsResponse`] JSON line back on the same connection once the
+    /// handler has run. (The raw `AgentEvent` traffic this socket also accepts
+    /// is answered by nothing at all; since issue #1129 every
+    /// [`DaemonMessage`] gets a line back, though `work_done`'s and
+    /// `dispatch`'s comes from the provenance gate rather than from a handler —
+    /// see [`SignalAck`].)
     ///
     /// Answered by the DAEMON rather than computed in the CLI so the menu comes
     /// from the same cwd and the same config the dispatch will use — a listing
@@ -1240,6 +1917,607 @@ pub enum DaemonMessage {
     /// see [`WaitDoneSignal`]. Fire-and-forget.
     #[serde(rename = "wait_done")]
     WaitDone(WaitDoneSignal),
+    /// Issue #1383: a worker acknowledges that its delegated task reached it
+    /// (`dot-agent-deck ack <delivery-id>`), so the daemon stops re-sending the
+    /// task pointer. Fire-and-forget like [`Self::WorkDone`]: the gate answers a
+    /// [`SignalAck`] and the handler produces nothing further.
+    ///
+    /// Additive on the unversioned hook socket, so it does NOT move the attach
+    /// `PROTOCOL_VERSION`. An older daemon decodes it as neither a
+    /// `DaemonMessage` nor an [`AgentEvent`] (it carries none of an event's
+    /// required fields), logs it as malformed and answers nothing, which the CLI
+    /// reports as harmless.
+    #[serde(rename = "ack")]
+    Ack(AckSignal),
+    /// PRD #1666: an agent-side inbox component (Claude's `asyncRewake`
+    /// waiter, the OpenCode plugin, the Pi extension) arms itself for the
+    /// pane's inbox. **Holds the connection**: the daemon moves it out of the
+    /// hook-ingest pool into the waiter pool, answers keepalives, and writes
+    /// the messages it hands over as [`InboxWaitReply`] lines. See
+    /// `crate::inbox_hub`.
+    #[serde(rename = "inbox_wait")]
+    InboxWait(InboxWaitRequest),
+    /// PRD #1666: a one-shot "this agent has an inbox component" from a hook
+    /// that does not hold a connection (Claude's `SessionStart`, Codex, Devin).
+    /// Answered with a [`SignalAck`].
+    #[serde(rename = "inbox_announce")]
+    InboxAnnounce(InboxAnnounceRequest),
+    /// PRD #1666: take the caller's queued messages, rendered, and (with
+    /// `ack`) acknowledge them in the same step. Answered with an
+    /// [`InboxWaitReply`] carrying `messages`.
+    #[serde(rename = "inbox_fetch")]
+    InboxFetch(InboxFetchRequest),
+    /// PRD #1666 part 2 §1.3: Claude's prompt hook commits the exact
+    /// attempts whose blocks a submitted prompt carried, after publishing
+    /// each one's `committed` receipt. Answered with an [`InboxWaitReply`].
+    #[serde(rename = "inbox_committed")]
+    InboxCommitted(InboxCommittedRequest),
+    /// PRD #1666 part 2 (wire audit W03–W05): a one-shot receiver asks whether
+    /// this daemon serves one-shot receipts, before it sends anything that
+    /// could take mail or commit it. Answered with an [`InboxWaitReply`]
+    /// carrying [`InboxWaitReply::one_shot_receipts`], on the same connection,
+    /// which then carries the receiver's request. An older daemon decodes it
+    /// as neither a `DaemonMessage` nor an [`AgentEvent`] and answers nothing,
+    /// so the receiver takes no mail ([`crate::inbox_oneshot::Connection::open_receipts`]).
+    #[serde(rename = "inbox_receipts")]
+    InboxReceipts(InboxReceiptsRequest),
+    /// PRD #1666 part 2: Claude's once-waiter on receipts. The request is an
+    /// `inbox_wait`'s, on a verb of its own that a 0.47.0 daemon cannot
+    /// decode, so no daemon that does not serve receipts can hand it mail on
+    /// legacy terms.
+    #[serde(rename = "inbox_receipt_wait")]
+    InboxReceiptWait(InboxWaitRequest),
+    /// PRD #1666 part 2: a hook's fetch as a one-shot receiver on receipts,
+    /// on a verb of its own for [`Self::InboxReceiptWait`]'s reason.
+    #[serde(rename = "inbox_receipt_fetch")]
+    InboxReceiptFetch(InboxFetchRequest),
+    /// PRD #1666: list the caller's inbox (and with `all`, an orchestrator's
+    /// scope). Answered with an [`InboxListReply`].
+    #[serde(rename = "inbox_list")]
+    InboxList(InboxListRequest),
+    /// PRD #1666 S11: announce something to every subscriber of a topic in the
+    /// sender's scope. Answered with an [`InboxPostReply`].
+    #[serde(rename = "inbox_publish")]
+    InboxPublish(InboxPublishRequest),
+    /// PRD #1666 S11: offer a job to the first free taker of a pool in the
+    /// orchestrator's scope. Answered with an [`InboxPostReply`].
+    #[serde(rename = "inbox_offer")]
+    InboxOffer(InboxOfferRequest),
+    /// PRD #1666 S11: the claimant of an offered job finished it. Answered
+    /// with an [`InboxClaimReply`].
+    #[serde(rename = "inbox_complete")]
+    InboxComplete(InboxClaimRequest),
+    /// PRD #1666 S11: the claimant of an offered job hands it back to its
+    /// pool. Answered with an [`InboxClaimReply`].
+    #[serde(rename = "inbox_release")]
+    InboxRelease(InboxClaimRequest),
+    /// PRD #1631: a producer reports a question and, with `hold`, keeps this
+    /// connection open for the daemon's answer — the Claude Code
+    /// `PermissionRequest` hook, and the `await-answer` child the OpenCode
+    /// plugin and the Pi extension start. The daemon applies the event exactly
+    /// as a bare one and, for a held question it accepted, writes one
+    /// [`crate::question::QuestionReply`] line when the question is answered
+    /// or let go; otherwise it answers a `released` reply at once.
+    ///
+    /// Additive on the unversioned hook socket, so it does NOT move the attach
+    /// `PROTOCOL_VERSION`. An older daemon decodes it as neither a
+    /// `DaemonMessage` nor an [`AgentEvent`], logs it as malformed and answers
+    /// nothing; the producer then exits with no decision and the agent shows
+    /// its own prompt, as it did before.
+    #[serde(rename = "question")]
+    Question(Box<QuestionSignal>),
+}
+
+impl DaemonMessage {
+    /// The pane this message claims to come from.
+    ///
+    /// Every variant carries one — that is what makes the provenance gate in
+    /// `crate::daemon::run_hook_loop` a single check rather than a per-arm one,
+    /// and the exhaustive `match` here is what keeps it true: a new variant
+    /// without a pane id will not compile until someone decides what it claims.
+    pub fn claimed_pane(&self) -> &str {
+        match self {
+            DaemonMessage::Delegate(s) => &s.pane_id,
+            DaemonMessage::WorkDone(s) => &s.pane_id,
+            DaemonMessage::HookCapabilities(r) => &r.pane_id,
+            DaemonMessage::WorkDoneTask(r) => &r.pane_id,
+            DaemonMessage::GetSeed(r) => &r.pane_id,
+            DaemonMessage::Dispatch(s) => &s.pane_id,
+            DaemonMessage::ListTargets(r) => &r.pane_id,
+            DaemonMessage::RestartRole(s) => &s.pane_id,
+            DaemonMessage::SpawnRole(s) => &s.pane_id,
+            DaemonMessage::WaitStart(s) => &s.pane_id,
+            DaemonMessage::WaitDone(s) => &s.pane_id,
+            DaemonMessage::Ack(s) => &s.pane_id,
+            DaemonMessage::InboxWait(r) => &r.pane_id,
+            DaemonMessage::InboxAnnounce(r) => &r.pane_id,
+            DaemonMessage::InboxFetch(r) => &r.pane_id,
+            DaemonMessage::InboxCommitted(r) => &r.pane_id,
+            DaemonMessage::InboxReceipts(r) => &r.pane_id,
+            DaemonMessage::InboxReceiptWait(r) => &r.pane_id,
+            DaemonMessage::InboxReceiptFetch(r) => &r.pane_id,
+            DaemonMessage::InboxList(r) => &r.pane_id,
+            DaemonMessage::InboxPublish(r) => &r.pane_id,
+            DaemonMessage::InboxOffer(r) => &r.pane_id,
+            DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => &r.pane_id,
+            DaemonMessage::Question(s) => &s.pane_id,
+        }
+    }
+
+    /// The hook capability token this message presented, if any. See
+    /// [`crate::hook_provenance`].
+    pub fn presented_token(&self) -> Option<&str> {
+        match self {
+            DaemonMessage::Delegate(s) => s.token.as_deref(),
+            DaemonMessage::WorkDone(s) => s.token.as_deref(),
+            DaemonMessage::HookCapabilities(r) => r.token.as_deref(),
+            DaemonMessage::WorkDoneTask(r) => r.token.as_deref(),
+            DaemonMessage::GetSeed(r) => r.token.as_deref(),
+            DaemonMessage::Dispatch(s) => s.token.as_deref(),
+            DaemonMessage::ListTargets(r) => r.token.as_deref(),
+            DaemonMessage::RestartRole(s) => s.token.as_deref(),
+            DaemonMessage::SpawnRole(s) => s.token.as_deref(),
+            DaemonMessage::WaitStart(s) => s.token.as_deref(),
+            DaemonMessage::WaitDone(s) => s.token.as_deref(),
+            DaemonMessage::Ack(s) => s.token.as_deref(),
+            DaemonMessage::InboxWait(r) => r.token.as_deref(),
+            DaemonMessage::InboxAnnounce(r) => r.token.as_deref(),
+            DaemonMessage::InboxFetch(r) => r.token.as_deref(),
+            DaemonMessage::InboxCommitted(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceipts(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceiptWait(r) => r.token.as_deref(),
+            DaemonMessage::InboxReceiptFetch(r) => r.token.as_deref(),
+            DaemonMessage::InboxList(r) => r.token.as_deref(),
+            DaemonMessage::InboxPublish(r) => r.token.as_deref(),
+            DaemonMessage::InboxOffer(r) => r.token.as_deref(),
+            DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => r.token.as_deref(),
+            DaemonMessage::Question(s) => s.token.as_deref(),
+        }
+    }
+
+    /// PRD #1666: whether this message may be acted on only for an agent its
+    /// token ATTESTS — every inbox verb, and an `ack` of an inbox message id.
+    /// A pane never issued a token is admitted by the provenance gate for its
+    /// status events, but has no agent an inbox message could be bound to.
+    pub fn requires_attested_agent(&self) -> bool {
+        match self {
+            DaemonMessage::InboxWait(_)
+            | DaemonMessage::InboxAnnounce(_)
+            | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
+            | DaemonMessage::InboxList(_)
+            | DaemonMessage::InboxPublish(_)
+            | DaemonMessage::InboxOffer(_)
+            | DaemonMessage::InboxComplete(_)
+            | DaemonMessage::InboxRelease(_)
+            | DaemonMessage::Ack(_) => true,
+            DaemonMessage::Delegate(_)
+            | DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
+            | DaemonMessage::GetSeed(_)
+            | DaemonMessage::Dispatch(_)
+            | DaemonMessage::ListTargets(_)
+            | DaemonMessage::RestartRole(_)
+            | DaemonMessage::SpawnRole(_)
+            | DaemonMessage::WaitStart(_)
+            | DaemonMessage::WaitDone(_)
+            | DaemonMessage::Question(_) => false,
+        }
+    }
+
+    /// PRD #1666: the agent an inbox verb says it speaks for, when it says. The
+    /// daemon refuses one that differs from the agent its token attests.
+    pub fn claimed_agent(&self) -> Option<&str> {
+        let claimed = match self {
+            DaemonMessage::InboxWait(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxAnnounce(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxFetch(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxCommitted(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceipts(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceiptWait(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxReceiptFetch(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxList(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxPublish(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxOffer(r) => r.agent_id.as_deref(),
+            DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => {
+                r.agent_id.as_deref()
+            }
+            DaemonMessage::Delegate(_)
+            | DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
+            | DaemonMessage::GetSeed(_)
+            | DaemonMessage::Dispatch(_)
+            | DaemonMessage::ListTargets(_)
+            | DaemonMessage::RestartRole(_)
+            | DaemonMessage::SpawnRole(_)
+            | DaemonMessage::WaitStart(_)
+            | DaemonMessage::WaitDone(_)
+            | DaemonMessage::Ack(_)
+            | DaemonMessage::Question(_) => None,
+        };
+        claimed.filter(|id| !id.is_empty())
+    }
+
+    /// The wire name of this verb, for logs. Matches the `#[serde(rename)]`
+    /// discriminator so a log line and a captured payload use one vocabulary.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            DaemonMessage::Delegate(_) => "delegate",
+            DaemonMessage::WorkDone(_) => "work_done",
+            DaemonMessage::HookCapabilities(_) => "hook_capabilities",
+            DaemonMessage::WorkDoneTask(_) => "work_done_task",
+            DaemonMessage::GetSeed(_) => "get_seed",
+            DaemonMessage::Dispatch(_) => "dispatch",
+            DaemonMessage::ListTargets(_) => "list_targets",
+            DaemonMessage::RestartRole(_) => "restart_role",
+            DaemonMessage::SpawnRole(_) => "spawn_role",
+            DaemonMessage::WaitStart(_) => "wait_start",
+            DaemonMessage::WaitDone(_) => "wait_done",
+            DaemonMessage::Ack(_) => "ack",
+            DaemonMessage::InboxWait(_) => "inbox_wait",
+            DaemonMessage::InboxAnnounce(_) => "inbox_announce",
+            DaemonMessage::InboxFetch(_) => "inbox_fetch",
+            DaemonMessage::InboxCommitted(_) => "inbox_committed",
+            DaemonMessage::InboxReceipts(_) => "inbox_receipts",
+            DaemonMessage::InboxReceiptWait(_) => "inbox_receipt_wait",
+            DaemonMessage::InboxReceiptFetch(_) => "inbox_receipt_fetch",
+            DaemonMessage::InboxList(_) => "inbox_list",
+            DaemonMessage::InboxPublish(_) => "inbox_publish",
+            DaemonMessage::InboxOffer(_) => "inbox_offer",
+            DaemonMessage::InboxComplete(_) => "inbox_complete",
+            DaemonMessage::InboxRelease(_) => "inbox_release",
+            DaemonMessage::Question(_) => "question",
+        }
+    }
+
+    /// The JSON line to write back when this message is refused for want of
+    /// provenance. Every variant answers one, and the exhaustive `match` is what
+    /// keeps that true.
+    ///
+    /// The verbs that already answer on the same connection answer a refusal in
+    /// their own response type: `delegate`'s whole point since PRD #466 is that a
+    /// delegation which routed nowhere is no longer invisible to the orchestrator
+    /// that issued it, and a refusal is exactly such a case.
+    ///
+    /// `work_done` and `dispatch` have nothing of their own to answer in — they
+    /// are fire-and-forget verbs whose handlers produce no response — so they
+    /// answer a [`SignalAck`]. That is issue #1129's half of #1077: before it,
+    /// their refusal was a `warn!` in the daemon log and nothing else, so the
+    /// legitimate sender most likely to trip the gate (a `dot-agent-deck` binary
+    /// in the pane older than the daemon, which forwards no token and is refused
+    /// as `missing_token`) saw a clean exit 0 on a report that was dropped. See
+    /// [`SignalAck`] for what the acknowledgement does and does not claim.
+    pub fn provenance_refusal_reply(&self, reason: &str, message: &str) -> Option<String> {
+        let json = match self {
+            DaemonMessage::Delegate(_) => serde_json::to_string(&DelegateResponse {
+                error: Some(message.to_string()),
+                ..Default::default()
+            }),
+            DaemonMessage::RestartRole(_) => serde_json::to_string(&RestartRoleResponse {
+                error: Some(message.to_string()),
+                ..Default::default()
+            }),
+            DaemonMessage::SpawnRole(_) => serde_json::to_string(&SpawnRoleResponse {
+                error: Some(message.to_string()),
+                ..Default::default()
+            }),
+            DaemonMessage::ListTargets(_) => serde_json::to_string(&ListTargetsResponse {
+                rendered: String::new(),
+                orchestrations: Vec::new(),
+                error: Some(message.to_string()),
+            }),
+            // A refused `get-seed` answers exactly as an admitted one does:
+            // since PRD #1666 part 3 (H5) the verb takes nothing for anyone
+            // ([`GetSeedResponse::withdrawn`]), so the answer tells a caller
+            // that guessed a pane id nothing about the pane.
+            DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse::withdrawn()),
+            // A refused question names the refusal and confirms no verb, so
+            // the sender withholds its mutation and says why.
+            DaemonMessage::HookCapabilities(_) => serde_json::to_string(&HookCapabilitiesReply {
+                task_scoped_completion: None,
+                code: Some(reason.to_string()),
+                message: Some(message.to_string()),
+            }),
+            DaemonMessage::WorkDoneTask(_) => {
+                serde_json::to_string(&WorkDoneTaskReply::refused(reason, message))
+            }
+            // PRD #499 `wait start` / `wait done` are fire-and-forget like
+            // `work_done`, so a refusal is answered in the same type.
+            DaemonMessage::WorkDone(_)
+            | DaemonMessage::Dispatch(_)
+            | DaemonMessage::WaitStart(_)
+            | DaemonMessage::WaitDone(_)
+            | DaemonMessage::Ack(_)
+            | DaemonMessage::InboxAnnounce(_) => {
+                serde_json::to_string(&SignalAck::refused(reason, message))
+            }
+            // An inbox refusal carries no `messages`, so a refused caller
+            // learns nothing about what the pane holds.
+            DaemonMessage::InboxWait(_)
+            | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
+            | DaemonMessage::InboxList(_) => {
+                serde_json::to_string(&InboxWaitReply::refused(reason, message))
+            }
+            DaemonMessage::InboxPublish(_) | DaemonMessage::InboxOffer(_) => {
+                serde_json::to_string(&InboxPostReply::refused(reason, message))
+            }
+            DaemonMessage::InboxComplete(_) | DaemonMessage::InboxRelease(_) => {
+                serde_json::to_string(&InboxClaimReply::refused(reason, message))
+            }
+            // A refused question is released as `refused`: the producer prints
+            // no decision, the agent's own prompt stays on screen, and the
+            // producer re-sends the event as a plain one so it is not lost.
+            DaemonMessage::Question(s) => {
+                serde_json::to_string(&crate::question::QuestionReply::released(
+                    &s.question_id().unwrap_or_default(),
+                    crate::question::ReleaseReason::Refused,
+                ))
+            }
+        };
+        json.ok()
+    }
+
+    /// The JSON line to write back when this message is **admitted** past the
+    /// provenance gate, or `None` for a verb whose own handler answers on the
+    /// connection.
+    ///
+    /// Only `dispatch` is `Some`, and the exhaustive `match` is what enforces
+    /// the invariant the hook loop depends on: **exactly one line per
+    /// message**. `work_done`, `delegate`, `restart_role`, `spawn_role`,
+    /// `list_targets`, `get_seed` and `ack` all write their own response after
+    /// their handler runs, so an admission line
+    /// here would be a second one and the caller — which reads exactly one line
+    /// — would take the ack for the answer. `ack` answers after its handler
+    /// (PR #1414 review) because admission is not what its caller needs to know:
+    /// [`SignalAck::acknowledged`] says whether the id matched a delivery, and the
+    /// handler is a map lookup, so answering after it parks nobody.
+    ///
+    /// It is written at the gate, **before** the handler runs, and that is
+    /// deliberate rather than incidental. `dispatch`'s handler is awaited inline
+    /// in the hook loop and does the whole worktree-create-and-spawn, so an
+    /// acknowledgement written after it would park the calling agent for as long
+    /// as the dispatch takes. The price is stated in [`SignalAck::accepted`]: an
+    /// admitted message is one the gate let through, not one whose work
+    /// succeeded.
+    ///
+    /// `work_done` was acknowledged here too until PRD #1631, and that ordered
+    /// nothing: a worker whose first report was acked here could send its
+    /// second before the first was queued for delivery, and the two could reach
+    /// the recipient reversed (`orchestration/work-done/010`). Its handler
+    /// acknowledges once the report is queued — a state change under the
+    /// `state` read lock and a queue push, not the delivery, which may wait for
+    /// the recipient's draft — so a sender that waits for its ack is ordered.
+    pub fn provenance_ack_reply(&self) -> Option<String> {
+        match self {
+            DaemonMessage::Dispatch(_) => serde_json::to_string(&SignalAck::accepted()).ok(),
+            DaemonMessage::WorkDone(_)
+            | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::WorkDoneTask(_)
+            | DaemonMessage::Delegate(_)
+            | DaemonMessage::RestartRole(_)
+            | DaemonMessage::SpawnRole(_)
+            | DaemonMessage::ListTargets(_)
+            | DaemonMessage::GetSeed(_)
+            | DaemonMessage::WaitStart(_)
+            | DaemonMessage::WaitDone(_)
+            | DaemonMessage::Ack(_)
+            | DaemonMessage::Question(_)
+            | DaemonMessage::InboxWait(_)
+            | DaemonMessage::InboxAnnounce(_)
+            | DaemonMessage::InboxFetch(_)
+            | DaemonMessage::InboxCommitted(_)
+            | DaemonMessage::InboxReceipts(_)
+            | DaemonMessage::InboxReceiptWait(_)
+            | DaemonMessage::InboxReceiptFetch(_)
+            | DaemonMessage::InboxList(_)
+            | DaemonMessage::InboxPublish(_)
+            | DaemonMessage::InboxOffer(_)
+            | DaemonMessage::InboxComplete(_)
+            | DaemonMessage::InboxRelease(_) => None,
+        }
+    }
+}
+
+/// The daemon's acknowledgement of a **fire-and-forget** hook-socket signal —
+/// `work_done` and `dispatch`, the two [`DaemonMessage`] variants whose handlers
+/// produce no response of their own.
+///
+/// Issue #1129. Until this existed, those two verbs were written to the socket
+/// and the CLI exited 0 whatever the daemon then did with them, so a message the
+/// provenance gate (issue #1077, [`crate::hook_provenance`]) refused was
+/// indistinguishable from one it acted on. The refusal was a `warn!` in
+/// `deck.log` and nothing else. The sender that matters here is not the
+/// adversary — who is not owed a diagnostic — but the **legitimate** one: a
+/// `dot-agent-deck` binary invoked inside a pane that is older than the daemon
+/// which spawned it forwards no token, is refused as `missing_token`, and
+/// reported success on a completion report that went nowhere. Issue #1182 is
+/// that failure mode observed in the wild, where it also masked an unrelated bug
+/// underneath by sending readers to the daemon log's refusals instead.
+///
+/// # What it claims, and what it does not
+///
+/// It claims exactly one thing: **this daemon admitted the message past the
+/// provenance gate**. It is not a receipt for the work: `dispatch`'s is written
+/// before its handler runs, and `work_done`'s once the handler has made its
+/// state changes and queued the report for delivery (PRD #1631), before the
+/// report is written into any pane. In particular these remain invisible to the sender, as
+/// they were before:
+///
+/// - a `dispatch` from a pane the registry holds no record for, which the hook
+///   loop logs as `dispatch from unknown pane` and drops;
+/// - a `work_done` from a pane in no role map and with no retained dispatch
+///   return, logged as `work-done from unknown pane` and dropped;
+/// - every later outcome of either handler — a worktree that could not be
+///   created, an orchestrator pane that has gone away.
+///
+/// Reporting those would mean answering after the handler, which for `dispatch`
+/// means holding the calling agent for the whole spawn. They are a separate
+/// question from this one and are deliberately left where they were.
+///
+/// # Why telling the caller is not a new disclosure
+///
+/// A refusal names why, and `missing_token`'s message says the claimed pane was
+/// issued a token — which tells a caller that guessed a pane id that the pane is
+/// real. That is not new information: pane ids are already published by
+/// `list-agents`, by `daemon status` and in the TUI, and `delegate`,
+/// `restart_role`, `spawn_role` and `list_targets` have answered their refusals
+/// on this same socket since #1077, so any caller able to send one of those
+/// already had the same oracle. [`crate::hook_provenance::Refusal::caller_message`]
+/// is what keeps it no wider than that: it never echoes the presented token and
+/// never names the pane a token actually belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalAck {
+    /// Affirmative discriminator, always [`SIGNAL_ACK_KIND`] on a line this
+    /// daemon wrote.
+    ///
+    /// Same reasoning as [`DelegateResponse::kind`], and it matters more here
+    /// because this type's other two fields are `#[serde(default)]` over a
+    /// `bool`: without the marker, `from_str::<SignalAck>` succeeds on any JSON
+    /// object — `{}`, or another verb's reply — and yields `accepted: false`,
+    /// i.e. a *refusal* manufactured out of a line that is not an ack at all.
+    /// That is the dangerous direction: it would turn a daemon we do not
+    /// understand into a reported failure on a signal that was delivered. A line
+    /// without this marker is therefore treated exactly like
+    /// [`crate::hook::SocketReply::NoReply`] — unverifiable, and reported as
+    /// success.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Whether the message was admitted past the provenance gate. **Not** whether
+    /// the work it asked for happened — see this type's docs.
+    #[serde(default)]
+    pub accepted: bool,
+    /// On a refusal, the stable greppable code from
+    /// [`crate::hook_provenance::Refusal::code`] — `missing_token`,
+    /// `unknown_token`, `token_names_another_pane`, `malformed_token`.
+    ///
+    /// Carried as well as `message` so the CLI's stderr and the daemon's own
+    /// `warn!` line share one word an operator can grep for across both, rather
+    /// than leaving them to match a sentence against a log field.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// On a refusal, the one-sentence explanation from
+    /// [`crate::hook_provenance::Refusal::caller_message`], which names the
+    /// remedy where there is one. `None` on an admission.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Issue #1383 / PR #1414 review: on an admitted `ack`, what the daemon did
+    /// with the message it names. `None` on every other verb, on a
+    /// refusal, and from a daemon that wrote the admission before looking the id
+    /// up. Additive and optional, so a CLI that predates it still parses the
+    /// line (see `an_ack_with_unknown_fields_still_reads_as_an_acceptance`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<AckDelivery>,
+}
+
+/// What an admitted `ack` did with its message id. The wire form of
+/// [`crate::inbox::AckOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckDelivery {
+    /// The message was already acknowledged.
+    AlreadyAcknowledged,
+    /// No such message — mistyped, or an id the deck does not hold (a `d-…`
+    /// delivery id from before PRD #1666 included).
+    Unknown,
+    /// PRD #1666: the inbox message is now acknowledged — delivered.
+    Acknowledged,
+    /// PRD #1666: the message is an offer, and the caller now holds its claim.
+    Claimed,
+    /// PRD #1666: the message exists but is addressed to another agent; its
+    /// state is unchanged.
+    WrongAgent,
+    /// PRD #1666: too late — the message is already undeliverable.
+    Undeliverable,
+    /// A value this build does not know — one a later daemon added, or one an
+    /// earlier daemon wrote for its delivery ids (`stopped`, `not_pending`).
+    /// Never written by this build; read so the ack still parses.
+    #[serde(other)]
+    Unrecognised,
+}
+
+impl AckDelivery {
+    /// Whether the worker may be told its acknowledgement was recorded.
+    pub fn recorded(self) -> bool {
+        match self {
+            AckDelivery::AlreadyAcknowledged | AckDelivery::Acknowledged | AckDelivery::Claimed => {
+                true
+            }
+            AckDelivery::Unknown
+            | AckDelivery::WrongAgent
+            | AckDelivery::Undeliverable
+            | AckDelivery::Unrecognised => false,
+        }
+    }
+}
+
+impl From<crate::inbox::AckOutcome> for AckDelivery {
+    fn from(outcome: crate::inbox::AckOutcome) -> Self {
+        use crate::inbox::AckOutcome;
+        match outcome {
+            AckOutcome::Acknowledged => AckDelivery::Acknowledged,
+            AckOutcome::Claimed { .. } => AckDelivery::Claimed,
+            AckOutcome::AlreadyAcknowledged => AckDelivery::AlreadyAcknowledged,
+            AckOutcome::WrongAgent => AckDelivery::WrongAgent,
+            AckOutcome::Undeliverable => AckDelivery::Undeliverable,
+            AckOutcome::Unknown => AckDelivery::Unknown,
+        }
+    }
+}
+
+/// The value [`SignalAck::kind`] carries on every ack this daemon writes.
+///
+/// One value for both verbs rather than one each: the CLI reads this line to
+/// answer a single question — was my signal admitted — and it already knows
+/// which verb it sent. See [`DELEGATE_RESPONSE_KIND`] for why renaming it would
+/// make every older CLI fall back to "delivered, unverifiable".
+pub const SIGNAL_ACK_KIND: &str = "signal_ack";
+
+impl SignalAck {
+    /// The ack for a message the gate admitted.
+    pub fn accepted() -> Self {
+        Self {
+            kind: Some(SIGNAL_ACK_KIND.to_string()),
+            accepted: true,
+            reason: None,
+            error: None,
+            delivery: None,
+        }
+    }
+
+    /// The answer to an admitted `ack`, written after its id was looked up.
+    pub fn acknowledged(delivery: AckDelivery) -> Self {
+        Self {
+            delivery: Some(delivery),
+            ..Self::accepted()
+        }
+    }
+
+    /// The ack for a message the gate refused, carrying the refusal's code and
+    /// its caller-facing sentence.
+    pub fn refused(reason: &str, message: &str) -> Self {
+        Self {
+            kind: Some(SIGNAL_ACK_KIND.to_string()),
+            accepted: false,
+            reason: Some(reason.to_string()),
+            error: Some(message.to_string()),
+            delivery: None,
+        }
+    }
+
+    /// Whether this parsed line positively identifies itself as an ack this
+    /// daemon wrote. See [`Self::kind`].
+    pub fn is_signal_ack(&self) -> bool {
+        self.kind.as_deref() == Some(SIGNAL_ACK_KIND)
+    }
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -1271,20 +2549,61 @@ pub struct GetSeedRequest {
     /// older CLI omits it, which deserializes to `None`.
     ///
     /// `None` therefore means "the caller could not say", not "the caller is
-    /// nobody", and the daemon treats it as such — see
-    /// [`crate::agent_pty::AgentPtyRegistry::take_pending_seed_native_for`].
+    /// nobody". Since PRD #1666 part 3 (H5) the daemon hands over nothing for
+    /// any agent, named or not (`get_seed_withdrawn` in `crate::daemon`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// PRD #201: the daemon's reply to a [`DaemonMessage::GetSeed`], written as a
 /// single JSON line back on the hook-socket connection. `seed` is `None`
 /// (serialized as `null`) when no seed is pending for the pane — the pane is
 /// unknown, or the seed was already delivered (pulled or injected).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GetSeedResponse {
     #[serde(default)]
     pub seed: Option<String>,
+    /// PRD #1666 part 3 (H5): why no seed was handed over. Additive: an
+    /// older reader ignores it and reads `seed: null` as nothing pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// PRD #1666 part 3 (H5): [`GetSeedResponse::withdrawn`]'s code.
+pub const GET_SEED_REMOVED: &str = "get_seed_removed";
+
+impl GetSeedResponse {
+    /// The answer to every `get-seed` since PRD #1666 part 3 (H5): the verb
+    /// takes no message any more. A pane's seed is its first inbox message,
+    /// which the agent's own receiver takes.
+    pub fn withdrawn() -> Self {
+        Self {
+            seed: None,
+            refused: Some(GET_SEED_REMOVED.to_string()),
+            error: Some(
+                "get-seed no longer takes messages: the deck hands the agent its seed as its first message".to_string(),
+            ),
+        }
+    }
 }
 
 /// PRD #220: payload of [`DaemonMessage::ListTargets`] — the pane whose repo's
@@ -1299,6 +2618,23 @@ pub struct GetSeedResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListTargetsRequest {
     pub pane_id: String,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// PRD #220: the daemon's reply to a [`DaemonMessage::ListTargets`], one JSON
@@ -1383,7 +2719,7 @@ pub struct KnownProject {
 pub struct ResolvedProject {
     /// The daemon-canonical path this resolved to, which may differ from the
     /// spelling the caller sent (an alias or a symlink resolves elsewhere).
-    /// This is the string a later `PrepareWorkflow` and `StartAgent` must use.
+    /// This is the string a later `PrepareOrchestration` and `StartAgent` must use.
     pub path: String,
     #[serde(default)]
     pub orchestrations: Vec<ProjectOrchestration>,
@@ -1391,7 +2727,7 @@ pub struct ResolvedProject {
     /// resolution was computed from.
     ///
     /// The client echoes it back on
-    /// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`], and a
+    /// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`], and a
     /// mismatch is refused — which is what closes the window between the
     /// picker's resolve and the launch's write. Derived from the config
     /// **content** as read (see
@@ -1425,7 +2761,7 @@ pub struct ProjectOrchestration {
 /// One role of a [`ProjectOrchestration`].
 ///
 /// `name` and `start` are the complete set the desktop reads
-/// (`order_workflow_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
+/// (`order_orchestration_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
 /// `OrchestrationRoleConfig` — `command`, `description`, `prompt_template`,
 /// `agent`, `clear` — is consumed only inside
 /// [`crate::orchestrator_context::prepare_orchestrator_prompt`], which moves
@@ -1439,10 +2775,14 @@ pub struct ProjectRole {
     pub start: bool,
 }
 
-/// PRD #819 M2: the daemon's reply to [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`].
+/// PRD #819 M2: the daemon's reply to
+/// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`] (and to its
+/// legacy spelling, `PrepareWorkflow` — the struct is the same for both; only
+/// the response field it rides on differs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreparedWorkflow {
-    /// Where the coordinator context was published, daemon-side.
+pub struct PreparedOrchestration {
+    /// Where the orchestrator context was published, daemon-side. Since issue
+    /// #1233 a file of this preparation's own, never rewritten by a later one.
     pub context_path: String,
     /// PRD #819 M6: the daemon-**canonical** project directory this preparation
     /// resolved to — the same string [`ResolvedProject::path`] carries, restated
@@ -1479,16 +2819,21 @@ pub struct PreparedWorkflow {
     pub token: String,
     #[serde(default)]
     pub roles: Vec<ProjectRole>,
-    /// PRD #819 M6: the one-liner to inject into the coordinator's PTY, as
+    /// PRD #819 M6: the one-liner to inject into the orchestrator's PTY, as
     /// composed by
     /// [`crate::orchestrator_context::prepare_orchestrator_context`].
     ///
     /// It is here because the client that spawns the roles has to deliver it and
-    /// **may not compose it itself**: the line names
-    /// `.dot-agent-deck/orchestrator-context.md`, which is project-state
-    /// knowledge this PRD moves daemon-side, and it varies with whether the
-    /// preparation carried a task. A client that built its own copy would be
-    /// holding a second, driftable spelling of a file only the daemon wrote.
+    /// **may not compose it itself**: the line names the context file this
+    /// preparation published, which is project-state knowledge this PRD moves
+    /// daemon-side, and it varies with whether the preparation carried a task.
+    /// Since issue #1233 that file is unique to the preparation
+    /// (`.dot-agent-deck/orchestrator-context-<32 hex>.md`, the file
+    /// [`Self::context_path`] names); an older daemon names the fixed
+    /// `.dot-agent-deck/orchestrator-context.md`. A client that built its own
+    /// copy would be holding a second, driftable spelling of a file only the
+    /// daemon wrote — and, against a current daemon, would point the coordinator
+    /// at the shared compatibility mirror rather than at its own brief.
     ///
     /// Additive on a response type, exactly like
     /// [`ResolvedProject::config_revision`]: `#[serde(default)]`, so an older
@@ -1545,21 +2890,96 @@ pub struct DelegateResponse {
     ///
     /// "Queued to a pane that resolved at delegate time" is the exact claim —
     /// the fan-out is detached (see [`crate::state::AppState::handle_delegate`]),
-    /// so no synchronous reply can promise the worker read it. A role whose
-    /// worker exited WITHOUT going through the `StopAgent` close path also still
-    /// resolves here, because only that path calls `AppState::unregister_pane`
-    /// (greptile P1 on PR #466, deferred to issue #524 — the liveness of a
-    /// registered pane is not decidable here, since a `clear = true` role's dead
-    /// pane is legitimately respawned by the dispatch rather than being a miss).
+    /// so no synchronous reply can promise the worker read it. Issue #524: a
+    /// role whose worker exited without a close is still in the daemon's role
+    /// maps, and is listed here only when it is `clear = true` — the dispatch
+    /// respawns it and the fresh worker receives the task. Any other role whose
+    /// workers have all exited is reported in [`Self::unresolved_roles`].
     #[serde(default)]
     pub delivered: Vec<String>,
     /// Roles named by `--to` that resolved to no worker pane in this
-    /// orchestration.
+    /// orchestration, or (issue #524) only to panes whose worker has exited and
+    /// is not respawned on delegate.
     #[serde(default)]
     pub unresolved_roles: Vec<String>,
     /// Set when the delegate could not be routed at all.
+    ///
+    /// Issue #580: also set when EVERY resolved role was refused as
+    /// [`Self::busy`] and nothing was dispatched, carrying the same explanation
+    /// the CLI prints. That is what makes the refusal loud on a CLI that predates
+    /// `busy`: it reads `error`, and without it would see an empty `delivered`,
+    /// an empty `unresolved_roles` and no error — a clean success.
     #[serde(default)]
     pub error: Option<String>,
+    /// Issue #580: roles NOT dispatched because their worker still owes a
+    /// `work-done` for an earlier delegation, and the caller did not pass
+    /// `--supersede`. The daemon reads that from its commission ledger, not from
+    /// the worker's status. A role listed here is absent from `delivered`.
+    ///
+    /// Additive on the hook socket, like every field of this reply: an older
+    /// daemon never writes it, and an older CLI ignores it. The behaviour behind
+    /// it is not additive — a delegate that used to be dispatched is now refused —
+    /// which is `changelog.d/580.breaking.md`.
+    #[serde(default)]
+    pub busy: Vec<BusyWorker>,
+    /// Issue #580: roles that WERE dispatched while their worker still owed a
+    /// `work-done` — the supersession, reported instead of silent. Either the
+    /// caller passed `--supersede`, or what was owed had been delegated by an
+    /// orchestrator agent since replaced in its pane, which the successor is
+    /// not refused over. A role listed here is also in `delivered`.
+    #[serde(default)]
+    pub superseded: Vec<BusyWorker>,
+    /// Issue #714: resolved roles whose worker's card reads `Blocked` — its
+    /// agent reported a provider usage-limit or credit error — whether the role
+    /// was delivered or refused as [`Self::busy`]. A warning, never a refusal:
+    /// the status is reported by the agent's own hooks or session log, which —
+    /// like every hook-reported status — is not an input this daemon may
+    /// authorize on (#601, #696), and a windowed limit may already have reset.
+    ///
+    /// Carries fixed data only — role, kind, age, reset — and never the text,
+    /// which is agent-controlled and would land in the orchestrator's tool
+    /// output. Additive on the hook socket like every field of this reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BlockedWorker>,
+    /// PRD #1666 S5: the inbox id of each task message this delegate posted,
+    /// one per worker pane it reached, so the orchestrator can follow each with
+    /// `dot-agent-deck inbox list`. Additive on the hook socket.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_ids: Vec<String>,
+}
+
+/// Issue #714: one delegate target whose worker appears blocked by a provider
+/// usage limit. See [`DelegateResponse::blocked`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedWorker {
+    /// The `--to` role the worker pane is registered for.
+    pub role: String,
+    /// Which limit the agent reported.
+    pub kind: crate::quota_block::BlockedKind,
+    /// Whole seconds since the agent reported the block.
+    #[serde(default)]
+    pub blocked_for_secs: u64,
+    /// Whole seconds until the provider said the limit resets, when it said
+    /// and that moment is still ahead. Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_in_secs: Option<u64>,
+}
+
+/// Issue #580: one worker that still owed a `work-done` when a delegate named
+/// it. See [`DelegateResponse::busy`] and [`DelegateResponse::superseded`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusyWorker {
+    /// The `--to` role the worker pane is registered for.
+    pub role: String,
+    /// Delegations to this worker that no `work-done` had been credited to,
+    /// before this delegate.
+    #[serde(default)]
+    pub outstanding: u32,
+    /// Age, in whole seconds, of the oldest of those delegations the daemon
+    /// still tracks individually. Each expires on its own a fixed time after it
+    /// was issued (issue #590), so this also says how long the refusal can last.
+    #[serde(default)]
+    pub oldest_age_secs: u64,
 }
 
 /// The value [`DelegateResponse::kind`] carries on every reply this daemon
@@ -1575,6 +2995,10 @@ impl Default for DelegateResponse {
             delivered: Vec::new(),
             unresolved_roles: Vec::new(),
             error: None,
+            busy: Vec::new(),
+            superseded: Vec::new(),
+            blocked: Vec::new(),
+            message_ids: Vec::new(),
         }
     }
 }
@@ -1594,50 +3018,33 @@ pub struct DelegateSignal {
     pub task: String,
     /// Role names to delegate to (one or more).
     pub to: Vec<String>,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Issue #580: dispatch even to a worker that still owes a `work-done` for
+    /// an earlier delegation (`delegate --supersede`). Without it the daemon
+    /// refuses that worker and reports it in [`DelegateResponse::busy`].
+    ///
+    /// Skipped when false, so a plain delegate serializes exactly as it did
+    /// before this field existed. An older daemon ignores the key — and delivers
+    /// regardless, which is what `--supersede` asks for anyway.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supersede: bool,
     pub timestamp: DateTime<Utc>,
-    /// Issue #567 (mirrors fork #358 M2's field on [`WorkDoneSignal::generation`]
-    /// exactly): the `AppState::pane_registration_generation` value the
-    /// SENDING orchestrator pane was actually spawned/registered under. Read
-    /// straight from this process's own `DOT_AGENT_DECK_REGISTRATION_GENERATION`
-    /// environment variable at `delegate` CLI time (same
-    /// `read_registration_context` helper `work-done` already uses), never
-    /// re-derived from live daemon state, for the same reason #358 gives: a
-    /// value re-derived at send time is always whatever the pane's CURRENT
-    /// generation is and can never disagree with itself microseconds later at
-    /// delivery. `handle_delegate_with_state` refuses delivery when this no
-    /// longer matches the sending pane's CURRENT generation — the pane was
-    /// re-registered (worktree teardown + reuse) since this orchestrator was
-    /// spawned, so `pane_role_map`/`pane_orchestration_map` now point at a
-    /// different tenant and a stale `delegate` must not be routed into it.
-    /// `#[serde(default)]` so an older CLI build that doesn't send this field
-    /// still parses (defaulting to `0`, which never matches a real
-    /// registration's generation — those start at `1` — so an old CLI talking
-    /// to a post-#567 daemon has its delegate refused rather than silently
-    /// misrouted; see `changelog.d/567.breaking.md`).
-    #[serde(default)]
-    pub generation: u64,
-    /// Issue #567 (mirrors fork #358 M4's [`WorkDoneSignal::daemon_boot_id`]
-    /// exactly): the `AppState::daemon_boot_id` value in effect when the
-    /// sending pane's registration generation (above) was reserved — read
-    /// from `DOT_AGENT_DECK_DAEMON_BOOT_ID`, injected at spawn time sibling to
-    /// `DOT_AGENT_DECK_REGISTRATION_GENERATION`. Needed for the same reason as
-    /// `work-done`'s: `generation` alone cannot distinguish a pre-restart
-    /// signal from a post-restart pane that reused the same pane_id and
-    /// legitimately carries the same small generation number — pairing it
-    /// with the daemon's own boot id closes that, since a fresh `AppState`
-    /// mints a fresh `daemon_boot_id` on every construction. `#[serde(default)]`
-    /// so an older CLI build that doesn't send this field still parses
-    /// (defaulting to `""`, which no real `daemon_boot_id` is ever minted as,
-    /// so an old CLI's delegate is refused exactly like a bare `generation: 0`
-    /// already was; see `changelog.d/567.breaking.md`).
-    #[serde(default)]
-    pub daemon_boot_id: String,
-    /// Issue #586 M4: an optional subject tag (issue/PR number, or a short
-    /// opaque token) this delegation is for. `#[serde(default)]` so an older
-    /// CLI's payload (no `subject` field) still parses to `None` — additive,
-    /// never rejects, no `PROTOCOL_VERSION` bump.
-    #[serde(default)]
-    pub subject: Option<String>,
 }
 
 /// Signal sent by the orchestrator via `dot-agent-deck pane restart <role>`
@@ -1651,6 +3058,23 @@ pub struct RestartRoleSignal {
     /// healthy pane is refused — the ordinary case is recovering a crashed
     /// worker, not interrupting a live one.
     pub force: bool,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -1700,6 +3124,23 @@ impl RestartRoleResponse {
 pub struct SpawnRoleSignal {
     pub pane_id: String,
     pub role: String,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -1839,6 +3280,46 @@ pub enum BroadcastMsg {
     /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
     #[serde(rename = "delegation_retired")]
     DelegationRetired(DelegationRetiredNotice),
+    /// PRD #1666 S3: a message in an agent's inbox changed state — posted
+    /// (`queued`), taken (`fetched`), handed back (`queued` again),
+    /// acknowledged, or found undeliverable (its agent exited, or it was taken
+    /// too many times without an acknowledgement). Sent for every change, so a
+    /// client can follow one message from post to delivery.
+    ///
+    /// A new `kind`, which is one of the reasons PRD #1666 moved
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`] to 11; a client from before
+    /// it reads the tag as [`Self::Unknown`].
+    #[serde(rename = "inbox")]
+    Inbox(InboxNotice),
+    /// PRD #1666 §2.8 (auditor R9S-A01): a new agent generation took a pane —
+    /// a first start, a `clear = true` respawn, a `pane restart`, a re-created
+    /// pane — with its inbox as it stood then. Sent under the lock every
+    /// [`Self::Inbox`] notice is sent under, so the account it carries covers
+    /// each notice for the pane before it and none after, as a card-surfacing
+    /// start's does ([`SURFACED_INBOX_METADATA_KEY`]). A client that keeps an
+    /// account of the pane takes this as its new one, and notices naming the
+    /// generation it replaced change nothing from here on.
+    ///
+    /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump, for
+    /// [`Self::HookBinaryNotice`]'s reason: a client that can attach to a v11
+    /// daemon reads an unknown kind as [`Self::Unknown`].
+    #[serde(rename = "inbox_handover")]
+    InboxHandover(InboxHandover),
+    /// Issue #1637: the daemon's hook-binary notices changed — an agent's
+    /// hooks were seen running an older `dot-agent-deck`, or stopped doing so.
+    /// Carries the whole current list, which replaces what a client holds.
+    ///
+    /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: every client that
+    /// can attach to a v10 daemon carries [`Self::Unknown`] (it first shipped in
+    /// v0.40.0, before v10 in v0.41.0), so an older client decodes this as
+    /// `Unknown` and the stream survives.
+    ///
+    /// The list rides in a struct, not as the variant's own payload: this enum
+    /// is internally tagged, and serde cannot serialize a tagged newtype
+    /// variant whose payload is a sequence — the frame failed to encode and no
+    /// client ever received it.
+    #[serde(rename = "hook_binary_notice")]
+    HookBinaryNotice(crate::hook_binary::HookBinaryNotices),
     /// A `kind` tag this build has never heard of (issue #801 item 3, applied
     /// by PRD #741 M8).
     ///
@@ -1987,6 +3468,77 @@ pub enum KeptReason {
     ProbeError,
 }
 
+/// PRD #1666 §2.8: the payload of [`BroadcastMsg::InboxHandover`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InboxHandover {
+    /// The pane the generation took.
+    pub pane_id: String,
+    /// The generation that took it.
+    pub agent_id: String,
+    /// That generation's inbox in the pane when it took it.
+    pub summary: crate::inbox_hub::InboxSummary,
+}
+
+/// PRD #1666 S3: the payload of [`BroadcastMsg::Inbox`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxNotice {
+    /// The pane the message is addressed to.
+    pub pane_id: String,
+    /// The agent generation the message is bound to, when it is bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub message_id: String,
+    /// The one-line subject, for a card or a status line.
+    pub subject: String,
+    /// Who the message is from, as the agent sees it labelled.
+    pub from_label: String,
+    /// The state the message is in now.
+    pub state: crate::inbox::StateName,
+    /// Why, when `state` is `undeliverable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::inbox::UndeliverableReason>,
+    /// PRD #1666 S11: an offered job LEFT this pane — released, expired or
+    /// never taken — and `state` is where the job went, not this pane's. A
+    /// client stops counting it for the pane. Additive: a client that does not
+    /// know it reads the job as still queued here, as before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub returned: bool,
+    /// PR #1735 fifth review (R5): with [`Self::wake_update`], whether
+    /// nothing has woken this pane's agent for its waiting messages now; the
+    /// card shows them as waiting to wake while it holds. Additive: a client
+    /// that does not know it shows them as queued.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_stalled: bool,
+    /// PR #1735 fifth review (B-03, B-04): this notice reports the agent's
+    /// wake stall ([`Self::wake_stalled`]) and nothing else — the message it
+    /// names (the one the stall was recorded against) did not change state,
+    /// and `state` repeats the state it is in. Every change of the stall is
+    /// sent as one of these, its end included, so a client follows the stall
+    /// from them and the summary alone. Additive, as `wake_stalled` is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_update: bool,
+    /// PRD #1666 §6.5: this notice carries the pane's whole card notices
+    /// ([`Self::notices`]) and nothing else, as [`Self::wake_update`] carries
+    /// the wake stall: a client replaces what it holds for the pane with
+    /// them. Additive: a client that does not know it ignores them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attention_update: bool,
+    /// Reviewer R9Q-03: `state` is `queued` because the message went back to
+    /// the queue from being taken — a hand-back, not a new post — so a client
+    /// whose account of the pane counted it as taken, without having seen it
+    /// yet, does not count it again. Additive: a client that does not know it
+    /// reads every unseen queued message as new, as before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requeued: bool,
+    /// PRD #1666 part 3, round 5 (plan D10): what the message is, when it is
+    /// a report or a dispatch result, so a client moves the task or unit it
+    /// names by id. Additive: a client that does not know it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::report_recovery::ReportProvenance>,
+    #[serde(flatten, default)]
+    pub notices: crate::inbox_hub::InboxCardNotices,
+}
+
 /// PRD #120: the structural membership of a daemon-spawned orchestration,
 /// pushed to attached TUIs (via [`BroadcastMsg::OrchestrationSurface`]) so they
 /// can build the orchestration tab live. Mirrors what the hydration partition
@@ -2004,10 +3556,8 @@ pub struct OrchestrationSurface {
     /// Optional user-facing tab title; `None` falls back to `name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_title: Option<String>,
-    /// Issue #868: the PRD #140 per-tab `Instance` orchestration
-    /// id, when the producer has one — additive, so an older daemon's surface
-    /// (or a `NameCwd`-identity orchestration, which has no such token)
-    /// carries `None`. `TabManager::orchestration_tab_index_for` requires this
+    /// Issue #868: the PRD #140 per-tab orchestration id, when the producer
+    /// has one — additive, so an older daemon's surface carries `None`. `TabManager::orchestration_tab_index_for` requires this
     /// to match a candidate tab's own stored id whenever BOTH sides carry one,
     /// rather than falling back to the bare `(cwd, name)` tuple, which cannot
     /// tell two same-named same-cwd orchestration instances apart.
@@ -2015,6 +3565,24 @@ pub struct OrchestrationSurface {
     pub orchestration_id: Option<String>,
     /// The spawned role panes, in role order.
     pub roles: Vec<OrchestrationSurfaceRole>,
+    /// Issue #1395 item 1: the per-publish orchestrator context file this
+    /// orchestration's start role was started with — the live-surface analogue
+    /// of [`crate::agent_pty::AgentRecord::orchestrator_context_path`], filled
+    /// by the daemon from what it recorded
+    /// ([`crate::state::AppState::orchestration_context_paths`]), never from a
+    /// value the request carried. Present only on a surface that carries the start
+    /// role; the TUI sets it on the tab so compaction and `/clear` re-arm from
+    /// the tab's own file, and a later surface without it leaves the tab's path
+    /// alone. The TUI accepts it only when it names a per-publish file directly
+    /// under this surface's own `cwd` (`agent_pty::is_own_context_path`) and
+    /// otherwise treats it as `None`.
+    ///
+    /// `None` from a daemon predating the field, for a surface of non-start
+    /// roles, and for a start the daemon holds no file for — the TUI then keeps
+    /// the fixed-path mirror fallback. Additive optional, so an older TUI
+    /// ignores it and no `PROTOCOL_VERSION` bump is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_path: Option<String>,
 }
 
 /// One role pane of a live-surfaced orchestration (see [`OrchestrationSurface`]).
@@ -2051,6 +3619,23 @@ pub struct DispatchSignal {
     /// So the hook-socket shape is unchanged and `PROTOCOL_VERSION` does not move.
     #[serde(default)]
     pub shape: Option<DispatchShape>,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -2071,7 +3656,856 @@ pub enum DispatchShape {
     },
 }
 
+/// Issue #1383: payload of [`DaemonMessage::Ack`], sent by a worker via
+/// `dot-agent-deck ack <delivery-id>`.
+///
+/// Deliberately carries NO `session_id`, `agent_type`, `event_type` or
+/// `timestamp`: an older daemon that does not know the `ack` tag falls back to
+/// decoding the line as an [`AgentEvent`], and those are the fields that decode
+/// requires. Without them the line is rejected as malformed instead of being
+/// ingested as a status event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AckSignal {
+    pub pane_id: String,
+    /// The inbox message id (`m-…`, [`crate::inbox::is_valid_message_id`]).
+    /// Validated by the daemon before any lookup or log line. Named
+    /// `delivery_id` on the wire since issue #1383's delivery ids, which PRD
+    /// #1666 retired.
+    pub delivery_id: String,
+    /// The sender's `DOT_AGENT_DECK_AGENT_ID`, so an older generation's ack cannot
+    /// stop a newer generation's retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The hook capability token; see [`WorkDoneSignal::token`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// PRD #1666: the inbox verbs on the hook socket
+// ---------------------------------------------------------------------------
+//
+// Additive on the unversioned hook socket. Like [`AckSignal`], none of these
+// payloads carries an [`AgentEvent`]'s required fields, so an older daemon that
+// does not know the tag rejects the line as malformed and answers nothing —
+// which every caller reads as "no inbox here".
+
+/// The agent-side component speaking for an agent's inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxComponent {
+    /// `dot-agent-deck inbox wait --agent claude-code`, run by Claude Code's
+    /// `asyncRewake` hook.
+    ClaudeWaiter,
+    /// The deck's synchronous Claude Code hook.
+    ClaudeHooks,
+    #[serde(rename = "opencode_plugin")]
+    OpenCodePlugin,
+    /// PRD #1666 S8: OpenCode's server plugin, armed only in `opencode
+    /// --mini`, where no TUI plugin loads. Its stream may ask the daemon to
+    /// nudge the pane into repainting ([`InboxStreamControl::repaint`]).
+    #[serde(rename = "opencode_mini")]
+    OpenCodeMini,
+    PiExtension,
+    CodexHooks,
+    DevinHooks,
+    /// A value a later CLI added. Read so a new component does not make the
+    /// whole request unparseable.
+    #[serde(other)]
+    Other,
+}
+
+impl InboxComponent {
+    /// How much one hand-over to this component may carry, framing included.
+    /// Claude caps hook output at 10,000 characters. Codex middle-truncates a
+    /// hook's text at about 2,500 tokens and spills the whole of it to a
+    /// group-readable file, so its budget is counted in UTF-8 bytes, which
+    /// stay under that for prose and code (PRD #1666 S7).
+    pub fn inline_budget(self) -> InboxBudget {
+        match self {
+            InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => InboxBudget::Chars(9_000),
+            InboxComponent::CodexHooks => InboxBudget::Bytes(6_000),
+            InboxComponent::OpenCodePlugin
+            | InboxComponent::OpenCodeMini
+            | InboxComponent::PiExtension
+            | InboxComponent::DevinHooks
+            | InboxComponent::Other => InboxBudget::Chars(64 * 1024),
+        }
+    }
+}
+
+/// PRD #1666 S7: a hand-over's size limit, in the unit the receiving agent
+/// counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxBudget {
+    Chars(usize),
+    /// UTF-8 bytes.
+    Bytes(usize),
+    /// PRD #1666 part 3 (H4): UTF-8 bytes once escaped as a JSON string's
+    /// contents ([`json_escaped_len`]), for a hand-over printed inside a hook's
+    /// JSON (Codex's): the whole output, its escaping included, has to fit.
+    JsonBytes(usize),
+}
+
+/// The bytes `c` takes inside a JSON string as `serde_json` writes it: a
+/// quote, a backslash and the short control escapes take two, another
+/// control character six (`\u00XX`), anything else its UTF-8 length.
+fn json_escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The bytes `text` takes inside a JSON string as `serde_json` writes it,
+/// without the quotes around it.
+pub fn json_escaped_len(text: &str) -> usize {
+    text.chars().map(json_escaped_char_len).sum()
+}
+
+impl InboxBudget {
+    /// The size of `text` in this budget's unit.
+    pub fn measure(self, text: &str) -> usize {
+        match self {
+            InboxBudget::Chars(_) => text.chars().count(),
+            InboxBudget::Bytes(_) => text.len(),
+            InboxBudget::JsonBytes(_) => json_escaped_len(text),
+        }
+    }
+
+    pub fn limit(self) -> usize {
+        match self {
+            InboxBudget::Chars(n) | InboxBudget::Bytes(n) | InboxBudget::JsonBytes(n) => n,
+        }
+    }
+
+    /// This budget less what `text` takes, in the same unit.
+    pub fn less(self, text: &str) -> Self {
+        let rest = self.limit().saturating_sub(self.measure(text));
+        match self {
+            InboxBudget::Chars(_) => InboxBudget::Chars(rest),
+            InboxBudget::Bytes(_) => InboxBudget::Bytes(rest),
+            InboxBudget::JsonBytes(_) => InboxBudget::JsonBytes(rest),
+        }
+    }
+
+    /// The longest prefix of `text` within `max` of this budget's unit, cut at
+    /// a character boundary.
+    pub fn head(self, text: &str, max: usize) -> &str {
+        let end = match self {
+            InboxBudget::Chars(_) => text.char_indices().nth(max).map_or(text.len(), |(i, _)| i),
+            InboxBudget::Bytes(_) => {
+                let mut end = max.min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                end
+            }
+            InboxBudget::JsonBytes(_) => {
+                let mut used = 0;
+                text.char_indices()
+                    .find(|(_, c)| {
+                        used += json_escaped_char_len(*c);
+                        used > max
+                    })
+                    .map_or(text.len(), |(i, _)| i)
+            }
+        };
+        &text[..end]
+    }
+}
+
+/// How an [`DaemonMessage::InboxWait`] connection consumes messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxWaitMode {
+    /// Single use: one batch, then the connection ends (Claude's waiter).
+    Once,
+    /// Long-lived: a receipt receiver's hand-overs, with its controls
+    /// ([`InboxStreamControl`]) written back on the same connection. Served
+    /// only for a component the receipt policy covers.
+    Stream,
+}
+
+/// What an [`DaemonMessage::InboxAnnounce`] says the agent can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxWake {
+    /// A component that wakes the agent itself (a waiter or plugin will arm).
+    Native,
+    /// Content is handed over at the end of a turn (Codex `Stop`).
+    TurnEnd,
+    /// Only the doorbell reaches this agent.
+    DoorbellOnly,
+}
+
+/// Who is fetching in an [`DaemonMessage::InboxFetch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxFetchConsumer {
+    /// `dot-agent-deck inbox fetch`.
+    Cli,
+    /// A turn-end hook (Codex `Stop`).
+    TurnEndHook,
+    /// A hook injecting the content after the doorbell (Claude
+    /// `UserPromptSubmit`).
+    DoorbellHook,
+}
+
+/// The hook's own session details, passed through for the log and for the
+/// daemon's `/clear` bookkeeping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxWaitSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Payload of [`DaemonMessage::InboxWait`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxWaitRequest {
+    pub pane_id: String,
+    /// The caller's `DOT_AGENT_DECK_AGENT_ID`. The daemon acts on the agent the
+    /// token attests and refuses a request naming another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub component: InboxComponent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_version: Option<String>,
+    pub mode: InboxWaitMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<InboxWaitSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// PRD #1666 §11: the integration the hand-over component declares
+    /// (`--adapter-integration`), forwarded by the watcher apart from its own
+    /// version. A component the receipt policy covers is refused below
+    /// [`crate::inbox_hub::ADAPTER_INTEGRATION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_integration: Option<u32>,
+    /// PRD #1666 §4: this stream only carries the component's doorbell
+    /// substitutions (OpenCode's server plugin in the full TUI): it registers
+    /// a receiver, but no message is handed to it unasked and it does not
+    /// count as armed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub doorbell_only: bool,
+    /// PRD #1666 §4: the component's callback queue survived since its
+    /// previous registration (a watcher respawned for the same context), so
+    /// its `not_handed` resume answers are believed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed: bool,
+    /// PRD #1666 part 2 §2.7: the one-shot receipt integration this binary
+    /// speaks ([`crate::inbox_hub::HOOK_INTEGRATION`]). A Claude once-waiter
+    /// without it, or below it, is refused before anything is issued to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_integration: Option<u32>,
+}
+
+/// PRD #1666 §2, §4: one attempt, by its identity. Every control on the
+/// receipt stream names one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxAttemptRef {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+}
+
+/// PRD #1666 §4: a resumed attempt rebound to the new incarnation, with the
+/// delivery number it now carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRebound {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    pub d: u64,
+    /// The attempt's caps, for the new watcher to publish its receipts with
+    /// (§5): the watcher strips them before the component sees the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<InboxAttemptCaps>,
+}
+
+/// PRD #1666 (r8k R8G-03): a final attempt of a retired incarnation of the
+/// registering slot whose late commit can still correct the sender — a
+/// `HandedInert` attempt after a Cancel, or a fenced one still verifying —
+/// handed to the new watcher with its COMMIT cap only, so a commit its
+/// predecessor took and died with can still be published. The watcher strips
+/// the cap before the component sees the line; the component sees the ref.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxCorrectable {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
+impl std::fmt::Debug for InboxCorrectable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboxCorrectable")
+            .field("id", &self.id)
+            .field("a", &self.a)
+            .field("e", &self.e)
+            .field("commit", &self.commit.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
+/// PRD #1666 §5: an attempt's two capabilities, as the daemon hands them to
+/// the watcher that publishes its receipts. Never written to the component's
+/// JavaScript, to a hook's output or to `inbox fetch --json`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxAttemptCaps {
+    pub handed: String,
+    pub commit: String,
+}
+
+impl std::fmt::Debug for InboxAttemptCaps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InboxAttemptCaps(..)")
+    }
+}
+
+/// PRD #1666 §2: one hand-out's attempt, beside the rendered block on a
+/// receipt stream ([`InboxDelivery::attempt`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxDeliveryAttempt {
+    pub a: u32,
+    pub e: u32,
+    /// The per-receiver delivery number `seen` counts (§4).
+    pub d: u64,
+    /// A marked repeat (§6.1): its frame carries the possible-repeat line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat: bool,
+    /// For the watcher only; stripped before the component sees the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<InboxAttemptCaps>,
+}
+
+/// PRD #1666 §4: an incarnation's answer for one attempt it was asked to
+/// resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxResumeReply {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    /// `retained`, `not_handed` or `unknown`.
+    pub answer: String,
+}
+
+/// PRD #1666 §4: a possession snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxPossess {
+    /// Rises strictly per incarnation; a stale or replayed one is dropped.
+    pub seq: u64,
+    /// The contiguous observed prefix of delivery numbers.
+    pub seen: u64,
+    #[serde(default)]
+    pub held: Vec<InboxAttemptRef>,
+}
+
+/// PRD #1666 §3: the final hand-over check's question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxMayHandOver {
+    /// The component's question number; the grant names it.
+    pub q: u64,
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+}
+
+/// PRD #1666 §3: the answer to [`InboxMayHandOver`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxGrant {
+    pub q: u64,
+    pub ok: bool,
+    /// Why not (`committed`, `revoked`, `wrong_receiver`, `unknown`, and from
+    /// PRD #1666 Q57 `held_earlier`). The deck's receiver acts on `ok` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+/// PRD #1666 §4: the first line on a receipt stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxRegistered {
+    /// The daemon-minted incarnation.
+    pub rx: u64,
+    /// `opencode_server`, `opencode_tui`, …
+    pub slot: String,
+    /// The daemon's keepalive interval: a watcher that hears no snapshot from
+    /// its component for three of them closes the stream (§4 "Dead adapter,
+    /// live watcher").
+    pub keepalive_ms: u64,
+    /// PRD #1666 part 2 §2.5: for a one-shot receiver, how long a `may`
+    /// approval stays usable, counted from when it asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_ttl_ms: Option<u64>,
+}
+
+/// PRD #1666 §5: caps for attempts a doorbell fetch issued to this
+/// incarnation; their bodies went to the fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxIssued {
+    pub id: String,
+    pub a: u32,
+    pub e: u32,
+    pub d: u64,
+    pub caps: InboxAttemptCaps,
+}
+
+/// Payload of [`DaemonMessage::InboxReceipts`]: who asks. Admitted like
+/// every inbox verb, for the agent its token attests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxReceiptsRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// Payload of [`DaemonMessage::InboxAnnounce`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxAnnounceRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub component: InboxComponent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_version: Option<String>,
+    pub wake: InboxWake,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+/// Payload of [`DaemonMessage::InboxFetch`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxFetchRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub consumer: InboxFetchConsumer,
+    /// The most characters of rendered messages the caller can take; `None`
+    /// is unlimited (the CLI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    /// PRD #1666 S7: the most UTF-8 bytes of rendered messages the caller can
+    /// take, for an agent that counts bytes (Codex). Additive: a daemon that
+    /// does not know it falls back on `max_chars`, which such a caller sets to
+    /// the same number as an upper bound. When both are set this one governs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    /// Acknowledge what is handed over in the same step: the hand-over is
+    /// itself the delivery.
+    #[serde(default)]
+    pub ack: bool,
+    /// PR #1735 review: the message a doorbell named, for a fetch the doorbell
+    /// started. Nothing is fetched unless that message is still queued for
+    /// the caller, decided under the inbox's lock with the fetch itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doorbell: Option<String>,
+    /// PRD #1666 §11: the integration of the component that runs the fetch
+    /// (OpenCode's doorbell substitution), as on [`InboxWaitRequest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_integration: Option<u32>,
+    /// PRD #1666 §4: the incarnation the fetched attempts are bound to — the
+    /// component's own receipt stream, which holds their caps and their
+    /// possession.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx: Option<u64>,
+    /// PRD #1666 part 2 §2.4, §2.7: the one-shot receipt integration of a
+    /// hook that fetches as a receiver of its own
+    /// ([`crate::inbox_hub::HOOK_INTEGRATION`]): the connection stays open
+    /// for its `may` and stage controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_integration: Option<u32>,
+    /// PRD #1666 part 3 (H4): the hook that fetches as a receiver of its own,
+    /// on [`DaemonMessage::InboxReceiptFetch`] (`codex_hooks` for Codex's).
+    /// Additive: a hook fetch without it is Claude Code's, as from part 2's
+    /// hooks. The CLI sends none; the deck knows its agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<InboxComponent>,
+    /// PRD #1666 part 3 (H4): the most UTF-8 bytes the hand-out's blocks may
+    /// take once escaped inside a JSON string, separators included
+    /// ([`InboxBudget::JsonBytes`]), for a hook that prints them inside its
+    /// JSON. Additive; when set it governs over `max_bytes` and `max_chars`.
+    /// Sent only to a deck that confirmed it serves the sender
+    /// ([`InboxWaitReply::one_shot_senders`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_json_bytes: Option<usize>,
+}
+
+/// PRD #1666 part 3 (H4): a one-shot that takes mail on the receipt verbs, as
+/// a deck's answer to [`DaemonMessage::InboxReceipts`] names the ones it
+/// serves ([`InboxWaitReply::one_shot_senders`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxOneShotSender {
+    /// Claude Code's `asyncRewake` waiter.
+    ClaudeWaiter,
+    /// Claude Code's prompt hook.
+    ClaudeHooks,
+    /// Codex's prompt and `Stop` hooks.
+    CodexHooks,
+    /// `dot-agent-deck inbox fetch`, run by the agent's model.
+    Cli,
+    /// A sender a later deck names. Read so a new one does not make the whole
+    /// answer unparseable.
+    #[serde(other)]
+    Unknown,
+}
+
+/// PRD #1666 part 2 §1.3: payload of [`DaemonMessage::InboxCommitted`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxCommittedRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The exact attempts a submitted prompt carried whole.
+    #[serde(default)]
+    pub attempts: Vec<InboxAttemptRef>,
+    /// Why a commit could not be recorded in the spool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+}
+
+/// Payload of [`DaemonMessage::InboxList`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxListRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// An orchestrator's whole scope rather than its own inbox.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// Payload of [`DaemonMessage::InboxPublish`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxPublishRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The topic, a name [`crate::inbox::is_valid_label`] accepts.
+    pub topic: String,
+    pub body: String,
+}
+
+/// Payload of [`DaemonMessage::InboxOffer`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxOfferRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The offer pool, a name [`crate::inbox::is_valid_label`] accepts.
+    pub pool: String,
+    pub body: String,
+    /// How long a taker may hold the job before it is offered again; the
+    /// deck's default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_ttl_ms: Option<u64>,
+}
+
+/// Payload of [`DaemonMessage::InboxComplete`] and
+/// [`DaemonMessage::InboxRelease`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxClaimRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The offered job's message id.
+    pub id: String,
+}
+
+/// The answer to [`DaemonMessage::InboxPublish`] and
+/// [`DaemonMessage::InboxOffer`]: the new message's id, or a refusal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxPostReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// A publish: how many subscribers it reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_to: Option<usize>,
+    /// A publish: subscribers whose inbox was full, by pane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_full: Vec<String>,
+    /// An offer: the pane it was handed to, absent while it waits in its pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offered_to: Option<String>,
+    /// A refusal's stable code (`rate_limited`, `not_orchestrator`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// A refusal's one-sentence explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl InboxPostReply {
+    pub fn refused(reason: &str, message: &str) -> Self {
+        Self {
+            refused: Some(reason.to_string()),
+            error: Some(message.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// The answer to [`DaemonMessage::InboxComplete`] and
+/// [`DaemonMessage::InboxRelease`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxClaimReply {
+    /// `completed` or `released`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// A refusal's stable code (`not_claimant`, `unknown`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// A refusal's one-sentence explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl InboxClaimReply {
+    pub fn refused(reason: &str, message: &str) -> Self {
+        Self {
+            refused: Some(reason.to_string()),
+            error: Some(message.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// One message as handed to an agent: the rendered block plus what a
+/// component needs to acknowledge it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxDelivery {
+    pub id: String,
+    pub subject: String,
+    /// The sender label the block names.
+    pub from: String,
+    /// `[dot-agent-deck message <id> from <from>]` … `[end of dot-agent-deck
+    /// message <id>]`.
+    pub text: String,
+    /// PRD #1666 §2: on a receipt stream, the attempt this hand-out is.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<InboxDeliveryAttempt>,
+}
+
+/// The line written for [`DaemonMessage::InboxWait`] and
+/// [`DaemonMessage::InboxFetch`]: exactly one of its fields is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxWaitReply {
+    /// A hand-over (possibly empty, for a fetch with nothing waiting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<InboxDelivery>>,
+    /// A newer waiter for the same agent replaced this one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
+    /// The caller is not the live agent of a pane this deck manages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_in_deck: bool,
+    /// A refusal's stable code (`missing_token`, `unattested`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// A refusal's one-sentence explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Sent on an idle waiter so both ends notice a dead peer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keepalive: bool,
+    /// PRD #1666 §4: a receipt registration's incarnation (first line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered: Option<InboxRegistered>,
+    /// PRD #1666 §4: attempts the new incarnation is asked to resume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume: Vec<InboxAttemptRef>,
+    /// PRD #1666 §4: resumed attempts now bound to this incarnation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebound: Vec<InboxRebound>,
+    /// PRD #1666 §3: the answer to a `may` question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<InboxGrant>,
+    /// PRD #1666 §2: attempts to revoke.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoke: Vec<InboxAttemptRef>,
+    /// PRD #1666 §5: caps of attempts a doorbell fetch issued here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issued: Vec<InboxIssued>,
+    /// PRD #1666 (r8k R8G-03): on a registration, final attempts of this
+    /// slot's retired incarnations whose late commit can still correct the
+    /// sender, with their commit authority. Additive inside the unreleased
+    /// inbox stream protocol; not part of the TUI↔daemon attach contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub correctable: Vec<InboxCorrectable>,
+    /// PRD #1666 part 2: the answer to [`DaemonMessage::InboxReceipts`], the
+    /// one-shot receipt support this daemon serves
+    /// ([`crate::inbox_hub::ONE_SHOT_RECEIPTS`]). Additive and optional. Its
+    /// absence from the answer to that question does not establish support;
+    /// other lines (refusals, keepalives, batches) omit it from any daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_shot_receipts: Option<u32>,
+    /// PRD #1666 part 3 (H4): with [`Self::one_shot_receipts`], the one-shot
+    /// senders this daemon serves on the receipt verbs. Additive. A sender
+    /// other than Claude Code's goes on only when it is named here, in the
+    /// answer on its own connection: `one_shot_receipts` 1 alone is Claude
+    /// Code's support (part 2's daemon answers it and serves no other).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_shot_senders: Vec<InboxOneShotSender>,
+}
+
+impl InboxWaitReply {
+    pub fn messages(messages: Vec<InboxDelivery>) -> Self {
+        Self {
+            messages: Some(messages),
+            ..Self::default()
+        }
+    }
+
+    pub fn superseded() -> Self {
+        Self {
+            superseded: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn not_in_deck() -> Self {
+        Self {
+            not_in_deck: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn keepalive() -> Self {
+        Self {
+            keepalive: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn refused(reason: &str, message: &str) -> Self {
+        Self {
+            refused: Some(reason.to_string()),
+            error: Some(message.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// A line a [`InboxWaitMode::Stream`] component — a receipt receiver —
+/// writes back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxStreamControl {
+    /// PRD #1666 S8: ask the daemon to make the agent's pane repaint (a
+    /// one-column shrink and restore of its PTY). Honoured only from an
+    /// [`InboxComponent::OpenCodeMini`] stream; a daemon that predates it
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repaint: bool,
+    /// PRD #1666 §4: the receipt stream's controls. A daemon that predates
+    /// them ignores them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possess: Option<InboxPossess>,
+    /// PRD #1666 Q57: the deck's receiver sends its `possess` on the same line, which
+    /// the daemon applies first, so the check is decided on what it held when
+    /// it asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub may: Option<InboxMayHandOver>,
+    /// PRD #1666 §3: attempts the component handed to the agent, their
+    /// `handed` receipt already published by the watcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handed: Vec<InboxAttemptRef>,
+    /// PRD #1666 §3: attempts the agent started on, their `committed`
+    /// receipt already published by the watcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub committed: Vec<InboxAttemptRef>,
+    /// PRD #1666 §2: attempts the component positively did not hand over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_handed: Vec<InboxAttemptRef>,
+    /// PRD #1666 §2: revoked attempts whose callback is off the queue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_ack: Vec<InboxAttemptRef>,
+    /// PRD #1666 §2: revoked attempts already past the native call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub already_handed: Vec<InboxAttemptRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume_answers: Vec<InboxResumeReply>,
+    /// PRD #1666 §3: the watcher could not publish a receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+}
+
+/// The answer to [`DaemonMessage::InboxList`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxListReply {
+    pub messages: Vec<crate::inbox::MessageSummary>,
+    /// Live `inbox wait` connections armed for the caller's agent.
+    pub armed: usize,
+    /// What the caller's component announced, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<InboxWake>,
+    /// PRD #1666 S8: the component behind the caller's wake path
+    /// (`opencode_mini`, `claude_waiter`, …), when one is armed or announced —
+    /// the summary's `component`. Absent from an older daemon's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+}
+
 /// Signal sent by a worker via `dot-agent-deck work-done`.
+/// PRD #1631: [`DaemonMessage::Question`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionSignal {
+    pub pane_id: String,
+    /// The hook capability token (issue #1077), as on every verb.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The event to apply. It carries the question
+    /// ([`QUESTION_METADATA_KEY`]).
+    pub event: AgentEvent,
+    /// Keep this connection open for the answer.
+    #[serde(default)]
+    pub hold: bool,
+    /// PRD #1631: after an answered reply this producer writes one
+    /// [`crate::question::ReplyAck`] line saying whether the agent took the
+    /// answer, and the daemon reports the answer only once it has. Only the
+    /// OpenCode plugin's `await-answer` child sets it: it hands the answer to
+    /// OpenCode's reply API, which can refuse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ack: bool,
+    /// PRD #1631 (PR #1698 review): when the daemon starts holding the
+    /// question, it says so at once, with a [`crate::question::QuestionReply`]
+    /// whose outcome is `held`, before the reply that ends the hold. A
+    /// producer that asks for it can tell a daemon that took the hold from
+    /// one that never will: a daemon from before `question` existed reads the
+    /// line as a malformed event and answers nothing, and the producer then
+    /// sends the event as a plain one so the card still reads Needs Input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirm_hold: bool,
+}
+
+impl QuestionSignal {
+    /// The id of the question the event carries, as the producer sent it.
+    pub fn question_id(&self) -> Option<String> {
+        self.event.question().map(|q| q.id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDoneSignal {
     pub pane_id: String,
@@ -2079,62 +4513,24 @@ pub struct WorkDoneSignal {
     /// When true, the orchestrator signals that the entire orchestration is complete.
     #[serde(default)]
     pub done: bool,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
-    /// Fork #358 (M2 redesign): the `AppState::pane_registration_generation`
-    /// value this worker was actually SPAWNED under. The `work-done` CLI
-    /// reads this straight from its own `DOT_AGENT_DECK_REGISTRATION_GENERATION`
-    /// environment variable — captured and injected at spawn time, sibling
-    /// to `DOT_AGENT_DECK_PANE_ID` — rather than asking the daemon what the
-    /// pane's generation is right now. That distinction is the whole fix:
-    /// a value re-derived from live daemon state at send time is, by
-    /// construction, whatever the pane's CURRENT generation is, so it can
-    /// never disagree with itself microseconds later at delivery — the
-    /// original cut of this field did exactly that and the gate it fed
-    /// never actually fired for the reported bug. `handle_work_done`
-    /// refuses delivery when this no longer matches the pane's CURRENT
-    /// generation: the pane was re-registered (worktree teardown + reuse)
-    /// since this worker was spawned, so `pane_cwd_map`/`pane_role_map` now
-    /// point at a different tenant. Fork #358 M4: this is only HALF of the
-    /// refusal check — see [`Self::daemon_boot_id`] below for the other
-    /// half, added because a bare daemon restart can reset this counter to
-    /// the same value a pre-restart worker already carried, which this
-    /// field alone cannot distinguish. `#[serde(default)]` so an older CLI
-    /// build that doesn't send this field still parses (defaulting to `0`,
-    /// which never matches a real registration's generation — those start
-    /// at `1` — so an old CLI talking to a post-#358 daemon has its reports
-    /// refused rather than silently misdelivered; see
-    /// `changelog.d/358.breaking.md` for why this tradeoff was accepted).
-    #[serde(default)]
-    pub generation: u64,
-    /// Fork #358 M4: the `AppState::daemon_boot_id` value in effect when
-    /// this worker's registration generation (above) was reserved — read
-    /// from `DOT_AGENT_DECK_DAEMON_BOOT_ID`, injected at spawn time sibling
-    /// to `DOT_AGENT_DECK_REGISTRATION_GENERATION`, same recipe as that
-    /// field. Needed because `generation` ALONE turned out not to close
-    /// fork issue #358's actual repro (reviewer + auditor, independently,
-    /// on 2026-08-17): `pane_registration_generation` is an in-memory map
-    /// that resets to empty on every daemon restart, exactly like the
-    /// counter it guards — so a pre-restart worker's signal and the
-    /// post-restart pane that reused its pane_id can both legitimately
-    /// carry generation `1`, and the generation check alone lets the stale
-    /// signal through. Pairing it with the daemon's own boot id closes that:
-    /// a fresh `AppState` mints a fresh `daemon_boot_id` on every
-    /// construction (real restart or test), so a pre-restart value can
-    /// never match a post-restart one, whatever the generation says.
-    /// `#[serde(default)]` so an older CLI build that doesn't send this
-    /// field still parses (defaulting to `""`, which no real
-    /// `daemon_boot_id` is ever minted as — see `DaemonBootId::default` —
-    /// so an old CLI's report is refused exactly like a bare `generation: 0`
-    /// already was; see `changelog.d/358.breaking.md`).
-    #[serde(default)]
-    pub daemon_boot_id: String,
-    /// Issue #586 M4: the subject tag this worker is echoing back on its own
-    /// report, so the daemon can compare it against the delegation's own
-    /// `DelegateSignal::subject` and flag a disagreement. `#[serde(default)]`
-    /// so an older CLI's payload (no `subject` field) still parses to
-    /// `None` — additive, never rejects, no `PROTOCOL_VERSION` bump.
-    #[serde(default)]
-    pub subject: Option<String>,
 }
 
 /// PRD #499 (reopened): the terminal outcome of an external dependency a
@@ -2167,6 +4563,17 @@ pub struct WaitStartSignal {
     /// actually records.
     pub ttl_secs: u64,
     pub timestamp: DateTime<Utc>,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// environment, presented like every other [`DaemonMessage`] verb so the
+    /// provenance gate can resolve **token -> record -> pane** and refuse a
+    /// message whose claimed `pane_id` is not the one the token was minted for.
+    /// Without it a `wait` signal would name a pane on the strength of an
+    /// environment variable alone, and a sibling agent could hold another pane
+    /// `Working` (or clear its wait). `None` from a CLI that predates the gate,
+    /// or in a pane the daemon never issued a token for; see
+    /// [`crate::hook_provenance::classify`] for what each admits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// Signal sent by `dot-agent-deck wait done <label> --outcome <...>`
@@ -2178,6 +4585,123 @@ pub struct WaitDoneSignal {
     pub label: String,
     pub outcome: WaitOutcome,
     pub timestamp: DateTime<Utc>,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// environment, presented like every other [`DaemonMessage`] verb so the
+    /// provenance gate can resolve **token -> record -> pane** and refuse a
+    /// message whose claimed `pane_id` is not the one the token was minted for.
+    /// Without it a `wait` signal would name a pane on the strength of an
+    /// environment variable alone, and a sibling agent could hold another pane
+    /// `Working` (or clear its wait). `None` from a CLI that predates the gate,
+    /// or in a pane the daemon never issued a token for; see
+    /// [`crate::hook_provenance::classify`] for what each admits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): the version of task-scoped
+/// completion this daemon serves, answered to [`HookCapabilitiesRequest`].
+/// A sender requires equality, never `>=`: a later version says it still
+/// serves version-1 senders by advertising version 1.
+pub const TASK_SCOPED_COMPLETION: u32 = 1;
+
+/// PRD #1666 part 3, round 5 (plan D1): which hook verbs this daemon serves,
+/// asked on the connection that will carry the mutation. An older daemon
+/// decodes it as nothing it knows and answers nothing, so a sender withholds
+/// its mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookCapabilitiesRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// The answer to a [`HookCapabilitiesRequest`]. Additive: a field a sender
+/// does not know is ignored, and one it needs but is absent reads as "not
+/// served".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookCapabilitiesReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_scoped_completion: Option<u32>,
+    /// On a refusal (the provenance gate), its stable code and sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// What a [`WorkDoneTaskRequest`] reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkDoneMode {
+    /// The delegated task with this id is complete.
+    Task { task_id: String },
+    /// The dispatched unit this agent is the terminal of is complete
+    /// (`--done`).
+    Terminal,
+    /// A note to the orchestrator that completes no task.
+    Uncorrelated,
+    /// A mode this daemon does not know; refused `unsupported_mode`.
+    #[serde(other)]
+    Unknown,
+}
+
+/// PRD #1666 part 3, round 5 (plan D1): a `work-done`, sent only on a
+/// connection where the daemon confirmed [`TASK_SCOPED_COMPLETION`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDoneTaskRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub mode: WorkDoneMode,
+    pub report: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// How a [`WorkDoneTaskRequest`] was settled (plan D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkDoneDisposition {
+    Accepted,
+    AlreadyAccepted,
+    Uncorrelated,
+    Refused,
+    /// A disposition a newer daemon added: the sender reads it as unconfirmed.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to a [`WorkDoneTaskRequest`] (plan D5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDoneTaskReply {
+    pub disposition: WorkDoneDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<crate::report_recovery::Destination>,
+    /// A repeat whose body differs from the report already taken.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub differs: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl WorkDoneTaskReply {
+    /// A refusal with its stable `code` and the sentence the worker reads.
+    pub fn refused(code: &str, message: &str) -> Self {
+        WorkDoneTaskReply {
+            disposition: WorkDoneDisposition::Refused,
+            task_id: None,
+            report_id: None,
+            destination: None,
+            differs: false,
+            code: Some(code.to_string()),
+            message: Some(message.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2266,6 +4790,8 @@ mod tests {
             schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         // Both fields must appear on the wire when set…
@@ -2301,6 +4827,8 @@ mod tests {
             schema_version: None,
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
@@ -2374,13 +4902,14 @@ mod tests {
         let ty: EventType = serde_json::from_str("\"some_future_event_type\"").unwrap();
         assert_eq!(ty, EventType::Unknown);
 
-        // Issue #652: `Unknown` is now also deliberately produced by this
-        // build (`wrap.rs`'s status-neutral model carrier), so it does have
-        // an "own" wire name (`"unknown"`) like `AgentType::None`'s
-        // `"none"` — this assertion predates that and no longer needs its
-        // own dedicated round-trip case here. Confirm the OTHER real
-        // variants this build produces still round-trip cleanly, so the
-        // catch-all didn't disturb ordinary encode/decode.
+        // Issue #652: `Unknown` is deliberately produced by this build too
+        // (`wrap.rs`'s status-neutral model carrier), so it has an "own" wire
+        // name (`"unknown"`) like `AgentType::None`'s `"none"`; the daemon's
+        // question release (`QUESTION_RELEASED_BY_DECK_METADATA_KEY`) is
+        // another emitter, and that frame relies on it reading back as the
+        // same no-op. Confirm the REAL variants this build DOES produce still
+        // round-trip cleanly, so the catch-all didn't disturb ordinary
+        // encode/decode.
         assert_eq!(
             serde_json::from_str::<EventType>(
                 &serde_json::to_string(&EventType::ShellBusy).unwrap()
@@ -2663,12 +5192,11 @@ mod tests {
             pane_id: "pane-1".into(),
             task: "Implement login".into(),
             to: vec!["coder".into()],
+            supersede: false,
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            generation: 1,
-            daemon_boot_id: "boot-abc123".into(),
-            subject: None,
+            token: None,
         };
         let msg = DaemonMessage::Delegate(signal);
         let json = serde_json::to_string(&msg).unwrap();
@@ -2692,9 +5220,7 @@ mod tests {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            generation: 0,
-            daemon_boot_id: "boot-deadbeef".into(),
-            subject: None,
+            token: None,
         };
         let msg = DaemonMessage::WorkDone(signal);
         let json = serde_json::to_string(&msg).unwrap();
@@ -2704,7 +5230,6 @@ mod tests {
                 assert_eq!(s.pane_id, "pane-2");
                 assert_eq!(s.task, "Implemented login");
                 assert!(!s.done);
-                assert_eq!(s.daemon_boot_id, "boot-deadbeef");
             }
             _ => panic!("expected WorkDone"),
         }
@@ -2718,6 +5243,7 @@ mod tests {
         let msg = DaemonMessage::GetSeed(GetSeedRequest {
             pane_id: "pane-7".into(),
             agent_id: Some("agent-42".into()),
+            token: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -2751,6 +5277,7 @@ mod tests {
         let without = serde_json::to_string(&DaemonMessage::GetSeed(GetSeedRequest {
             pane_id: "pane-7".into(),
             agent_id: None,
+            token: None,
         }))
         .unwrap();
         assert!(
@@ -2780,6 +5307,51 @@ mod tests {
         {
             DaemonMessage::GetSeed(r) => assert_eq!(r.agent_id.as_deref(), Some("a1")),
             _ => panic!("expected GetSeed"),
+        }
+    }
+
+    /// Issue #1077: `token` is additive on the hook socket in both directions,
+    /// on every `DaemonMessage` that carries it, which is why it moves no
+    /// `PROTOCOL_VERSION`. What changed across versions is the MEANING of an
+    /// absent token to a daemon that mints them — see
+    /// `changelog.d/1077.breaking.md` — not the shape, and this pins the shape.
+    ///
+    /// Written as a table over the raw wire forms rather than over constructed
+    /// structs, because the compatibility claim is about bytes an older peer
+    /// actually sends and receives.
+    #[test]
+    fn hook_token_is_additive_on_every_daemon_message() {
+        let legacy = [
+            r#"{"message_type":"delegate","pane_id":"p","task":"t","to":["w"],"timestamp":"2026-09-16T00:00:00Z"}"#,
+            r#"{"message_type":"work_done","pane_id":"p","task":"t","done":false,"timestamp":"2026-09-16T00:00:00Z"}"#,
+            r#"{"message_type":"get_seed","pane_id":"p"}"#,
+            r#"{"message_type":"dispatch","pane_id":"p","name":"n","timestamp":"2026-09-16T00:00:00Z"}"#,
+            r#"{"message_type":"list_targets","pane_id":"p"}"#,
+            r#"{"message_type":"restart_role","pane_id":"p","role":"r","force":false,"timestamp":"2026-09-16T00:00:00Z"}"#,
+            r#"{"message_type":"spawn_role","pane_id":"p","role":"r","timestamp":"2026-09-16T00:00:00Z"}"#,
+        ];
+        for raw in legacy {
+            // An OLD client's payload still parses, and reads as "no token".
+            let msg: DaemonMessage = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("a pre-#1077 payload must parse ({e}): {raw}"));
+            assert_eq!(msg.claimed_pane(), "p", "{raw}");
+            assert_eq!(msg.presented_token(), None, "{raw}");
+
+            // A NEW client with no token emits the payload it always emitted —
+            // the key is absent, not `null`, so an older daemon sees nothing new.
+            let reencoded = serde_json::to_string(&msg).unwrap();
+            assert!(
+                !reencoded.contains("token"),
+                "an absent token must be omitted from the wire: {reencoded}"
+            );
+
+            // And a NEW client's token survives a round trip, which is the half
+            // a newer daemon relies on. An older daemon has no
+            // `deny_unknown_fields` on any of these, so it ignores the key.
+            let with_token = raw.replacen(r#""pane_id":"p""#, r#""pane_id":"p","token":"tk""#, 1);
+            let parsed: DaemonMessage = serde_json::from_str(&with_token)
+                .unwrap_or_else(|e| panic!("a tokened payload must parse ({e}): {with_token}"));
+            assert_eq!(parsed.presented_token(), Some("tk"), "{with_token}");
         }
     }
 
@@ -2821,6 +5393,8 @@ mod tests {
             schema_version: None,
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         });
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(matches!(
@@ -2835,6 +5409,7 @@ mod tests {
                 display_title: None,
                 orchestration_id: None,
                 roles: Vec::new(),
+                context_path: None,
             }))
             .expect("serialize");
         assert!(matches!(
@@ -2859,6 +5434,7 @@ mod tests {
         // Some(seed) round-trips…
         let resp = GetSeedResponse {
             seed: Some("Read .dot-agent-deck/worker-task-coder.md for your task.".into()),
+            ..GetSeedResponse::default()
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
@@ -2867,11 +5443,22 @@ mod tests {
             Some("Read .dot-agent-deck/worker-task-coder.md for your task.")
         );
         // …and "no seed" is a null the get-seed CLI reads as "print nothing".
-        let none = GetSeedResponse { seed: None };
+        let none = GetSeedResponse::default();
         let json = serde_json::to_string(&none).unwrap();
         assert_eq!(json, "{\"seed\":null}");
         let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
         assert!(back.seed.is_none());
+        // PRD #1666 part 3 (H5): the withdrawal's fields are additive, so a
+        // reader of `{"seed": …}` alone still reads no seed.
+        let withdrawn = serde_json::to_value(GetSeedResponse::withdrawn()).unwrap();
+        assert!(withdrawn["seed"].is_null());
+        assert_eq!(withdrawn["refused"], GET_SEED_REMOVED);
+        #[derive(serde::Deserialize)]
+        struct OldReader {
+            seed: Option<String>,
+        }
+        let old: OldReader = serde_json::from_value(withdrawn).unwrap();
+        assert!(old.seed.is_none());
     }
 
     #[test]
@@ -2891,10 +5478,67 @@ mod tests {
         }
     }
 
+    /// Issue #1395 item 1: `OrchestrationSurface::context_path` is additive
+    /// optional — an older daemon's surface (no key) decodes as `None`, `None`
+    /// puts no key on the wire, and a value round-trips.
+    #[test]
+    fn orchestration_surface_context_path_is_additive_optional() {
+        let legacy = r#"{"kind":"orchestration_surface","name":"n","cwd":"/p","roles":[]}"#;
+        let BroadcastMsg::OrchestrationSurface(back) =
+            serde_json::from_str::<BroadcastMsg>(legacy).expect("a surface without the field")
+        else {
+            panic!("expected a BroadcastMsg::OrchestrationSurface");
+        };
+        assert_eq!(back.context_path, None);
+        let wire = serde_json::to_value(BroadcastMsg::OrchestrationSurface(back.clone())).unwrap();
+        assert!(
+            wire.get("context_path").is_none(),
+            "None must be omitted from the wire: {wire}"
+        );
+
+        let path = "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let with_path = OrchestrationSurface {
+            context_path: Some(path.into()),
+            ..back
+        };
+        let json = serde_json::to_string(&BroadcastMsg::OrchestrationSurface(with_path)).unwrap();
+        let BroadcastMsg::OrchestrationSurface(round) = serde_json::from_str(&json).unwrap() else {
+            panic!("expected a BroadcastMsg::OrchestrationSurface");
+        };
+        assert_eq!(round.context_path.as_deref(), Some(path));
+    }
+
     // PRD #120: the live-orchestration-surface broadcast must round-trip
     // through the same `BroadcastMsg` wire the daemon forwards over KIND_EVENT,
     // and tag itself `orchestration_surface` so it's distinguishable from the
     // `event` variant an older peer expects (the reason PROTOCOL_VERSION bumped).
+    // Issue #1637: the hook-binary notice broadcast must actually encode. This
+    // enum is internally tagged, so a variant whose payload is a sequence
+    // fails `serde_json::to_vec` and the daemon skips the frame.
+    #[test]
+    fn hook_binary_notice_broadcast_round_trips() {
+        let notice = crate::hook_binary::HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: crate::hook_binary::HookBinaryReason::Older,
+            remedy: "Run:".into(),
+            command: Some("brew upgrade dot-agent-deck".into()),
+        };
+        for notices in [Vec::new(), vec![notice]] {
+            let msg = BroadcastMsg::HookBinaryNotice(crate::hook_binary::HookBinaryNotices {
+                notices: notices.clone(),
+            });
+            let json = serde_json::to_value(&msg).expect("encodes");
+            assert_eq!(json["kind"], "hook_binary_notice", "{json}");
+            match serde_json::from_value::<BroadcastMsg>(json).expect("decodes") {
+                BroadcastMsg::HookBinaryNotice(payload) => assert_eq!(payload.notices, notices),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn orchestration_surface_broadcast_round_trips() {
         let msg = BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
@@ -2916,6 +5560,7 @@ mod tests {
                     is_start_role: false,
                 },
             ],
+            context_path: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -3059,6 +5704,23 @@ mod tests {
         );
         // Unknown / malformed states map to None (the CLI turns this into a
         // clear non-zero error). Includes casing and near-miss variants.
+        // Issue #622: the detail reports.
+        assert_eq!(
+            agent_event_type_from_state("prompt"),
+            Some(EventType::Thinking)
+        );
+        assert_eq!(
+            agent_event_type_from_state("tool-start"),
+            Some(EventType::ToolStart)
+        );
+        assert_eq!(
+            agent_event_type_from_state("tool-end"),
+            Some(EventType::ToolEnd)
+        );
+        for t in AGENT_EVENT_TYPES {
+            assert!(agent_event_type_from_state(t).is_some(), "{t} must map");
+        }
+        assert_eq!(agent_event_type_from_state("tool_start"), None);
         assert_eq!(agent_event_type_from_state("idle"), None);
         assert_eq!(agent_event_type_from_state("Running"), None);
         assert_eq!(agent_event_type_from_state("done"), None);
@@ -3076,90 +5738,345 @@ mod tests {
         assert!(serde_json::from_str::<DaemonMessage>(json).is_err());
     }
 
-    /// Builds a Codex `SessionStart` `AgentEvent` with `CODEX_HOOK_TRUST_METADATA_KEY`
-    /// stamped to `value` in its metadata (or omitted entirely when `value` is
-    /// `None`), for exercising `codex_hook_trust_outcome()`'s parse in isolation.
-    fn codex_session_start_with_trust_metadata(value: Option<&str>) -> AgentEvent {
-        let mut metadata = HashMap::new();
-        if let Some(value) = value {
-            metadata.insert(CODEX_HOOK_TRUST_METADATA_KEY.to_string(), value.to_string());
+    // -----------------------------------------------------------------
+    // Issue #1129: the fire-and-forget verbs' acknowledgement.
+    // -----------------------------------------------------------------
+
+    /// Build one message of every variant, so the two reply matrices below are
+    /// exhaustive by construction rather than by a reviewer's memory. A new
+    /// variant makes `DaemonMessage`'s own `match` arms fail to compile, and
+    /// forgetting it here makes the counts below wrong.
+    fn one_of_every_variant() -> Vec<DaemonMessage> {
+        let ts = chrono::Utc::now();
+        vec![
+            DaemonMessage::Delegate(DelegateSignal {
+                pane_id: "p".into(),
+                task: "t".into(),
+                to: vec!["worker".into()],
+                supersede: false,
+                timestamp: ts,
+                token: None,
+            }),
+            DaemonMessage::WorkDone(WorkDoneSignal {
+                pane_id: "p".into(),
+                task: "t".into(),
+                done: false,
+                timestamp: ts,
+                token: None,
+            }),
+            DaemonMessage::GetSeed(GetSeedRequest {
+                pane_id: "p".into(),
+                agent_id: None,
+                token: None,
+            }),
+            DaemonMessage::Dispatch(DispatchSignal {
+                pane_id: "p".into(),
+                name: "unit".into(),
+                task: None,
+                shape: None,
+                timestamp: ts,
+                token: None,
+            }),
+            DaemonMessage::ListTargets(ListTargetsRequest {
+                pane_id: "p".into(),
+                token: None,
+            }),
+            DaemonMessage::RestartRole(RestartRoleSignal {
+                pane_id: "p".into(),
+                role: "worker".into(),
+                force: false,
+                timestamp: ts,
+                token: None,
+            }),
+            DaemonMessage::SpawnRole(SpawnRoleSignal {
+                pane_id: "p".into(),
+                role: "worker".into(),
+                timestamp: ts,
+                token: None,
+            }),
+        ]
+    }
+
+    /// The invariant the hook loop rests on: **exactly one line per message**.
+    /// A verb that answers in its own arm must return `None` from
+    /// `provenance_ack_reply`, or the caller — which reads exactly one line —
+    /// would take the admission for the answer. `work_done` answers in its own
+    /// arm since PRD #1631, once its report is queued.
+    #[test]
+    fn only_dispatch_is_acknowledged_at_the_gate() {
+        for msg in one_of_every_variant() {
+            let acked = msg.provenance_ack_reply().is_some();
+            let expected = matches!(msg, DaemonMessage::Dispatch(_));
+            assert_eq!(
+                acked,
+                expected,
+                "{} must {} be acknowledged at the gate",
+                msg.verb(),
+                if expected { "" } else { "NOT" }
+            );
         }
-        AgentEvent {
-            session_id: "codex-hook-outcome".into(),
-            agent_type: AgentType::Codex,
-            event_type: EventType::SessionStart,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp: Utc::now(),
-            user_prompt: None,
-            metadata,
-            pane_id: Some("codex-hook-outcome-pane".into()),
-            agent_id: None,
-            agent_version: None,
-            schema_version: None,
-            live_target: None,
-            model: None,
+    }
+
+    /// Every verb answers a refusal — that is what makes the gate's refusal
+    /// visible to the sender rather than only to `deck.log`.
+    #[test]
+    fn every_verb_answers_a_provenance_refusal() {
+        for msg in one_of_every_variant() {
+            assert!(
+                msg.provenance_refusal_reply("missing_token", "refused: because")
+                    .is_some(),
+                "{} answers nothing when refused, so its sender is not told",
+                msg.verb()
+            );
         }
     }
 
-    /// Scenario: PRD #254's `codex_hook_trust_outcome()` parses the wrapper's
-    /// two real stamped values -- `"true"` reports a known-successful hook
-    /// install/trust, `"false"` reports a known failure. Neither passes
-    /// through any resolution logic beyond the literal string match, so this
-    /// pins the parse in isolation from the rest of the plumbing chain
-    /// (`codex_spawn_prep`, `apply_event`) that consumes it.
+    /// The two fire-and-forget verbs answer a refusal in a `SignalAck` that
+    /// carries the greppable code as well as the sentence, so the CLI's stderr
+    /// and the daemon's `warn!` share one word.
     #[test]
-    fn codex_hook_trust_outcome_parses_true_and_false() {
-        assert_eq!(
-            codex_session_start_with_trust_metadata(Some("true")).codex_hook_trust_outcome(),
-            Some(true)
-        );
-        assert_eq!(
-            codex_session_start_with_trust_metadata(Some("false")).codex_hook_trust_outcome(),
-            Some(false)
-        );
+    fn a_refused_fire_and_forget_verb_answers_a_signal_ack() {
+        for msg in one_of_every_variant() {
+            if !matches!(msg, DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_)) {
+                continue;
+            }
+            let line = msg
+                .provenance_refusal_reply("missing_token", "refused: because")
+                .expect("a fire-and-forget refusal is answered");
+            let ack: SignalAck = serde_json::from_str(&line).expect("the refusal parses as an ack");
+            assert!(ack.is_signal_ack());
+            assert!(
+                !ack.accepted,
+                "{}: a refusal is not an acceptance",
+                msg.verb()
+            );
+            assert_eq!(ack.reason.as_deref(), Some("missing_token"));
+            assert_eq!(ack.error.as_deref(), Some("refused: because"));
+        }
     }
 
-    /// Scenario: an event carrying no `CODEX_HOOK_TRUST_METADATA_KEY` at all
-    /// -- an old wrapper build, a non-Codex-identity spawn, or any
-    /// non-wrapper producer -- must resolve `None` ("no outcome reported"),
-    /// never read as either a success or a failure. This is the deliberate
-    /// backward-compatibility default the function's own doc comment
-    /// describes, and it stays `None` even though I2 (below) changed how a
-    /// PRESENT-but-garbled value resolves -- an absent key and a garbled
-    /// value are different facts and must not collapse to the same outcome.
+    /// The admission is affirmative: it identifies itself and carries no error.
     #[test]
-    fn codex_hook_trust_outcome_absent_key_is_none() {
-        assert_eq!(
-            codex_session_start_with_trust_metadata(None).codex_hook_trust_outcome(),
-            None
-        );
+    fn an_admitted_dispatch_answers_an_affirmative_ack() {
+        let msg = one_of_every_variant()
+            .into_iter()
+            .find(|msg| matches!(msg, DaemonMessage::Dispatch(_)))
+            .expect("a dispatch");
+        let line = msg
+            .provenance_ack_reply()
+            .expect("dispatch is acknowledged at the gate");
+        let ack: SignalAck = serde_json::from_str(&line).expect("the ack parses");
+        assert!(ack.is_signal_ack());
+        assert!(ack.accepted);
+        assert_eq!(ack.reason, None);
+        assert_eq!(ack.error, None);
     }
 
-    /// Scenario: PRD #254 auditor I2. A stamped-but-UNRECOGNISED value --
-    /// neither the literal `"true"` nor `"false"` any current wrapper writes
-    /// (a future format, a typo, a corrupted write) -- must NOT fall into the
-    /// same arm as an ABSENT key, which would read as "no outcome reported"
-    /// and resolve the pane back to `Reports` -- the exact
-    /// silently-healthy-looking failure shape H1 is about (see
-    /// `codex_spawn_prep_ok_zero_hooks_is_not_confirmed` in `wrap.rs`), just
-    /// reached through a garbled value instead of a missing one. A key that
-    /// IS present but unparseable is evidence something went wrong and must
-    /// not be indistinguishable from "nothing was reported": it resolves to
-    /// `Some(false)` (not confirmed), the same fail-safe direction as every
-    /// other unresolvable outcome in this chain. This pins that fix: it was
-    /// proven RED against the pre-fix code, where the `Some(_)` and `None`
-    /// arms both collapsed into one wildcard.
+    /// The marker check, and the direction of its failure. Every field of
+    /// `SignalAck` is `#[serde(default)]` over an `accepted: bool`, so a line
+    /// that is not an ack at all parses into `accepted: false` — a refusal
+    /// manufactured out of another daemon's reply. `is_signal_ack` is what stops
+    /// the CLI turning that into a reported failure on a signal it delivered.
     #[test]
-    fn codex_hook_trust_outcome_unrecognized_present_value_is_not_confirmed() {
-        assert_eq!(
-            codex_session_start_with_trust_metadata(Some("maybe")).codex_hook_trust_outcome(),
-            Some(false),
-            "PRD #254 I2: a stamped-but-unrecognised trust value must resolve \
-             as a known failure (Some(false)), not fall through to None as if \
-             the key were absent -- that silently restores the pre-fix \
-             Reports behaviour"
+    fn a_line_that_is_not_an_ack_is_not_read_as_a_refusal() {
+        for line in [
+            "{}",
+            r#"{"seed":null}"#,
+            r#"{"kind":"delegate","delivered":[]}"#,
+            r#"{"accepted":false}"#,
+        ] {
+            let parsed: SignalAck =
+                serde_json::from_str(line).expect("these all parse, which is the hazard");
+            assert!(
+                !parsed.is_signal_ack(),
+                "{line} was accepted as an ack, so a daemon we do not understand would be                  reported as having refused"
+            );
+        }
+    }
+
+    /// A CLI that predates the ack emits exactly the payload it always did, and
+    /// a daemon that predates it writes nothing back. Neither half is exercised
+    /// here — this pins the third: an ack read by a build that knows the type
+    /// but not a field a later daemon added must not become a refusal.
+    #[test]
+    fn an_ack_with_unknown_fields_still_reads_as_an_acceptance() {
+        let ack: SignalAck = serde_json::from_str(
+            r#"{"kind":"signal_ack","accepted":true,"something_new":{"a":1}}"#,
+        )
+        .expect("unknown keys are ignored");
+        assert!(ack.is_signal_ack());
+        assert!(ack.accepted);
+    }
+
+    /// PR #1414 review: `delivery` is additive and optional — absent from every
+    /// line that does not carry it, so a reply to `work-done` is byte-for-byte
+    /// what it was, and a value a later daemon adds still parses.
+    #[test]
+    fn ack_delivery_is_an_additive_optional_field() {
+        let admitted = serde_json::to_string(&SignalAck::accepted()).unwrap();
+        assert!(!admitted.contains("delivery"), "{admitted}");
+        let refused = serde_json::to_string(&SignalAck::refused("missing_token", "m")).unwrap();
+        assert!(!refused.contains("delivery"), "{refused}");
+        for (delivery, wire) in [
+            (AckDelivery::Acknowledged, "acknowledged"),
+            (AckDelivery::AlreadyAcknowledged, "already_acknowledged"),
+            (AckDelivery::Unknown, "unknown"),
+        ] {
+            let line = serde_json::to_string(&SignalAck::acknowledged(delivery)).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["delivery"], wire, "{line}");
+            let back: SignalAck = serde_json::from_str(&line).unwrap();
+            assert_eq!(back.delivery, Some(delivery));
+            assert_eq!(delivery.recorded(), delivery != AckDelivery::Unknown);
+        }
+        let later: SignalAck = serde_json::from_str(
+            r#"{"kind":"signal_ack","accepted":true,"delivery":"something_new"}"#,
+        )
+        .expect("a later outcome must not make the ack unparseable");
+        assert_eq!(later.delivery, Some(AckDelivery::Unrecognised));
+        // PRD #1666: an older daemon's delivery-id outcomes read the same way.
+        let earlier: SignalAck =
+            serde_json::from_str(r#"{"kind":"signal_ack","accepted":true,"delivery":"stopped"}"#)
+                .expect("an earlier outcome must not make the ack unparseable");
+        assert_eq!(earlier.delivery, Some(AckDelivery::Unrecognised));
+        assert!(!AckDelivery::Unrecognised.recorded());
+    }
+
+    fn ack_message() -> DaemonMessage {
+        DaemonMessage::Ack(AckSignal {
+            pane_id: "pane-7".to_string(),
+            delivery_id: "d-7f3a9c21".to_string(),
+            agent_id: Some("agent-3".to_string()),
+            token: Some("tok".to_string()),
+        })
+    }
+
+    /// Issue #1383: `ack` rides the hook socket under the `ack` tag and
+    /// round-trips.
+    #[test]
+    fn ack_signal_round_trips_with_the_ack_tag() {
+        let json = serde_json::to_string(&ack_message()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["message_type"], "ack");
+        assert_eq!(value["delivery_id"], "d-7f3a9c21");
+        match serde_json::from_str::<DaemonMessage>(&json).unwrap() {
+            DaemonMessage::Ack(sig) => {
+                assert_eq!(sig.pane_id, "pane-7");
+                assert_eq!(sig.agent_id.as_deref(), Some("agent-3"));
+                assert_eq!(sig.token.as_deref(), Some("tok"));
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+        let bare: DaemonMessage = serde_json::from_str(
+            r#"{"message_type":"ack","pane_id":"p","delivery_id":"d-00000000"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            bare,
+            DaemonMessage::Ack(AckSignal {
+                agent_id: None,
+                token: None,
+                ..
+            })
+        ));
+    }
+
+    /// Issue #1383, cross-version case (a): an older daemon that does not know
+    /// the `ack` tag falls back to decoding the line as an `AgentEvent`. It must
+    /// fail there too, or that daemon would ingest the ack as a status event.
+    #[test]
+    fn an_ack_line_never_decodes_as_an_agent_event() {
+        let json = serde_json::to_string(&ack_message()).unwrap();
+        assert!(serde_json::from_str::<AgentEvent>(&json).is_err());
+    }
+
+    /// PRD #1666 part 2 (wire audit W03–W05): every line a one-shot sends
+    /// that could take mail or commit it is a verb a 0.47.0 daemon does not
+    /// decode (its list copied from `v0.47.0`) and is no [`AgentEvent`]
+    /// either, so an older daemon logs it as malformed and answers nothing:
+    /// it can neither hand the one-shot mail on legacy terms nor ingest the
+    /// line as a status report.
+    #[test]
+    fn a_one_shots_receipt_lines_are_nothing_a_0_47_daemon_decodes() {
+        const RELEASED_0_47: &[&str] = &[
+            "delegate",
+            "work_done",
+            "get_seed",
+            "dispatch",
+            "list_targets",
+            "restart_role",
+            "spawn_role",
+            "ack",
+            "inbox_wait",
+            "inbox_announce",
+            "inbox_fetch",
+            "inbox_list",
+            "inbox_publish",
+            "inbox_offer",
+            "inbox_complete",
+            "inbox_release",
+            "question",
+        ];
+        let who = serde_json::json!({"pane_id":"7", "agent_id":"a", "token":"tok"});
+        let with = |verb: &str, extra: serde_json::Value| {
+            let mut line = who.clone();
+            line["message_type"] = serde_json::json!(verb);
+            for (key, value) in extra.as_object().unwrap() {
+                line[key] = value.clone();
+            }
+            let msg: DaemonMessage = serde_json::from_value(line).expect(verb);
+            serde_json::to_string(&msg).unwrap()
+        };
+        for line in [
+            with("inbox_receipts", serde_json::json!({})),
+            with(
+                "inbox_receipt_wait",
+                serde_json::json!({"component":"claude_waiter", "mode":"once",
+                    "hook_integration":1}),
+            ),
+            with(
+                "inbox_receipt_fetch",
+                serde_json::json!({"consumer":"doorbell_hook", "hook_integration":1}),
+            ),
+            with(
+                "inbox_committed",
+                serde_json::json!({"attempts":[{"id":"m-k3xzq2ab-0f3c9a71d2e4b850",
+                    "a":1, "e":1}]}),
+            ),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let verb = value["message_type"].as_str().unwrap();
+            assert!(!RELEASED_0_47.contains(&verb), "{line}");
+            assert!(serde_json::from_str::<AgentEvent>(&line).is_err(), "{line}");
+        }
+    }
+
+    /// Issue #1383: `ack` is attested by its pane like `work-done` and answers
+    /// a refusal at the gate with a `SignalAck`. An admission is NOT answered at
+    /// the gate (PR #1414 review): its handler answers once it has looked the id
+    /// up, so the reply can say whether it matched.
+    #[test]
+    fn ack_is_gated_like_work_done_and_answered_after_its_lookup() {
+        let msg = ack_message();
+        assert_eq!(msg.claimed_pane(), "pane-7");
+        assert_eq!(msg.presented_token(), Some("tok"));
+        assert_eq!(msg.verb(), "ack");
+        assert!(
+            msg.provenance_ack_reply().is_none(),
+            "an admitted ack is answered by its handler; a gate line would be a second one"
         );
+        let accepted: SignalAck = serde_json::from_str(
+            &serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Acknowledged)).unwrap(),
+        )
+        .unwrap();
+        assert!(accepted.is_signal_ack() && accepted.accepted);
+        assert_eq!(accepted.delivery, Some(AckDelivery::Acknowledged));
+        let refused: SignalAck = serde_json::from_str(
+            &msg.provenance_refusal_reply("missing_token", "no token")
+                .expect("a refusal is answered"),
+        )
+        .unwrap();
+        assert!(refused.is_signal_ack() && !refused.accepted);
+        assert_eq!(refused.reason.as_deref(), Some("missing_token"));
     }
 }

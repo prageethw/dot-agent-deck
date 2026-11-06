@@ -414,7 +414,7 @@ fn codex_hooks_install_006_write_is_atomic_replacement() {
     );
 }
 
-/// Scenario: Seed a Codex hooks.json whose single PreToolUse rule object carries both a deck command and the user's own audit handler under one matcher, then reinstall from that same deck path. The user's handler and the rule's matcher must survive with only the deck's command taken out of it, and the refreshed deck rule added beside it.
+/// Scenario: Seed a Codex hooks.json whose single PreToolUse rule object carries both a deck command and the user's own audit handler under one matcher, then reinstall from that same deck path. The user's handler and the rule's matcher must survive, and the deck's command must be refreshed where it already sat so the user's handler keeps the index Codex keys its trust record to.
 #[test]
 fn codex_hooks_install_007_a_mixed_rule_keeps_the_users_sibling_handler() {
     let home = test_temp::tempdir().expect("create Codex home");
@@ -447,15 +447,33 @@ fn codex_hooks_install_007_a_mixed_rule_keeps_the_users_sibling_handler() {
         .unwrap_or_else(|| {
             panic!("the rule object the user shared with the deck was deleted: {rules:?}")
         });
+    // Issue #1034 INVERTED this assertion, and the inversion is the fix rather
+    // than a relaxation. Until then the deck's command was taken out of the
+    // shared rule and re-added as a rule of its own, which left the user's
+    // handler alone but MOVED it from `…:0:1` to `…:0:0` — and Codex keys a
+    // trust grant by exactly that index, so the user's trusted handler came
+    // back untrusted. The deck's command is now refreshed where it already sat,
+    // so the rule still carries both handlers in the order it always did.
     assert_eq!(
         shared["hooks"].as_array().map(Vec::len),
-        Some(1),
-        "only the deck's own command may be removed from a shared rule: {shared:?}"
+        Some(2),
+        "the shared rule must still carry both handlers, refreshed in place: {shared:?}"
     );
     assert_eq!(
         shared["hooks"][0]["command"],
+        json!(deck_command),
+        "the deck's command must be refreshed at the index it already occupied: {shared:?}"
+    );
+    assert_eq!(
+        shared["hooks"][1]["command"],
         json!(user_command),
-        "the user's sibling handler must survive the reinstall: {shared:?}"
+        "the user's sibling handler must survive at the index its trust record is keyed to: \
+         {shared:?}"
+    );
+    assert_eq!(
+        rules.len(),
+        1,
+        "no second deck rule may be appended beside the refreshed one: {rules:?}"
     );
     assert_eq!(
         deck_commands_for(home.path(), "PreToolUse"),
@@ -464,16 +482,15 @@ fn codex_hooks_install_007_a_mixed_rule_keeps_the_users_sibling_handler() {
     );
 }
 
-/// Scenario: Reinstall Codex hooks over a deck-owned rule pinned at a second, still-valid deck install, and separately over one whose binary is positively gone. The valid foreign pin must be left in place with the fresh rule added beside it; the dead one must be repaired away, leaving a single deck rule.
+/// Scenario: Reinstall Codex hooks over a second valid deck installation, and separately over a missing installation. Both are replaced in place with exactly one command for the installing deck.
 #[test]
-fn codex_hooks_install_008_a_valid_foreign_pin_survives_and_a_dead_one_is_repaired() {
+fn codex_hooks_install_008_valid_and_dead_deck_pins_are_replaced_in_place() {
     let fixture = test_temp::tempdir().expect("create install fixture");
     let installing = seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
     let installing_command = expected_hook_command(&installing);
 
-    // Arm 1 — a DIFFERENT but still-valid install, deliberately sharing the
-    // installing binary's own basename so the only thing standing between it and
-    // deletion is `pin_is_repairable` saying the target is still there.
+    // Arm 1 — a different still-valid install with the deck's basename.
+    // The valid sibling must be replaced under the consolidation policy.
     let other = seed_executable(&fixture.path().join("other-install").join("dot-agent-deck"));
     let other_command = expected_hook_command(&other);
     let valid = test_temp::tempdir().expect("create Codex home");
@@ -492,14 +509,11 @@ fn codex_hooks_install_008_a_valid_foreign_pin_survives_and_a_dead_one_is_repair
 
     assert_eq!(
         deck_commands_for(valid.path(), "SessionStart"),
-        vec![other_command.clone(), installing_command.clone()],
-        "PRD #381 Open Question 3: a deck pin that still works is left alone and the fresh \
-         rule is added ALONGSIDE it, never repointed"
+        vec![installing_command.clone()],
+        "a different valid deck install must be replaced in place, never appended alongside"
     );
 
-    // Arm 2 — the same shape, but the pin is positively gone. Without this arm
-    // the first one proves nothing: a predicate that never prunes anything would
-    // pass it.
+    // Arm 2 — the same shape with a missing binary still exercises dead-pin repair.
     let dead = fixture
         .path()
         .join("pruned-worktree")
@@ -541,6 +555,7 @@ fn codex_trust_004_only_the_exact_generated_command_is_trust_eligible() {
         current_hash: format!("sha256:{key}"),
         trust_status: "untrusted".to_string(),
         is_managed: Some(false),
+        enabled: None,
     };
     // The class, not an exploit: the deck's verb is a convention anything able
     // to write into `hooks.json` can also end a command with, so under the old
@@ -612,6 +627,7 @@ fn codex_trust_an_absent_is_managed_field_resolves_per_direction() {
         current_hash: format!("sha256:{key}"),
         trust_status: "untrusted".to_string(),
         is_managed,
+        enabled: None,
     };
     let entries = vec![
         entry("present-false", Some(false)),
@@ -993,7 +1009,7 @@ fn own_home_entry(command: &str, index: usize, hash: &str) -> Value {
     )
 }
 
-/// Scenario: Run the documented Codex hook installation command against an isolated home, an isolated `$HOME` holding a seeded durable deck, and a deterministic app-server stand-in. The command must succeed, materialize Codex hook definitions, and pin the seeded durable binary rather than anything the host happens to have installed.
+/// Scenario: Run Codex hook installation against a scratch CODEX_HOME and a separate scratch HOME with a seeded durable deck and deterministic app-server. SessionStart, UserPromptSubmit and Stop must each install one synchronous inbox-capable hook in CODEX_HOME, pin the seeded deck and leave HOME/.codex absent.
 #[spec("codex/hooks/004")]
 #[test]
 fn codex_hooks_004_cli_install_succeeds() {
@@ -1024,6 +1040,30 @@ fn codex_hooks_004_cli_install_succeeds() {
         written.contains(durable.to_str().expect("durable path is UTF-8")),
         "the install pinned something other than the durable binary seeded in this fixture, so \
          the test's outcome is being decided by host state:\n{written}"
+    );
+    let settings: Value = serde_json::from_str(&written).unwrap();
+    for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+        let handlers: Vec<_> = settings["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|rule| rule["hooks"].as_array().unwrap())
+            .filter(|handler| {
+                handler["command"]
+                    .as_str()
+                    .is_some_and(|cmd| cmd.ends_with(DECK_COMMAND_SUFFIX))
+            })
+            .collect();
+        assert_eq!(handlers.len(), 1, "one inbox-relevant {event} hook");
+        assert_eq!(handlers[0]["type"], "command");
+        assert_ne!(
+            handlers[0]["async"], true,
+            "{event} must return its hand-over synchronously"
+        );
+    }
+    assert!(
+        !deck_home.path().join(".codex").exists(),
+        "CODEX_HOME confines the install"
     );
 }
 
@@ -1196,12 +1236,852 @@ fn codex_hooks_006_unreachable_trust_is_reported_on_both_arms() {
     );
     // The residue the warning exists to name: definitions gone, trust row still
     // there. Asserted because it is why the message is worth printing, not
-    // because it is desirable — if the orphan collection #1027's first item
-    // describes ever lands, this is the assertion to change.
+    // because it is desirable. Issue #1027 item 1's collection does not reach
+    // it: that sweep runs only from an install whose listing names the deck's
+    // current hook, and an uninstall has none (`codex_trust_006` covers it).
     assert_eq!(
         trust_state_keys(home.path()),
         vec![deck_key],
         "the trust record the uninstall could not reach is left behind, which is exactly what \
          the warning tells the user"
+    );
+}
+
+/// The trust key Codex 0.149.0 addresses a grant by, reproduced here rather
+/// than imported: `<sourcePath>:<event_snake>:<group_idx>:<handler_idx>`, where
+/// `group_idx` is the rule's index in the event array and `handler_idx` the
+/// handler's index inside that rule. Spelled out in the test so an assertion
+/// about positions reads as the thing Codex actually keys on (issue #1034).
+fn trust_keys_for(home: &std::path::Path, event_snake: &str, event: &str) -> Vec<String> {
+    let root = read_hooks(home);
+    let mut keys = Vec::new();
+    let Some(rules) = root["hooks"][event].as_array() else {
+        return keys;
+    };
+    for (group_idx, rule) in rules.iter().enumerate() {
+        let Some(handlers) = rule["hooks"].as_array() else {
+            continue;
+        };
+        for (handler_idx, handler) in handlers.iter().enumerate() {
+            let command = handler["command"].as_str().unwrap_or("<no string command>");
+            keys.push(format!(
+                "{}/hooks.json:{event_snake}:{group_idx}:{handler_idx} -> {command}",
+                home.display()
+            ));
+        }
+    }
+    keys
+}
+
+/// Scenario: Seed a Codex home the way a user's own file really looks — the deck's rule first and the user's own hook appended after it, both in the same shared `hooks.json` — then run the deck's install over it twice. Every position the user's handler occupies must be byte-identical before and after, because Codex addresses a trust grant by that position and moving it silently untrusts their hook.
+#[spec("codex/hooks/007")]
+#[test]
+fn codex_hooks_007_install_leaves_a_users_hook_at_its_trust_key() {
+    let home = test_temp::tempdir().expect("create Codex home");
+
+    // The shape the defect needs, and the shape a real file takes: the deck
+    // installs first, the user appends their own hook afterwards. Two of them,
+    // in the two arrangements Codex indexes differently — a rule of their own
+    // (a `group_idx` after the deck's) and a handler sharing the deck's rule
+    // object (a `handler_idx` after the deck's), which is what a user editing
+    // `hooks.json` by hand naturally produces.
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "hooks": [
+                        // Seeded as the command this install would itself write,
+                        // so the refresh is a genuine no-op on the string and
+                        // the comparison below is about POSITION alone. Seeding
+                        // a hand-spelled equivalent would make the test pass
+                        // only while `build_command` happens not to quote.
+                        { "type": "command", "command": expected_hook_command(DECK_BINARY) },
+                        { "type": "command", "command": "/usr/local/bin/my-audit.sh" },
+                    ] },
+                    { "matcher": "Bash", "hooks": [
+                        { "type": "command", "command": "/usr/bin/env USER_HOOK=1" },
+                    ] },
+                ],
+            }
+        }),
+    );
+    let before = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+
+    install_to(home.path(), DECK_BINARY).expect("first install");
+    let after_one = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+    install_to(home.path(), DECK_BINARY).expect("second install");
+    let after_two = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+
+    // Measured against real codex-cli 0.149.0 before this fix: the user's
+    // `/usr/bin/env USER_HOOK=1` went from `pre_tool_use:1:0 trustStatus:
+    // trusted` to `pre_tool_use:0:0 trustStatus: modified` after ONE install,
+    // having been moved onto the deck's own stale record at the key it landed
+    // on. Their own record did not survive as an orphan either: the deck's rule
+    // took over `:1:0`, and the trust write updates whatever row is already at
+    // a key, so the user's hash was gone from `[hooks.state]` entirely.
+    assert_eq!(
+        after_one, before,
+        "install moved a hook to a different Codex trust key, so the grant the user made no \
+         longer binds to their handler (issue #1034)"
+    );
+    assert_eq!(
+        after_two, after_one,
+        "the second install moved something the first did not — the property has to hold on \
+         every launch, not just converge after one"
+    );
+    // Non-vacuity: the fixture really does hold the two positions the defect
+    // needs, so the equality above is not comparing two empty vectors.
+    assert_eq!(
+        before.len(),
+        3,
+        "fixture must carry the deck's handler plus a user handler AFTER it in the same rule and \
+         a user rule AFTER the deck's: {before:?}"
+    );
+    assert!(
+        before[1].ends_with("/usr/local/bin/my-audit.sh")
+            && before[2].ends_with("/usr/bin/env USER_HOOK=1"),
+        "fixture must place both user handlers after the deck's: {before:?}"
+    );
+    // And the install still did its job: exactly one deck command, refreshed
+    // where it already sat rather than appended beside the old one.
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![expected_hook_command(DECK_BINARY)],
+        "the deck's own command must be present exactly once, refreshed in place"
+    );
+}
+
+/// Scenario: Seed a Codex home holding two of this binary's own deck rules — the duplicate shape only a pre-fix install could leave behind — with a user's hook sitting between them, then install once. The surplus deck rule must go while the user's handler keeps the exact `group_idx` it started with, and the trailing rule it vacated is dropped.
+#[spec("codex/hooks/008")]
+#[test]
+fn codex_hooks_008_a_surplus_deck_rule_is_dropped_without_moving_the_user() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_command = format!("{DECK_BINARY} {DECK_COMMAND_SUFFIX}");
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "hooks": [ { "type": "command", "command": deck_command } ] },
+                    { "hooks": [ { "type": "command", "command": "/usr/bin/env USER_HOOK=1" } ] },
+                    { "hooks": [ { "type": "command", "command": deck_command } ] },
+                ],
+            }
+        }),
+    );
+
+    install_to(home.path(), DECK_BINARY).expect("install");
+
+    let root = read_hooks(home.path());
+    let rules = root["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array");
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![expected_hook_command(DECK_BINARY)],
+        "the surplus copy of this binary's own rule must be removed"
+    );
+    // The point of the test: the user was at `group_idx` 1 and is still at
+    // `group_idx` 1. The rule the surplus emptied is TRAILING, so it is dropped
+    // (PRD #1487) — nothing follows it to re-key. An emptied rule with anything
+    // after it is kept instead; `agent_hook_config`'s consolidation tests pin
+    // that half.
+    assert_eq!(
+        rules[1]["hooks"][0]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user's rule must keep the group_idx Codex keyed their trust record to: {rules:?}"
+    );
+    assert_eq!(
+        rules.len(),
+        2,
+        "a trailing rule the surplus handler vacated is dropped: {rules:?}"
+    );
+}
+
+/// Scenario: Install over a Codex home holding the deck's command in the legacy flat `{"command": …}` rule shape, in the two arrangements that get opposite answers — the flat rule reached before any nested deck handler, and one reached after it. The first must fall back to the old strip-then-append path and the second must be swept, and neither may leave a second deck command behind.
+#[spec("codex/hooks/009")]
+#[test]
+fn codex_hooks_009_a_legacy_flat_deck_rule_is_swept_without_disturbing_the_nested_ones() {
+    let deck_command = format!("{DECK_BINARY} {DECK_COMMAND_SUFFIX}");
+    let flat = json!({ "command": deck_command });
+    let nested = json!({ "hooks": [ { "type": "command", "command": deck_command } ] });
+    let user = json!({ "hooks": [ { "type": "command", "command": "/usr/bin/env USER_HOOK=1" } ] });
+
+    // Arm 1 — the flat rule comes FIRST, so no position is claimed and the whole
+    // array goes back to the pre-#1034 path. The user's index is not preserved
+    // here and that is the documented trade: the Codex adapter never writes a
+    // flat rule, so this shape is a hand-edit no probe covers.
+    let home = test_temp::tempdir().expect("create Codex home");
+    write_hooks(
+        home.path(),
+        &json!({ "hooks": { "PreToolUse": [flat.clone(), user.clone(), nested.clone()] } }),
+    );
+    install_to(home.path(), DECK_BINARY).expect("install over a leading flat rule");
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![expected_hook_command(DECK_BINARY)],
+        "a leading flat deck rule must not survive beside the refreshed one"
+    );
+
+    // Arm 2 — the flat rule comes AFTER a nested one, so the nested one is
+    // claimed and refreshed in place and the flat one is surplus. Removing it
+    // is measurably safe rather than hopefully so: a rule with no `hooks` array
+    // contributes no listed entry at all on 0.149.0, so it holds no trust key
+    // and taking its `command` out moves nothing.
+    let home = test_temp::tempdir().expect("create Codex home");
+    write_hooks(
+        home.path(),
+        &json!({ "hooks": { "PreToolUse": [nested, user, flat] } }),
+    );
+    install_to(home.path(), DECK_BINARY).expect("install over a trailing flat rule");
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![expected_hook_command(DECK_BINARY)],
+        "a trailing flat deck rule must be swept out of a file the deck keeps tidy"
+    );
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array")
+        .clone();
+    assert_eq!(
+        rules[1]["hooks"][0]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user keeps the group_idx their trust record is keyed to: {rules:?}"
+    );
+    assert_eq!(
+        rules.len(),
+        2,
+        "a trailing rule the flat command vacated is dropped, moving nothing (PRD #1487): {rules:?}"
+    );
+}
+
+/// Scenario: Seed one Codex rule holding the deck's command twice with the user's own handler last — the shape where dropping the surplus copy would slide the user's handler down a slot — then install. The user's handler must keep `handler_idx` 2, because Codex keys their trust record to it.
+#[spec("codex/hooks/010")]
+#[test]
+fn codex_hooks_010_a_surplus_handler_is_not_dropped_out_from_under_a_user() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": "/usr/bin/env USER_HOOK=1" },
+                    ]
+                }]
+            }
+        }),
+    );
+    let before = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+
+    install_to(home.path(), DECK_BINARY).expect("install");
+
+    let after = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+    // Greptile's P1 on PR #1166. The first draft of the in-place refresh removed
+    // every surplus copy wherever it sat, which slid this user's handler from
+    // `pre_tool_use:0:2` to `:0:1` — the same re-keying the whole change exists
+    // to stop, one level down from the `group_idx` it had already fixed. The
+    // surplus copy is kept and refreshed instead: the deck's own hook firing
+    // twice is the cheaper side of the trade against losing a user's grant.
+    assert_eq!(
+        after, before,
+        "dropping a surplus deck handler must not slide a user's handler down a slot"
+    );
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array")
+        .clone();
+    assert_eq!(
+        rules[0]["hooks"][2]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user's handler must still be the third: {rules:?}"
+    );
+    // The kept copy is REFRESHED, not merely left: a stale dead pin left in
+    // place is an exec failure on every event, where a duplicate is not.
+    for index in [0usize, 1] {
+        assert_eq!(
+            rules[0]["hooks"][index]["command"],
+            json!(deck_command),
+            "both surviving deck handlers must carry the current command: {rules:?}"
+        );
+    }
+}
+
+/// Scenario: Seed a rule whose trailing handlers are all the deck's own surplus copies, with nothing of the user's after them, then install. Those copies must actually be removed, so the tail rule is a real sweep rather than a blanket refusal to tidy.
+#[spec("codex/hooks/011")]
+#[test]
+fn codex_hooks_011_a_trailing_surplus_handler_is_still_swept() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "hooks": [
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": "/usr/bin/env USER_HOOK=1" },
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": deck_command },
+                    ]
+                }]
+            }
+        }),
+    );
+
+    install_to(home.path(), DECK_BINARY).expect("install");
+
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array")
+        .clone();
+    let handlers = rules[0]["hooks"].as_array().expect("handlers").clone();
+    assert_eq!(
+        handlers.len(),
+        2,
+        "both trailing surplus copies must go — nothing of the user's follows them: {rules:?}"
+    );
+    assert_eq!(handlers[0]["command"], json!(deck_command));
+    assert_eq!(
+        handlers[1]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user's handler keeps handler_idx 1: {rules:?}"
+    );
+}
+
+/// Run the real wrapper around `program` inside a deck-managed pane (a pane id
+/// is set, so the trust step runs), with `path` as its WHOLE `$PATH` and a real
+/// hook socket collecting every event it emits.
+///
+/// `path` is the variable issue #559 turns on: the trust step shells a bare
+/// `codex app-server` resolved against the WRAPPER's `$PATH`, so a `codex` that
+/// exists only inside the launcher (`devbox run codex-big`) is `NotFound` there.
+/// Everything else is [`run_wrapped_program`]'s isolation — a seeded durable
+/// deck in `deck_home`, a pinned `CODEX_HOME` — for the same reasons.
+fn run_wrapped_program_collecting_events(
+    program: &std::path::Path,
+    codex_home: &std::path::Path,
+    fixture_dir: &std::path::Path,
+    deck_home: &std::path::Path,
+    hook_response: &str,
+    path: &str,
+) -> (Output, Vec<dot_agent_deck::event::AgentEvent>) {
+    use std::io::Read as _;
+
+    let socket = fixture_dir.join("hook.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket).expect("bind wrapper event socket");
+    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["wrap", "--agent", "codex", "--"])
+        .arg(program)
+        .env("PATH", path)
+        .env("HOME", deck_home)
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_ARGS_RECORD", fixture_dir.join("args.txt"))
+        .env("CODEX_HOME_RECORD", fixture_dir.join("home.txt"))
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_response)
+        .env("DOT_AGENT_DECK_PANE_ID", "codex-prompt-reports-pane")
+        .env("DOT_AGENT_DECK_AGENT_ID", "codex-prompt-reports-agent")
+        .env("DOT_AGENT_DECK_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run wrapper collecting its events");
+    // The pipe path sends every event synchronously before the wrapper exits,
+    // so each one is already a queued connection by now.
+    listener
+        .set_nonblocking(true)
+        .expect("make wrapper event listener nonblocking");
+    let mut events = Vec::new();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("read the queued event blocking");
+                let mut json = String::new();
+                stream
+                    .read_to_string(&mut json)
+                    .expect("read wrapper event");
+                events.push(serde_json::from_str(json.trim()).expect("parse wrapper event"));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("accept wrapper event: {error}"),
+        }
+    }
+    (output, events)
+}
+
+/// The deck's own `UserPromptSubmit` entry as Codex lists it, with the user's
+/// `/hooks` toggle set to `enabled`.
+fn prompt_hook_entry(command: &str, enabled: bool) -> Value {
+    let mut entry = hook_entry(
+        "__CODEX_HOME__/hooks.json:user_prompt_submit:0:0",
+        command,
+        "__CODEX_HOME__/hooks.json",
+        "sha256:deck-prompt",
+        false,
+    );
+    entry["eventName"] = json!("userPromptSubmit");
+    entry["enabled"] = json!(enabled);
+    entry
+}
+
+/// Scenario: Run the real wrapper in a deck-managed pane around a Codex launcher script three times, collecting every event it emits: with a `codex` app-server stand-in on its PATH that lists the deck's prompt hook switched on, with no `codex` on its PATH at all (a launcher like `devbox run codex-big` whose `codex` exists only inside it), and with the stand-in listing the prompt hook switched OFF in Codex's `/hooks` browser. The first run records trust and must declare nothing. The other two leave no prompt hook that will run, so every event they emit must declare that no submitted-prompt report will come from this pane.
+#[spec("codex/trust/005")]
+#[test]
+fn codex_trust_005_untrusted_hooks_are_declared_on_every_wrapper_event() {
+    use dot_agent_deck::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Case {
+        /// The healthy wrapped Codex: prompt hook listed, on, and trusted.
+        PromptHookTrusted,
+        /// Issue #559's PATH shape: no `codex` for the trust step to run.
+        NoCodexOnPath,
+        /// Trust recorded, but only for a hook that is not the prompt hook —
+        /// the prompt hook is listed and switched off (Qodo on PR #1390).
+        PromptHookDisabled,
+    }
+
+    for case in [
+        Case::PromptHookTrusted,
+        Case::NoCodexOnPath,
+        Case::PromptHookDisabled,
+    ] {
+        let fixture = test_temp::tempdir().expect("create wrapper fixture");
+        let home = test_temp::tempdir().expect("create Codex home");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        let deck_command = expected_hook_command(
+            seed_durable_binary(deck_home.path())
+                .to_str()
+                .expect("durable path is UTF-8"),
+        );
+        let fake_codex = write_fake_codex(fixture.path());
+        let launcher = fixture.path().join("launcher.sh");
+        write_fake_program(&launcher);
+        let response = hook_list_response(vec![
+            own_home_entry(&deck_command, 0, "sha256:deck"),
+            prompt_hook_entry(&deck_command, case != Case::PromptHookDisabled),
+        ]);
+        let path = if case == Case::NoCodexOnPath {
+            // The system directories only: no `codex` anywhere, as on a host
+            // where it is reachable solely through the launcher.
+            std::fs::remove_file(&fake_codex).expect("take codex off the wrapper's PATH");
+            "/usr/bin:/bin".to_string()
+        } else {
+            fixture_path(fixture.path())
+        };
+
+        let (output, events) = run_wrapped_program_collecting_events(
+            &launcher,
+            home.path(),
+            fixture.path(),
+            deck_home.path(),
+            &response,
+            &path,
+        );
+
+        assert!(output.status.success(), "wrapper failed: {output:?}");
+        let trust_recorded = home.path().join("config.toml").exists();
+        assert_eq!(
+            trust_recorded,
+            case != Case::NoCodexOnPath,
+            "precondition ({case:?}): whether the trust step recorded anything; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            events.len() >= 2,
+            "expected at least the fork-time start and the exit-time event; events={events:?}"
+        );
+        let declaring: Vec<bool> = events
+            .iter()
+            .map(|event| {
+                event
+                    .metadata
+                    .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
+            })
+            .collect();
+        if case == Case::PromptHookTrusted {
+            assert!(
+                declaring.iter().all(|declared| !declared),
+                "a wrapper that got Codex's prompt hook trusted must declare nothing: Codex's \
+                 own UserPromptSubmit will report, and declaring otherwise would take every \
+                 healthy Codex pane's retry away; events={events:?}"
+            );
+        } else {
+            assert!(
+                declaring.iter().all(|declared| *declared),
+                "{case:?}: a wrapper whose prompt hook will not run must say so on EVERY event \
+                 — the fork-time start included, since it is the first thing the deck learns \
+                 the pane is Codex from — or the deck reads the pane as able to confirm a \
+                 delivery and types a delivered prompt in again (issue #559); events={events:?}"
+            );
+        }
+    }
+}
+
+/// A `hooks/list` reply like [`hook_list_response`], but carrying `warnings`.
+///
+/// Codex reports a hook it could not load through `warnings` (and `errors`)
+/// while still answering successfully, so a listing that carries one may be
+/// missing positions that are really in the file (issue #1027).
+fn hook_list_response_with_warnings(entries: Vec<Value>, warnings: Vec<&str>) -> String {
+    json!({
+        "id": 2,
+        "result": {
+            "data": [{
+                "cwd": "/workspace",
+                "hooks": entries,
+                "warnings": warnings,
+                "errors": []
+            }]
+        }
+    })
+    .to_string()
+}
+
+/// Every `[hooks.state]` record in `home`'s `config.toml`, as `key -> trusted_hash`
+/// (an empty hash for a record that carries none).
+fn trust_state_hashes(home: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let contents =
+        std::fs::read_to_string(home.join("config.toml")).expect("read Codex config.toml");
+    let root: toml::Value = toml::from_str(&contents).expect("parse Codex config.toml");
+    root.get("hooks")
+        .and_then(|value| value.get("state"))
+        .and_then(toml::Value::as_table)
+        .expect("config.toml has [hooks.state] entries")
+        .iter()
+        .map(|(key, record)| {
+            let hash = record
+                .get("trusted_hash")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (key.clone(), hash)
+        })
+        .collect()
+}
+
+/// Scenario: Seed a Codex home whose `config.toml` already holds trust records left behind at positions the deck's hook no longer occupies, next to records belonging to the user, to an older deck build and to another Codex home, then run `dot-agent-deck hooks install --agent codex` against a stand-in listing the deck's hook and one user hook. Only the deck's own stale records — at an unlisted position, in this home's `hooks.json`, carrying the hash of the deck's current hook — must be removed; every other record must survive, and nothing at all is removed when the listing carries a warning.
+#[spec("codex/trust/006")]
+#[test]
+fn codex_trust_006_only_the_decks_own_stale_trust_records_are_collected() {
+    let deck_hash = "sha256:deck";
+    let run = |warnings: Vec<&str>| {
+        let fixture = test_temp::tempdir().expect("create CLI fixture");
+        let home = test_temp::tempdir().expect("create Codex home");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        write_fake_codex(fixture.path());
+        let deck_command = expected_hook_command(
+            seed_durable_binary(deck_home.path())
+                .to_str()
+                .expect("durable path is UTF-8"),
+        );
+        let ours = format!("{}/hooks.json", home.path().display());
+        let key = |position: &str| format!("{ours}:{position}");
+        // The user's hook is in the SAME shared hooks.json as the deck's, which is
+        // why neither position alone nor hash alone may decide a deletion.
+        let user_entry = hook_entry(
+            "__CODEX_HOME__/hooks.json:pre_tool_use:1:0",
+            "/usr/bin/env USER_HOOK=1",
+            "__CODEX_HOME__/hooks.json",
+            "sha256:user",
+            false,
+        );
+        let seeded = format!(
+            "model = \"gpt-user-choice\"\n\n\
+             [hooks.state.\"{current}\"]\ntrusted_hash = \"{deck_hash}\"\n\n\
+             [hooks.state.\"{listed_with_deck_hash}\"]\ntrusted_hash = \"{deck_hash}\"\n\n\
+             [hooks.state.\"{stale_table}\"]\ntrusted_hash = \"{deck_hash}\"\n\n\
+             [hooks.state.\"{users_own}\"]\ntrusted_hash = \"sha256:user-earlier\"\n\n\
+             [hooks.state.\"{older_deck}\"]\ntrusted_hash = \"sha256:older-deck-build\"\n\n\
+             [hooks.state.\"{other_home}\"]\ntrusted_hash = \"{deck_hash}\"\n\n\
+             [hooks.state]\n\"{stale_inline}\" = {{ enabled = false, trusted_hash = \"{deck_hash}\" }}\n\
+             \"not-a-codex-key\" = {{ trusted_hash = \"{deck_hash}\" }}\n",
+            current = key("pre_tool_use:0:0"),
+            listed_with_deck_hash = key("pre_tool_use:1:0"),
+            stale_table = key("pre_tool_use:2:0"),
+            users_own = key("pre_tool_use:0:1"),
+            older_deck = key("stop:4:0"),
+            other_home = "/elsewhere/.codex/hooks.json:pre_tool_use:2:0",
+            stale_inline = key("stop:3:0"),
+        );
+        std::fs::write(home.path().join("config.toml"), &seeded).expect("seed Codex config");
+        let response = hook_list_response_with_warnings(
+            vec![own_home_entry(&deck_command, 0, deck_hash), user_entry],
+            warnings,
+        );
+
+        let output = run_cli_install(
+            home.path(),
+            deck_home.path(),
+            &fixture_path(fixture.path()),
+            &response,
+        );
+        assert!(
+            output.status.success(),
+            "hook install failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let after = trust_state_hashes(home.path());
+        let keys: Vec<String> = after.keys().cloned().collect();
+        let names = [
+            ("current", key("pre_tool_use:0:0")),
+            ("listed_with_deck_hash", key("pre_tool_use:1:0")),
+            ("stale_table", key("pre_tool_use:2:0")),
+            ("stale_inline", key("stop:3:0")),
+            ("users_own", key("pre_tool_use:0:1")),
+            ("older_deck", key("stop:4:0")),
+            (
+                "other_home",
+                "/elsewhere/.codex/hooks.json:pre_tool_use:2:0".to_string(),
+            ),
+            ("not_a_codex_key", "not-a-codex-key".to_string()),
+        ];
+        let present: Vec<&str> = names
+            .iter()
+            .filter(|(_, key)| keys.contains(key))
+            .map(|(name, _)| *name)
+            .collect();
+        let config = std::fs::read_to_string(home.path().join("config.toml"))
+            .expect("read Codex config.toml");
+        (present, config)
+    };
+
+    // A clean listing: the deck's two stale records go, everything else stays.
+    let (present, config) = run(Vec::new());
+    assert_eq!(
+        present,
+        vec![
+            "current",
+            "listed_with_deck_hash",
+            "users_own",
+            "older_deck",
+            "other_home",
+            "not_a_codex_key",
+        ],
+        "only the deck's own stale records may be collected — a user's record in the same \
+         file, a deck-hash record at a position Codex still lists, an older deck build's record \
+         and another home's record must all survive:\n{config}"
+    );
+    assert!(
+        config.starts_with("model = \"gpt-user-choice\"\n"),
+        "the rest of the user's config must be left alone:\n{config}"
+    );
+
+    // Control: the same seed, but Codex reported a warning, so the listing may be
+    // missing positions that are really in the file. Nothing is collected.
+    let (present, config) = run(vec!["hooks.json: unsupported handler type"]);
+    assert_eq!(
+        present,
+        vec![
+            "current",
+            "listed_with_deck_hash",
+            "stale_table",
+            "stale_inline",
+            "users_own",
+            "older_deck",
+            "other_home",
+            "not_a_codex_key",
+        ],
+        "a listing that carries a warning is not evidence a position is gone, so no record may \
+         be collected from it:\n{config}"
+    );
+}
+
+/// Scenario: A user has turned the deck's own Codex `PreToolUse` hook off in Codex's `/hooks` list (`enabled = false` on its trust record), then runs `dot-agent-deck hooks install --agent codex`. The hook must stay off while its trust is refreshed, and the command must tell the user, by event name, that the deck's hook is turned off in Codex; with the hook on, no such note appears.
+#[spec("codex/hooks/012")]
+#[test]
+fn codex_hooks_012_install_names_a_deck_hook_the_user_turned_off() {
+    let run = |enabled: bool| {
+        let fixture = test_temp::tempdir().expect("create CLI fixture");
+        let home = test_temp::tempdir().expect("create Codex home");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        write_fake_codex(fixture.path());
+        let deck_command = expected_hook_command(
+            seed_durable_binary(deck_home.path())
+                .to_str()
+                .expect("durable path is UTF-8"),
+        );
+        let deck_key = format!("{}/hooks.json:pre_tool_use:0:0", home.path().display());
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "[hooks.state.\"{deck_key}\"]\nenabled = {enabled}\ntrusted_hash = \"sha256:stale\"\n"
+            ),
+        )
+        .expect("seed Codex config");
+        let mut entry = own_home_entry(&deck_command, 0, "sha256:deck");
+        entry["enabled"] = json!(enabled);
+        let log = fixture.path().join("deck.log");
+        let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .args(["hooks", "install", "--agent", "codex"])
+            .env("PATH", fixture_path(fixture.path()))
+            .env("HOME", deck_home.path())
+            .env("CODEX_HOME", home.path())
+            .env("CODEX_HOOK_LIST_RESPONSE", hook_list_response(vec![entry]))
+            .env("DOT_AGENT_DECK_LOG", &log)
+            .output()
+            .expect("install Codex hooks from CLI");
+        assert!(
+            output.status.success(),
+            "hook install failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = std::fs::read_to_string(home.path().join("config.toml"))
+            .expect("read Codex config.toml");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        (config, stdout, log)
+    };
+
+    let (config, stdout, log) = run(false);
+    assert!(
+        config.contains("enabled = false") && config.contains("trusted_hash = \"sha256:deck\""),
+        "the user's `enabled = false` must survive while the hash is refreshed:\n{config}"
+    );
+    let note = stdout
+        .lines()
+        .find(|line| line.contains("turned off"))
+        .unwrap_or_else(|| {
+            panic!("install must tell the user the deck's hook is turned off:\n{stdout}")
+        });
+    assert!(
+        note.contains("PreToolUse"),
+        "the note must name the hook by its event: {note:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "Trusted hooks: 1"),
+        "the trust count line must stay a bare count: {stdout}"
+    );
+    assert!(
+        log.contains("WARN") && log.contains("turned off"),
+        "a warn-level log line must record the turned-off deck hook:\n{log}"
+    );
+
+    // Control: the same install with the hook switched on says nothing about it.
+    let (_, stdout, _) = run(true);
+    assert!(
+        !stdout.contains("turned off"),
+        "no note may appear when the deck's hooks are on:\n{stdout}"
+    );
+}
+
+/// Scenario: Seed a Codex home whose `hooks.json` holds three user rules under `PreToolUse` and whose `config.toml` holds two records carrying the deck's hash at positions the `hooks/list` stand-in does not report — one at a position that exists in `hooks.json` (as when another deck process wrote and trusted it after this run took its listing) and one at a position that does not — then run `dot-agent-deck hooks install --agent codex`. Only the record at the position missing from the file must be removed.
+#[spec("codex/trust/007")]
+#[test]
+fn codex_trust_007_a_position_still_in_hooks_json_keeps_its_record() {
+    let fixture = test_temp::tempdir().expect("create CLI fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    write_fake_codex(fixture.path());
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
+    let user_rule = |n: u8| json!({"hooks": [{"type": "command", "command": format!("/usr/bin/env USER_HOOK={n}")}]});
+    write_hooks(
+        home.path(),
+        &json!({"hooks": {"PreToolUse": [user_rule(1), user_rule(2), user_rule(3)]}}),
+    );
+    let key = |position: &str| format!("{}/hooks.json:{position}", home.path().display());
+    let in_file = key("pre_tool_use:2:0");
+    let gone = key("pre_tool_use:9:0");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[hooks.state.\"{in_file}\"]\ntrusted_hash = \"sha256:deck\"\n\n\
+             [hooks.state.\"{gone}\"]\ntrusted_hash = \"sha256:deck\"\n"
+        ),
+    )
+    .expect("seed Codex config");
+    // The listing names the deck's hook (so the sweep runs) but not position
+    // `2:0` — the shape a listing taken before a concurrent deck process
+    // rewrote `hooks.json` has.
+    let response = hook_list_response(vec![own_home_entry(&deck_command, 0, "sha256:deck")]);
+
+    let output = run_cli_install(
+        home.path(),
+        deck_home.path(),
+        &fixture_path(fixture.path()),
+        &response,
+    );
+    assert!(
+        output.status.success(),
+        "hook install failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let keys = trust_state_keys(home.path());
+    assert!(
+        keys.contains(&in_file),
+        "a record at a position hooks.json still holds must survive even when the listing \
+         missed it: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&gone),
+        "a deck-hash record at a position neither listed nor in hooks.json must still go: \
+         {keys:?}"
+    );
+}
+
+/// Scenario: Launch the real wrapper in a deck pane against a Codex stand-in whose `app-server` takes 6 s to answer `initialize`, the shape a starved box gave real Codex 0.160.0. The deck's hook must still be trusted in the pinned home's `config.toml` before the stand-in is launched, so Codex would run it rather than stopping on its hook-review dialog.
+#[spec("codex/trust/009")]
+#[test]
+fn codex_trust_009_a_slow_app_server_still_gets_the_spawn_trust_write() {
+    let fixture = test_temp::tempdir().expect("create wrapper fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
+    let fake_codex = write_fake_codex(fixture.path());
+    let script = std::fs::read_to_string(&fake_codex).expect("read fake codex");
+    let slow = script.replacen(
+        "then\n    IFS= read -r _initialize\n",
+        "then\n    IFS= read -r _initialize\n    sleep 6\n",
+        1,
+    );
+    assert_ne!(
+        slow, script,
+        "the stand-in's app-server branch must gain the delay"
+    );
+    std::fs::write(&fake_codex, slow).expect("write slow fake codex");
+    let key = "__CODEX_HOME__/hooks.json:pre_tool_use:0:0";
+    let response = hook_list_response(vec![hook_entry(
+        key,
+        &deck_command,
+        "__CODEX_HOME__/hooks.json",
+        "sha256:deck",
+        false,
+    )]);
+
+    let (output, args, _) = run_wrapped_program(
+        std::path::Path::new("codex"),
+        home.path(),
+        fixture.path(),
+        deck_home.path(),
+        &response,
+    );
+
+    assert!(output.status.success(), "wrapper failed: {output:?}");
+    assert!(!args.is_empty(), "the stand-in Codex was never launched");
+    assert!(
+        home.path().join("config.toml").is_file(),
+        "a hooks/list reply 6 s late must still be waited for at spawn; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        trust_state_keys(home.path()),
+        vec![key.replace("__CODEX_HOME__", &home.path().display().to_string())],
     );
 }

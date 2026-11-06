@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::untrusted_text::strip_control_and_bidi;
+use crate::version::parse_version_output;
 
 /// GitHub releases base URL used to download `dot-agent-deck` binaries onto
 /// remote hosts. Kept as a re-export under this crate-local name because three
@@ -43,20 +44,27 @@ pub struct SshTarget {
     pub user: Option<String>,
     pub port: u16,
     pub key: Option<PathBuf>,
+    /// PRD #1487 (Risk 4): a `Host` name from `~/.ssh/config` to reach the deck
+    /// through, as `ssh -J <alias>` — the deck list's `jump_host`, so `remote
+    /// upgrade` takes the route the desktop tunnel uses. Emitted by
+    /// [`SystemSshExecutor::build_command`] only when it validates as a
+    /// [`crate::remote_tunnel::HostAlias`]; `connect`'s
+    /// [`crate::connect::build_connect_command`] still ignores it.
+    pub jump: Option<String>,
 }
 
 impl SshTarget {
     /// Parse `[user@]host` and combine with `--port` / `--key` flags.
     pub fn parse(target: &str, port: u16, key: Option<PathBuf>) -> Self {
-        let (user, host) = match target.split_once('@') {
-            Some((u, h)) => (Some(u.to_string()), h.to_string()),
-            None => (None, target.to_string()),
-        };
+        // The last `@`, as ssh splits a destination (issue #1350's review).
+        let (user, host) = crate::deck_list::split_login(target);
+        let (user, host) = (user.map(str::to_string), host.to_string());
         Self {
             host,
             user,
             port,
             key,
+            jump: None,
         }
     }
 
@@ -84,12 +92,80 @@ impl SshTarget {
     /// `-i` is deliberately absent: host-key verification happens before
     /// authentication, so naming a key buys nothing here, and leaving it out
     /// keeps a `--key` path out of a rendered message.
+    ///
+    /// The jump host is named when the session takes one (Qodo 4202060288):
+    /// without `-J` the remedy reaches the deck by a different route than the
+    /// one that failed, or not at all.
     pub fn host_key_remedy(&self) -> String {
-        if self.port == DEFAULT_SSH_PORT {
-            format!("ssh {}", self.user_host())
-        } else {
-            format!("ssh -p {} {}", self.port, self.user_host())
+        let mut line = String::from("ssh");
+        if let Some(jump) = self.valid_jump() {
+            line.push_str(&format!(" -J {}", shell_word(jump.as_str())));
         }
+        if self.port != DEFAULT_SSH_PORT {
+            line.push_str(&format!(" -p {}", self.port));
+        }
+        line.push(' ');
+        line.push_str(&self.user_host());
+        line
+    }
+
+    /// [`Self::jump`] when it validates as a
+    /// [`crate::remote_tunnel::HostAlias`], the form every ssh session and
+    /// every printed command uses; an invalid value (a hand-edited registry)
+    /// is dropped, as [`SystemSshExecutor::build_command`] drops it.
+    pub fn valid_jump(&self) -> Option<crate::remote_tunnel::HostAlias> {
+        crate::remote_tunnel::HostAlias::parse(self.jump.as_deref()?).ok()
+    }
+
+    /// A command line the user can paste to run `remote_command` on this
+    /// remote themselves: the registered port and identity file included, so
+    /// it reaches the endpoint the deck talks to rather than port 22 (PR
+    /// #1373 review — the same wrong-endpoint defect `host_key_remedy`
+    /// records). Every word is quoted for a POSIX shell whenever it holds
+    /// anything outside a plain set. For the destination and key path, which
+    /// came from the user's `remote add`, that makes pasting the line run only
+    /// `ssh` locally. For `remote_command`, it keeps a `~` for the REMOTE shell
+    /// to expand, not the laptop's, whose home can be a different path (PR
+    /// #1373 review). A destination
+    /// that starts with `-` is preceded by `--` so ssh cannot read it as an
+    /// option (PR #1373 review). The jump host rides along as `-J`, in the
+    /// position [`SystemSshExecutor::build_command`] passes it, so the line
+    /// takes the deck's route (Qodo 4202060288).
+    pub fn command_line(&self, remote_command: &str) -> String {
+        let mut line = String::from("ssh");
+        if self.port != DEFAULT_SSH_PORT {
+            line.push_str(&format!(" -p {}", self.port));
+        }
+        if let Some(key) = &self.key {
+            line.push_str(&format!(" -i {}", shell_word(&key.to_string_lossy())));
+        }
+        if let Some(jump) = self.valid_jump() {
+            line.push_str(&format!(" -J {}", shell_word(jump.as_str())));
+        }
+        let destination = self.user_host();
+        if destination.starts_with('-') {
+            line.push_str(" --");
+        }
+        line.push_str(&format!(
+            " {} {}",
+            shell_word(&destination),
+            shell_word(remote_command)
+        ));
+        line
+    }
+}
+
+/// `word` as one POSIX shell word: unchanged when it is made only of
+/// characters no shell treats specially, single-quoted otherwise.
+pub(crate) fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
 }
 
@@ -172,7 +248,7 @@ pub enum SshError {
 /// receives a stripped value, so its escape became a second line of defence
 /// and the doctor quotes the residue rather than the escaped original. See its
 /// doc comment — that trade is recorded there.
-fn scrub_remote_text(s: &str) -> String {
+pub(crate) fn scrub_remote_text(s: &str) -> String {
     strip_control_and_bidi(s, true).trim().to_string()
 }
 
@@ -326,7 +402,84 @@ pub trait SshExecutor {
         }
         Ok(CappedOutput { output, truncated })
     }
+
+    /// [`run_capped`](Self::run_capped) under a laptop-side wall-clock
+    /// `deadline` of the call's own, whatever the executor was built for.
+    ///
+    /// PRD #1487 audit A1: the remote-upgrade executor is deliberately built
+    /// with no wall-clock kill, because a release download may legitimately
+    /// take minutes. The short plumbing commands that reach the remote daemon
+    /// run on the same ssh target and jump route, but a reply to one of them is
+    /// a few KiB and arrives in seconds, so they must be bounded per command:
+    /// both streams capped while they drain, and the session killed at
+    /// `deadline`. The production [`SystemSshExecutor`] does exactly that; this
+    /// default, for fakes whose transport is already bounded, ignores
+    /// `deadline` and falls back to [`run_capped`](Self::run_capped).
+    fn run_capped_within(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        let _ = deadline;
+        self.run_capped(target, command, max_capture_bytes)
+    }
+
+    /// [`run_capped_within`](Self::run_capped_within) with `input` written to
+    /// the remote command's stdin, which is then closed (issue #1619).
+    ///
+    /// For a payload too large for the command line: the ssh route runs one
+    /// remote command string, which the remote shell receives as one argument,
+    /// so anything carried in it shares Linux's per-argument limit
+    /// (`MAX_ARG_STRLEN`, 128 KiB). Bounded exactly as `run_capped_within` is.
+    /// On Unix the writer stops when the call returns, so a remote that never
+    /// reads its stdin costs nothing past the deadline; elsewhere a write
+    /// blocked on a full pipe is abandoned and ends when the pipe's last
+    /// reader closes.
+    ///
+    /// The default refuses without running anything: an executor that cannot
+    /// deliver the input must not run a command that expects it. The
+    /// production [`SystemSshExecutor`] overrides it. Callers check
+    /// [`writes_stdin`](Self::writes_stdin) first, so the refusal is a
+    /// backstop rather than a path.
+    fn run_capped_within_input(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        input: &[u8],
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        let _ = (command, input, max_capture_bytes, deadline);
+        Err(SshError::Other {
+            target: target.user_host(),
+            detail: "this ssh executor cannot write to a remote command's stdin".to_string(),
+        })
+    }
+
+    /// Whether [`run_capped_within_input`](Self::run_capped_within_input)
+    /// delivers its input. `false` for this default, which refuses.
+    fn writes_stdin(&self) -> bool {
+        false
+    }
+
+    /// The shortest `deadline` [`run_capped_within`](Self::run_capped_within)
+    /// honours: a caller with less time left should not start a command. Zero
+    /// for this default, which ignores the deadline; the production
+    /// [`SystemSshExecutor`] counts whole seconds and returns
+    /// [`MIN_BOUNDED_REMOTE_RUN`].
+    fn min_bounded_run(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
 }
+
+/// The shortest deadline [`SystemSshExecutor`]'s
+/// [`SshExecutor::run_capped_within`] honours. Its kill timer counts whole
+/// seconds, so a deadline is rounded down to one, and one under a second is
+/// refused without starting a session — a caller with less than this left
+/// should not start a remote command at all.
+pub const MIN_BOUNDED_REMOTE_RUN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Issue #858: seconds of headroom the laptop-side wallclock kill gets on top
 /// of the worst case the probe's own ssh options permit.
@@ -401,6 +554,14 @@ pub struct SystemSshExecutor {
     /// capping a slow-but-alive transfer. `None` keeps the original behavior.
     /// Mutually exclusive with `wallclock_timeout` by construction.
     keepalive: Option<SshKeepalive>,
+    /// Issue #1490: force `StrictHostKeyChecking=yes`, so a session refuses a
+    /// host whose key is not already trusted instead of following a permissive
+    /// user `Host` block. See [`Self::requiring_known_host_key`].
+    require_known_host_key: bool,
+    /// The ssh client to run: `ssh`, found on `PATH`. Only a unit test points
+    /// it elsewhere, at a stand-in that misbehaves the way a hostile remote
+    /// would, so the production executor's own bounds are what get exercised.
+    program: std::ffi::OsString,
 }
 
 /// PRD #161 FIX 3: ssh keepalive parameters for the remote-upgrade executor.
@@ -421,6 +582,8 @@ impl SystemSshExecutor {
             wallclock_timeout: None,
             observation: false,
             keepalive: None,
+            require_known_host_key: false,
+            program: "ssh".into(),
         }
     }
 
@@ -433,6 +596,8 @@ impl SystemSshExecutor {
             wallclock_timeout: Some(secs),
             observation: false,
             keepalive: None,
+            require_known_host_key: false,
+            program: "ssh".into(),
         }
     }
 
@@ -451,6 +616,8 @@ impl SystemSshExecutor {
             wallclock_timeout: Some(secs),
             observation: true,
             keepalive: None,
+            require_known_host_key: false,
+            program: "ssh".into(),
         }
     }
 
@@ -471,7 +638,34 @@ impl SystemSshExecutor {
                 interval,
                 count_max,
             }),
+            require_known_host_key: false,
+            program: "ssh".into(),
         }
+    }
+
+    /// Make every session of this executor an **observation** session — the
+    /// [`apply_observation_options`] flags, the one list of them — whatever
+    /// bounds it was built with. [`Self::for_observation`] is this over the
+    /// wallclock cap; issue #1490's desktop checks and start use it over the
+    /// keepalive bounds, because they run unattended against a deck the app
+    /// is not connected to and need to authenticate to the host, never to
+    /// delegate a credential to it.
+    pub fn observing(mut self) -> Self {
+        self.observation = true;
+        self
+    }
+
+    /// Force `StrictHostKeyChecking=yes` (issue #1490), the host-key policy the
+    /// desktop's tunnel forces ([`crate::remote_tunnel`]'s `forced_options`).
+    /// A session to a host whose key is not already trusted then fails with
+    /// [`SshError::HostKeyVerificationFailed`] instead of following a user
+    /// `Host` block's `accept-new` or `no` — so a desktop check or start
+    /// cannot silently accept a key the tunnel would then refuse. Not part of
+    /// [`apply_observation_options`], whose docs say why `remote doctor` must
+    /// still work against a host it has never connected to.
+    pub fn requiring_known_host_key(mut self) -> Self {
+        self.require_known_host_key = true;
+        self
     }
 
     /// The laptop-side wallclock deadline this executor arms on each ssh
@@ -484,15 +678,36 @@ impl SystemSshExecutor {
         self.wallclock_timeout.map(wallclock_kill_secs)
     }
 
+    /// Run `program` instead of `ssh` — a test's stand-in for a misbehaving
+    /// remote. Everything else about the executor stays as built.
+    #[cfg(test)]
+    pub(crate) fn with_program(mut self, program: impl Into<std::ffi::OsString>) -> Self {
+        self.program = program.into();
+        self
+    }
+
     /// Build the `ssh` command without spawning it. Exposed for tests so we
     /// can verify argument quoting without forking a subprocess.
     pub fn build_command(&self, target: &SshTarget, remote_command: &str) -> Command {
-        let mut cmd = Command::new("ssh");
+        self.build_command_with(target, remote_command, false)
+    }
+
+    /// [`Self::build_command`], with `-T` when the session carries input on
+    /// stdin: a terminal the user's `RequestTTY` asked for would echo and
+    /// rewrite that input instead of passing it through (Greptile 4236434468).
+    fn build_command_with(&self, target: &SshTarget, remote_command: &str, input: bool) -> Command {
+        let mut cmd = Command::new(&self.program);
+        if input {
+            cmd.arg("-T");
+        }
         // BatchMode=yes makes ssh fail fast on missing keys/known_hosts
         // instead of hanging on a TTY prompt. Users who haven't trusted the
         // host yet will see an actionable error rather than the deck CLI
         // wedging.
         cmd.arg("-o").arg("BatchMode=yes");
+        if self.require_known_host_key {
+            cmd.arg("-o").arg("StrictHostKeyChecking=yes");
+        }
         if self.observation {
             apply_observation_options(&mut cmd);
         }
@@ -526,6 +741,22 @@ impl SystemSshExecutor {
         cmd.arg("-p").arg(target.port.to_string());
         if let Some(key) = &target.key {
             cmd.arg("-i").arg(key);
+        }
+        // PRD #1487: the deck list's jump host, validated as the tunnel
+        // validates it — a name from the user's ssh config, nothing an option
+        // or a `ProxyCommand` could reinterpret. A value that fails the check
+        // (a hand-edited registry) is dropped with a warning rather than passed.
+        if let Some(jump) = &target.jump {
+            match crate::remote_tunnel::HostAlias::parse(jump) {
+                Ok(alias) => {
+                    cmd.arg("-J").arg(alias.as_str());
+                }
+                Err(e) => tracing::warn!(
+                    target: "remote",
+                    error = %e,
+                    "ignoring an invalid jump host for this ssh session"
+                ),
+            }
         }
         cmd.arg("--");
         cmd.arg(target.user_host());
@@ -737,6 +968,105 @@ impl SshExecutor for SystemSshExecutor {
             truncated,
         })
     }
+
+    /// Always bounded, whatever this executor was built for: both streams are
+    /// capped at `max_capture_bytes` while they drain, and the session is
+    /// killed at `deadline` rounded down to whole seconds (or at this
+    /// executor's own kill deadline, when it has a shorter one). A deadline
+    /// under [`MIN_BOUNDED_REMOTE_RUN`] starts nothing and is an error. The ssh options the executor was built with — the
+    /// upgrade path's keepalives, a jump host — are kept, so the command takes
+    /// the same route as every other session to that deck (PRD #1487 audit A1).
+    fn run_capped_within(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        self.run_bounded_session(target, command, None, max_capture_bytes, deadline)
+    }
+
+    /// [`Self::run_capped_within`], with `input` fed to the session's stdin.
+    fn run_capped_within_input(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        input: &[u8],
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        self.run_bounded_session(target, command, Some(input), max_capture_bytes, deadline)
+    }
+
+    fn writes_stdin(&self) -> bool {
+        true
+    }
+
+    fn min_bounded_run(&self) -> std::time::Duration {
+        MIN_BOUNDED_REMOTE_RUN
+    }
+}
+
+impl SystemSshExecutor {
+    /// The body of [`SshExecutor::run_capped_within`] and
+    /// [`SshExecutor::run_capped_within_input`]: stdin is null, or `input`.
+    fn run_bounded_session(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        input: Option<&[u8]>,
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        // Whole seconds, rounded DOWN: `run_local_bounded`'s granularity. A
+        // deadline under one second cannot be honoured, so nothing is started
+        // rather than granting the session a whole second the caller does not
+        // have (PRD #1487, Qodo review item 13).
+        let mut secs = deadline.as_secs();
+        if let Some(own) = self.kill_deadline_secs() {
+            secs = secs.min(own);
+        }
+        if secs == 0 {
+            return Err(SshError::Other {
+                target: target.user_host(),
+                detail: format!(
+                    "{:.1}s left is less than the {}s a remote command needs, so it was not started",
+                    deadline.as_secs_f64(),
+                    MIN_BOUNDED_REMOTE_RUN.as_secs()
+                ),
+            });
+        }
+        let mut cmd = self.build_command_with(target, command, input.is_some());
+        // Its own process group: a `ProxyCommand` or jump-route helper that
+        // outlives the session is killed with it (PRD #1487 re-check R1).
+        let capture = run_local_bounded_in(&mut cmd, secs, max_capture_bytes, true, input)
+            .map_err(|source| SshError::Io {
+                target: target.user_host(),
+                source,
+            })?;
+        let Some(status) = capture.status else {
+            return Err(SshError::Other {
+                target: target.user_host(),
+                detail: format!(
+                    "the remote command did not finish within {secs}s, so it was stopped"
+                ),
+            });
+        };
+        let status = status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&capture.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&capture.stderr).into_owned();
+        if status == 255 {
+            return Err(classify_ssh_error(target, &stderr));
+        }
+        Ok(CappedOutput {
+            output: SshOutput {
+                status,
+                stdout,
+                stderr,
+            },
+            truncated: capture.truncated,
+        })
+    }
 }
 
 /// What one bounded local subprocess run produced.
@@ -759,6 +1089,24 @@ pub struct LocalCapture {
     pub timed_out: bool,
 }
 
+/// How long a stream may stay open after the child [`run_local_bounded`]
+/// spawned has exited. A process that exited has said everything it will say —
+/// what it wrote is already in the pipe — so a stream still open past this is
+/// held by a descendant that inherited it (a `ProxyCommand`, a jump-route
+/// helper, a wrapper, a `ControlPersist` master started with `-v`), and waiting
+/// on it would put that descendant's lifetime in charge of the call's.
+const POST_EXIT_STREAM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a cancelled stream reader gets to drain what is already buffered
+/// and close its pipe. On Unix the reader is non-blocking and stops within one
+/// poll tick; where it cannot be made non-blocking it is abandoned after this.
+const READER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// After a cancel, a reader keeps reading only what the kernel already holds
+/// — at most a pipe buffer, which Linux caps at 1 MiB — so a descendant that
+/// keeps writing cannot keep a cancelled reader alive.
+const FINAL_DRAIN_BYTES: usize = 1024 * 1024;
+
 /// Spawn `cmd`, enforce a laptop-side wallclock kill at `secs` seconds, and
 /// bound the in-memory capture of each stream at `max_capture_bytes`.
 ///
@@ -775,27 +1123,42 @@ pub struct LocalCapture {
 ///   remote binary or wrapping shell could observe local input for up to the
 ///   deadline.
 /// - Pipes stdout/stderr and drains them concurrently in two helper threads
-///   while the main loop polls `child.try_wait()`. This is what
+///   while the main loop polls the child for exit. This is what
 ///   `Command::output()` does internally, and it's required for any child
 ///   producing more output than a single pipe buffer (~64 KiB on Linux):
 ///   without concurrent draining, the child blocks in `write(2)` before it
-///   can exit, `try_wait` keeps returning `None`, and the wallclock fires
+///   can exit, the poll keeps reporting it running, and the wallclock fires
 ///   even though the child wasn't actually stalled.
 /// - Applies `max_capture_bytes` to *each* stream independently — stdout and
 ///   stderr are separate attack vectors, and a hostile peer that floods stderr
 ///   drives memory growth just as easily as one that floods stdout. A drainer
-///   stops reading altogether at its cap; if the child keeps writing it fills
-///   the kernel pipe buffer, blocks in `write(2)`, and the deadline reaps it.
-/// - Polls `child.try_wait()` every 50ms until the deadline. Polling cadence
+///   stops reading altogether at its cap and closes its pipe, so a child that
+///   keeps writing dies of `SIGPIPE`/`EPIPE` or is reaped at the deadline.
+/// - Polls the child every 50ms until the deadline — on Unix with
+///   `waitid(…, WNOWAIT)`, which observes the exit without reaping, so the
+///   child is reaped exactly once, after the last signal (see [`Leader`]).
+///   Polling cadence
 ///   is a wallclock-vs-CPU tradeoff; 50ms keeps the worst-case overshoot
 ///   under a tick while costing ~20 syscalls/sec.
-/// - On deadline: SIGKILL via `child.kill()`, reap with `child.wait()`, and
-///   return `timed_out: true`. **The kill reaches the child only.** `ssh -G`
-///   evaluates `Match exec`, so a config with `Match exec "sleep 30"` has
-///   already forked a descendant that this does not signal; such a descendant
-///   is orphaned and reaped by init when it exits on its own. The bound this
-///   helper offers is on *our* wait and *our* memory, not on what the user's
-///   own configuration chose to spawn.
+/// - **The deadline bounds the streams, not only the child** (PRD #1487
+///   re-check R1). A descendant that inherited a stream keeps its write end
+///   open after the child exits or is killed, so "wait for EOF" can outlive any
+///   deadline. The call therefore never joins a reader unconditionally: once
+///   the child has exited, a stream still open after
+///   [`POST_EXIT_STREAM_GRACE`] is cancelled, and at the deadline both are.
+///   A cancelled reader drains what is already buffered and closes its pipe —
+///   on Unix it reads non-blocking under `poll(2)`, so it notices the cancel
+///   within a tick; elsewhere a reader still blocked after
+///   [`READER_STOP_GRACE`] is abandoned rather than joined, and exits when the
+///   last writer closes.
+/// - On deadline: SIGKILL the child, then reap it, and
+///   return `timed_out: true`. **Here the kill reaches the child only.**
+///   `ssh -G` evaluates `Match exec`, so a config with `Match exec "sleep 30"`
+///   has already forked a descendant that this does not signal; such a
+///   descendant is orphaned and reaped by init when it exits on its own. The
+///   bound this helper offers is on *our* wait and *our* memory, not on what
+///   the user's own configuration chose to spawn.
+///   [`run_local_bounded_owning_group`] is the variant that also kills them.
 /// - Computes the deadline with `Instant::checked_add` so an absurd `secs`
 ///   (e.g. `u64::MAX`) can never panic between `spawn` and the polling
 ///   loop and leak the child — probe callers already clamp to a sane upper
@@ -805,98 +1168,156 @@ pub fn run_local_bounded(
     secs: u64,
     max_capture_bytes: usize,
 ) -> std::io::Result<LocalCapture> {
+    run_local_bounded_in(cmd, secs, max_capture_bytes, false, None)
+}
+
+/// [`run_local_bounded`], with the child started in a process group of its own
+/// on Unix, so that whatever it spawns into that group is killed with it.
+///
+/// The group is sent `SIGKILL` whenever the call ends with any of it possibly
+/// still running: at the deadline, and when the child has exited but a stream
+/// is still held open past [`POST_EXIT_STREAM_GRACE`] — the shape of a
+/// `ProxyCommand` or jump-route helper outliving its `ssh`. The child itself is
+/// reaped here, and only after that signal: until then it is kept an unreaped
+/// zombie, so the group id it names cannot have been reused by the time the
+/// signal is sent ([`Leader`]). A killed descendant is not our child and is
+/// reaped by whoever inherited it. A descendant that left the group (`setsid`, as a
+/// `ControlPersist` master does) is not signalled, and the call still returns
+/// on time because its readers are cancelled rather than joined.
+///
+/// Not the default, because a child in its own group no longer receives the
+/// terminal's `Ctrl+C`: this is for short plumbing commands whose lifetime the
+/// caller owns outright (PRD #1487's remote upgrade), not for the
+/// user-interruptible install pipeline. On non-Unix hosts it is
+/// [`run_local_bounded`].
+pub fn run_local_bounded_owning_group(
+    cmd: &mut Command,
+    secs: u64,
+    max_capture_bytes: usize,
+) -> std::io::Result<LocalCapture> {
+    run_local_bounded_in(cmd, secs, max_capture_bytes, true, None)
+}
+
+/// `input`, when given, is written to the child's stdin by a [`PipeWriter`],
+/// which then closes it; otherwise stdin is null. The writer is cancelled when
+/// the call returns, however it returns (issue #1619). On Unix that stops it
+/// within a poll tick, so a child (or a descendant holding its stdin) that
+/// never reads costs nothing past the call; elsewhere a write blocked on a full
+/// pipe is abandoned, as a blocked reader is, and ends when the pipe's last
+/// reader closes.
+fn run_local_bounded_in(
+    cmd: &mut Command,
+    secs: u64,
+    max_capture_bytes: usize,
+    own_group: bool,
+    input: Option<&[u8]>,
+) -> std::io::Result<LocalCapture> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if own_group {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn()?;
+    let mut leader = Leader::new(child, own_group);
+    // Dropped on every return below, which cancels it.
+    let _writer = input.and_then(|bytes| {
+        leader
+            .child
+            .stdin
+            .take()
+            .map(|pipe| PipeWriter::spawn(pipe, bytes.to_vec()))
+    });
 
     // `usize::MAX` is the wrapper's spelling of "no cap"; map it back to
-    // `None` so the uncapped install path keeps its plain `read_to_end`
-    // instead of looping through the chunked capped drainer for nothing.
+    // `None` so the uncapped install path reads without a byte limit.
     let cap = (max_capture_bytes != usize::MAX).then_some(max_capture_bytes);
-    let stdout_handle = child
+    let stdout = leader
+        .child
         .stdout
         .take()
-        .map(|s| std::thread::spawn(move || drain_pipe(s, cap)));
-    let stderr_handle = child
+        .map(|s| PipeReader::spawn(s, cap));
+    let stderr = leader
+        .child
         .stderr
         .take()
-        .map(|s| std::thread::spawn(move || drain_pipe(s, cap)));
+        .map(|s| PipeReader::spawn(s, cap));
+    let readers: Vec<&PipeReader> = stdout.iter().chain(stderr.iter()).collect();
 
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(secs))
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
     let poll_interval = Duration::from_millis(50);
 
-    let join_pipes = |stdout_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
-                      stderr_handle: Option<std::thread::JoinHandle<Vec<u8>>>|
-     -> (Vec<u8>, Vec<u8>) {
-        let stdout = stdout_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        let stderr = stderr_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        (stdout, stderr)
-    };
+    // The child is observed here but never reaped: it stays a zombie, holding
+    // its pid — and so its group id — until `leader.reap()` below, which comes
+    // after the last signal this call sends (PRD #1487 final audit F1).
+    let mut exited_at: Option<Instant> = None;
+    let mut timed_out = false;
+    loop {
+        if exited_at.is_none() {
+            match leader.has_exited() {
+                Ok(true) => exited_at = Some(Instant::now()),
+                Ok(false) => {}
+                Err(source) => {
+                    leader.abandon(&source);
+                    PipeReader::stop_all(&readers);
+                    return Err(source);
+                }
+            }
+        }
+        let streams_closed = readers.iter().all(|r| r.is_done());
+        if exited_at.is_some() && streams_closed {
+            break;
+        }
+        let now = Instant::now();
+        let held_after_exit = exited_at.is_some_and(|at| {
+            at.checked_add(POST_EXIT_STREAM_GRACE)
+                .is_none_or(|limit| now >= limit)
+        });
+        if now >= deadline || held_after_exit {
+            // Something this call started may still be running: the child
+            // itself, or a descendant holding one of its streams open. Best
+            // effort, secondary errors ignored — SIGKILL is unblockable, so
+            // the reap below returns, and the readers are cancelled, never
+            // joined.
+            leader.kill();
+            timed_out = exited_at.is_none();
+            PipeReader::stop_all(&readers);
+            break;
+        }
+        std::thread::sleep(poll_interval);
+    }
+    // The only reap, after every signal: from here on the pid and the group id
+    // may belong to someone else, and `reap` consumes the leader so nothing
+    // can signal them.
+    let reaped = leader.reap();
+    let status = if timed_out { None } else { Some(reaped?) };
 
+    let stdout = stdout.map(|r| r.take()).unwrap_or_default();
+    let stderr = stderr.map(|r| r.take()).unwrap_or_default();
     // A drainer stops exactly AT its cap, so a stream that reached it is a
     // prefix of what the child wanted to say. An output that happens to be
     // exactly `max_capture_bytes` long is reported truncated too; that errs
     // toward "I could not read all of it", which is the safe direction for
     // every caller here.
-    let truncated = |stdout: &[u8], stderr: &[u8]| {
-        stdout.len() >= max_capture_bytes || stderr.len() >= max_capture_bytes
-    };
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Child already exited; close the pipes by joining the
-                // drain threads (they will see EOF once the kernel reaps
-                // the writers).
-                let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
-                let truncated = truncated(&stdout, &stderr);
-                return Ok(LocalCapture {
-                    status: Some(status),
-                    stdout,
-                    stderr,
-                    truncated,
-                    timed_out: false,
-                });
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Best-effort cleanup: ignore secondary errors. SIGKILL
-                    // is unblockable so the child is guaranteed to be
-                    // reaped, and `wait` collects the zombie. Joining the
-                    // drain threads after kill ensures their pipe handles
-                    // don't outlive this function.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
-                    let truncated = truncated(&stdout, &stderr);
-                    return Ok(LocalCapture {
-                        status: None,
-                        stdout,
-                        stderr,
-                        truncated,
-                        timed_out: true,
-                    });
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(source) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = join_pipes(stdout_handle, stderr_handle);
-                return Err(source);
-            }
-        }
-    }
+    let truncated = stdout.len() >= max_capture_bytes || stderr.len() >= max_capture_bytes;
+    Ok(LocalCapture {
+        status,
+        stdout,
+        stderr,
+        truncated,
+        timed_out,
+    })
 }
 
 /// Spawn `cmd` and enforce a laptop-side wallclock kill at `secs` seconds,
@@ -943,40 +1364,410 @@ fn run_with_wallclock_kill(
     }
 }
 
-/// Drain a child-process pipe into a `Vec<u8>`, optionally capping how much
-/// is retained. When `cap` is `Some(n)`, at most `n` bytes are buffered and
-/// the helper returns immediately once that bound is hit — no further `read`
-/// syscalls are issued. If the child keeps writing it will fill the kernel
-/// pipe buffer and then block in `write(2)`; the surrounding wallclock kill
-/// is the documented fallback that reaps such children. Errors are
-/// swallowed: a half-read pipe still returns the bytes that did land,
-/// matching the behavior `Command::output()` exhibits when the kernel closes
-/// the writer.
-fn drain_pipe<R: std::io::Read>(mut reader: R, cap: Option<usize>) -> Vec<u8> {
-    match cap {
-        None => {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
+/// The child [`run_local_bounded_in`] spawned, and the process group it owns
+/// when the call is [`run_local_bounded_owning_group`].
+///
+/// The group id is the child's pid, so it names this call's group only while
+/// the kernel keeps that pid: while the child runs, and after it exits for as
+/// long as it stays an unreaped zombie. A group signal sent after the reap
+/// could reach a stranger's group once the number is reused, and a descendant
+/// that left the group with `setsid` while holding a stream keeps the call
+/// waiting through exactly that window, with no member left to hold the id
+/// (PRD #1487 final audit F1). So the child's exit is observed without reaping
+/// it (`waitid(…, WNOWAIT)`), every signal is sent before [`Leader::reap`], and
+/// `reap` consumes the value, so no signal can follow it.
+struct Leader {
+    child: std::process::Child,
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
+}
+
+impl Leader {
+    fn new(child: std::process::Child, own_group: bool) -> Self {
+        #[cfg(unix)]
+        {
+            let pgid = own_group
+                .then(|| libc::pid_t::try_from(child.id()).ok())
+                .flatten()
+                .filter(|&pgid| group_is_signalable(pgid));
+            Self { child, pgid }
         }
-        Some(cap) => {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                if buf.len() >= cap {
-                    break;
-                }
-                let needed = cap - buf.len();
-                let take = chunk.len().min(needed);
-                match reader.read(&mut chunk[..take]) {
-                    Ok(0) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(_) => break,
-                }
-            }
-            buf
+        #[cfg(not(unix))]
+        {
+            let _ = own_group;
+            Self { child }
         }
     }
+
+    /// Whether the child has exited. On Unix it is left unreaped, so its pid
+    /// and group id stay reserved until [`Leader::reap`].
+    fn has_exited(&mut self) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            exited_unreaped(self.child.id())
+        }
+        // No process groups here; std keeps the status for `reap` to return.
+        #[cfg(not(unix))]
+        {
+            self.child.try_wait().map(|status| status.is_some())
+        }
+    }
+
+    /// SIGKILL the child and, when this call owns one, its whole group. Safe
+    /// to aim at the group because the child has not been reaped: whether it
+    /// is running or a zombie, its pid — the group id — is still its own.
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.filter(|&pgid| group_is_signalable(pgid)) {
+            #[cfg(all(test, unix))]
+            leader_seam::record(leader_seam::Event::GroupSignal {
+                leader_unreaped: leader_seam::unreaped(self.child.id()),
+            });
+            // SAFETY: killpg takes plain integers and has no memory effects.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+    }
+
+    /// Give up after the child's exit could not be observed. No group signal:
+    /// the failure may mean something else reaped the child (a process that
+    /// ignores `SIGCHLD` has its children reaped automatically), and then
+    /// neither its pid nor its group id is ours any more. `ECHILD` says exactly
+    /// that, so nothing is signalled; any other failure kills the child alone
+    /// and reaps it, as before.
+    fn abandon(mut self, err: &std::io::Error) {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ECHILD) {
+            return;
+        }
+        let _ = err;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Reap the child — the last thing done with it. Consumes the leader, so
+    /// no signal can be sent after the pid and group id are released.
+    fn reap(mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(all(test, unix))]
+        leader_seam::record(leader_seam::Event::Reap);
+        self.child.wait()
+    }
+}
+
+/// Whether child `pid` has exited, observed without reaping it.
+#[cfg(unix)]
+fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid out-parameter, and
+        // `waitid` writes no more than one. `WNOWAIT` leaves the child
+        // waitable, so this neither reaps it nor changes what a later wait
+        // sees; `WNOHANG` returns at once with `si_pid` still 0 when the child
+        // has not exited.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::from(pid),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: `waitid` filled `info` (or left it zeroed).
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// Defence in depth for a group signal: `killpg(0)` would signal the caller's
+/// own group, `1` is init's, and a non-positive id is not a group at all.
+/// Whatever produced `pgid`, these are never this call's to kill.
+#[cfg(unix)]
+fn group_is_signalable(pgid: libc::pid_t) -> bool {
+    // SAFETY: getpgrp takes no arguments and cannot fail.
+    pgid > 1 && pgid != unsafe { libc::getpgrp() }
+}
+
+/// What [`Leader`] did, in order, so a test can assert that no group signal
+/// follows the reap, and that the kernel still held the child at the moment
+/// of each signal. Recording is per thread and off until a test turns it on.
+#[cfg(all(test, unix))]
+mod leader_seam {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Event {
+        /// The group was signalled; `leader_unreaped` is the kernel's answer,
+        /// at that moment, to whether the child was still waitable.
+        GroupSignal {
+            leader_unreaped: bool,
+        },
+        Reap,
+    }
+
+    thread_local! {
+        static EVENTS: RefCell<Option<Vec<Event>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(event: Event) {
+        EVENTS.with(|events| {
+            if let Some(events) = events.borrow_mut().as_mut() {
+                events.push(event);
+            }
+        });
+    }
+
+    /// Run `f` with recording on, and return what it recorded.
+    pub(super) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Event>) {
+        EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        let recorded = EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default());
+        (out, recorded)
+    }
+
+    /// Whether child `pid` is still waitable — running, or an unreaped zombie.
+    pub(super) fn unreaped(pid: u32) -> bool {
+        super::exited_unreaped(pid).is_ok()
+    }
+}
+
+/// One stream's drainer: a helper thread that reads the pipe into a shared
+/// buffer, so the caller can stop waiting for it — and still keep what it
+/// read — without joining the thread. Crate-visible for the daemon's restart
+/// target check (`daemon_restart::run_version_bounded`, issue #1615), which
+/// has the same problem of a descendant holding a pipe open.
+pub(crate) struct PipeReader {
+    shared: std::sync::Arc<PipeShared>,
+}
+
+#[derive(Default)]
+struct PipeShared {
+    buf: std::sync::Mutex<Vec<u8>>,
+    /// Set by the reader once it has stopped and closed its pipe.
+    done: std::sync::atomic::AtomicBool,
+    /// Set by the caller to ask the reader to drain what is buffered and stop.
+    cancel: std::sync::atomic::AtomicBool,
+}
+
+impl PipeReader {
+    pub(crate) fn spawn<R>(pipe: R, cap: Option<usize>) -> Self
+    where
+        R: std::io::Read + PipeFd + Send + 'static,
+    {
+        let shared = std::sync::Arc::new(PipeShared::default());
+        let thread_shared = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            drain_pipe(pipe, cap, &thread_shared);
+            thread_shared
+                .done
+                .store(true, std::sync::atomic::Ordering::Release);
+        });
+        Self { shared }
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.shared.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Cancel every reader, then give them [`READER_STOP_GRACE`] together to
+    /// drain and close. A reader still running after that is abandoned: it
+    /// owns nothing but its pipe and its share of the buffer.
+    pub(crate) fn stop_all(readers: &[&PipeReader]) {
+        for reader in readers {
+            reader
+                .shared
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let until = std::time::Instant::now() + READER_STOP_GRACE;
+        while !readers.iter().all(|r| r.is_done()) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// What this stream delivered so far.
+    pub(crate) fn take(self) -> Vec<u8> {
+        let mut buf = self
+            .shared
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *buf)
+    }
+}
+
+/// Drain a child-process pipe into `shared.buf`, optionally capping how much
+/// is retained. When `cap` is `Some(n)`, at most `n` bytes are buffered and
+/// the helper stops — closing the pipe — once that bound is hit. Errors end
+/// the drain: a half-read pipe still keeps the bytes that did land, matching
+/// the behavior `Command::output()` exhibits when the kernel closes the writer.
+///
+/// On Unix the pipe is read non-blocking under `poll(2)`, so a cancel is
+/// noticed within a tick even while a quiet descendant holds the write end;
+/// after a cancel the reader takes what the kernel already holds (at most
+/// [`FINAL_DRAIN_BYTES`]) and stops. Elsewhere the read blocks, and a cancel
+/// is only noticed between reads.
+fn drain_pipe<R: std::io::Read + PipeFd>(mut pipe: R, cap: Option<usize>, shared: &PipeShared) {
+    use std::sync::atomic::Ordering;
+
+    let nonblocking = pipe.set_nonblocking();
+    let mut chunk = [0u8; 8192];
+    let mut after_cancel = 0usize;
+    let mut len = 0usize;
+    loop {
+        let cancelled = shared.cancel.load(Ordering::Acquire);
+        if cancelled && (!nonblocking || after_cancel >= FINAL_DRAIN_BYTES) {
+            break;
+        }
+        let room = cap.map_or(chunk.len(), |cap| cap.saturating_sub(len));
+        if room == 0 {
+            break;
+        }
+        let take = chunk.len().min(room);
+        match pipe.read(&mut chunk[..take]) {
+            Ok(0) => break,
+            Ok(n) => {
+                shared
+                    .buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..n]);
+                len += n;
+                if cancelled {
+                    after_cancel += n;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if cancelled {
+                    // Everything the kernel held has been read.
+                    break;
+                }
+                pipe.wait_ready(Ready::Readable, std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    drop(pipe);
+}
+
+/// One child's stdin feeder: a helper thread that writes a payload into the
+/// pipe and then closes it, so the child reads the payload and then EOF.
+/// Dropping the value cancels it, and the caller never joins the thread.
+struct PipeWriter {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PipeWriter {
+    fn spawn<W>(pipe: W, payload: Vec<u8>) -> Self
+    where
+        W: std::io::Write + PipeFd + Send + 'static,
+    {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_cancel = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || feed_pipe(pipe, &payload, &thread_cancel));
+        Self { cancel }
+    }
+}
+
+impl Drop for PipeWriter {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Write `payload` into a child's stdin, then close it. On Unix the pipe is
+/// written non-blocking under `poll(2)`, so a cancel is noticed within a tick
+/// while nothing reads the other end; elsewhere the write blocks, and the
+/// thread ends when the last reader closes the pipe (`EPIPE`), which is when
+/// the child and anything that inherited its stdin have exited.
+fn feed_pipe<W: std::io::Write + PipeFd>(
+    mut pipe: W,
+    payload: &[u8],
+    cancel: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+
+    pipe.set_nonblocking();
+    let mut rest = payload;
+    while !rest.is_empty() && !cancel.load(Ordering::Acquire) {
+        match pipe.write(rest) {
+            Ok(0) => break,
+            Ok(n) => rest = &rest[n..],
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                pipe.wait_ready(Ready::Writable, std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    drop(pipe);
+}
+
+/// Which readiness [`PipeFd::wait_ready`] waits for.
+#[derive(Clone, Copy)]
+pub(crate) enum Ready {
+    Readable,
+    Writable,
+}
+
+/// The two things [`drain_pipe`] and [`feed_pipe`] need from a pipe beyond
+/// `Read`/`Write`, which only Unix can provide; elsewhere both are no-ops and
+/// the read or write blocks.
+pub(crate) trait PipeFd {
+    /// Switch this end to non-blocking. `false` when that failed or is not
+    /// supported, in which case reads and writes block.
+    fn set_nonblocking(&self) -> bool;
+    /// Wait up to `timeout` for the pipe to become `ready`, or closed.
+    fn wait_ready(&self, ready: Ready, timeout: std::time::Duration);
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> PipeFd for T {
+    fn set_nonblocking(&self) -> bool {
+        let fd = self.as_raw_fd();
+        // SAFETY: fcntl on a descriptor this value owns; F_GETFL/F_SETFL have
+        // no memory effects. O_NONBLOCK is per open file description, and the
+        // child's end of the pipe is a different one, so the child is
+        // unaffected.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+        }
+    }
+
+    fn wait_ready(&self, ready: Ready, timeout: std::time::Duration) {
+        let mut pfd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: match ready {
+                Ready::Readable => libc::POLLIN,
+                Ready::Writable => libc::POLLOUT,
+            },
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one valid pollfd, count 1; an EINTR return is just an early
+        // wake-up, and the caller reads again either way.
+        unsafe {
+            libc::poll(&mut pfd, 1, millis);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl<T> PipeFd for T {
+    fn set_nonblocking(&self) -> bool {
+        false
+    }
+
+    fn wait_ready(&self, _ready: Ready, _timeout: std::time::Duration) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,14 +1800,199 @@ pub struct RemoteEntry {
     /// untouched so the registry only records sessions that actually ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_connected: Option<String>,
+    /// How the deck is installed on the remote, as `remote add` / `remote
+    /// upgrade` last detected it (issue #1372): [`INSTALL_LOCAL_BIN`] or
+    /// [`INSTALL_HOMEBREW`]. `None` on entries written before the field
+    /// existed, which try [`REMOTE_INSTALL_PATH`] first; `connect` can discover
+    /// and record a Homebrew install if that path is gone. Kept as a string
+    /// rather than an enum so a value written by a newer build does not make
+    /// this build refuse the whole registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<String>,
+    /// Absolute path of the deck binary on the remote, recorded when it is not
+    /// [`REMOTE_INSTALL_PATH`] — today, a Homebrew install's
+    /// `<prefix>/bin/dot-agent-deck`. `connect`, `remote doctor` and the hook
+    /// install run this path; `None` means [`REMOTE_INSTALL_PATH`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<RemoteBinaryPath>,
+    /// Issue #1350: the fields the desktop app's deck rows carry, optional so
+    /// every row `remote add` wrote before them still loads. See
+    /// [`crate::deck_list`], which is how both clients edit this file.
+    ///
+    /// The desktop's stable id for the row. A row without one has an id
+    /// derived from its `name` ([`crate::deck_list::deck_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The login name, when it cannot be folded into `host` as `user@host`
+    /// (a login containing `@` itself). Wins over a user in `host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// A `Host` name from `~/.ssh/config` to reach the deck through (`ssh -J`).
+    /// Used by the desktop; `connect` does not route through it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<String>,
+    /// The daemon's attach socket path on the remote, as the desktop's `Test
+    /// connection` discovered it. `connect` does not need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
 }
 
 impl RemoteEntry {
     /// Reconstruct an [`SshTarget`] from this entry's stored host/port/key. The
     /// `host` field carries the original `[user@]host` string the user typed
-    /// at `remote add` time; we re-parse it the same way `add` does.
+    /// at `remote add` time; we re-parse it the same way `add` does. An
+    /// explicit `user` field (issue #1350) wins over the one in `host`.
     pub fn ssh_target(&self) -> SshTarget {
-        SshTarget::parse(&self.host, self.port, self.key.as_ref().map(PathBuf::from))
+        let mut target =
+            SshTarget::parse(&self.host, self.port, self.key.as_ref().map(PathBuf::from));
+        if let Some(user) = &self.user {
+            target.user = Some(user.clone());
+        }
+        target.jump = self.jump_host.clone();
+        target
+    }
+
+    /// Whether `other` reaches the same daemon this row does: the same ssh
+    /// route (host, login, port, key and jump host) and the same daemon
+    /// socket. What an upgrade captured at its start is compared with the row
+    /// it is about to record into, so a row moved to another machine in the
+    /// meantime is refused rather than written over (PRD #1487, Greptile
+    /// 4208066970).
+    pub fn same_route(&self, other: &RemoteEntry) -> bool {
+        self.ssh_target() == other.ssh_target() && self.socket == other.socket
+    }
+
+    /// The deck binary to invoke on the remote, spelled for the remote shell:
+    /// the recorded [`binary`](Self::binary) when there is one, otherwise
+    /// [`REMOTE_INSTALL_PATH`]. Safe to interpolate into a remote command
+    /// unquoted, because [`RemoteBinaryPath`] admits no shell metacharacter
+    /// and [`REMOTE_INSTALL_PATH`] is a constant.
+    pub fn remote_binary(&self) -> &str {
+        self.binary
+            .as_ref()
+            .map_or(REMOTE_INSTALL_PATH, RemoteBinaryPath::as_str)
+    }
+
+    /// [`Self::remote_binary`] as the validated type a remote command takes.
+    pub fn deck_binary(&self) -> RemoteDeckBinary {
+        RemoteDeckBinary::recorded_or_default(self.binary.as_ref())
+    }
+}
+
+/// Where `remote add` installs the deck on a remote that has no Homebrew
+/// install of it, and the binary every command runs for an entry that records
+/// no other. Invoked by absolute path because a non-interactive ssh shell
+/// typically does not have `~/.local/bin` on `PATH`.
+pub use crate::connect::REMOTE_INSTALL_PATH;
+
+/// [`RemoteEntry::install`] for a deck downloaded to [`REMOTE_INSTALL_PATH`].
+pub const INSTALL_LOCAL_BIN: &str = "local-bin";
+/// [`RemoteEntry::install`] for a deck installed by a Homebrew formula.
+pub const INSTALL_HOMEBREW: &str = "homebrew";
+
+/// Homebrew's default prefixes — Apple silicon, Intel macOS, Linux — probed
+/// by absolute path because a non-interactive ssh shell usually does not have
+/// `brew` on `PATH` (Homebrew adds itself in a login profile). A custom prefix
+/// is found only through `command -v brew`.
+pub const HOMEBREW_PREFIXES: &[&str] =
+    &["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
+
+/// An absolute path on the remote, restricted to characters that need no
+/// quoting in a POSIX shell, so it can be interpolated into a remote command
+/// as-is. The restriction is enforced on both ways in — parsing the remote's
+/// own answer, and deserializing `remotes.toml` — so a hand-edited or hostile
+/// value is refused rather than handed to the remote shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RemoteBinaryPath(String);
+
+impl RemoteBinaryPath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RemoteBinaryPath {
+    type Error = String;
+
+    fn try_from(path: String) -> Result<Self, Self::Error> {
+        let safe = path.len() > 1
+            && path.starts_with('/')
+            && path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'));
+        if safe {
+            Ok(Self(path))
+        } else {
+            Err(format!(
+                "`{}` is not an absolute path made only of letters, digits and `/._-+`",
+                scrub_remote_text(&path)
+            ))
+        }
+    }
+}
+
+impl From<RemoteBinaryPath> for String {
+    fn from(path: RemoteBinaryPath) -> Self {
+        path.0
+    }
+}
+
+/// The deck binary a remote command runs, as a type that can hold only a value
+/// safe to put **unquoted** at the start of a remote shell command (issue
+/// #1490): the default install or a validated [`RemoteBinaryPath`]. A raw
+/// string enters only through [`TryFrom<&str>`], which refuses anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteDeckBinary {
+    /// [`REMOTE_INSTALL_PATH`], the `~/.local/bin` install. Its leading `~` is
+    /// deliberately left unquoted so the remote shell expands it to the remote
+    /// user's home; quoting it would name a directory literally called `~`.
+    DefaultInstall,
+    /// A recorded absolute path, such as a Homebrew install.
+    Path(RemoteBinaryPath),
+}
+
+impl RemoteDeckBinary {
+    /// The deck-list row's recorded binary, or the default install when it
+    /// records none.
+    pub fn recorded_or_default(recorded: Option<&RemoteBinaryPath>) -> Self {
+        recorded.map_or(Self::DefaultInstall, |path| Self::Path(path.clone()))
+    }
+
+    /// The binary as spelled for the remote shell, ready to interpolate
+    /// unquoted.
+    pub fn as_shell_word(&self) -> &str {
+        match self {
+            Self::DefaultInstall => REMOTE_INSTALL_PATH,
+            Self::Path(path) => path.as_str(),
+        }
+    }
+}
+
+impl From<RemoteBinaryPath> for RemoteDeckBinary {
+    fn from(path: RemoteBinaryPath) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl TryFrom<&str> for RemoteDeckBinary {
+    type Error = String;
+
+    /// [`REMOTE_INSTALL_PATH`] exactly, or an absolute path
+    /// [`RemoteBinaryPath`] accepts. Anything else — whitespace, a shell
+    /// metacharacter, a relative path, any other `~` spelling — is refused.
+    fn try_from(binary: &str) -> Result<Self, Self::Error> {
+        if binary == REMOTE_INSTALL_PATH {
+            Ok(Self::DefaultInstall)
+        } else {
+            RemoteBinaryPath::try_from(binary.to_string()).map(Self::Path)
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteDeckBinary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_shell_word())
     }
 }
 
@@ -1042,117 +2018,59 @@ pub enum RemoteConfigError {
     },
     #[error("Failed to serialize remotes file: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error("Cannot edit remotes file at {path}: {reason}")]
+    Unwritable { path: String, reason: String },
+    /// Issue #1350: an edit would have written an ssh address field that
+    /// [`crate::deck_list::validate_deck_address`] refuses, so nothing was
+    /// written.
+    #[error("Refusing to write remotes file at {path}: {source}")]
+    InvalidAddress {
+        path: String,
+        #[source]
+        source: crate::remote_tunnel::SshArgumentError,
+    },
+    /// Issue #1350: the cross-process edit lock
+    /// ([`crate::deck_list::edit`]) could not be taken, so nothing was read or
+    /// written. `reason` names no path.
+    #[error("Cannot take the edit lock for remotes file at {path}: {reason}")]
+    Locked { path: String, reason: String },
 }
 
 impl RemotesFile {
-    /// Load the registry from `path`. Missing file → empty registry.
+    /// Load the registry from `path`. Missing file → empty registry. Bounded:
+    /// a path that is not a regular file, or is over
+    /// [`crate::deck_list::MAX_REGISTRY_BYTES`], is a read error (issue #1350).
     pub fn load(path: &Path) -> Result<Self, RemoteConfigError> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents).map_err(|source| RemoteConfigError::Parse {
-                path: path.display().to_string(),
-                source,
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(RemoteConfigError::Io {
-                path: path.display().to_string(),
-                source,
-            }),
+        match crate::deck_list::read_registry(path)? {
+            Some(contents) => {
+                toml::from_str(&contents).map_err(|source| RemoteConfigError::Parse {
+                    path: path.display().to_string(),
+                    source,
+                })
+            }
+            None => Ok(Self::default()),
         }
     }
 
     /// Atomically replace the file at `path` with the serialized form of
-    /// `self`. Creates the parent directory if missing. Writes via a sibling
-    /// temp file with mode 0o600, then `rename(2)`s it into place — so a
-    /// partial write or a crash mid-save can never leave a half-written
-    /// `remotes.toml` for the next run to choke on, and the final file is
-    /// owner-only (0o600) regardless of the user's umask.
+    /// `self` — see [`crate::deck_list::write_atomic`].
+    ///
+    /// Rewrites the **whole** file, so it drops any key [`RemoteEntry`] does
+    /// not know. Every production writer edits one row through
+    /// [`crate::deck_list`] instead (issue #1350); this remains for callers
+    /// that build a registry from scratch, such as test fixtures.
     pub fn save(&self, path: &Path) -> Result<(), RemoteConfigError> {
-        use std::io::Write;
-
-        // PRD #163 auditor: create the parent through the fsperm seam, not plain
-        // `create_dir_all`, so the *directory* is owner-only too — the same call
-        // `schedules.toml` already makes. The per-file DACL/mode protects the
-        // contents; this protects the metadata (which remotes exist, by filename)
-        // when `DOT_AGENT_DECK_REMOTES_DIR` points somewhere shared. Create-only,
-        // so an existing directory is never surprise-tightened (PRD #127 S2).
-        let parent = path.parent().unwrap_or(Path::new("."));
-        crate::platform::fsperm::create_owner_only_dir(parent).map_err(|source| {
-            RemoteConfigError::Io {
-                path: parent.display().to_string(),
-                source,
-            }
-        })?;
-
         let contents = toml::to_string_pretty(self)?;
-
-        // Sibling temp file: same directory as the final path so `rename` is
-        // atomic on POSIX filesystems. Pid suffix avoids collisions when
-        // multiple deck processes save concurrently to different registries.
-        let file_name = path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "remotes.toml".to_string());
-        let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
-
-        // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
-        // seam — `.mode(0o600)` on Unix; on Windows (#163) the DACL cannot be
-        // supplied at create time, so the seam instead puts `WRITE_DAC` on the
-        // handle, which is what lets the `set_file_owner_only` call below apply it.
-        let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.create(true).write(true).truncate(true);
-        crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
-        let open_result = open_opts.open(&tmp_path);
-        let mut tmp_file = open_result.map_err(|source| RemoteConfigError::Io {
-            path: tmp_path.display().to_string(),
-            source,
-        })?;
-
-        // Owner-only permissions BEFORE the first content byte (PRD #163 M4).
-        //
-        // Two reasons this runs here rather than after the write. (1) Defense in
-        // depth on Unix, as before: a stale temp file from a crashed previous save
-        // would not have had `OpenOptions::mode()` re-applied, so the bits have to
-        // be set explicitly. (2) On Windows this call is not a re-assert but the
-        // *only* place the protected current-user-only DACL is applied —
-        // `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook, so
-        // `set_create_mode_owner_only` can only pre-authorize this call by putting
-        // `WRITE_DAC` on the handle. Doing that after `write_all` would leave
-        // the credentials in this file readable under the parent directory's
-        // inherited ACL for the length of the write; doing it now means only an
-        // empty file is ever exposed. The end state on Unix is identical.
-        let perm_result = crate::platform::fsperm::set_file_owner_only(&tmp_file);
-        if let Err(source) = perm_result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(RemoteConfigError::Io {
-                path: tmp_path.display().to_string(),
-                source,
-            });
-        }
-
-        let write_result = tmp_file.write_all(contents.as_bytes());
-        if let Err(source) = write_result {
-            // Best-effort cleanup; ignore secondary errors.
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(RemoteConfigError::Io {
-                path: tmp_path.display().to_string(),
-                source,
-            });
-        }
-        drop(tmp_file);
-
-        std::fs::rename(&tmp_path, path).map_err(|source| {
-            let _ = std::fs::remove_file(&tmp_path);
-            RemoteConfigError::Io {
-                path: path.display().to_string(),
-                source,
-            }
-        })
+        crate::deck_list::write_atomic(path, &contents)
     }
 }
 
 /// Default location for the registry: `$DOT_AGENT_DECK_REMOTES` if set,
 /// else `~/.config/dot-agent-deck/remotes.toml`. The env var override is
 /// new; tests use it (or pass an explicit path to `add`).
+///
+/// The one resolver for the deck list: the desktop app calls this too
+/// (issue #1350), so the two clients cannot disagree about which file it is.
 pub fn default_remotes_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_REMOTES") {
         return PathBuf::from(p);
@@ -1192,12 +2110,29 @@ pub enum RemoteAddError {
         "A remote named '{name}' already exists. Use `dot-agent-deck remote remove {name}` first or pick a different name."
     )]
     DuplicateName { name: String },
+    #[error("Invalid remote name: {0}.")]
+    InvalidName(crate::deck_list::DeckNameError),
+    #[error("Invalid remote address: {0}.")]
+    InvalidAddress(crate::remote_tunnel::SshArgumentError),
     #[error("Remote type 'kubernetes' is not yet implemented; planned in PRD #81.")]
     KubernetesNotYetImplemented,
     #[error("Unsupported remote type '{kind}'. Supported: ssh.")]
     UnsupportedType { kind: String },
     #[error("Invalid --version '{input}': must look like '0.24.5' or 'v0.24.5'.")]
     InvalidVersion { input: String },
+    /// The version to install is the one this build reports, and this build
+    /// does not know it (issue #326): it fell back to the `0.1.0` placeholder,
+    /// which names an old release rather than this build.
+    #[error(
+        "This dot-agent-deck build does not know its own version (it reports {input}), so it cannot choose a release to install. Pass --version <x.y.z> naming the release you want on the remote."
+    )]
+    VersionUnknown { input: String },
+    /// The remote's binary reports that it does not know its own version
+    /// (issue #326), so whether it is the requested release cannot be told.
+    #[error(
+        "The remote's dot-agent-deck build does not know its own version (it reports {actual}), so it cannot be checked against {expected}. Install a release there (`remote add` or `remote upgrade` without --no-install), or rebuild it with DAD_VERSION=<x.y.z> set, or from a checkout with tags."
+    )]
+    RemoteVersionUnknown { actual: String, expected: String },
     #[error(transparent)]
     Ssh(#[from] SshError),
     #[error("Remote arch is `{arch}`; supported: linux-{{amd64,arm64}}, darwin-{{amd64,arm64}}.")]
@@ -1215,8 +2150,33 @@ pub enum RemoteAddError {
     },
     #[error("Installed binary reports `{actual}` but expected `{expected}`.")]
     VersionMismatch { actual: String, expected: String },
+    /// The install had already put a build at `binary` — the download moved
+    /// into place, or `brew upgrade` succeeded — when the version check that
+    /// follows failed (`source`). Nothing is rolled back, so the binary is no
+    /// longer the one that was there before (PRD #1487 review). `on_disk` is
+    /// the version the check read, when it read one, and otherwise
+    /// [`UNVERIFIED_BUILD`].
+    #[error(
+        "{binary} on the remote was replaced, but the new binary did not pass its version check: {source} What is installed there now is {on_disk}. Run the install again; if the check keeps failing, run `{binary} --version` on the remote to see what it reports."
+    )]
+    ReplacedButUnverified {
+        binary: String,
+        on_disk: String,
+        #[source]
+        source: Box<RemoteAddError>,
+    },
     #[error("`dot-agent-deck hooks install` on remote failed (exit {status}): {stderr}")]
     HooksInstallFailed { status: i32, stderr: String },
+    #[error(
+        "Could not tell how dot-agent-deck is installed on the remote (exit {status}): {detail}"
+    )]
+    InstallProbeFailed { status: i32, detail: String },
+    #[error("The remote's Homebrew prefix cannot be used: {detail}")]
+    UnsafeHomebrewPrefix { detail: String },
+    #[error(
+        "`brew upgrade dot-agent-deck` on remote failed (exit {status}): {stderr}\nThe remote's deck is installed by Homebrew, so it is upgraded through Homebrew and never by downloading a second copy."
+    )]
+    BrewUpgradeFailed { status: i32, stderr: String },
     #[error(transparent)]
     Registry(#[from] RemoteConfigError),
 }
@@ -1241,6 +2201,14 @@ fn version_regex() -> &'static Regex {
 /// (GitHub release tag) prepends `v` themselves. The user may type either
 /// `0.24.5` or `v0.24.5`; both normalize to `0.24.5`.
 pub fn validate_version_string(version: &str) -> Result<String, RemoteAddError> {
+    // Issue #326: the default `--version` is this build's own, and a build
+    // that does not know it carries `+unknown`. Say so, rather than calling
+    // the user's input invalid when they typed none.
+    if crate::version::is_unknown_version(version) {
+        return Err(RemoteAddError::VersionUnknown {
+            input: version.to_string(),
+        });
+    }
     if version_regex().is_match(version) {
         Ok(version.strip_prefix('v').unwrap_or(version).to_string())
     } else {
@@ -1293,12 +2261,6 @@ fn detect_platform(uname_stdout: &str) -> Option<&'static str> {
     }
 }
 
-/// Pull the version number out of `dot-agent-deck --version` output.
-/// Expected shape: `dot-agent-deck X.Y.Z` (possibly with trailing whitespace).
-fn parse_version_output(stdout: &str) -> Option<String> {
-    stdout.split_whitespace().nth(1).map(|s| s.to_string())
-}
-
 /// Install (or version-check, with `no_install`) the remote binary and assert
 /// it reports the expected version. Shared between `add` and `upgrade` — the
 /// only piece that's identical between the two flows. Caller is responsible
@@ -1325,6 +2287,12 @@ fn install_and_verify(
             });
         }
         let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
+        if crate::version::is_unknown_version(&actual) {
+            return Err(RemoteAddError::RemoteVersionUnknown {
+                actual: scrub_remote_text(&actual),
+                expected: version.to_string(),
+            });
+        }
         if actual != version {
             return Err(RemoteAddError::VersionMismatch {
                 actual: scrub_remote_text(&actual),
@@ -1352,29 +2320,439 @@ fn install_and_verify(
             ),
         });
     }
-    let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
+    // The download is in place from here on: a failed check no longer means
+    // "nothing changed", so it says what replaced the binary.
+    remote_binary_version(executor, target, REMOTE_INSTALL_PATH, version)
+        .and_then(|actual| {
+            if actual == version {
+                Ok(())
+            } else {
+                Err(RemoteAddError::VersionMismatch {
+                    actual,
+                    expected: version.to_string(),
+                })
+            }
+        })
+        .map_err(|e| replaced_but_unverified(REMOTE_INSTALL_PATH, e))
+}
+
+/// What a remote's binary is called once a build replaced it and its version
+/// check failed without reading a version.
+pub const UNVERIFIED_BUILD: &str = "an unverified build";
+
+/// Wrap a version-check failure that came after the install put a new binary at
+/// `binary`, keeping the version the check read when it read a valid one.
+fn replaced_but_unverified(binary: &str, check: RemoteAddError) -> RemoteAddError {
+    let on_disk = match &check {
+        RemoteAddError::VersionMismatch { actual, .. } => validate_version_string(actual).ok(),
+        RemoteAddError::RemoteVersionUnknown { actual, .. } => Some(actual.clone()),
+        _ => None,
+    };
+    RemoteAddError::ReplacedButUnverified {
+        binary: binary.to_string(),
+        on_disk: on_disk.unwrap_or_else(|| UNVERIFIED_BUILD.to_string()),
+        source: Box::new(check),
+    }
+}
+
+/// How the deck is installed on a remote, as [`detect_install`] found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteInstall {
+    /// An executable exists at [`REMOTE_INSTALL_PATH`].
+    local_bin: bool,
+    /// The prefix of a Homebrew that has the `dot-agent-deck` formula
+    /// installed and linked, when there is one.
+    homebrew_prefix: Option<String>,
+    /// Formula that owns the linked binary, validated against the two names
+    /// the probe can emit before it is interpolated into an upgrade command.
+    homebrew_formula: Option<&'static str>,
+}
+
+impl RemoteInstall {
+    /// The Homebrew install's `<prefix>/bin/dot-agent-deck` — the symlink
+    /// Homebrew keeps pointing at the current keg, so it survives upgrades
+    /// where a `Cellar/<version>` path would not.
+    fn homebrew_binary(&self) -> Option<RemoteBinaryPath> {
+        let prefix = self.homebrew_prefix.as_deref()?;
+        RemoteBinaryPath::try_from(format!("{prefix}/bin/dot-agent-deck")).ok()
+    }
+}
+
+/// The remote command behind [`detect_install`]. It prints `local-bin=`,
+/// `homebrew=` and `formula=` lines, and exits 0.
+///
+/// A Homebrew install is recognised by asking Homebrew, not by the shape of a
+/// path: `brew list --formula` must succeed for stable or beta, and the
+/// linked executable must be the same file as the formula's own binary.
+/// A formula can remain installed after another one takes over the link, so
+/// checking only that both exist can upgrade the wrong channel.
+/// `brew` is looked for on `PATH` first and then
+/// at each of [`HOMEBREW_PREFIXES`], because the `PATH` of a non-interactive
+/// ssh command usually lacks it.
+fn install_probe_command() -> String {
+    let brews: Vec<String> = HOMEBREW_PREFIXES
+        .iter()
+        .map(|prefix| format!("{prefix}/bin/brew"))
+        .collect();
+    format!(
+        concat!(
+            "if [ -x {local_bin} ]; then echo local-bin=present; else echo local-bin=; fi; ",
+            "for dad_brew in \"$(command -v brew 2>/dev/null)\" {brews}; do ",
+            "[ -n \"$dad_brew\" ] && [ -x \"$dad_brew\" ] || continue; ",
+            "dad_prefix=$(\"$dad_brew\" --prefix 2>/dev/null) || continue; ",
+            "[ -x \"$dad_prefix/bin/dot-agent-deck\" ] || continue; ",
+            "for dad_formula in dot-agent-deck dot-agent-deck-beta; do ",
+            "\"$dad_brew\" list --formula \"$dad_formula\" >/dev/null 2>&1 || continue; ",
+            "dad_keg=$(\"$dad_brew\" --prefix \"$dad_formula\" 2>/dev/null) || continue; ",
+            "[ \"$dad_prefix/bin/dot-agent-deck\" -ef \"$dad_keg/bin/dot-agent-deck\" ] || continue; ",
+            "echo \"homebrew=$dad_prefix\"; echo \"formula=$dad_formula\"; exit 0; ",
+            "done; ",
+            "done; ",
+            "echo homebrew=; echo formula="
+        ),
+        local_bin = REMOTE_INSTALL_PATH,
+        brews = brews.join(" "),
+    )
+}
+
+/// The most [`discover_homebrew_binary`] reads of the install probe's answer.
+const HOMEBREW_DISCOVERY_CAP: usize = 8 * 1024;
+
+/// Discover a Homebrew binary without changing the remote install. Used when
+/// `connect` finds that a legacy entry's default ~/.local/bin path is gone.
+/// The connect executor supplies its short SSH deadline; cap the answer as
+/// well, since this is a probe rather than an installation operation.
+pub(crate) fn discover_homebrew_binary(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+) -> Result<Option<RemoteBinaryPath>, SshError> {
+    homebrew_binary_from(executor.run_capped(
+        target,
+        &install_probe_command(),
+        HOMEBREW_DISCOVERY_CAP,
+    )?)
+}
+
+/// [`discover_homebrew_binary`] bounded by `deadline`, for an executor that
+/// carries no wall-clock bound of its own — the desktop's check and start of a
+/// deck's daemon (issue #1675).
+pub(crate) fn discover_homebrew_binary_within(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    deadline: std::time::Duration,
+) -> Result<Option<RemoteBinaryPath>, SshError> {
+    homebrew_binary_from(executor.run_capped_within(
+        target,
+        &install_probe_command(),
+        HOMEBREW_DISCOVERY_CAP,
+        deadline,
+    )?)
+}
+
+/// The Homebrew binary the install probe's answer names, if any.
+fn homebrew_binary_from(probe: CappedOutput) -> Result<Option<RemoteBinaryPath>, SshError> {
+    if probe.truncated || probe.output.status != 0 {
+        return Ok(None);
+    }
+    let prefix = probe.output.stdout.lines().find_map(|line| {
+        line.strip_prefix("homebrew=")
+            .filter(|prefix| !prefix.is_empty())
+    });
+    Ok(prefix
+        .and_then(|prefix| RemoteBinaryPath::try_from(format!("{prefix}/bin/dot-agent-deck")).ok()))
+}
+
+/// Record in the deck list at `remotes_path` a Homebrew binary found and
+/// verified for the deck-list row `entry` (issue #1459), reporting `version`,
+/// so the next check runs it straight away. `connect` and the desktop's check
+/// and start of a deck's daemon (issue #1675) both record through this.
+///
+/// The row is changed only while it still reaches the machine `entry` reached
+/// and records the install `entry` recorded, so a concurrent move or upgrade
+/// of the row is not written over.
+pub(crate) fn record_homebrew_binary(
+    remotes_path: &Path,
+    entry: &RemoteEntry,
+    binary: RemoteBinaryPath,
+    version: &str,
+) -> Result<Option<RemoteEntry>, RemoteConfigError> {
+    crate::deck_list::update(
+        remotes_path,
+        crate::deck_list::DeckRef::Name(&entry.name),
+        |row| {
+            if crate::deck_list::address_key(row) == crate::deck_list::address_key(entry)
+                && row.install == entry.install
+                && row.binary == entry.binary
+            {
+                row.install = Some(INSTALL_HOMEBREW.to_string());
+                row.binary = Some(binary);
+                row.version = version.to_string();
+            }
+        },
+    )
+}
+
+/// Find out how the deck is installed on the remote (issue #1372).
+fn detect_install(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+) -> Result<RemoteInstall, RemoteAddError> {
+    let probe = executor.run(target, &install_probe_command())?;
+    let probe_failed = |detail: &str| RemoteAddError::InstallProbeFailed {
+        status: probe.status,
+        detail: scrub_remote_text(detail),
+    };
+    if probe.status != 0 {
+        return Err(probe_failed(&probe.stderr));
+    }
+    let mut local_bin = None;
+    let mut homebrew = None;
+    let mut formula = None;
+    for line in probe.stdout.lines() {
+        if let Some(value) = line.strip_prefix("local-bin=") {
+            local_bin = Some(!value.is_empty());
+        } else if let Some(value) = line.strip_prefix("homebrew=") {
+            homebrew = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("formula=") {
+            formula = Some(value);
+        }
+    }
+    let (Some(local_bin), Some(homebrew), Some(formula)) = (local_bin, homebrew, formula) else {
+        return Err(probe_failed(&probe.stdout));
+    };
+    let homebrew_formula = match (homebrew.is_empty(), formula) {
+        (true, "") => None,
+        (false, "dot-agent-deck") => Some("dot-agent-deck"),
+        (false, "dot-agent-deck-beta") => Some("dot-agent-deck-beta"),
+        _ => return Err(probe_failed(&probe.stdout)),
+    };
+    let install = RemoteInstall {
+        local_bin,
+        homebrew_prefix: (!homebrew.is_empty()).then_some(homebrew),
+        homebrew_formula,
+    };
+    if install.homebrew_prefix.is_some() && install.homebrew_binary().is_none() {
+        let prefix = install.homebrew_prefix.unwrap_or_default();
+        return Err(RemoteAddError::UnsafeHomebrewPrefix {
+            detail: RemoteBinaryPath::try_from(prefix).err().unwrap_or_default(),
+        });
+    }
+    Ok(install)
+}
+
+/// Run `<binary> --version` on the remote and return the version it reports.
+fn remote_binary_version(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    binary: &str,
+    expected: &str,
+) -> Result<String, RemoteAddError> {
+    let v = executor.run(target, &format!("{binary} --version"))?;
     if v.status != 0 {
         return Err(RemoteAddError::VersionMismatch {
             actual: format!("(exit {}) {}", v.status, scrub_remote_text(&v.stderr)),
-            expected: version.to_string(),
+            expected: expected.to_string(),
         });
     }
     let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
-    if actual != version {
-        return Err(RemoteAddError::VersionMismatch {
+    if crate::version::is_unknown_version(&actual) {
+        return Err(RemoteAddError::RemoteVersionUnknown {
             actual: scrub_remote_text(&actual),
+            expected: expected.to_string(),
+        });
+    }
+    validate_version_string(&actual).map_err(|_| RemoteAddError::VersionMismatch {
+        actual: scrub_remote_text(&actual),
+        expected: expected.to_string(),
+    })
+}
+
+/// A command that runs `program` with `<prefix>/bin` first on `PATH`.
+///
+/// For `brew`, which expects its own `bin` on `PATH`. For `hooks install`,
+/// because the hook installer pins an *installed* deck, and it recognises the
+/// binary it is running as one only when that binary's directory is on `PATH`
+/// (`platform::paths::durable_binary_path`). Without this, a non-interactive
+/// ssh `PATH` that lacks Homebrew's `bin` sends it looking elsewhere, which is
+/// how hooks ended up pinned to a `~/.local/bin` copy.
+fn with_homebrew_path(prefix: &str, program: &str) -> String {
+    format!("PATH={prefix}/bin:\"$PATH\" {program}")
+}
+
+/// What [`install_or_upgrade`] left on the remote.
+struct Installed {
+    method: &'static str,
+    /// `None` for [`REMOTE_INSTALL_PATH`].
+    binary: Option<RemoteBinaryPath>,
+    /// The Homebrew prefix, for a Homebrew install.
+    homebrew_prefix: Option<String>,
+    /// The version the installed binary reports.
+    version: String,
+}
+
+impl Installed {
+    fn remote_binary(&self) -> &str {
+        self.binary
+            .as_ref()
+            .map_or(REMOTE_INSTALL_PATH, RemoteBinaryPath::as_str)
+    }
+}
+
+/// Put the requested deck on the remote through whatever owns it there, and
+/// report what landed. Shared by `add` and `upgrade`.
+///
+/// - **Homebrew** owns the install when [`detect_install`] finds the formula.
+///   Nothing is downloaded and nothing is written to [`REMOTE_INSTALL_PATH`].
+///   `brew upgrade dot-agent-deck` runs only when `run_brew_upgrade` is set
+///   (`remote upgrade` without `--no-install`); `remote add` registers the
+///   install as it is. Homebrew cannot install a chosen version, so the
+///   version that landed is what is recorded, and a difference from
+///   `version` is reported rather than refused — except under `no_install`,
+///   which requires the match exactly as it does for `~/.local/bin`.
+/// - Otherwise the release binary goes to [`REMOTE_INSTALL_PATH`], exactly as
+///   before issue #1372.
+///
+/// When both exist — the state issue #1372's bug leaves behind — both are
+/// reported, along with which one the deck uses.
+#[allow(clippy::too_many_arguments)]
+fn install_or_upgrade(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    name: &str,
+    platform: &str,
+    version: &str,
+    release_base: &str,
+    no_install: bool,
+    run_brew_upgrade: bool,
+    out: &mut dyn std::io::Write,
+) -> Result<Installed, RemoteAddError> {
+    let found = detect_install(executor, target)?;
+    let Some(binary) = found.homebrew_binary() else {
+        install_and_verify(
+            executor,
+            target,
+            platform,
+            version,
+            release_base,
+            no_install,
+        )?;
+        return Ok(Installed {
+            method: INSTALL_LOCAL_BIN,
+            binary: None,
+            homebrew_prefix: None,
+            version: version.to_string(),
+        });
+    };
+    let prefix = found.homebrew_prefix.as_deref().unwrap_or_default();
+
+    if found.local_bin {
+        let _ = writeln!(
+            out,
+            "Remote '{name}' has two dot-agent-deck installs: Homebrew's at {binary} and a copy at {REMOTE_INSTALL_PATH}. The deck uses the Homebrew one and leaves the other untouched. Remove it (`{cleanup}`) — an older dot-agent-deck client still runs it on `connect`.",
+            binary = binary.as_str(),
+            cleanup = target.command_line(&format!("rm {REMOTE_INSTALL_PATH}")),
+        );
+    }
+
+    if run_brew_upgrade {
+        let formula = found
+            .homebrew_formula
+            .expect("a detected Homebrew install has a formula");
+        let brew = with_homebrew_path(prefix, &format!("{prefix}/bin/brew upgrade {formula}"));
+        let upgraded = executor.run(target, &brew)?;
+        if upgraded.status != 0 {
+            return Err(RemoteAddError::BrewUpgradeFailed {
+                status: upgraded.status,
+                stderr: scrub_remote_text(&upgraded.stderr),
+            });
+        }
+    }
+
+    // After a `brew upgrade` that succeeded, Homebrew may have replaced the
+    // binary, so a failed check says so; without one nothing changed.
+    let landed =
+        remote_binary_version(executor, target, binary.as_str(), version).map_err(|e| {
+            if run_brew_upgrade {
+                replaced_but_unverified(binary.as_str(), e)
+            } else {
+                e
+            }
+        })?;
+    // `--no-install` is a pre-flight that the remote already runs the
+    // requested version, on this path as on the `~/.local/bin` one; it is
+    // only when this command installs through Homebrew that a different
+    // version is accepted, because Homebrew cannot install a chosen one.
+    if no_install && landed != version {
+        return Err(RemoteAddError::VersionMismatch {
+            actual: landed,
             expected: version.to_string(),
         });
+    }
+    if landed != version {
+        let next = if run_brew_upgrade {
+            "Homebrew installs its tap's latest release and cannot install a chosen one"
+        } else {
+            "Run `dot-agent-deck remote upgrade` to upgrade it through Homebrew"
+        };
+        let _ = writeln!(
+            out,
+            "Remote '{name}' runs dot-agent-deck {landed} from Homebrew ({binary}), not the requested {version}. {next}; the registry records {landed}.",
+            binary = binary.as_str(),
+        );
+    }
+    Ok(Installed {
+        method: INSTALL_HOMEBREW,
+        binary: Some(binary),
+        homebrew_prefix: Some(prefix.to_string()),
+        version: landed,
+    })
+}
+
+/// Run `hooks install` on the remote with the binary that was just installed,
+/// printing whatever it reports. Shared by `add` and `upgrade`.
+fn install_remote_hooks(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    installed: &Installed,
+    out: &mut dyn std::io::Write,
+) -> Result<(), RemoteAddError> {
+    let command = format!("{} hooks install", installed.remote_binary());
+    let command = match installed.homebrew_prefix.as_deref() {
+        Some(prefix) => with_homebrew_path(prefix, &command),
+        None => command,
+    };
+    let hooks = executor.run(target, &command)?;
+    if hooks.status != 0 {
+        return Err(RemoteAddError::HooksInstallFailed {
+            status: hooks.status,
+            stderr: scrub_remote_text(&hooks.stderr),
+        });
+    }
+    if !hooks.stdout.is_empty() {
+        let _ = write!(out, "{}", hooks.stdout);
+        if !hooks.stdout.ends_with('\n') {
+            let _ = writeln!(out);
+        }
     }
     Ok(())
 }
 
 /// Run the `add` flow. Returns the registry entry that was written, so
-/// callers (and tests) can assert on it.
+/// callers (and tests) can assert on it. Progress goes to stdout.
 pub fn add(
     opts: &AddOptions,
     executor: &dyn SshExecutor,
     remotes_path: &Path,
+) -> Result<RemoteEntry, RemoteAddError> {
+    add_reporting_to(opts, executor, remotes_path, &mut std::io::stdout().lock())
+}
+
+/// [`add`], writing what it reports to `out` instead of stdout.
+pub fn add_reporting_to(
+    opts: &AddOptions,
+    executor: &dyn SshExecutor,
+    remotes_path: &Path,
+    out: &mut dyn std::io::Write,
 ) -> Result<RemoteEntry, RemoteAddError> {
     // 1. Type validation.
     match opts.remote_type.as_str() {
@@ -1396,12 +2774,19 @@ pub fn add(
     //    and the post-install version comparison matches the binary's
     //    unprefixed `--version` output.
     let version = validate_version_string(&opts.version)?;
+    // Issue #1350: the name is a slug, checked before any ssh call too.
+    crate::deck_list::validate_deck_name(&opts.name).map_err(RemoteAddError::InvalidName)?;
+    // …and so is the address: the rules `deck_list::add` enforces on the row,
+    // applied here so an unsafe target never reaches ssh.
+    let key = opts.key.as_ref().map(|p| p.to_string_lossy());
+    crate::deck_list::validate_ssh_target(&opts.target, opts.port, key.as_deref())
+        .map_err(RemoteAddError::InvalidAddress)?;
 
     // 3. Uniqueness check — done *before* any ssh call so a duplicate name
     //    short-circuits without bothering the remote (and lets the
     //    `duplicate_name_rejected` test assert the fake recorded zero
     //    commands).
-    let mut registry = RemotesFile::load(remotes_path)?;
+    let registry = RemotesFile::load(remotes_path)?;
     if registry.remotes.iter().any(|r| r.name == opts.name) {
         return Err(RemoteAddError::DuplicateName {
             name: opts.name.clone(),
@@ -1423,32 +2808,24 @@ pub fn add(
             arch: scrub_remote_text(&uname.stdout),
         })?;
 
-    // 4. Install or version-check (shared between `add` and `upgrade`).
-    install_and_verify(
+    // 4. Install or version-check through whatever owns the install on the
+    //    remote (shared between `add` and `upgrade`, issue #1372). `add`
+    //    registers an existing Homebrew install as it is rather than
+    //    upgrading it.
+    let installed = install_or_upgrade(
         executor,
         &target,
+        &opts.name,
         platform,
         &version,
         &opts.release_base,
         opts.no_install,
+        false,
+        out,
     )?;
 
-    // 5. Hook install on the remote. Use the absolute path consistently —
-    //    a bare `dot-agent-deck` lookup over a non-interactive ssh shell
-    //    fails for the standard `~/.local/bin/` install location.
-    let hooks = executor.run(&target, "~/.local/bin/dot-agent-deck hooks install")?;
-    if hooks.status != 0 {
-        return Err(RemoteAddError::HooksInstallFailed {
-            status: hooks.status,
-            stderr: scrub_remote_text(&hooks.stderr),
-        });
-    }
-    if !hooks.stdout.is_empty() {
-        print!("{}", hooks.stdout);
-        if !hooks.stdout.ends_with('\n') {
-            println!();
-        }
-    }
+    // 5. Hook install on the remote, by the binary that was just verified.
+    install_remote_hooks(executor, &target, &installed, out)?;
 
     // 6. Append to registry.
     let entry = RemoteEntry {
@@ -1462,18 +2839,26 @@ pub fn add(
             .and_then(|p| p.as_os_str().to_str())
             .map(|s| s.to_string())
             .or_else(|| opts.key.as_ref().map(|p| p.to_string_lossy().into_owned())),
-        version: version.clone(),
+        version: installed.version.clone(),
         added_at: chrono::Utc::now().to_rfc3339(),
         upgraded_at: None,
         last_connected: None,
+        install: Some(installed.method.to_string()),
+        binary: installed.binary.clone(),
+        id: None,
+        user: None,
+        jump_host: None,
+        socket: None,
     };
-    registry.remotes.push(entry.clone());
-    registry.save(remotes_path)?;
+    // Against a fresh read (issue #1350): the install above took seconds, and
+    // the desktop may have saved a deck meanwhile.
+    let entry = crate::deck_list::add(remotes_path, entry)?;
 
     // 7. Final success line.
-    println!(
+    let _ = writeln!(
+        out,
         "Added remote '{}' (ssh: {}, version {}). Run `dot-agent-deck connect {}` to attach.",
-        opts.name, opts.target, version, opts.name,
+        opts.name, opts.target, entry.version, opts.name,
     );
 
     Ok(entry)
@@ -1606,20 +2991,11 @@ pub enum RemoteRemoveError {
 /// can confirm what was deleted. **Does not** touch the remote host — no
 /// hooks uninstall, no binary cleanup, no ssh call.
 pub fn remove(name: &str, remotes_path: &Path) -> Result<RemoteEntry, RemoteRemoveError> {
-    let mut registry = RemotesFile::load(remotes_path)?;
-    let idx = registry
-        .remotes
-        .iter()
-        .position(|r| r.name == name)
-        .ok_or_else(|| RemoteRemoveError::UnknownName {
+    crate::deck_list::remove(remotes_path, crate::deck_list::DeckRef::Name(name))?.ok_or_else(
+        || RemoteRemoveError::UnknownName {
             name: name.to_string(),
-        })?;
-    let removed = registry.remotes.remove(idx);
-    // If this was the last entry, `registry.remotes` is now an empty Vec —
-    // serde will emit `remotes = []` so the file remains valid TOML for
-    // future loads.
-    registry.save(remotes_path)?;
-    Ok(removed)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1647,6 +3023,56 @@ pub enum RemoteUpgradeError {
     /// keep the `?` ergonomics for `SshError` and `RemoteConfigError`.
     #[error(transparent)]
     Inner(#[from] RemoteAddError),
+    /// The deck list's row for this remote no longer reaches the machine the
+    /// upgrade installed on: it was removed and re-added, or edited, for
+    /// another address while the upgrade ran (PRD #1487, Greptile
+    /// 4208066970). Nothing is recorded over the row.
+    #[error(
+        "the deck list's row for '{name}' was changed to reach a different machine while the upgrade ran, so the result was not recorded over it. Check the row with `dot-agent-deck remote list` and run the upgrade again."
+    )]
+    RouteChanged { name: String },
+    /// The new build is already in place on the remote, and a step after it —
+    /// reinstalling the hooks, or recording it in the deck list — failed. The
+    /// binary is not rolled back; running the upgrade again finishes the rest.
+    #[error("{installed_version} was installed, but {step} failed: {source}")]
+    AfterInstall {
+        installed_version: String,
+        /// The binary the build was installed at — what the deck list would
+        /// have recorded had this step not failed (issue #1604).
+        binary: String,
+        step: &'static str,
+        #[source]
+        source: Box<RemoteUpgradeError>,
+    },
+}
+
+impl RemoteUpgradeError {
+    /// What is in place when this error happened, if the install had already
+    /// replaced the binary: the version it finished with, or — when the check
+    /// after the replacement failed — the version that check read, or
+    /// [`UNVERIFIED_BUILD`].
+    pub fn installed_version(&self) -> Option<&str> {
+        match self {
+            Self::AfterInstall {
+                installed_version, ..
+            } => Some(installed_version),
+            Self::Inner(RemoteAddError::ReplacedButUnverified { on_disk, .. }) => Some(on_disk),
+            _ => None,
+        }
+    }
+
+    /// The binary [`Self::installed_version`] is at, whenever that is set.
+    /// The deck list may still name the binary from before the upgrade — a
+    /// legacy `~/.local/bin` copy beside the Homebrew install that was just
+    /// upgraded — because the step that records the new one is what failed
+    /// (issue #1604).
+    pub fn installed_binary(&self) -> Option<&str> {
+        match self {
+            Self::AfterInstall { binary, .. } => Some(binary),
+            Self::Inner(RemoteAddError::ReplacedButUnverified { binary, .. }) => Some(binary),
+            _ => None,
+        }
+    }
 }
 
 impl From<SshError> for RemoteUpgradeError {
@@ -1670,27 +3096,50 @@ pub fn upgrade(
     executor: &dyn SshExecutor,
     remotes_path: &Path,
 ) -> Result<RemoteEntry, RemoteUpgradeError> {
+    upgrade_reporting_to(opts, executor, remotes_path, &mut std::io::stdout().lock())
+}
+
+/// [`upgrade`], writing what it reports to `out` instead of stdout.
+pub fn upgrade_reporting_to(
+    opts: &UpgradeOptions,
+    executor: &dyn SshExecutor,
+    remotes_path: &Path,
+    out: &mut dyn std::io::Write,
+) -> Result<RemoteEntry, RemoteUpgradeError> {
     // 1. Version validation BEFORE any ssh call (mirrors `add`).
-    let version = validate_version_string(&opts.version)?;
+    validate_version_string(&opts.version)?;
 
     // 2. Lookup. Unknown name short-circuits before any ssh work.
-    let mut registry = RemotesFile::load(remotes_path)?;
-    let idx = registry
+    let registry = RemotesFile::load(remotes_path)?;
+    let existing = registry
         .remotes
-        .iter()
-        .position(|r| r.name == opts.name)
+        .into_iter()
+        .find(|r| r.name == opts.name)
         .ok_or_else(|| RemoteUpgradeError::UnknownName {
             name: opts.name.clone(),
         })?;
+    upgrade_entry_reporting_to(opts, &existing, executor, remotes_path, out)
+}
 
-    let target = {
-        let entry = &registry.remotes[idx];
-        SshTarget::parse(
-            &entry.host,
-            entry.port,
-            entry.key.as_ref().map(PathBuf::from),
-        )
-    };
+/// [`upgrade_reporting_to`] against `existing`, the row the caller already
+/// read, instead of reading it again by name — so the install goes to the
+/// machine the caller's other commands (its probe and restart) go to. The
+/// result is recorded only while the row named `opts.name` still reaches that
+/// machine ([`RemoteEntry::same_route`]); a row moved elsewhere in the
+/// meantime is refused with [`RemoteUpgradeError::RouteChanged`] (PRD #1487,
+/// Greptile 4208066970).
+pub fn upgrade_entry_reporting_to(
+    opts: &UpgradeOptions,
+    existing: &RemoteEntry,
+    executor: &dyn SshExecutor,
+    remotes_path: &Path,
+    out: &mut dyn std::io::Write,
+) -> Result<RemoteEntry, RemoteUpgradeError> {
+    // 1. Version validation BEFORE any ssh call (mirrors `add`).
+    let version = validate_version_string(&opts.version)?;
+
+    let target = existing.ssh_target();
+    let was_homebrew = existing.install.as_deref() == Some(INSTALL_HOMEBREW);
 
     // 3. Reachability + arch detect.
     let uname = executor.run(&target, "uname -s -m")?;
@@ -1706,48 +3155,86 @@ pub fn upgrade(
             arch: scrub_remote_text(&uname.stdout),
         })?;
 
-    // 4. Install + version-check (shared with `add`).
-    install_and_verify(
+    // 4. Install + version-check through whatever owns the install on the
+    //    remote (shared with `add`, issue #1372): `brew upgrade` for a
+    //    Homebrew install, the release download to `~/.local/bin` otherwise.
+    let installed = install_or_upgrade(
         executor,
         &target,
+        &opts.name,
         platform,
         &version,
         &opts.release_base,
         opts.no_install,
+        !opts.no_install,
+        out,
     )?;
+    if was_homebrew && installed.method != INSTALL_HOMEBREW {
+        let _ = writeln!(
+            out,
+            "Remote '{}' no longer has a Homebrew install of dot-agent-deck; it now uses {REMOTE_INSTALL_PATH}.",
+            opts.name
+        );
+    }
 
     // 5. Reinstall hooks on the remote. A release may change hook behavior,
     //    so the upgraded binary must be paired with refreshed hook scripts —
     //    otherwise `remote upgrade` reports success while leaving the remote
     //    on stale hooks. Mirrors the same step in `add()` so both paths stay
-    //    in lockstep. Runs BEFORE `registry.save` so a hook-install failure
-    //    fails loud rather than persisting half-finished state.
-    let hooks = executor.run(&target, "~/.local/bin/dot-agent-deck hooks install")?;
-    if hooks.status != 0 {
-        return Err(RemoteAddError::HooksInstallFailed {
-            status: hooks.status,
-            stderr: scrub_remote_text(&hooks.stderr),
+    //    in lockstep. Runs BEFORE the registry update so a hook-install failure
+    //    fails loud rather than persisting half-finished state. The binary is
+    //    already in place by now, so a failure from here on says so.
+    let after_install = |step: &'static str| {
+        let installed_version = installed.version.clone();
+        let binary = installed.remote_binary().to_string();
+        move |source: RemoteUpgradeError| RemoteUpgradeError::AfterInstall {
+            installed_version,
+            binary,
+            step,
+            source: Box::new(source),
         }
-        .into());
-    }
-    if !hooks.stdout.is_empty() {
-        print!("{}", hooks.stdout);
-        if !hooks.stdout.ends_with('\n') {
-            println!();
-        }
-    }
+    };
+    install_remote_hooks(executor, &target, &installed, out)
+        .map_err(|e| after_install("reinstalling the hooks")(e.into()))?;
 
     // 6. Update registry. `added_at` stays at the original registration
     //    timestamp; `upgraded_at` records the most recent upgrade so users
-    //    can see both moments without losing the registration history.
+    //    can see both moments without losing the registration history. The
+    //    install method and binary are re-recorded on every upgrade, which is
+    //    what moves an entry written before issue #1372 onto the method that
+    //    actually owns the remote's install.
+    //    Only while the row still reaches the machine this run installed on:
+    //    one moved to another address since `existing` was read is refused
+    //    rather than stamped with a version that machine does not run.
     let now = chrono::Utc::now().to_rfc3339();
-    let entry = &mut registry.remotes[idx];
-    entry.version = version.clone();
-    entry.upgraded_at = Some(now);
-    let updated = entry.clone();
-    registry.save(remotes_path)?;
+    let updated = crate::deck_list::update_if(
+        remotes_path,
+        crate::deck_list::DeckRef::Name(&opts.name),
+        |entry| {
+            if entry.same_route(existing) {
+                Ok(())
+            } else {
+                Err(RemoteUpgradeError::RouteChanged {
+                    name: opts.name.clone(),
+                })
+            }
+        },
+        |entry| {
+            entry.version = installed.version.clone();
+            entry.upgraded_at = Some(now);
+            entry.install = Some(installed.method.to_string());
+            entry.binary = installed.binary.clone();
+        },
+    )
+    .map_err(after_install("recording it in the deck list"))?
+    .ok_or_else(|| {
+        after_install("recording it in the deck list")(RemoteUpgradeError::UnknownName {
+            name: opts.name.clone(),
+        })
+    })?;
 
-    println!(
+    let _ = writeln!(
+        out,
         "Upgraded remote '{}' to version {}.",
         opts.name, updated.version,
     );
@@ -1783,6 +3270,57 @@ mod tests {
     }
 
     #[test]
+    fn command_line_carries_the_registered_port_and_key() {
+        assert_eq!(
+            SshTarget::parse("u@h", 22, None).command_line("rm x"),
+            "ssh u@h 'rm x'"
+        );
+        assert_eq!(
+            SshTarget::parse("u@h", 2222, Some(PathBuf::from("/k/it's key"))).command_line("rm x"),
+            "ssh -p 2222 -i '/k/it'\\''s key' u@h 'rm x'"
+        );
+        assert_eq!(
+            SshTarget::parse("u@h", 22, Some(PathBuf::from("/home/u/.ssh/id_ed25519")))
+                .command_line("rm x"),
+            "ssh -i /home/u/.ssh/id_ed25519 u@h 'rm x'"
+        );
+        // The destination is the user's own `remote add` input; pasting the
+        // line must still run nothing but `ssh` locally.
+        let hostile = SshTarget::parse("u@h;touch pwned", 22, None).command_line("rm x");
+        assert_eq!(hostile, "ssh 'u@h;touch pwned' 'rm x'");
+        let option = SshTarget::parse("-oProxyCommand=id", 22, None).command_line("rm x");
+        assert_eq!(option, "ssh -- -oProxyCommand=id 'rm x'");
+    }
+
+    /// Scenario: a deck reached through a jump host prints its remedy and its
+    /// cleanup commands with `-J <jump host>`, in the place the real session
+    /// passes it, so a pasted command takes the deck's route; a jump host that
+    /// does not validate is left out of both, as the session leaves it out
+    /// (PRD #1487, Qodo 4202060288).
+    #[test]
+    fn printed_commands_take_the_jump_host_the_session_takes() {
+        let mut routed = SshTarget::parse("u@h", 2222, Some(PathBuf::from("/k/id")));
+        routed.jump = Some("bastion".to_string());
+        assert_eq!(
+            routed.command_line("rm x"),
+            "ssh -p 2222 -i /k/id -J bastion u@h 'rm x'"
+        );
+        assert_eq!(routed.host_key_remedy(), "ssh -J bastion -p 2222 u@h");
+        let session = SystemSshExecutor::default().build_command(&routed, "rm x");
+        let args: Vec<String> = session
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let jump_at = args.iter().position(|a| a == "-J").expect("-J is passed");
+        assert_eq!(args[jump_at + 1], "bastion");
+
+        let mut hostile = SshTarget::parse("u@h", 22, None);
+        hostile.jump = Some("-oProxyCommand=id".to_string());
+        assert_eq!(hostile.command_line("rm x"), "ssh u@h 'rm x'");
+        assert_eq!(hostile.host_key_remedy(), "ssh u@h");
+    }
+
+    #[test]
     fn ssh_target_parse_without_user() {
         let t = SshTarget::parse("hetzner-1.example.com", 22, None);
         assert!(t.user.is_none());
@@ -1800,6 +3338,7 @@ mod tests {
             user: Some("user;rm -rf /".to_string()),
             port: 2222,
             key: Some(PathBuf::from("/tmp/key id_rsa")),
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "uname -s -m; echo $(id)");
         let args = args_of(&cmd);
@@ -1827,6 +3366,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -1849,6 +3389,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -1874,6 +3415,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::with_wallclock_timeout(7).build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -1931,6 +3473,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::for_observation(9).build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -1981,6 +3524,134 @@ mod tests {
         );
     }
 
+    /// Issue #1490 audit A1: `observing()` over the keepalive bounds applies
+    /// the one observation list, and `requiring_known_host_key()` adds the
+    /// tunnel's host-key policy — neither is applied unless asked for.
+    #[test]
+    fn system_ssh_executor_observing_with_keepalive_requires_a_known_host_key() {
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+            jump: None,
+        };
+        let observing = SystemSshExecutor::with_keepalive(10, 15, 8)
+            .observing()
+            .requiring_known_host_key();
+        let args = args_of(&observing.build_command(&target, "echo hi"));
+        let mut observation_only = Command::new("ssh");
+        apply_observation_options(&mut observation_only);
+        for expected in args_of(&observation_only)
+            .iter()
+            .filter(|arg| *arg != "-o")
+            .map(String::as_str)
+            .chain([
+                "StrictHostKeyChecking=yes",
+                "BatchMode=yes",
+                "ConnectTimeout=10",
+                "ServerAliveInterval=15",
+                "ServerAliveCountMax=8",
+            ])
+        {
+            assert!(args.iter().any(|a| a == expected), "{expected}: {args:?}");
+        }
+        // Keepalive-bounded, not wallclock-killed.
+        assert_eq!(observing.kill_deadline_secs(), None);
+
+        let plain =
+            args_of(&SystemSshExecutor::with_keepalive(10, 15, 8).build_command(&target, "x"));
+        assert!(
+            !plain
+                .iter()
+                .any(|a| a.starts_with("StrictHostKeyChecking") || a == "ForwardAgent=no"),
+            "an ordinary keepalive session honours the user's Host block: {plain:?}"
+        );
+    }
+
+    /// Issue #1490 audit A2: a raw string becomes a remote command's binary
+    /// only through `RemoteDeckBinary::try_from`, which accepts the default
+    /// install and a safe absolute path and refuses whitespace, every shell
+    /// metacharacter, relative paths and any other `~` spelling.
+    #[test]
+    fn remote_deck_binary_refuses_anything_a_shell_would_reinterpret() {
+        assert_eq!(
+            RemoteDeckBinary::try_from(REMOTE_INSTALL_PATH),
+            Ok(RemoteDeckBinary::DefaultInstall)
+        );
+        assert_eq!(
+            RemoteDeckBinary::DefaultInstall.as_shell_word(),
+            "~/.local/bin/dot-agent-deck",
+            "the default keeps its `~` for the remote shell to expand"
+        );
+        let homebrew = RemoteDeckBinary::try_from("/opt/homebrew/bin/dot-agent-deck").unwrap();
+        assert_eq!(homebrew.as_shell_word(), "/opt/homebrew/bin/dot-agent-deck");
+        for refused in [
+            "",
+            "/",
+            "dot-agent-deck",
+            "bin/dot-agent-deck",
+            "~/bin/dot-agent-deck",
+            "~other/.local/bin/dot-agent-deck",
+            "/opt/my bin/dot-agent-deck",
+            "/opt/bin/dot-agent-deck\t",
+            "/opt/bin/dot-agent-deck\n",
+            "/opt/bin/dot-agent-deck;rm -rf ~",
+            "/opt/bin/dot-agent-deck&&id",
+            "/opt/bin/dot-agent-deck|id",
+            "/opt/bin/$(id)",
+            "/opt/bin/`id`",
+            "/opt/bin/$HOME",
+            "/opt/bin/dot-agent-deck>x",
+            "/opt/bin/dot-agent-deck<x",
+            "/opt/bin/'dot-agent-deck'",
+            "/opt/bin/\"dot-agent-deck\"",
+            "/opt/bin/dot*",
+            "/opt/bin/dot?",
+            "/opt/bin/\\dot",
+            "/opt/bin/(dot)",
+            "/opt/bin/{dot}",
+            "/opt/bin/dot#x",
+            "/opt/bin/dot!x",
+        ] {
+            assert!(
+                RemoteDeckBinary::try_from(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+        let row = RemoteEntry {
+            binary: Some(
+                RemoteBinaryPath::try_from("/opt/homebrew/bin/dot-agent-deck".to_string()).unwrap(),
+            ),
+            ..entry_with_binary_none()
+        };
+        assert_eq!(row.deck_binary(), homebrew);
+        assert_eq!(
+            entry_with_binary_none().deck_binary(),
+            RemoteDeckBinary::DefaultInstall
+        );
+    }
+
+    fn entry_with_binary_none() -> RemoteEntry {
+        RemoteEntry {
+            name: "mac".to_string(),
+            kind: "ssh".to_string(),
+            host: "user@mac".to_string(),
+            port: 22,
+            key: None,
+            version: "0.1.0".to_string(),
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            upgraded_at: None,
+            last_connected: None,
+            install: None,
+            binary: None,
+            id: None,
+            user: None,
+            jump_host: None,
+            socket: None,
+        }
+    }
+
     #[test]
     fn system_ssh_executor_with_keepalive_sets_alive_options_without_count_max_1() {
         // PRD #161 FIX 3: the remote-UPGRADE executor sets ConnectTimeout +
@@ -1993,6 +3664,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::with_keepalive(30, 15, 8).build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2411,6 +4083,278 @@ mod tests {
         );
     }
 
+    /// A check that read no version after the binary moved — it exited
+    /// non-zero — reports an unverified build rather than a version, on both
+    /// the download path and after a `brew upgrade`. Under `--no-install`, and
+    /// on `remote add`'s Homebrew path, nothing was replaced, so the plain
+    /// mismatch stands and no version is claimed.
+    #[test]
+    fn a_replaced_binary_that_reads_no_version_is_an_unverified_build() {
+        let target = SshTarget::parse("user@host", 22, None);
+        let version_fails = || SshOutput {
+            status: 126,
+            stdout: String::new(),
+            stderr: "cannot execute binary file".to_string(),
+        };
+
+        let executor = ScriptedSsh::new([ssh_ok(""), version_fails()]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+        )
+        .expect_err("a failed version check must fail");
+        assert!(
+            matches!(
+                &err,
+                RemoteAddError::ReplacedButUnverified { binary, on_disk, .. }
+                    if binary == REMOTE_INSTALL_PATH && on_disk == UNVERIFIED_BUILD
+            ),
+            "{err:?}"
+        );
+        let upgrade_err = RemoteUpgradeError::Inner(err);
+        assert_eq!(upgrade_err.installed_version(), Some(UNVERIFIED_BUILD));
+        assert_eq!(upgrade_err.installed_binary(), Some(REMOTE_INSTALL_PATH));
+        let msg = upgrade_err.to_string();
+        assert!(msg.contains("cannot execute binary file"), "{msg}");
+        assert!(msg.contains("an unverified build"), "{msg}");
+
+        let brew_probe = || ssh_ok("local-bin=\nhomebrew=/opt/homebrew\nformula=dot-agent-deck\n");
+        let executor = ScriptedSsh::new([brew_probe(), ssh_ok(""), version_fails()]);
+        let err = install_or_upgrade(
+            &executor,
+            &target,
+            "mac",
+            "darwin-arm64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+            true,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("a failed version check after brew upgrade must fail");
+        assert!(
+            matches!(
+                &err,
+                RemoteAddError::ReplacedButUnverified { binary, on_disk, .. }
+                    if binary == "/opt/homebrew/bin/dot-agent-deck" && on_disk == UNVERIFIED_BUILD
+            ),
+            "{err:?}"
+        );
+
+        let executor = ScriptedSsh::new([brew_probe(), version_fails()]);
+        let err = install_or_upgrade(
+            &executor,
+            &target,
+            "mac",
+            "darwin-arm64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("a failed version check must fail");
+        assert!(
+            matches!(err, RemoteAddError::VersionMismatch { .. }),
+            "{err:?}"
+        );
+
+        let executor = ScriptedSsh::new([version_fails()]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            true,
+        )
+        .expect_err("a failed --no-install check must fail");
+        assert!(
+            matches!(err, RemoteAddError::VersionMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(RemoteUpgradeError::Inner(err).installed_version(), None);
+    }
+
+    /// Issue #326: `remote add` and `remote upgrade` default `--version` to
+    /// this build's own, and a build that does not know it reports
+    /// `0.1.0+unknown`. Both refuse it as "version unknown" before any ssh
+    /// call (an empty script panics on the first one), rather than installing
+    /// the real, ancient v0.1.0 or calling the user's input invalid.
+    #[test]
+    fn remote_add_and_upgrade_refuse_an_unknown_own_version_before_any_ssh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("remotes.toml");
+        let opts = AddOptions {
+            name: "prod".to_string(),
+            remote_type: "ssh".to_string(),
+            target: "user@host".to_string(),
+            port: 22,
+            key: None,
+            version: "0.1.0+unknown".to_string(),
+            no_install: true,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        for no_install in [true, false] {
+            let opts = AddOptions {
+                no_install,
+                ..opts.clone()
+            };
+            let err = add(&opts, &ScriptedSsh::new([]), &path).expect_err("refused");
+            assert!(
+                matches!(&err, RemoteAddError::VersionUnknown { input } if input == "0.1.0+unknown"),
+                "{err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("does not know its own version"), "{msg}");
+            assert!(msg.contains("--version <x.y.z>"), "{msg}");
+        }
+        assert!(!path.exists(), "a refused add wrote the registry");
+
+        let upgrade_opts = UpgradeOptions {
+            name: "prod".to_string(),
+            version: "0.1.0+unknown".to_string(),
+            no_install: true,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        let err =
+            upgrade_reporting_to(&upgrade_opts, &ScriptedSsh::new([]), &path, &mut Vec::new())
+                .expect_err("refused");
+        assert!(
+            matches!(
+                &err,
+                RemoteUpgradeError::Inner(RemoteAddError::VersionUnknown { .. })
+            ),
+            "{err:?}"
+        );
+
+        // A genuine 0.1.0 is a real release, and still a valid --version.
+        assert_eq!(validate_version_string("0.1.0").unwrap(), "0.1.0");
+    }
+
+    /// Issue #326: `--no-install` against a remote whose binary does not know
+    /// its own version says so, on the `~/.local/bin` path and the Homebrew
+    /// one, rather than reporting a mismatch with an ancient `0.1.0`.
+    #[test]
+    fn no_install_reports_a_remote_build_that_does_not_know_its_version() {
+        let target = SshTarget::parse("user@host", 22, None);
+        let unknown = || ssh_ok("dot-agent-deck 0.1.0+unknown\n");
+
+        let executor = ScriptedSsh::new([unknown()]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.49.3",
+            "https://example.test/releases/download",
+            true,
+        )
+        .expect_err("an unknown remote version is not the requested one");
+        assert!(
+            matches!(
+                &err,
+                RemoteAddError::RemoteVersionUnknown { actual, expected }
+                    if actual == "0.1.0+unknown" && expected == "0.49.3"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("does not know its own version"),
+            "{err}"
+        );
+
+        let brew_probe = || ssh_ok("local-bin=\nhomebrew=/opt/homebrew\nformula=dot-agent-deck\n");
+        let executor = ScriptedSsh::new([brew_probe(), unknown()]);
+        let err = install_or_upgrade(
+            &executor,
+            &target,
+            "mac",
+            "darwin-arm64",
+            "0.49.3",
+            "https://example.test/releases/download",
+            true,
+            false,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("an unknown Homebrew version is not the requested one");
+        assert!(
+            matches!(err, RemoteAddError::RemoteVersionUnknown { .. }),
+            "{err:?}"
+        );
+
+        // A remote that genuinely runs the 0.1.0 release is still a mismatch.
+        let executor = ScriptedSsh::new([ssh_ok("dot-agent-deck 0.1.0\n")]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.49.3",
+            "https://example.test/releases/download",
+            true,
+        )
+        .expect_err("a different release is a mismatch");
+        assert!(
+            matches!(err, RemoteAddError::VersionMismatch { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Issue #1350: `remote add` refuses an unsafe address with the rules the
+    /// shared deck list enforces, before any ssh call — an empty script panics
+    /// on the first one — and writes nothing.
+    #[test]
+    fn remote_add_refuses_an_unsafe_address_before_any_ssh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("remotes.toml");
+        let base = AddOptions {
+            name: "prod".to_string(),
+            remote_type: "ssh".to_string(),
+            target: "user@host".to_string(),
+            port: 22,
+            key: None,
+            version: "0.24.5".to_string(),
+            no_install: true,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        let cases = [
+            AddOptions {
+                target: "-oProxyCommand=touch /tmp/x".to_string(),
+                ..base.clone()
+            },
+            AddOptions {
+                target: "user@host;id".to_string(),
+                ..base.clone()
+            },
+            AddOptions {
+                target: "-l@host".to_string(),
+                ..base.clone()
+            },
+            AddOptions {
+                port: 0,
+                ..base.clone()
+            },
+            AddOptions {
+                key: Some(PathBuf::from("-oProxyCommand=x")),
+                ..base.clone()
+            },
+        ];
+        for opts in cases {
+            let executor = ScriptedSsh::new([]);
+            match add(&opts, &executor, &path) {
+                Err(RemoteAddError::InvalidAddress(_)) => {}
+                other => panic!("{:?}: expected InvalidAddress, got {other:?}", opts.target),
+            }
+            assert!(!path.exists(), "a refused add wrote the registry");
+        }
+    }
+
     #[test]
     fn remote_add_scrubs_control_bytes_from_every_remote_derived_error() {
         // `remote add` reads the remote's own bytes at four points beyond the
@@ -2462,6 +4406,7 @@ mod tests {
                 "remote reports a different version",
                 vec![
                     ssh_ok("Linux x86_64\n"),
+                    ssh_ok("local-bin=present\nhomebrew=\nformula=\n"),
                     ssh_ok(&format!("dot-agent-deck {HOSTILE}9.9.9\n")),
                 ],
                 |e| matches!(e, RemoteAddError::VersionMismatch { .. }),
@@ -2471,6 +4416,7 @@ mod tests {
                 "hook install failed",
                 vec![
                     ssh_ok("Linux x86_64\n"),
+                    ssh_ok("local-bin=present\nhomebrew=\nformula=\n"),
                     ssh_ok("dot-agent-deck 0.24.5\n"),
                     ssh_hostile_failure(3, "hooks: settings.json is not writable"),
                 ],
@@ -2498,5 +4444,1023 @@ mod tests {
                 "{label}: expected the stripped residue in {msg:?}"
             );
         }
+    }
+
+    /// Scenario: a child that starts a quiet descendant inheriting its
+    /// streams, prints one line and exits. The plain runner does not own the
+    /// descendant, so it does not kill it — but it stops waiting for the
+    /// streams shortly after the child exits instead of until the descendant
+    /// does, and keeps the line (PRD #1487 re-check R1).
+    #[cfg(unix)]
+    #[test]
+    fn run_local_bounded_does_not_wait_on_a_descendant_after_the_child_exits() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 600 & echo \"pid=$!\""]);
+        let capture = run_local_bounded(&mut cmd, 60, 4096).unwrap();
+        let elapsed = started.elapsed();
+        let stdout = String::from_utf8(capture.stdout).unwrap();
+        if let Some(pid) = stdout
+            .trim()
+            .strip_prefix("pid=")
+            .and_then(|p| p.parse::<libc::pid_t>().ok())
+        {
+            // SAFETY: plain signal to the pid this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "the call waited on the descendant: {elapsed:?}"
+        );
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert!(!capture.timed_out && !capture.truncated);
+        assert!(stdout.starts_with("pid="), "the line was lost: {stdout:?}");
+    }
+
+    /// Run `script` under `/bin/sh` through the group-owning runner with the
+    /// leader seam recording, and return the capture, what the runner did to
+    /// the leader, and the pid the script printed as `pid=<n>`, if any.
+    #[cfg(unix)]
+    fn run_owning_group_recorded(
+        script: &str,
+        secs: u64,
+    ) -> (LocalCapture, Vec<leader_seam::Event>, Option<libc::pid_t>) {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        let (capture, events) =
+            leader_seam::capture(|| run_local_bounded_owning_group(&mut cmd, secs, 4096));
+        let capture = capture.unwrap();
+        let pid = String::from_utf8_lossy(&capture.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("pid=")?.trim().parse().ok());
+        (capture, events, pid)
+    }
+
+    /// The order every group-owning run that signals must keep: one group
+    /// signal, sent while the kernel still held the child, then the one reap.
+    #[cfg(unix)]
+    fn assert_signalled_before_reaping(events: &[leader_seam::Event], label: &str) {
+        use leader_seam::Event;
+        assert_eq!(
+            events,
+            [
+                Event::GroupSignal {
+                    leader_unreaped: true
+                },
+                Event::Reap
+            ],
+            "{label}: the group must be signalled while the leader is unreaped, then reaped once"
+        );
+    }
+
+    /// Scenario: the escaped-writer interleaving from PRD #1487's final audit
+    /// (F1) — the child starts a descendant that leaves its process group with
+    /// `setsid` while keeping stdout open, prints a line and exits. The call
+    /// waits out the stream grace and signals the group; that signal must go
+    /// out while the exited child is still an unreaped zombie holding the
+    /// group id, and the child is reaped only afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owning_group_signals_an_escapees_old_group_only_before_reaping_its_leader() {
+        if Command::new("setsid")
+            .arg("true")
+            .status()
+            .map_or(true, |s| !s.success())
+        {
+            eprintln!("SKIP: no `setsid` on this host");
+            return;
+        }
+        let (capture, events, pid) =
+            run_owning_group_recorded("setsid sleep 600 &\necho \"pid=$!\"\nexit 0", 60);
+        if let Some(pid) = pid {
+            // Out of reach of the group kill, so this test cleans it up.
+            // SAFETY: plain signal to the pid this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(pid.is_some(), "the line was lost: {:?}", capture.stdout);
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert!(!capture.timed_out);
+        assert_signalled_before_reaping(&events, "escapee");
+    }
+
+    /// Scenario: a descendant that stays in the group holds the streams after
+    /// the child exits, and, separately, a child that never exits. Both end
+    /// in a group signal; in both the signal precedes the only reap and finds
+    /// the child still unreaped.
+    #[cfg(unix)]
+    #[test]
+    fn owning_group_never_signals_after_reaping_its_leader() {
+        let (capture, events, pid) =
+            run_owning_group_recorded("sleep 600 &\necho \"pid=$!\"\nexit 0", 60);
+        if let Some(pid) = pid {
+            // SAFETY: plain signal to the pid this test started; it is
+            // already dead if the group kill reached it.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert_signalled_before_reaping(&events, "held after exit");
+
+        let (capture, events, _) = run_owning_group_recorded("exec sleep 600", 1);
+        assert!(capture.timed_out && capture.status.is_none());
+        assert_signalled_before_reaping(&events, "deadline");
+    }
+
+    /// Scenario: a child that prints a line and exits with nothing left
+    /// holding its streams. Nothing could still be running, so the group is
+    /// not signalled at all; the child is reaped once and its status kept.
+    #[cfg(unix)]
+    #[test]
+    fn owning_group_reaps_a_clean_exit_without_signalling() {
+        let (capture, events, _) = run_owning_group_recorded("echo pid=0; exit 3", 60);
+        assert_eq!(capture.status.and_then(|s| s.code()), Some(3));
+        assert_eq!(events, [leader_seam::Event::Reap]);
+    }
+
+    /// Scenario: the defence-in-depth check on a group id. Zero (the caller's
+    /// own group to `killpg`), one (init's), a negative number, and the
+    /// caller's own group are refused; an ordinary other id is allowed.
+    #[cfg(unix)]
+    #[test]
+    fn group_signal_refuses_ids_that_are_never_this_calls() {
+        // SAFETY: getpgrp takes no arguments and cannot fail.
+        let own = unsafe { libc::getpgrp() };
+        for refused in [0, 1, -1, -own, own] {
+            assert!(!group_is_signalable(refused), "{refused} must be refused");
+        }
+        let other = if own == i32::MAX { own - 1 } else { own + 1 };
+        assert!(group_is_signalable(other.max(2)));
+    }
+}
+
+/// Issue #1372: `remote add` / `remote upgrade` against a remote whose deck is
+/// installed by Homebrew.
+///
+/// The "remote" is this machine's own `/bin/sh`, run with a sandbox `HOME` and
+/// `PATH`, so every command the flows send is **executed** rather than
+/// string-matched. Stand-ins, named for what they stand in for:
+///
+/// - `brew` is a script that answers `--prefix`, `list --formula
+///   dot-agent-deck` and `upgrade dot-agent-deck` the way Homebrew does,
+///   swapping a `Cellar/dot-agent-deck/<version>` keg in behind
+///   `<prefix>/bin/dot-agent-deck`, which is a symlink into the Cellar as a
+///   real brew install is.
+/// - `curl` is a script that writes a deck stand-in to its `-o` path, so the
+///   `~/.local/bin` installer "succeeds" exactly as it does against a real
+///   release — which is what made the second copy invisible.
+/// - each deck stand-in answers `--version` and records `hooks install` along
+///   with the path it was invoked as.
+///
+/// None of this reaches a real remote, a real `ssh` or a real Homebrew; what
+/// it pins is the remote-side behaviour of the commands themselves.
+#[cfg(all(test, unix))]
+pub(crate) mod homebrew_remote_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    /// Where the remote's `brew` can be found.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum BrewAt {
+        /// On the `PATH` of the non-interactive shell.
+        OnPath,
+        /// Only at its prefix — the usual macOS case, where Homebrew puts
+        /// itself on `PATH` from a login profile a non-interactive ssh command
+        /// never reads.
+        PrefixOnly,
+    }
+
+    /// Runs each remote command under `/bin/sh -c` in the sandbox, and records
+    /// it. Nothing inherits from the test's own environment.
+    ///
+    /// `rewrites` points each of the production [`HOMEBREW_PREFIXES`] at a
+    /// sandbox path, so neither a Homebrew on the machine running the tests
+    /// nor its absence can change an answer.
+    pub(crate) struct SandboxShell {
+        home: PathBuf,
+        path: String,
+        rewrites: Vec<(String, String)>,
+        commands: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl SshExecutor for SandboxShell {
+        fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+            let mut command = command.to_string();
+            if command.contains("list --formula") {
+                for (from, to) in &self.rewrites {
+                    assert!(
+                        command.contains(from.as_str()),
+                        "the install probe no longer names {from}: {command}"
+                    );
+                    command = command.replace(from.as_str(), to);
+                }
+            }
+            self.commands.borrow_mut().push(command.clone());
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&command)
+                .env_clear()
+                .env("HOME", &self.home)
+                .env("PATH", &self.path)
+                .current_dir(&self.home)
+                .output()
+                .expect("/bin/sh must run");
+            Ok(SshOutput {
+                status: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            })
+        }
+    }
+
+    fn write_script(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::test_isolation::write_script(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A deck stand-in that reports `version` and logs `hooks install` as
+    /// `hooks <the path it was invoked as> PATH=<its PATH>`.
+    fn deck_script(version: &str, log: &Path) -> String {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo \"dot-agent-deck {version}\" ;;\nhooks) echo \"hooks $0 PATH=$PATH\" >> '{log}' ;;\nesac\n",
+            log = log.display()
+        )
+    }
+
+    /// What the remote has installed before the flow under test runs.
+    pub(crate) struct Fixture {
+        /// Version Homebrew has installed, if any.
+        pub(crate) brew: Option<&'static str>,
+        /// Version of a copy at `~/.local/bin`, if any.
+        pub(crate) local_bin: Option<&'static str>,
+        /// What `brew upgrade` lands, and what the release download writes.
+        pub(crate) tap: &'static str,
+        /// `brew upgrade` exits non-zero without changing anything.
+        pub(crate) brew_upgrade_fails: bool,
+    }
+
+    pub(crate) struct Remote {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        home: PathBuf,
+        brew_prefix: PathBuf,
+        log: PathBuf,
+        pub(crate) registry: PathBuf,
+    }
+
+    impl Remote {
+        pub(crate) fn new(fixture: Fixture) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().canonicalize().unwrap();
+            let home = root.join("home");
+            let brew_prefix = root.join("brew");
+            let log = root.join("remote.log");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(&log, "").unwrap();
+
+            write_script(
+                &root.join("stubs/curl"),
+                &format!(
+                    "#!/bin/sh\necho \"curl $*\" >> '{log}'\nwhile [ $# -gt 0 ]; do\nif [ \"$1\" = -o ]; then out=\"$2\"; fi\nshift\ndone\ncat > \"$out\" <<'EOF'\n{deck}EOF\n",
+                    log = log.display(),
+                    deck = deck_script(fixture.tap, &log),
+                ),
+            );
+
+            if let Some(v) = fixture.brew {
+                let keg = |v: &str| {
+                    brew_prefix.join(format!("Cellar/dot-agent-deck/{v}/bin/dot-agent-deck"))
+                };
+                write_script(&keg(v), &deck_script(v, &log));
+                std::fs::create_dir_all(brew_prefix.join("bin")).unwrap();
+                symlink(keg(v), brew_prefix.join("bin/dot-agent-deck")).unwrap();
+                let new_keg = keg(fixture.tap);
+                let upgrade = if fixture.brew_upgrade_fails {
+                    "echo 'Error: dot-agent-deck is pinned' >&2\nexit 1".to_string()
+                } else {
+                    format!(
+                        "mkdir -p '{new_dir}'\ncat > '{new_keg}' <<'EOF'\n{deck}EOF\nchmod 0755 '{new_keg}'\nln -sfn '{new_keg}' \"$prefix/bin/dot-agent-deck\"",
+                        new_dir = new_keg.parent().unwrap().display(),
+                        new_keg = new_keg.display(),
+                        deck = deck_script(fixture.tap, &log),
+                    )
+                };
+                write_script(
+                    &brew_prefix.join("bin/brew"),
+                    &format!(
+                        "#!/bin/sh\nprefix='{prefix}'\ncase \"$1\" in\n--prefix) if [ \"$2\" = dot-agent-deck ]; then printf '%s\\n' \"$prefix/Cellar/dot-agent-deck/{version}\"; else printf '%s\\n' \"$prefix\"; fi ;;\nlist) [ \"$2\" = --formula ] && [ \"$3\" = dot-agent-deck ] && [ -d \"$prefix/Cellar/dot-agent-deck\" ] ;;\nupgrade)\necho \"brew $*\" >> '{log}'\n{upgrade} ;;\n*) exit 1 ;;\nesac\n",
+                        prefix = brew_prefix.display(),
+                        version = v,
+                        log = log.display(),
+                    ),
+                );
+            }
+            if let Some(v) = fixture.local_bin {
+                write_script(
+                    &home.join(".local/bin/dot-agent-deck"),
+                    &deck_script(v, &log),
+                );
+            }
+
+            Self {
+                _dir: dir,
+                registry: root.join("remotes.toml"),
+                root,
+                home,
+                brew_prefix,
+                log,
+            }
+        }
+
+        pub(crate) fn shell(&self, brew_at: BrewAt) -> SandboxShell {
+            let mut path = format!("{}:/usr/bin:/bin", self.root.join("stubs").display());
+            if brew_at == BrewAt::OnPath {
+                path = format!("{}:{path}", self.brew_prefix.join("bin").display());
+            }
+            let rewrites = HOMEBREW_PREFIXES
+                .iter()
+                .enumerate()
+                .map(|(i, prefix)| {
+                    let to = if brew_at == BrewAt::PrefixOnly && i == 0 {
+                        self.brew_prefix.join("bin/brew")
+                    } else {
+                        self.root.join(format!("absent-{i}/bin/brew"))
+                    };
+                    (format!("{prefix}/bin/brew"), to.display().to_string())
+                })
+                .collect();
+            SandboxShell {
+                home: self.home.clone(),
+                path,
+                rewrites,
+                commands: Default::default(),
+            }
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap()
+        }
+
+        pub(crate) fn local_bin_copy(&self) -> PathBuf {
+            self.home.join(".local/bin/dot-agent-deck")
+        }
+
+        pub(crate) fn brew_binary(&self) -> PathBuf {
+            self.brew_prefix.join("bin/dot-agent-deck")
+        }
+
+        pub(crate) fn version_of(&self, binary: &Path) -> String {
+            let out = Command::new(binary).arg("--version").output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Register the remote as an entry written before #1372: no install
+        /// method recorded.
+        pub(crate) fn register_legacy_entry(&self, version: &str) {
+            RemotesFile {
+                remotes: vec![RemoteEntry {
+                    name: "mac".to_string(),
+                    kind: "ssh".to_string(),
+                    host: "user@mac".to_string(),
+                    port: 22,
+                    key: None,
+                    version: version.to_string(),
+                    added_at: "2026-01-01T00:00:00Z".to_string(),
+                    upgraded_at: None,
+                    last_connected: None,
+                    install: None,
+                    binary: None,
+                    id: None,
+                    user: None,
+                    jump_host: None,
+                    socket: None,
+                }],
+            }
+            .save(&self.registry)
+            .unwrap();
+        }
+
+        pub(crate) fn entry(&self) -> RemoteEntry {
+            RemotesFile::load(&self.registry).unwrap().remotes[0].clone()
+        }
+
+        fn upgrade(
+            &self,
+            brew_at: BrewAt,
+            version: &str,
+            no_install: bool,
+        ) -> (Result<RemoteEntry, RemoteUpgradeError>, String) {
+            let opts = UpgradeOptions {
+                name: "mac".to_string(),
+                version: version.to_string(),
+                no_install,
+                release_base: "https://example.test/releases/download".to_string(),
+            };
+            let mut out = Vec::new();
+            let result =
+                upgrade_reporting_to(&opts, &self.shell(brew_at), &self.registry, &mut out);
+            (result, String::from_utf8(out).unwrap())
+        }
+    }
+
+    #[test]
+    fn beta_link_wins_over_installed_but_unlinked_stable_formula() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: None,
+            tap: "0.44.0-rc.1",
+            brew_upgrade_fails: false,
+        });
+        let stable_keg = remote
+            .brew_prefix
+            .join("Cellar/dot-agent-deck/0.44.0/bin/dot-agent-deck");
+        let beta_keg = remote
+            .brew_prefix
+            .join("Cellar/dot-agent-deck-beta/0.44.0-rc.1/bin/dot-agent-deck");
+        write_script(&stable_keg, &deck_script("0.44.0", &remote.log));
+        write_script(&beta_keg, &deck_script("0.44.0-rc.1", &remote.log));
+        std::fs::create_dir_all(remote.brew_prefix.join("bin")).unwrap();
+        symlink(&beta_keg, remote.brew_binary()).unwrap();
+        write_script(
+            &remote.brew_prefix.join("bin/brew"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n--prefix) case \"$2\" in\ndot-agent-deck) echo '{stable}' ;;\ndot-agent-deck-beta) echo '{beta}' ;;\n*) echo '{prefix}' ;;\nesac ;;\nlist) [ \"$2\" = --formula ] && case \"$3\" in dot-agent-deck|dot-agent-deck-beta) true ;; *) false ;; esac ;;\nupgrade) echo \"brew $*\" >> '{log}' ;;\n*) exit 1 ;;\nesac\n",
+                prefix = remote.brew_prefix.display(),
+                stable = stable_keg.parent().unwrap().parent().unwrap().display(),
+                beta = beta_keg.parent().unwrap().parent().unwrap().display(),
+                log = remote.log.display(),
+            ),
+        );
+        let shell = remote.shell(BrewAt::OnPath);
+        let target = SshTarget::parse("user@mac", 22, None);
+        assert_eq!(
+            discover_homebrew_binary(&shell, &target)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            remote.brew_binary().to_str().unwrap()
+        );
+        assert_eq!(
+            detect_install(&shell, &target).unwrap().homebrew_formula,
+            Some("dot-agent-deck-beta")
+        );
+        remote.register_legacy_entry("0.44.0-rc.1");
+        let (upgraded, _) = remote.upgrade(BrewAt::OnPath, "0.44.0-rc.1", false);
+        upgraded.expect("upgrade keeps the beta formula");
+        assert!(
+            remote.log().contains("brew upgrade dot-agent-deck-beta"),
+            "the beta formula, not stable, owns this install"
+        );
+        assert!(!remote.local_bin_copy().exists());
+        assert_eq!(
+            remote.entry().remote_binary(),
+            remote.brew_binary().to_str().unwrap()
+        );
+    }
+
+    /// The issue's report: a brew-installed remote, upgraded with `remote
+    /// upgrade`, must be upgraded by brew and must not gain a second copy in
+    /// `~/.local/bin` — whether or not `brew` is on the non-interactive
+    /// `PATH`. The entry, written before #1372, then records the Homebrew
+    /// binary, which is what `connect` and `remote doctor` run.
+    #[test]
+    fn upgrade_on_a_homebrew_remote_goes_through_brew_and_writes_no_second_copy() {
+        for brew_at in [BrewAt::OnPath, BrewAt::PrefixOnly] {
+            let remote = Remote::new(Fixture {
+                brew: Some("0.40.0"),
+                local_bin: None,
+                tap: "0.43.0",
+                brew_upgrade_fails: false,
+            });
+            remote.register_legacy_entry("0.40.0");
+
+            let (result, out) = remote.upgrade(brew_at, "0.43.0", false);
+            let log = remote.log();
+
+            assert!(
+                !remote.local_bin_copy().exists(),
+                "{brew_at:?}: `remote upgrade` wrote a second copy to ~/.local/bin on a brew \
+                 remote (result: {result:?}, remote log:\n{log})"
+            );
+            assert!(
+                !log.contains("curl "),
+                "{brew_at:?}: nothing may be downloaded: {log}"
+            );
+            assert!(
+                log.contains("brew upgrade dot-agent-deck"),
+                "{brew_at:?}: the upgrade must go through brew: {log}"
+            );
+            assert_eq!(
+                remote.version_of(&remote.brew_binary()),
+                "dot-agent-deck 0.43.0",
+                "{brew_at:?}: the brew copy must be the upgraded one"
+            );
+            assert!(
+                log.contains(&format!("hooks {}", remote.brew_binary().display())),
+                "{brew_at:?}: hooks must be installed by the brew binary: {log}"
+            );
+            // The hook installer pins the binary it runs only when that
+            // binary's directory is on `PATH` (`durable_binary_path`), and a
+            // non-interactive ssh `PATH` usually lacks Homebrew's `bin`.
+            assert!(
+                log.contains(&format!(
+                    "hooks {} PATH={}:",
+                    remote.brew_binary().display(),
+                    remote.brew_prefix.join("bin").display()
+                )),
+                "{brew_at:?}: hooks install must run with Homebrew's bin first on PATH: {log}"
+            );
+            result.unwrap_or_else(|e| panic!("{brew_at:?}: upgrade must succeed: {e}"));
+            assert!(
+                out.contains("Upgraded remote 'mac' to version 0.43.0."),
+                "{brew_at:?}: {out}"
+            );
+
+            let entry = remote.entry();
+            assert_eq!(entry.version, "0.43.0");
+            assert_eq!(entry.install.as_deref(), Some(INSTALL_HOMEBREW));
+            assert_eq!(
+                entry.remote_binary(),
+                remote.brew_binary().display().to_string(),
+                "{brew_at:?}: `connect` must run the Homebrew binary from now on"
+            );
+        }
+    }
+
+    /// PRD #1487 review: the release lands and then `hooks install` fails. The
+    /// binary is not rolled back, so the error says the new version is
+    /// installed and which later step failed — never that nothing changed —
+    /// and the deck list still records the version it had.
+    #[test]
+    fn a_failure_after_the_binary_landed_names_the_installed_version_and_the_step() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        // The release that lands reports its version, but its hook install fails.
+        let landed = "#!/bin/sh\ncase \"$1\" in\n--version) echo \"dot-agent-deck 0.43.0\" ;;\nhooks) echo 'hooks: settings.json is not writable' >&2; exit 3 ;;\nesac\n";
+        write_script(
+            &remote.root.join("stubs/curl"),
+            &format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do\nif [ \"$1\" = -o ]; then out=\"$2\"; fi\nshift\ndone\ncat > \"$out\" <<'EOF'\n{landed}EOF\n"
+            ),
+        );
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
+        let err = result.expect_err("a failed hook install must fail the upgrade");
+        assert_eq!(err.installed_version(), Some("0.43.0"));
+        assert_eq!(err.installed_binary(), Some(REMOTE_INSTALL_PATH));
+        assert!(
+            matches!(
+                &err,
+                RemoteUpgradeError::AfterInstall { step: "reinstalling the hooks", source, .. }
+                    if matches!(**source, RemoteUpgradeError::Inner(RemoteAddError::HooksInstallFailed { .. }))
+            ),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("0.43.0 was installed, but reinstalling the hooks failed:"),
+            "{msg}"
+        );
+        assert!(msg.contains("settings.json is not writable"), "{msg}");
+        assert_eq!(
+            remote.version_of(&remote.local_bin_copy()),
+            "dot-agent-deck 0.43.0"
+        );
+        assert_eq!(remote.entry().version, "0.40.0");
+
+        // A failure before anything landed carries no installed version.
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", true);
+        let err = result.expect_err("version mismatch");
+        assert_eq!(err.installed_version(), None);
+        assert_eq!(err.installed_binary(), None);
+    }
+
+    /// Control: a remote with no Homebrew install keeps today's behaviour —
+    /// the release binary lands in `~/.local/bin` — and says so in the entry.
+    #[test]
+    fn upgrade_on_a_local_bin_remote_still_installs_to_local_bin() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
+        let entry = result.expect("upgrade must succeed");
+        let log = remote.log();
+
+        assert_eq!(entry.version, "0.43.0");
+        assert_eq!(
+            remote.version_of(&remote.local_bin_copy()),
+            "dot-agent-deck 0.43.0"
+        );
+        assert!(
+            log.contains("curl "),
+            "the release must be downloaded: {log}"
+        );
+        assert!(!log.contains("brew "), "no brew on this remote: {log}");
+        assert!(
+            log.contains(&format!("hooks {}", remote.local_bin_copy().display())),
+            "hooks must be installed by the ~/.local/bin binary: {log}"
+        );
+        assert_eq!(entry.install.as_deref(), Some(INSTALL_LOCAL_BIN));
+        assert_eq!(entry.binary, None);
+        assert_eq!(entry.remote_binary(), REMOTE_INSTALL_PATH);
+    }
+
+    /// Scenario: an upgrade starts against the deck-list row it read for
+    /// `mac` (`user@mac`), and while it runs that row is removed and re-added
+    /// for another machine (`user@elsewhere`). Every ssh command still goes to
+    /// the machine the upgrade started on, and the result is refused rather
+    /// than recorded over the moved row — the error says so in plain words and
+    /// that the build was installed (PRD #1487, Greptile 4208066970).
+    #[test]
+    fn an_upgrade_whose_row_moves_to_another_machine_mid_run_installs_on_the_first_and_records_nothing()
+     {
+        struct MovesTheRow<'a> {
+            inner: SandboxShell,
+            targets: std::cell::RefCell<Vec<SshTarget>>,
+            registry: &'a Path,
+        }
+        impl SshExecutor for MovesTheRow<'_> {
+            fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                if self.targets.borrow().is_empty() {
+                    // Another client removes `mac` and adds it back for a
+                    // different machine, while this upgrade is under way.
+                    let mut file = RemotesFile::load(self.registry).unwrap();
+                    file.remotes[0].host = "user@elsewhere".to_string();
+                    file.save(self.registry).unwrap();
+                }
+                self.targets.borrow_mut().push(target.clone());
+                self.inner.run(target, command)
+            }
+        }
+
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        let pinned = remote.entry();
+        let executor = MovesTheRow {
+            inner: remote.shell(BrewAt::PrefixOnly),
+            targets: Default::default(),
+            registry: &remote.registry,
+        };
+        let opts = UpgradeOptions {
+            name: "mac".to_string(),
+            version: "0.43.0".to_string(),
+            no_install: false,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        let mut out = Vec::new();
+        let error =
+            upgrade_entry_reporting_to(&opts, &pinned, &executor, &remote.registry, &mut out)
+                .expect_err("a row moved to another machine must not be recorded over");
+
+        let targets = executor.targets.borrow();
+        assert!(!targets.is_empty());
+        assert!(
+            targets.iter().all(|t| *t == pinned.ssh_target()),
+            "every command must reach the machine the upgrade started on: {targets:?}"
+        );
+        assert!(
+            matches!(
+                &error,
+                RemoteUpgradeError::AfterInstall { source, .. }
+                    if matches!(**source, RemoteUpgradeError::RouteChanged { .. })
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(error.installed_version(), Some("0.43.0"));
+        assert_eq!(error.installed_binary(), Some(REMOTE_INSTALL_PATH));
+        let message = error.to_string();
+        assert!(
+            message.contains("was changed to reach a different machine"),
+            "{message}"
+        );
+        let row = remote.entry();
+        assert_eq!(row.host, "user@elsewhere", "the re-added row is kept");
+        assert_eq!(row.version, "0.40.0", "nothing recorded over it");
+        assert_eq!(row.upgraded_at, None);
+    }
+
+    /// A row whose route is unchanged is the same machine: [`RemoteEntry::same_route`]
+    /// ignores what an upgrade itself records, and notices every address field.
+    #[test]
+    fn same_route_compares_the_address_and_socket_only() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: None,
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        let base = remote.entry();
+        let mut recorded = base.clone();
+        recorded.version = "0.43.0".into();
+        recorded.upgraded_at = Some("2026-10-07T00:00:00Z".into());
+        recorded.install = Some(INSTALL_LOCAL_BIN.into());
+        assert!(base.same_route(&recorded));
+        let moved: [fn(&mut RemoteEntry); 6] = [
+            |e| e.host = "user@elsewhere".into(),
+            |e| e.port = 2222,
+            |e| e.key = Some("/k/id".into()),
+            |e| e.user = Some("other".into()),
+            |e| e.jump_host = Some("bastion".into()),
+            |e| e.socket = Some("/run/other.sock".into()),
+        ];
+        for change in moved {
+            let mut other = base.clone();
+            change(&mut other);
+            assert!(!base.same_route(&other), "{other:?}");
+        }
+    }
+
+    /// The state the bug leaves behind — a Homebrew install AND a
+    /// `~/.local/bin` copy. The upgrade still goes through Homebrew, the other
+    /// copy is left alone, and the output names both and which one is used.
+    #[test]
+    fn upgrade_with_both_installs_uses_homebrew_and_reports_both() {
+        let remote = Remote::new(Fixture {
+            brew: Some("0.40.0"),
+            local_bin: Some("0.41.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.41.0");
+
+        let (result, out) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
+        result.expect("upgrade must succeed");
+        let log = remote.log();
+
+        assert!(log.contains("brew upgrade dot-agent-deck"), "{log}");
+        assert!(!log.contains("curl "), "{log}");
+        assert_eq!(
+            remote.version_of(&remote.local_bin_copy()),
+            "dot-agent-deck 0.41.0",
+            "the other copy must be left untouched"
+        );
+        let brew_binary = remote.brew_binary().display().to_string();
+        assert!(
+            out.contains("has two dot-agent-deck installs")
+                && out.contains(&brew_binary)
+                && out.contains(REMOTE_INSTALL_PATH)
+                && out.contains("uses the Homebrew one")
+                && out.contains("`ssh user@mac 'rm ~/.local/bin/dot-agent-deck'`"),
+            "both installs, the one in use and the cleanup must be named: {out}"
+        );
+        assert_eq!(remote.entry().remote_binary(), brew_binary);
+    }
+
+    /// `remote add` registers a Homebrew install as it is: no download, no
+    /// `brew upgrade`, nothing in `~/.local/bin`, and the version Homebrew has
+    /// is what is recorded, with the difference from the requested one said.
+    #[test]
+    fn add_on_a_homebrew_remote_registers_the_brew_install() {
+        let remote = Remote::new(Fixture {
+            brew: Some("0.40.0"),
+            local_bin: None,
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        let opts = AddOptions {
+            name: "mac".to_string(),
+            remote_type: "ssh".to_string(),
+            target: "user@mac".to_string(),
+            port: 22,
+            key: None,
+            version: "0.43.0".to_string(),
+            no_install: false,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        let mut out = Vec::new();
+        let entry = add_reporting_to(
+            &opts,
+            &remote.shell(BrewAt::PrefixOnly),
+            &remote.registry,
+            &mut out,
+        )
+        .expect("add must succeed");
+        let out = String::from_utf8(out).unwrap();
+        let log = remote.log();
+
+        assert!(!remote.local_bin_copy().exists(), "{log}");
+        assert!(!log.contains("curl "), "{log}");
+        assert!(
+            !log.contains("brew upgrade"),
+            "`add` must not upgrade: {log}"
+        );
+        assert!(
+            log.contains(&format!("hooks {}", remote.brew_binary().display())),
+            "{log}"
+        );
+        assert_eq!(entry, remote.entry());
+        assert_eq!(entry.version, "0.40.0");
+        assert_eq!(entry.install.as_deref(), Some(INSTALL_HOMEBREW));
+        assert_eq!(
+            entry.remote_binary(),
+            remote.brew_binary().display().to_string()
+        );
+        assert!(
+            out.contains("runs dot-agent-deck 0.40.0 from Homebrew")
+                && out.contains("not the requested 0.43.0")
+                && out.contains("remote upgrade"),
+            "{out}"
+        );
+    }
+
+    /// Homebrew installs its tap's latest and cannot install a chosen
+    /// version. The upgrade reports which version landed and records it.
+    #[test]
+    fn upgrade_through_homebrew_records_the_version_that_landed() {
+        let remote = Remote::new(Fixture {
+            brew: Some("0.40.0"),
+            local_bin: None,
+            tap: "0.42.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+
+        let (result, out) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
+        let entry = result.expect("upgrade must succeed");
+
+        assert_eq!(entry.version, "0.42.0");
+        assert!(
+            out.contains("runs dot-agent-deck 0.42.0 from Homebrew")
+                && out.contains("not the requested 0.43.0")
+                && out.contains("tap's latest"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Upgraded remote 'mac' to version 0.42.0."),
+            "{out}"
+        );
+    }
+
+    /// `--no-install` on a Homebrew remote verifies the Homebrew binary and
+    /// changes nothing on the remote — before #1372 it verified a
+    /// `~/.local/bin` copy that a brew-only remote does not have, and failed.
+    #[test]
+    fn upgrade_no_install_on_a_homebrew_remote_verifies_the_brew_binary() {
+        let remote = Remote::new(Fixture {
+            brew: Some("0.43.0"),
+            local_bin: None,
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", true);
+        let entry = result.expect("upgrade --no-install must succeed");
+        let log = remote.log();
+
+        assert!(!log.contains("brew upgrade"), "{log}");
+        assert!(!log.contains("curl "), "{log}");
+        assert!(!remote.local_bin_copy().exists());
+        assert_eq!(entry.version, "0.43.0");
+        assert_eq!(entry.install.as_deref(), Some(INSTALL_HOMEBREW));
+
+        // A different version fails the pre-flight, as it does for a
+        // `~/.local/bin` install, and leaves the registry alone (PR #1373
+        // review).
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", true);
+        let err = result.expect_err("--no-install must require the requested version");
+        assert!(
+            matches!(
+                err,
+                RemoteUpgradeError::Inner(RemoteAddError::VersionMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(remote.entry().version, "0.43.0");
+    }
+
+    /// A failing `brew upgrade` fails the command and never falls back to a
+    /// download, and the registry is left as it was.
+    #[test]
+    fn a_failed_brew_upgrade_fails_without_a_fallback_download() {
+        let remote = Remote::new(Fixture {
+            brew: Some("0.40.0"),
+            local_bin: None,
+            tap: "0.43.0",
+            brew_upgrade_fails: true,
+        });
+        remote.register_legacy_entry("0.40.0");
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
+        let err = result.expect_err("a failed brew upgrade must fail the command");
+        let msg = err.to_string();
+
+        assert!(
+            matches!(
+                err,
+                RemoteUpgradeError::Inner(RemoteAddError::BrewUpgradeFailed { status: 1, .. })
+            ),
+            "{err:?}"
+        );
+        assert!(msg.contains("dot-agent-deck is pinned"), "{msg}");
+        assert!(!remote.local_bin_copy().exists());
+        assert!(!remote.log().contains("curl "));
+        let entry = remote.entry();
+        assert_eq!(entry.version, "0.40.0");
+        assert_eq!(entry.install, None);
+    }
+
+    /// PRD #1487 review (Qodo 4200041523): the download moved into place and
+    /// then failed its version check. The binary is not rolled back, so the
+    /// error says it was replaced and carries the version the check read —
+    /// which the upgrade outcome reports as installed — and the registry is
+    /// left as it was.
+    #[test]
+    fn a_download_that_lands_the_wrong_version_says_the_binary_was_replaced() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", false);
+        let err = result.expect_err("a version check that fails must fail the command");
+        let msg = err.to_string();
+
+        assert!(
+            matches!(
+                &err,
+                RemoteUpgradeError::Inner(RemoteAddError::ReplacedButUnverified { on_disk, source, .. })
+                    if on_disk == "0.43.0"
+                        && matches!(**source, RemoteAddError::VersionMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.installed_version(), Some("0.43.0"));
+        assert!(msg.contains("was replaced"), "{msg}");
+        assert!(
+            msg.contains("reports `0.43.0` but expected `0.44.0`"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("What is installed there now is 0.43.0"),
+            "{msg}"
+        );
+        assert_eq!(
+            remote.version_of(&remote.local_bin_copy()),
+            "dot-agent-deck 0.43.0"
+        );
+        assert_eq!(remote.entry().version, "0.40.0");
+    }
+
+    /// An entry written before #1372 has neither field and runs
+    /// [`REMOTE_INSTALL_PATH`], exactly as it did.
+    #[test]
+    fn a_legacy_registry_entry_runs_the_local_bin_path() {
+        let file: RemotesFile = toml::from_str(
+            "[[remotes]]\nname = \"old\"\ntype = \"ssh\"\nhost = \"u@h\"\nport = 22\nversion = \"0.40.0\"\nadded_at = \"2026-01-01T00:00:00Z\"\n",
+        )
+        .expect("a legacy entry must parse");
+        let entry = &file.remotes[0];
+        assert_eq!(entry.install, None);
+        assert_eq!(entry.binary, None);
+        assert_eq!(entry.remote_binary(), REMOTE_INSTALL_PATH);
+    }
+
+    /// The recorded binary is interpolated into remote commands unquoted, so a
+    /// value that could inject one is refused when `remotes.toml` is read
+    /// rather than handed to the remote shell.
+    #[test]
+    fn a_registry_binary_with_shell_metacharacters_is_refused() {
+        let legacy = "[[remotes]]\nname = \"old\"\ntype = \"ssh\"\nhost = \"u@h\"\nport = 22\nversion = \"0.40.0\"\nadded_at = \"2026-01-01T00:00:00Z\"\ninstall = \"homebrew\"\n";
+        for hostile in [
+            "/opt/homebrew/bin/dot-agent-deck; rm -rf ~",
+            "/opt/homebrew/bin/$(id)",
+            "/opt/home brew/bin/dot-agent-deck",
+            "opt/homebrew/bin/dot-agent-deck",
+            "/opt/homebrew/bin/dot-agent-deck\n",
+        ] {
+            let text = format!("{legacy}binary = {hostile:?}\n");
+            assert!(
+                toml::from_str::<RemotesFile>(&text).is_err(),
+                "{hostile:?} must be refused"
+            );
+        }
+        let text = format!("{legacy}binary = \"/opt/homebrew/bin/dot-agent-deck\"\n");
+        let file: RemotesFile = toml::from_str(&text).expect("a safe path must parse");
+        assert_eq!(
+            file.remotes[0].remote_binary(),
+            "/opt/homebrew/bin/dot-agent-deck"
+        );
+        let round_trip: RemotesFile =
+            toml::from_str(&toml::to_string_pretty(&file).unwrap()).unwrap();
+        assert_eq!(round_trip, file);
     }
 }

@@ -286,7 +286,12 @@ impl AgentProcessGroup {
     /// Reap the agent and every descendant in its job. Returns `false` when
     /// there is no job to terminate (so the caller falls back to a single-process
     /// kill) or the call failed.
-    fn terminate_tree(&self, phase: &'static str) -> bool {
+    ///
+    /// `pub(crate)` for the one caller outside agent teardown: the Claude Code
+    /// version probe (`hooks_manage::probe_claude_version`), which adopts its
+    /// `claude --version` child into a job for the same reason an agent is
+    /// adopted — so a helper that outlives the direct child dies with it.
+    pub(crate) fn terminate_tree(&self, phase: &'static str) -> bool {
         let Some(job) = self.job.as_ref() else {
             return false;
         };
@@ -307,13 +312,18 @@ impl AgentProcessGroup {
 
 /// Tear the agent's whole tree down, falling back to `portable-pty`'s
 /// single-process kill when there is no job (see [`AgentProcessGroup::adopt`]).
+///
+/// Returns whether the JOB-object teardown succeeded. `false` means the
+/// single-process fallback below ran instead, so any descendant the agent
+/// spawned survives; see the Unix twin for why issue #1118 surfaces this rather
+/// than swallowing it.
 fn reap_tree_or_fallback(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
     phase: &'static str,
-) {
+) -> bool {
     if group.terminate_tree(phase) {
-        return;
+        return true;
     }
     tracing::warn!(
         pid = ?child.process_id(),
@@ -322,6 +332,7 @@ fn reap_tree_or_fallback(
          spawned will leak"
     );
     let _ = child.kill();
+    false
 }
 
 /// Best-effort `CTRL_BREAK_EVENT` to the child's process group — the closest
@@ -363,7 +374,9 @@ pub fn force_kill_child_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
 ) {
-    force_kill_child_group(child, group);
+    // Deliberately discarded, for the same reason as the Unix twin: the blocking
+    // `wait()` below is this caller's own answer.
+    let _ = force_kill_child_group(child, group);
     let _ = child.wait();
 }
 
@@ -377,11 +390,22 @@ pub fn force_kill_child_and_wait(
 /// handle signals, and a caller that interleaves terminate-then-wait per agent
 /// leaves every later agent's job un-terminated for as long as one child takes
 /// to go away.
+///
+/// **The return value is a NEGATIVE signal, not a delivery receipt** (issue
+/// #1118, Greptile P1), and it means the same thing as the Unix twin's even
+/// though the mechanism differs: `false` says the primary teardown —
+/// `TerminateJobObject` over the agent's whole tree — reported a failure, so the
+/// single-process fallback ran and any descendant survives. `true` says nothing
+/// reported a failure. `force_kill_and_reap_all` reports it on the agents it
+/// gives up on.
+#[must_use = "this is how a caller learns the force-kill did not land; issue #1118's Greptile P1 \
+              was exactly this value being dropped. Discard it with `let _ =` only where you have \
+              another answer (a blocking `wait()` right after), never by accident"]
 pub fn force_kill_child_group(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
-) {
-    reap_tree_or_fallback(child, group, "force-kill");
+) -> bool {
+    reap_tree_or_fallback(child, group, "force-kill")
 }
 
 /// Best-effort-graceful-then-force teardown used by the single-pane Ctrl+W path:
@@ -748,6 +772,117 @@ pub async fn process_table_async(
 // Orphan watchdog (test-gated, OFF in production).
 // ---------------------------------------------------------------------------
 
+/// Audit F3: the executable process `pid` runs. Not implemented on Windows, so
+/// `None`: the caller falls back to not checking.
+pub fn executable_of(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// PRD #1666 hardening M2 (PR #1735 review): the parent of process `pid`,
+/// from a Toolhelp process snapshot. `None` when the snapshot cannot be taken
+/// or does not list `pid` (it is not running).
+///
+/// Windows keeps a process's recorded parent pid after that parent exits, and
+/// reuses pids, so the recorded pid can name an unrelated process started
+/// later. A recorded parent that cannot be opened (it exited, or this user may
+/// not query it), or that started after `pid` did (its pid was reused), is
+/// answered as `Some(0)`: the walk in [`super::descends_from_with`] then ends
+/// as "not a descendant", as an orphan reparented to init does on Linux.
+/// [`placement_parent_of`] answers `None` there instead.
+pub fn parent_pid_of(pid: u32) -> Option<u32> {
+    followable_parent(pid).map(|parent| parent.unwrap_or(0))
+}
+
+/// R2-fix4 (U2): [`parent_pid_of`] for a walk that must not read "cannot
+/// follow" as "outside": `None` where that answers `Some(0)` for a recorded
+/// parent that cannot be opened or started after `pid` did, so the walk ends
+/// [`super::Ancestry::Unreadable`]. A recorded parent of 0 stays `Some(0)`.
+pub fn placement_parent_of(pid: u32) -> Option<u32> {
+    followable_parent(pid).flatten()
+}
+
+/// `pid`'s recorded parent, `Some(None)` when the walk cannot follow it (it
+/// cannot be opened, or started after `pid` did), and `None` when the
+/// snapshot does not list `pid`.
+fn followable_parent(pid: u32) -> Option<Option<u32>> {
+    let recorded = recorded_parent(pid)?;
+    if recorded == 0 {
+        return Some(Some(0));
+    }
+    match (creation_time(pid), creation_time(recorded)) {
+        (_, None) => Some(None),
+        (Some(child_started), Some(parent_started)) if parent_started > child_started => Some(None),
+        _ => Some(Some(recorded)),
+    }
+}
+
+/// `pid`'s parent as a Toolhelp snapshot records it, or `None` when the
+/// snapshot cannot be taken or does not list `pid`.
+fn recorded_parent(pid: u32) -> Option<u32> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot of every process; no pointer is passed in, and the
+    // handle is closed below on every path.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..PROCESSENTRY32W::default()
+    };
+    let mut found = None;
+    // SAFETY: `snapshot` is a valid snapshot handle and `entry` a stack value
+    // whose `dwSize` is set as both calls require; they write only into it.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32ProcessID == pid {
+            found = Some(entry.th32ParentProcessID);
+            break;
+        }
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: `snapshot` is a handle this function opened and closes once.
+    unsafe { CloseHandle(snapshot) };
+    found
+}
+
+/// PR #1735 third review (F2): when process `pid` started, in `FILETIME`
+/// units, or `None` when it cannot be opened — see the Unix variant.
+pub fn process_start_of(pid: u32) -> Option<u64> {
+    creation_time(pid)
+}
+
+/// When process `pid` started, in `FILETIME` units, or `None` when it cannot
+/// be opened (it is gone, or this user may not query it).
+fn creation_time(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: `OpenProcess` takes no pointer; a null handle is checked below.
+    let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut times = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: `handle` was opened with query rights above and the four
+    // pointers name distinct stack values the call writes into.
+    let ok = unsafe { GetProcessTimes(handle, created, exited, kernel, user) } != 0;
+    // SAFETY: `handle` is a handle this function opened and closes once.
+    unsafe { CloseHandle(handle) };
+    ok.then(|| (u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime))
+}
+
 /// The orphan watchdog has no Windows analogue (`getppid`/pid-1-reparent is
 /// POSIX) and is test-only / OFF in production. Returns a sentinel so
 /// `should_exit_orphaned` never triggers.
@@ -778,6 +913,24 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn the helper process tree")
+    }
+
+    /// PR #1735 review: the inbox's process-tree check reads real ancestry
+    /// here — a child descends from this test process, and this process does
+    /// not descend from its child.
+    #[test]
+    fn parent_lookup_tells_a_child_from_an_unrelated_process() {
+        let mut child = spawn_helper_tree();
+        let pid = child.id();
+        let me = std::process::id();
+        let read = (
+            parent_pid_of(pid),
+            super::super::descends_from(pid, me),
+            super::super::descends_from(me, pid),
+        );
+        let _ = force_kill_pid(pid);
+        let _ = child.wait();
+        assert_eq!(read, (Some(me), Some(true), Some(false)));
     }
 
     /// The escalation state machine's platform input: a live process reads as

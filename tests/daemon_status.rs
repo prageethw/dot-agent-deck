@@ -6,15 +6,20 @@
 //! lifecycle CLI cannot carry. `/002` and `/005` exercise the real
 //! `agent-event --type running` subprocess with the pane/agent environment a
 //! daemon-managed spawn receives. `/003` queries a scratch attach-socket path
-//! with nothing listening.
+//! with nothing listening, and `/006` queries one where a stub peer accepts
+//! the connection and then never replies — the only staging that reaches the
+//! [`STATUS_REQUEST_TIMEOUT`] deadline, since `/003`'s path fails at
+//! `connect(2)` long before it.
 
 use std::path::Path;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
-    DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+    CommissionArm, DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+#[cfg(unix)]
+use dot_agent_deck::daemon_status::STATUS_REQUEST_TIMEOUT;
 use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 use dot_agent_deck::state::SessionStatus;
 #[cfg(unix)]
@@ -51,6 +56,34 @@ const OBS_WORKER_PANE: &str = "status-obs-worker-pane-a47d20";
 #[cfg(unix)]
 const JSON_ORCH_PANE: &str = "status-json-orch-pane-3f7c9a";
 
+/// Absolute ceiling on ONE wedged-peer `daemon status` run, watchdogged in
+/// this test rather than trusted to the binary.
+///
+/// Deliberately a literal, and deliberately NOT derived from
+/// [`STATUS_REQUEST_TIMEOUT`]: a bound that follows the constant it is
+/// guarding would sail through a build that raised that constant to a minute,
+/// which is half of what `daemon/status/006` exists to catch. The other half —
+/// a build that dropped the deadline entirely — hangs forever, so without a
+/// watchdog the test would HANG rather than fail, which reports nothing to
+/// anyone.
+///
+/// 8s leaves the passing run (~3s of deadline plus subprocess startup, both
+/// modes concurrent against one stub) a wide margin while keeping even the
+/// failing run inside the fast tier's budget.
+#[cfg(unix)]
+const WEDGED_PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Slack over [`STATUS_REQUEST_TIMEOUT`] allowed for forking the debug binary,
+/// dynamically linking it, and CI scheduling noise before the deadline it
+/// declares can even start running.
+///
+/// Paired with [`WEDGED_PEER_DEADLINE`], not redundant with it: this one is
+/// relative, and catches a build whose code no longer honours the constant it
+/// still declares (a diagnostic that says "no response within 3s" after
+/// waiting six is lying to the operator reading it).
+#[cfg(unix)]
+const WEDGED_PEER_SPAWN_SLACK: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// Build the same raw `AgentEvent` the `agent-event --type running` CLI path
 /// sends (`agent_event_type_from_state("running") == EventType::Thinking`),
 /// except written directly to the hook socket so an optional `user_prompt`
@@ -74,6 +107,8 @@ fn thinking_event(pane_id: &str, agent_id: &str, user_prompt: Option<&str>) -> A
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -142,6 +177,135 @@ async fn run_daemon_status_cli(attach_socket: &Path, json: bool) -> CliStatusRes
     .expect("daemon status CLI subprocess task did not panic")
 }
 
+/// A peer bound to an attach-socket path that ACCEPTS every connection and
+/// then never writes a byte back.
+///
+/// A peer that is merely ABSENT does not reach [`STATUS_REQUEST_TIMEOUT`],
+/// which is what issue #458 is about: `daemon/status/003` points the CLI at a
+/// path with nothing bound, and that fails at `connect(2)` in microseconds and
+/// takes the transport-error branch. Accepting and then staying silent is the
+/// cheap, deterministic way to hold the client at the deadline instead — a
+/// real daemon can of course get there by simply being slow, but nothing in
+/// the suite can stage that on demand.
+///
+/// The accepted streams are HELD in `held` rather than dropped, and that is
+/// load-bearing: dropping one closes the connection, the client reads EOF, and
+/// `run_daemon_status_cli` reports `unavailable (<transport error>)` from its
+/// `Ok(Err(_))` arm instead of the timeout arm — a green-looking run of the
+/// wrong branch.
+#[cfg(unix)]
+struct WedgedPeer {
+    path: std::path::PathBuf,
+    held: std::sync::Arc<tokio::sync::Mutex<Vec<tokio::net::UnixStream>>>,
+    acceptor: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl WedgedPeer {
+    /// Bind the stub inside a scratch directory. The caller owns the path, so
+    /// this never touches the per-user attach socket a real daemon on this
+    /// machine is listening on.
+    async fn bind(path: std::path::PathBuf) -> Self {
+        let listener = tokio::net::UnixListener::bind(&path)
+            .unwrap_or_else(|e| panic!("bind the wedged stub listener at {}: {e}", path.display()));
+        let held = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let accepted = std::sync::Arc::clone(&held);
+        let acceptor = tokio::spawn(async move {
+            while let Ok((stream, _addr)) = listener.accept().await {
+                accepted.lock().await.push(stream);
+            }
+        });
+        Self {
+            path,
+            held,
+            acceptor,
+        }
+    }
+
+    /// How many connections the stub has accepted and is still holding open.
+    async fn connections_accepted(&self) -> usize {
+        self.held.lock().await.len()
+    }
+
+    /// Tear the stub down through its own handle: stop the acceptor, close
+    /// every held connection, and unlink the socket inode (binding a Unix
+    /// socket creates a file that closing the listener does not remove).
+    async fn shutdown(self) {
+        let Self {
+            path,
+            held,
+            acceptor,
+        } = self;
+        acceptor.abort();
+        let _ = acceptor.await;
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// One watchdogged CLI run: what the subprocess reported, and how long the
+/// caller actually waited for it.
+#[cfg(unix)]
+struct TimedCliRun {
+    result: CliStatusResult,
+    elapsed: std::time::Duration,
+}
+
+/// Run the REAL `dot-agent-deck daemon status [--json]` CLI against
+/// `attach_socket` under this test's own wall-clock watchdog.
+///
+/// `kill_on_drop` is what makes the watchdog real rather than decorative: on
+/// expiry `tokio::time::timeout` drops the wait future, which drops the
+/// [`tokio::process::Child`] it owns, which sends the child a `SIGKILL`.
+/// Without it a build that lost its deadline would leave a `daemon status`
+/// process blocked on the stub's socket for the rest of the test binary's
+/// life.
+#[cfg(unix)]
+async fn run_daemon_status_cli_bounded(
+    attach_socket: &Path,
+    json: bool,
+    ceiling: std::time::Duration,
+) -> TimedCliRun {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    cmd.arg("daemon").arg("status");
+    if json {
+        cmd.arg("--json");
+    }
+    cmd.env("DOT_AGENT_DECK_ATTACH_SOCKET", attach_socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let started = std::time::Instant::now();
+    let child = cmd
+        .spawn()
+        .expect("spawn the real `dot-agent-deck daemon status` CLI as a subprocess");
+    let output = tokio::time::timeout(ceiling, child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "`dot-agent-deck daemon status{}` did not return within {ceiling:?} against a \
+                 peer that accepted the connection and never replied. The command bounds its \
+                 whole connect+request round trip with STATUS_REQUEST_TIMEOUT ({}s, \
+                 `src/daemon_status.rs`); it is now either gone, raised past this test's own \
+                 ceiling, or no longer wrapping this path, so `daemon status` hangs on a \
+                 wedged daemon instead of reporting it",
+                if json { " --json" } else { "" },
+                STATUS_REQUEST_TIMEOUT.as_secs(),
+            )
+        })
+        .expect("collect the daemon status CLI subprocess output");
+    TimedCliRun {
+        result: CliStatusResult {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        elapsed: started.elapsed(),
+    }
+}
+
 /// Wait until the in-process daemon's attach endpoint accepts connections.
 /// `spawn_inprocess_daemon` proves hook-socket readiness, but the attach bind
 /// happens immediately afterward and a TUI-style `StartAgent` must not race it.
@@ -161,6 +325,16 @@ async fn wait_for_attach_socket(attach_socket: &Path, timeout: Duration) {
     }
 }
 
+/// PRD #1666 G6: the agent dir a Pi stand-in started in `cwd` resolves, so the
+/// deck's refresh of its extension lands in the test's scratch directory.
+#[cfg(unix)]
+fn pi_agent_dir(cwd: &std::path::Path) -> (String, String) {
+    (
+        "PI_CODING_AGENT_DIR".to_string(),
+        cwd.join("pi-agent").display().to_string(),
+    )
+}
+
 /// Spawn a pane through the same attach request the TUI uses. The registry
 /// injects `DOT_AGENT_DECK_AGENT_ID`; the returned id is then replayed into the
 /// real `agent-event` subprocess exactly as it is inside the managed pane.
@@ -173,12 +347,15 @@ async fn start_tui_managed_agent(
     pane_id: &str,
     cwd: &str,
 ) -> (String, String) {
-    wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
+    wait_for_attach_socket(&daemon.attach_path, common::INPROC_DAEMON_READY_TIMEOUT).await;
     let (agent_id, minted_pane_id) = DaemonClient::new(daemon.attach_path.clone())
         .start_agent_with_pane_id(StartAgentOptions {
-            command: Some("cat".to_string()),
+            command: Some(common::capability_export_command("cat")),
             cwd: Some(cwd.to_string()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
+                pi_agent_dir(std::path::Path::new(cwd)),
+            ],
             agent_type: Some(AgentType::Pi),
             ..StartAgentOptions::default()
         })
@@ -204,6 +381,9 @@ async fn run_agent_event_cli(
     let hook_path = daemon.hook_path.clone();
     let pane_id_owned = pane_id.to_string();
     let agent_id_owned = agent_id.to_string();
+    let token = common::recorded_hook_capability(cwd, agent_id)
+        .await
+        .expect("managed capability");
     let cwd = cwd.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -216,6 +396,7 @@ async fn run_agent_event_cli(
             .env("DOT_AGENT_DECK_SOCKET", &hook_path)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id_owned)
             .env(DOT_AGENT_DECK_AGENT_ID, &agent_id_owned)
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", token)
             .output()
             .expect("run the real `dot-agent-deck agent-event --type running` CLI")
     })
@@ -280,7 +461,7 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
     let driven_agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some("cat"),
+            command: Some(&common::capability_export_command("cat")),
             cwd: Some(&cwd_str),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), DRIVEN_PANE.to_string())],
             ..SpawnOptions::default()
@@ -298,8 +479,13 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
 
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&thinking_event(DRIVEN_PANE, &driven_agent_id, None))
-            .expect("serialize driven Thinking event"),
+        &dot_agent_deck::event::agent_event_line(
+            &thinking_event(DRIVEN_PANE, &driven_agent_id, None),
+            common::recorded_hook_capability(cwd.path(), &driven_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize driven Thinking event"),
     )
     .expect("write driven Thinking event");
     wait_for_live_session(
@@ -368,7 +554,7 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Spawn a fully described managed pane through the daemon attach API, drive it through the real `agent-event --type running` CLI and into an active tool, arm all three delegation-watch detectors (idle, silence, commission) for that same pane directly on the registry, then invoke `dot-agent-deck daemon status --json`. Assert the document pins the exact current schema version, every public field in a populated agent row — including the three joined delegation-watch fields — and all six supported live-status strings. Issue #586 M1: the arm-then-assert step proves the `ListAgents` handler actually wires `delegation_watch_snapshot` onto the live record, not just that the snapshot function itself is correct in isolation (already covered by `agent_pty`'s own unit tests).
+/// Scenario: Spawn a fully described managed pane through the daemon attach API, drive it through the real `agent-event --type running` CLI and into an active tool, arm both delegation-watch detectors (idle, commission) for that same pane directly on the registry, then invoke `dot-agent-deck daemon status --json`. Assert the document pins the exact current schema version, every public field in a populated agent row — including the two joined delegation-watch fields — and all six supported live-status strings. Issue #586 M1: the arm-then-assert step proves the `ListAgents` handler actually wires `delegation_watch_snapshot` onto the live record, not just that the snapshot function itself is correct in isolation (already covered by `agent_pty`'s own unit tests).
 #[spec("daemon/status/002")]
 #[test]
 #[cfg(unix)]
@@ -386,17 +572,21 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
-    wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
+    wait_for_attach_socket(&daemon.attach_path, common::INPROC_DAEMON_READY_TIMEOUT).await;
     // PRD fork#365 M2: the daemon mints and owns `pane_id`, so this test
     // reads back the actual minted value via `start_agent_with_pane_id`
     // rather than assume `JSON_PANE` (its proposed `DOT_AGENT_DECK_PANE_ID`)
     // survives.
     let (agent_id, pane_id) = DaemonClient::new(daemon.attach_path.clone())
         .start_agent_with_pane_id(StartAgentOptions {
-            command: Some("cat".to_string()),
+            command: Some(common::capability_export_command("cat")),
             cwd: Some(cwd_str.clone()),
             display_name: Some(JSON_LABEL.to_string()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), JSON_PANE.to_string())],
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), JSON_PANE.to_string()),
+                // A Pi start refreshes the extension into its own agent dir.
+                pi_agent_dir(cwd.path()),
+            ],
             tab_membership: Some(TabMembership::Mode {
                 name: JSON_MODE.to_string(),
             }),
@@ -417,7 +607,13 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     tool_event.tool_name = Some(JSON_TOOL.to_string());
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&tool_event).expect("serialize populated schema-row ToolStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &tool_event,
+            common::recorded_hook_capability(cwd.path(), &agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize populated schema-row ToolStart"),
     )
     .expect("write populated schema-row ToolStart to the daemon hook socket");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -456,14 +652,15 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             .is_some(),
         "arm the idle-worker watch for the schema row's pane"
     );
-    daemon
-        .registry
-        .arm_silence_watch(pane_id, JSON_ORCH_PANE, None)
-        .expect("arm the silent-worker watch for two open panes");
+    // The in-flight guard inside `Armed` is dropped at once: only the owed
+    // commission matters here, not a dispatch task holding the worker's lock.
     assert!(
-        daemon
-            .registry
-            .arm_delegation_commission(pane_id, JSON_ORCH_PANE, None),
+        matches!(
+            daemon
+                .registry
+                .arm_delegation_commission(pane_id, JSON_ORCH_PANE, None, false),
+            CommissionArm::Armed { .. }
+        ),
         "arm the commission ledger for the schema row's pane"
     );
 
@@ -522,21 +719,21 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "agent_id",
             "cwd",
             "delegation_commission",
+            "inbox",
             "label",
             "observing_delegations",
             "outstanding_delegation",
             "pane_id",
             "role",
             "shell_synthetic_working",
-            "silence_watch",
             "status",
             "wait_observing",
         ]),
         "the current schema version must pin every public field name on a fully populated agent row \
-         (issue #586 M1: including the three joined delegation-watch fields); got agent={agent:?}"
+         (issue #586 M1: including the two joined delegation-watch fields); got agent={agent:?}"
     );
 
-    // The three delegation-watch fields carry a live, per-request timestamp
+    // The delegation-watch fields carry a live, per-request timestamp
     // (`armed_secs_ago` / `oldest_armed_secs_ago`), so they cannot be pinned
     // by exact equality alongside the rest of the row. Pull them out, assert
     // the base row exactly as before, then assert each watch field's static
@@ -549,9 +746,6 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     let outstanding_delegation = agent_obj
         .remove("outstanding_delegation")
         .expect("issue #586 M1: the armed idle-worker watch must be joined onto the record");
-    let silence_watch = agent_obj
-        .remove("silence_watch")
-        .expect("issue #586 M1: the armed silent-worker watch must be joined onto the record");
     let delegation_commission = agent_obj
         .remove("delegation_commission")
         .expect("issue #586 M1: the armed commission ledger entry must be joined onto the record");
@@ -562,6 +756,15 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             "active_tool": { "name": JSON_TOOL },
             "agent_id": agent_id,
             "cwd": cwd_str,
+            "inbox": {
+                "queued": 0,
+                "fetched": 0,
+                "claimed": 0,
+                "undeliverable": 0,
+                "last_acked_at": null,
+                "wake": "doorbell",
+                "component": null,
+            },
             "label": JSON_LABEL,
             "observing_delegations": false,
             "pane_id": pane_id,
@@ -586,20 +789,6 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
             .is_some_and(|secs| secs < 5),
         "the idle-worker watch's age must reflect a real, recent arm time; \
          got {outstanding_delegation:?}"
-    );
-
-    assert_eq!(
-        silence_watch.get("orchestrator_pane_id"),
-        Some(&serde_json::Value::String(JSON_ORCH_PANE.to_string())),
-        "the silent-worker watch join must carry the orchestrator pane id it was armed with; \
-         got {silence_watch:?}"
-    );
-    assert!(
-        silence_watch
-            .get("armed_secs_ago")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|secs| secs < 5),
-        "the silent-worker watch's age must reflect a real, recent arm time; got {silence_watch:?}"
     );
 
     assert_eq!(
@@ -739,7 +928,7 @@ async fn daemon_status_004_outputs_never_leak_prompt_or_tool_detail_inner() {
     let agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some("cat"),
+            command: Some(&common::capability_export_command("cat")),
             cwd: Some(&cwd_str),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), LEAK_PANE.to_string())],
             ..SpawnOptions::default()
@@ -752,7 +941,13 @@ async fn daemon_status_004_outputs_never_leak_prompt_or_tool_detail_inner() {
     event.tool_detail = Some(TOOL_DETAIL_SENTINEL.to_string());
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&event).expect("serialize sentinel-carrying ToolStart event"),
+        &dot_agent_deck::event::agent_event_line(
+            &event,
+            common::recorded_hook_capability(cwd.path(), &agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize sentinel-carrying ToolStart event"),
     )
     .expect("write sentinel-carrying ToolStart event");
     wait_for_live_session(&daemon, LEAK_PANE, &agent_id, Duration::from_secs(5)).await;
@@ -939,22 +1134,22 @@ fn json_observing_delegations(stdout: &str, pane: &str) -> Option<bool> {
 }
 
 /// Scenario: Bring up an in-process daemon with an Idle orchestrator agent and no agent at all on a worker pane. With no delegation outstanding, run the real `daemon status` (human and `--json`) and confirm the orchestrator reads `Idle` / `observing_delegations: false`. Then arm an outstanding delegation from the orchestrator onto the agentless worker pane and run both again: the orchestrator must read `Observing` / `true`, because the daemon still holds the delegation even though the worker pane prints no row (issue #817).
-#[spec("daemon/status/006")]
+#[spec("daemon/status/007")]
 #[test]
 #[cfg(unix)]
-fn daemon_status_006_orchestrator_observes_delegation_on_agentless_worker_pane() {
+fn daemon_status_007_orchestrator_observes_delegation_on_agentless_worker_pane() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("build daemon-status observing runtime")
         .block_on(
-            daemon_status_006_orchestrator_observes_delegation_on_agentless_worker_pane_inner(),
+            daemon_status_007_orchestrator_observes_delegation_on_agentless_worker_pane_inner(),
         );
 }
 
 #[cfg(unix)]
-async fn daemon_status_006_orchestrator_observes_delegation_on_agentless_worker_pane_inner() {
+async fn daemon_status_007_orchestrator_observes_delegation_on_agentless_worker_pane_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -1080,4 +1275,99 @@ async fn daemon_status_006_orchestrator_observes_delegation_on_agentless_worker_
     );
 
     daemon.registry.shutdown_all();
+}
+
+/// Scenario: Bind a stub Unix socket in a scratch directory that accepts every connection and then never writes a reply, and point the REAL `dot-agent-deck daemon status` CLI at it in both its human and `--json` forms at once. Assert each subprocess returns inside this test's own 8s watchdog rather than hanging, exits non-zero without panicking, prints the `no response within 3s` timeout diagnostic naming the command's declared deadline, and emits nothing on stdout — so a wedged daemon is reported rather than waited on, and `--json` never fabricates an empty document for one.
+#[spec("daemon/status/006")]
+#[test]
+#[cfg(unix)]
+fn daemon_status_006_wedged_peer_times_out_instead_of_hanging() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wedged-peer daemon-status runtime")
+        .block_on(daemon_status_006_wedged_peer_times_out_instead_of_hanging_inner());
+}
+
+#[cfg(unix)]
+async fn daemon_status_006_wedged_peer_times_out_instead_of_hanging_inner() {
+    common::init_test_env();
+    let scratch = common::race_safe_tempdir();
+    // `attach.sock` exactly, not a descriptive name: this socket is BOUND, so
+    // it is charged against `HARNESS_SOCKET_OVERHEAD`, whose 48 bytes budget
+    // 12 for the longest bound socket name and leave `MAX_TEMP_BASE_LEN` at
+    // 55. A 55-byte base plus the harness's per-process and per-test segments
+    // plus `/attach.sock` comes to exactly 103 — `sun_path`'s usable limit on
+    // macOS — so any longer name here overruns it and `bind(2)` fails with
+    // `AF_UNIX path too long` before the deadline is ever reached. The scratch
+    // dir is already unique, so the plain name is unambiguous anyway.
+    // (`daemon/status/003`'s longer `never-bound-attach.sock` is fine under
+    // the same rule precisely because nothing ever binds it.)
+    let attach_path = scratch.path().join("attach.sock");
+    let peer = WedgedPeer::bind(attach_path.clone()).await;
+
+    // Both modes concurrently against the one stub: each pays the same ~3s
+    // deadline, so running them in parallel keeps the whole test at roughly
+    // one deadline instead of two.
+    let (human, json) = tokio::join!(
+        run_daemon_status_cli_bounded(&attach_path, false, WEDGED_PEER_DEADLINE),
+        run_daemon_status_cli_bounded(&attach_path, true, WEDGED_PEER_DEADLINE),
+    );
+
+    let accepted = peer.connections_accepted().await;
+    peer.shutdown().await;
+
+    assert_eq!(
+        accepted, 2,
+        "the stub must have ACCEPTED one connection per CLI invocation; anything else means \
+         this ran `daemon/status/003`'s connect-failure path again rather than the \
+         accepted-but-unanswered one the round-trip deadline exists for"
+    );
+
+    for (mode, run) in [("daemon status", &human), ("daemon status --json", &json)] {
+        assert!(
+            !run.result.status.success(),
+            "`{mode}` against a peer that never replies must not report success; got \
+             status={:?} stdout={:?} stderr={:?}",
+            run.result.status,
+            run.result.stdout,
+            run.result.stderr
+        );
+        assert!(
+            !run.result.stderr.contains("panicked"),
+            "a wedged daemon must produce a controlled diagnostic, not a Rust panic; \
+             `{mode}` stderr={:?}",
+            run.result.stderr
+        );
+        assert!(
+            run.elapsed <= STATUS_REQUEST_TIMEOUT + WEDGED_PEER_SPAWN_SLACK,
+            "`{mode}` took {:?}, past its own declared {:?} round-trip deadline plus {:?} of \
+             spawn slack — the command is no longer honouring the STATUS_REQUEST_TIMEOUT it \
+             still reports to the operator",
+            run.elapsed,
+            STATUS_REQUEST_TIMEOUT,
+            WEDGED_PEER_SPAWN_SLACK
+        );
+        // The phrase is the branch's own signature: `run_daemon_status_cli`
+        // prints it from the `Err(_elapsed)` arm alone, so matching it rules
+        // out a transport error or a server-side `ok: false` having produced
+        // the non-zero exit instead.
+        let expected = format!("no response within {}s", STATUS_REQUEST_TIMEOUT.as_secs());
+        assert!(
+            run.result.stderr.contains(&expected),
+            "`{mode}` must report the round-trip deadline expiring, naming the deadline it \
+             actually applied; expected stderr to contain {expected:?}, got stderr={:?} \
+             stdout={:?}",
+            run.result.stderr,
+            run.result.stdout
+        );
+        assert!(
+            run.result.stdout.trim().is_empty(),
+            "a timed-out `{mode}` must print no status output at all — for `--json` in \
+             particular, an empty-but-well-formed document would tell a consumer the daemon \
+             is up with zero agents, which is the opposite of what happened; stdout={:?}",
+            run.result.stdout
+        );
+    }
 }

@@ -68,7 +68,7 @@ fn identity_013_two_orchestration_opens_land_as_distinctly_named_tabs() {
     // from — it fails against an unborn HEAD (the harness's own bare
     // `git init`).
     commit_fixture(&work);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let launch_dir_basename = work
         .file_name()
@@ -130,7 +130,7 @@ fn identity_033_directories_with_the_same_basename_both_suggest_orchestrator_1()
     let deck = TuiDeck::launch_with_fixture("orch-deck");
     let work = deck.workdir().to_path_buf();
     commit_fixture(&work);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let toml = std::fs::read_to_string(work.join(".dot-agent-deck.toml"))
         .expect("read fixture's own .dot-agent-deck.toml to duplicate into each leaf");
@@ -410,7 +410,7 @@ fn identity_037_sibling_directories_with_the_same_name_each_resolve_their_own_wo
     let deck = TuiDeck::launch_with_fixture("orch-deck");
     let work = deck.workdir().to_path_buf();
     commit_fixture(&work);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let toml = std::fs::read_to_string(work.join(".dot-agent-deck.toml"))
         .expect("read fixture's own .dot-agent-deck.toml to duplicate into each leaf");

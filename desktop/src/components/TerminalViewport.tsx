@@ -1,16 +1,159 @@
 import { useEffect, useRef } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { Terminal } from "@xterm/xterm";
-import type { TerminalBuffer, TerminalFeed } from "../types";
+import { Terminal, type IDisposable } from "@xterm/xterm";
+import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
+import { writeClipboardText } from "../lib/clipboard";
+import { osc52CopyText } from "../lib/osc52";
+import { isSelectionCtrlC, isTerminalCopyChord } from "../lib/terminalCopy";
+import { agentKeySequence, keyPlatform, leavesPasteToWebview } from "../lib/terminalKeys";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
+import { keepSelectionAcrossResize } from "../lib/terminalSelection";
+
+/**
+ * Issue #1705 — clipboard writes from agents' terminals, one at a time and
+ * newest last. `writeClipboardText` is asynchronous (an import, then an IPC
+ * round trip), so two copies started back to back, from one pane or from two,
+ * could finish out of order and leave the older text on the clipboard.
+ *
+ * So one write is in flight at a time, and while it is, only the NEWEST copy
+ * waits behind it: each copy replaces the last on the clipboard, so a copy
+ * overtaken before its turn would only be overwritten, and keeping one bounds
+ * what a stream of copies can hold. A write that has not settled after
+ * `CLIPBOARD_WRITE_TIMEOUT_MS` stops holding up the next, so a platform call
+ * that never returns cannot hold a pending copy forever. Such a write is not
+ * cancelled; if it finishes after a newer write has, `writeClipboardText`
+ * writes the newest text again, for every writer in the app. A write the
+ * platform refuses has no better outcome than the unchanged clipboard it
+ * leaves, so a failure ends that write and not the queue.
+ */
+const CLIPBOARD_WRITE_TIMEOUT_MS = 5_000;
+let clipboardWriting = false;
+let pendingClipboardText: string | undefined;
+function copyInOrder(text: string): void {
+  pendingClipboardText = text;
+  if (!clipboardWriting) void drainClipboardWrites();
+}
+async function drainClipboardWrites(): Promise<void> {
+  clipboardWriting = true;
+  try {
+    while (pendingClipboardText !== undefined) {
+      const text = pendingClipboardText;
+      pendingClipboardText = undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        writeClipboardText(text).catch(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, CLIPBOARD_WRITE_TIMEOUT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
+  } finally {
+    clipboardWriting = false;
+  }
+}
+
+/**
+ * PRD #1666 part 3 (Q35-23) — what the replay's query handlers need to know
+ * about xterm 6.0.0's replies; the handlers themselves are in the terminal
+ * effect below.
+ *
+ * `CSI t` parameters that xterm answers with a report (`CSI 4`, `6` and `8 …
+ * t`: the window and cell sizes in pixels, the text area in characters). Its
+ * other window operations (title push and pop) reply nothing and stay xterm's.
+ */
+const WINDOW_REPORTS = new Set<number | number[]>([14, 16, 18]);
+/** OSC 4 (an indexed colour) and 10–12 (foreground, background, cursor). */
+const COLOUR_OSCS = [4, 10, 11, 12];
+const FOCUS_IN = "\x1b[I";
+const FOCUS_OUT = "\x1b[O";
+
+/**
+ * Whether xterm would answer this colour OSC with a report: the `?` slots it
+ * reads, the way `setOrReportIndexedColor` and `_setOrReportSpecialColor` read
+ * them. OSC 4 is `index;spec` pairs with an index from 0 to 255; OSC 10–12
+ * stack, each slot the next of foreground, background and cursor, so OSC 10
+ * reads three slots, 11 two and 12 one.
+ */
+function asksForColour(ident: number, data: string): boolean {
+  const slots = data.split(";");
+  if (ident !== 4) return slots.slice(0, 13 - ident).includes("?");
+  for (let i = 0; i + 1 < slots.length; i += 2) {
+    if (slots[i + 1] === "?" && /^\d+$/.test(slots[i]) && Number(slots[i]) <= 255) return true;
+  }
+  return false;
+}
+
+/**
+ * The one xterm internal the replay uses: the event its input handler fires
+ * when focus reporting is enabled, which xterm's own focus report listens to.
+ * Every step is optional so a moved name disables the focus guard rather than
+ * throwing.
+ */
+interface XtermInternals {
+  _core?: { _inputHandler?: { onRequestSendFocus?: (listener: () => void) => IDisposable } };
+}
 
 interface TerminalViewportProps {
   agentId: string;
+  /**
+   * PRD #1105's security audit — which deck's `agentId` this is.
+   *
+   * The feed below is addressed by the composite `(deckId, agentId)` because a
+   * bare agent id is not an identity: ids are per-daemon monotonic, and leaving
+   * a deck detaches its sessions without clearing its retained buffers. A
+   * viewport mounted for the next deck's namesake therefore read the previous
+   * deck's backlog and wrote it straight into the new xterm — up to the feed's
+   * 1 MiB retention of another machine's output, under a correctly resolved
+   * heading, and indefinitely where no replacement stream ever arrives.
+   *
+   * Supplied by `AgentTile` from `agent.daemonId`, so it is the deck of the
+   * agent being rendered rather than whichever deck happens to be selected.
+   * Optional only because a caller with no fleet at all (the standalone-render
+   * tests) has no deck to name; such a caller also supplies no feed.
+   */
+  deckId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7) — the daemon process that listed this agent.
+   *
+   * A restarted deck — the same build included — numbers its agents from 1
+   * again, so `(deckId, agentId)` names an unrelated successor too. The feed,
+   * the terminal registry and this component's own lifecycle are keyed by the
+   * bound pair, so a successor never reads the previous process's backlog and
+   * never inherits its xterm. Absent is a deck that named no process (and the
+   * standalone-render tests), which is its own key.
+   */
+  incarnation?: string;
   label: string;
   transcript: string;
   terminalFeed?: TerminalFeed;
   readOnly?: boolean;
+  /**
+   * Issue #1042 — the pane's input-acceptance state in the `SendResult`
+   * vocabulary, published as `data-input-state` on the wrapper so the state is
+   * readable from the DOM rather than inferred from a disabled cursor.
+   *
+   * Undefined when nothing about the pane is being claimed: the agent-status
+   * gate disables the input without saying anything about its lease, and an
+   * attribute asserting `applied` there would be a claim this component cannot
+   * support. The sentence that goes with either case is rendered by the tile,
+   * beside this viewport, so it survives this component being mocked.
+   *
+   * So this attribute is the pane's CLAIM, not the input's disabled-ness, and
+   * the two are different axes: `aria-disabled` on the same wrapper is the
+   * authoritative disabled signal and is emitted for every disabling reason,
+   * including the status-gate one that leaves this attribute absent. Anything
+   * reading `data-input-state` to infer enabled/disabled will misread a
+   * status-disabled pane.
+   */
+  inputState?: SendResult;
+  /**
+   * Increments when something outside asks this terminal to take focus — the
+   * command palette's "Message coordinator…" entry is the only caller today.
+   * `onFocus` reports focus outward; this is the way in.
+   */
+  focusToken?: number;
   onInput: (data: string) => void;
   onResize: (cols: number, rows: number) => void;
   /**
@@ -28,15 +171,20 @@ interface TerminalViewportProps {
 
 export function TerminalViewport({
   agentId,
+  deckId,
+  incarnation,
   label,
   transcript,
   terminalFeed,
   readOnly,
+  inputState,
+  focusToken = 0,
   onInput,
   onResize,
   applied,
   onFocus,
 }: TerminalViewportProps) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | undefined>(undefined);
   const lastStreamRef = useRef<TerminalBuffer | undefined>(undefined);
@@ -54,13 +202,38 @@ export function TerminalViewport({
   // rebuilding the terminal on that would destroy scroll position and selection
   // every time somebody opened the TUI.
   const appliedRef = useRef(applied);
+  // Read through a ref for the same reason: a renamed agent must not cost the
+  // operator their scroll position and selection.
+  const labelRef = useRef(label);
+  // Issue #1042 — and read through a ref for the strongest version of that
+  // reason. `readOnly` used to be status-only, and a status is effectively
+  // monotonic (queued -> running -> passed), so rebuilding on it was rare.
+  // It is now also derived from the WRITE LEASE, which is bidirectional and
+  // flips during ordinary multi-client operation (PRD #882 hand-off): baking it
+  // into the build effect's dependencies tore the pane down and rebuilt it —
+  // losing scroll position and any in-progress selection — every time a TUI
+  // attached, and again when the lease came back.
+  //
+  // The ref is what keeps the `onData` guard below honest across that flip: it
+  // reads the CURRENT value rather than the one captured when the terminal was
+  // built, so a terminal can never announce itself disabled while still
+  // accepting keystrokes. The other two seams — `disableStdin` and the helper
+  // textarea's native `disabled` — are reconciled by the effect below.
+  const readOnlyRef = useRef(readOnly);
   // Set by the terminal effect below so the geometry effect can re-run the
   // grid reconciliation without owning the xterm instance.
   const applyGridRef = useRef<(() => void) | undefined>(undefined);
+  // Issue #1705 — set by the terminal effect below: write bytes that are
+  // HISTORY (the transcript, a remount's backlog, an attach's replay) rather
+  // than output the agent is producing now, so an OSC 52 copy inside them is
+  // not honoured a second time.
+  const replayRef = useRef<((data: string | Uint8Array) => void) | undefined>(undefined);
   transcriptRef.current = transcript;
   onInputRef.current = onInput;
   onResizeRef.current = onResize;
   appliedRef.current = applied;
+  labelRef.current = label;
+  readOnlyRef.current = readOnly;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -69,9 +242,9 @@ export function TerminalViewport({
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
-      cursorBlink: !readOnly,
+      cursorBlink: !readOnlyRef.current,
       cursorStyle: "bar",
-      disableStdin: readOnly,
+      disableStdin: Boolean(readOnlyRef.current),
       drawBoldTextInBrightColors: false,
       fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
       fontSize: 13.5,
@@ -111,6 +284,13 @@ export function TerminalViewport({
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.open(host);
+    /* Issue #1492 — whether the buffer holds more than the rows on screen,
+       on the host, so CSS keeps xterm's scrollbar shown at rest while it does
+       (xterm 6 fades it out unless hovered or scrolled, with no option to
+       change that). Re-read on every scroll, write, resize and switch to or
+       from the alternate screen, which has no scrollback. */
+    const markScrollback = () => host.classList.toggle("has-scrollback", terminal.buffer.active.baseY > 0);
+    const scrollbackListeners = [terminal.onScroll(markScrollback), terminal.onWriteParsed(markScrollback), terminal.onResize(markScrollback), terminal.buffer.onBufferChange(markScrollback)];
     // GPU rendering. Without it xterm falls back to the DOM renderer, which
     // cannot keep up with several agents streaming output at once. Loading it
     // must happen after open(); a lost WebGL context degrades to the DOM
@@ -121,6 +301,12 @@ export function TerminalViewport({
       webglAddon.onContextLoss(() => {
         webglAddon?.dispose();
         webglAddon = undefined;
+        // The DOM renderer that takes over draws nothing until something
+        // asks it to, so a pane whose context was lost mid-session would stay
+        // blank until its next output. Repaint what is already in the buffer.
+        // PRD #1401 is why this came up: on Linux the in-app pull request
+        // browser moves the app's webview between GTK containers.
+        terminal.refresh(0, terminal.rows - 1);
       });
       terminal.loadAddon(webglAddon);
     } catch {
@@ -128,20 +314,201 @@ export function TerminalViewport({
       webglAddon = undefined;
     }
     terminalRef.current = terminal;
+    // xterm's own `promptLabel` is a module-level string shared by every
+    // instance, so the per-agent name has to be written onto this terminal's
+    // helper textarea directly. `disabled` goes with it: `disableStdin` only
+    // makes xterm ignore what is typed, and an input that still takes focus and
+    // a caret while swallowing every keystroke is the void #1042 is about.
+    const textarea = terminal.textarea;
+    if (textarea) {
+      textarea.setAttribute("aria-label", `${labelRef.current} terminal input`);
+      textarea.disabled = Boolean(readOnlyRef.current);
+    }
+    // Issue #1705 — honour an agent's OSC 52 copy. An agent that turns on
+    // mouse reporting (Claude Code) takes every drag for itself, so xterm holds
+    // no selection for the copy key; the agent selects and asks the terminal
+    // to copy with OSC 52 instead. `osc52CopyText` is write-only and refuses
+    // anything malformed, so a read request (`?`) is swallowed unanswered.
+    //
+    // Only output the agent produces while this pane is open is honoured.
+    // History reaches xterm through `replay`, which brackets its write with two
+    // empty writes whose callbacks xterm runs in write order, immediately
+    // before and after it parses those bytes — so a copy the agent made an hour
+    // ago, still in the backlog, does not overwrite the clipboard every time
+    // the pane opens. The daemon replays its scrollback as the first chunk of
+    // every attach, and the bridge delivers that as one replacing chunk, which
+    // the feed effect below writes through `replay`.
+    //
+    // Not gated on `readOnly`: copying out of a pane is reading it.
+    let replaying = false;
+    // The focus guard of the replay's query handlers below.
+    let focusReportsToDrop = 0;
+    const replay = (data: string | Uint8Array) => {
+      terminal.write("", () => {
+        replaying = true;
+      });
+      terminal.write(data, () => {
+        replaying = false;
+        focusReportsToDrop = 0;
+      });
+    };
+    replayRef.current = replay;
+    const clipboardRequests = terminal.parser.registerOscHandler(52, (data) => {
+      const text = replaying ? undefined : osc52CopyText(data);
+      if (text !== undefined) copyInOrder(text);
+      return true;
+    });
+    // PRD #1666 part 3 (Q35-23) — history answers no terminal query.
+    //
+    // xterm answers every query it parses, and `onData` forwards the answer to
+    // the agent as if the user had typed it. A query the agent sent an hour ago
+    // (a cursor-position request, a colour or focus report) is still in the
+    // backlog, so every attach answered it again, into whatever the agent was
+    // reading at the time. While `replaying`, each handler below claims its
+    // sequence (returns `true`), so xterm's own handler, which is the one that
+    // replies, does not run; a live query returns `false` and xterm answers it
+    // as before. The TUI answers no queries at all, so this makes the desktop's
+    // replay match it.
+    //
+    // These are the reply sites found by reading the installed xterm (6.0.0).
+    // `TerminalViewport.replay.test.tsx` counts the reply calls in the xterm
+    // source files and methods it names, so a change in the number of counted
+    // reply calls in one of those methods fails it and forces a review; a
+    // change that leaves those counts the same (a reply's condition or payload,
+    // or a reply added under an existing call), a reply added in another file
+    // and one under a new call spelling would not, so an xterm upgrade still
+    // needs its reply paths read again. Only queries are claimed: the window-ops handler
+    // claims the size reports and leaves title push and pop to xterm, and a
+    // colour sequence is claimed only when it asks for a colour. One that both
+    // sets and asks in a single sequence is claimed whole, so a replay of it
+    // skips the set and can leave the redrawn colours different from the
+    // original session's; a set in a sequence of its own, including one next
+    // to a query, still applies. Which form agents send has not been measured.
+    // `TerminalViewport.replayColour.test.tsx` pins both behaviours.
+    const focusReported = (terminal as unknown as XtermInternals)._core?._inputHandler?.onRequestSendFocus?.(() => {
+      if (focusReportsToDrop > 0) focusReportsToDrop -= 1;
+    });
+    const historical = () => replaying;
+    const replyHandlers = [
+      terminal.parser.registerCsiHandler({ final: "c" }, historical), // DA1
+      terminal.parser.registerCsiHandler({ prefix: ">", final: "c" }, historical), // DA2
+      terminal.parser.registerCsiHandler({ final: "n" }, historical), // DSR, CPR
+      terminal.parser.registerCsiHandler({ prefix: "?", final: "n" }, historical), // private CPR
+      terminal.parser.registerCsiHandler({ intermediates: "$", final: "p" }, historical), // DECRQM
+      terminal.parser.registerCsiHandler({ prefix: "?", intermediates: "$", final: "p" }, historical),
+      terminal.parser.registerDcsHandler({ intermediates: "$", final: "q" }, historical), // DECRQSS
+      terminal.parser.registerCsiHandler({ final: "t" }, (params) => replaying && WINDOW_REPORTS.has(params[0])),
+      ...COLOUR_OSCS.map((ident) =>
+        terminal.parser.registerOscHandler(ident, (data) => replaying && asksForColour(ident, data)),
+      ),
+      // Focus is the one reply a MODE sends rather than a query: enabling
+      // focus reporting (`CSI ? 1004 h`) makes xterm report the current focus
+      // at once, inside the same handler. The mode itself must still apply, so
+      // this handler lets xterm run and arms a guard for exactly that report:
+      // `onData` drops a focus report while it is armed, and xterm's
+      // `onRequestSendFocus`, which fires once per 1004 and whose listener
+      // above runs right after xterm's own reporting one, disarms it. It cannot
+      // outlast that synchronous report, so a `terminal.input` or a key later
+      // in the same parse is forwarded, focus-shaped or not. Where the event
+      // is not there to disarm it (an xterm that moved it), the guard is never
+      // armed, and the replay test fails on the moved site.
+      terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
+        focusReportsToDrop = replaying && focusReported ? params.filter((param) => param === 1004).length : 0;
+        return false;
+      }),
+    ];
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
-    registerTerminal(agentId, terminal);
-    terminal.write(transcriptRef.current);
+    registerTerminal(deckId, agentId, terminal, incarnation);
+    replay(transcriptRef.current);
+
+    // Issue #1457 — a selection, or a drag still in progress, survives the
+    // daemon reshaping this grid; see `keepSelectionAcrossResize`.
+    const selectionKeeper = keepSelectionAcrossResize(terminal, host);
 
     const inputDisposable = terminal.onData((data) => {
-      if (!readOnly) onInputRef.current(data);
+      // A historical `?1004h`'s focus report (see `focusReportsToDrop` above);
+      // nothing else is dropped here, whatever it looks like.
+      if (focusReportsToDrop > 0 && (data === FOCUS_IN || data === FOCUS_OUT)) return;
+      if (!readOnlyRef.current) onInputRef.current(data);
+    });
+    // Issue #1403 — copy the selection with `Ctrl+Shift+C` / `Cmd+C`, and
+    // (issue #1705) on Windows with plain `Ctrl+C` while text is selected.
+    //
+    // A capture-phase listener on the wrapper runs before xterm's own `keydown`
+    // on its helper textarea, so stopping the chord here means xterm never
+    // evaluates it and nothing reaches the agent. xterm would send nothing for
+    // either chord today, but `preventDefault` also claims the webview's own
+    // reaction to it, and a copy key that could ever leak a byte into an agent
+    // is not one to leave to a library's key table. Plain `Ctrl+C` is not the
+    // chord and passes through untouched as the agent's interrupt, except on
+    // Windows over a selection, where it is the copy key and clears the
+    // selection, so the next one interrupts.
+    //
+    // Deliberately a DOM listener rather than `attachCustomKeyEventHandler`:
+    // xterm keeps exactly one custom handler per terminal, and taking the slot
+    // for copy would silently collide with anything else that needs it.
+    const wrapper = wrapperRef.current;
+    // The platform is the webview's (what `navigator` reports), read once per
+    // terminal: it decides the copy and paste keys. The editing keys are one
+    // table on every platform, the TUI's.
+    const platform = keyPlatform();
+    const onCopyKey = (event: KeyboardEvent) => {
+      const hasSelection = terminal.hasSelection();
+      if (!isTerminalCopyChord(event, platform, hasSelection)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const selection = terminal.getSelection();
+      if (isSelectionCtrlC(event, platform, hasSelection)) terminal.clearSelection();
+      // Nothing selected leaves the clipboard as it was.
+      if (selection) copyInOrder(selection);
+    };
+    // A read-only pane's textarea is `disabled` and cannot take focus, and
+    // xterm's selection handler cancels the press that would otherwise have
+    // focused something — so without this the chord after a drag would land
+    // on whatever held focus before, never on this pane. The wrapper takes it
+    // instead, which is all the chord needs.
+    const onPress = () => {
+      if (readOnlyRef.current) wrapper?.focus({ preventScroll: true });
+    };
+    wrapper?.addEventListener("keydown", onCopyKey, true);
+    wrapper?.addEventListener("mousedown", onPress, true);
+    // Issue #1422 — the keys xterm would encode differently from the TUI
+    // (Ctrl+Enter and Shift+Enter above all: xterm sends the submitting CR for
+    // both), or in a form the agents do not act on (the editing
+    // chords, such as Cmd+Left). `terminal.input` routes the replacement through
+    // `onData`, so it passes the same input gates as a key xterm sent itself.
+    //
+    // Copy is not handled here, and this handler claims neither copy chord:
+    // issue #1403's Ctrl+Shift+C / Cmd+C is the capture-phase listener on the
+    // wrapper above, which sees the key before xterm or this handler does.
+    // Keep Ctrl+Shift+C and Cmd+C out of both tables below.
+    terminal.attachCustomKeyEventHandler((event) => {
+      // The platform's paste key: keep xterm from encoding it (on Windows it
+      // would send Ctrl+V as ^V and cancel the paste) and leave the event
+      // uncancelled, so the webview pastes into xterm's textarea and xterm's
+      // own paste handling sends the text to the agent.
+      if (leavesPasteToWebview(event, platform)) return false;
+      const sequence = agentKeySequence(event);
+      if (sequence === undefined) return true;
+      // Claim the key the way xterm claims one it sends: no newline typed into
+      // its helper textarea, and no bubbling to the app's window shortcuts.
+      // Returning false covers the keypress and keyup halves as well.
+      event.preventDefault();
+      if (event.type === "keydown") {
+        event.stopPropagation();
+        terminal.input(sequence, true);
+      }
+      return false;
     });
     // PRD #882 — `fit()` PROPOSES a size; the daemon disposes.
     //
     // A PTY has exactly one window size, so every client attached to an agent
-    // sees the same grid. The daemon sizes each agent to the smallest viewport
-    // among its attached viewers, which means the grid this tile should render
-    // is not necessarily the one that fits its box: with a smaller client
-    // attached it is smaller, and the remainder of the box is unused.
+    // sees the same grid. The daemon sizes each agent to the last-focused
+    // client's viewer size, or to the smallest viewport among its attached
+    // viewers when no client claimed focus (PRD #1105), which means the grid
+    // this tile should render is not necessarily the one that fits its box:
+    // with a smaller client deciding it is smaller and the remainder of the box
+    // is unused, and with a larger focused client it is larger and clips.
     //
     // So this measures the tile, reports it as a REQUEST, and then puts the
     // grid back to whatever the daemon last applied. Letting `fitAddon.fit()`
@@ -188,21 +555,89 @@ export function TerminalViewport({
     // PRD #882: `fit` reports the tile's box as a REQUEST and then restores the
     // applied grid, so a zoom-driven refit proposes a new size without ever
     // leaving xterm parsing at a geometry the PTY is not using.
-    registerRefit(agentId, fit);
+    registerRefit(deckId, agentId, fit, incarnation);
 
     return () => {
       applyGridRef.current = undefined;
+      replayRef.current = undefined;
+      clipboardRequests.dispose();
+      for (const handler of replyHandlers) handler.dispose();
+      focusReported?.dispose();
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
-      unregisterRefit(agentId, fit);
-      unregisterTerminal(agentId, terminal);
+      for (const listener of scrollbackListeners) listener.dispose();
+      selectionKeeper.dispose();
+      wrapper?.removeEventListener("keydown", onCopyKey, true);
+      wrapper?.removeEventListener("mousedown", onPress, true);
+      unregisterRefit(deckId, agentId, fit, incarnation);
+      unregisterTerminal(deckId, agentId, terminal, incarnation);
       webglAddon?.dispose();
       terminal.dispose();
       terminalRef.current = undefined;
       lastStreamRef.current = undefined;
     };
-  }, [agentId, readOnly]);
+    /*
+      `deckId` is a dependency, not a passenger — issue
+      [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s open item
+      3. This effect built and disposed the xterm on `agentId` alone, so moving
+      from deck A's `planner` to deck B's reused the same component, the same
+      xterm, the same helper textarea, the same focus and the same
+      `lastStreamRef` — the deck changed only which feed was subscribed to.
+      B's backlog is then correctly absent, nothing resets the bytes already
+      rendered, and the transcript effect below refuses to reset while
+      `lastStreamRef.current` still holds A's buffer: A's scrollback stays on
+      screen inside B's tile, indefinitely where B has no frame yet or its
+      attach failed.
+
+      The cost of having it here is a rebuilt terminal when the identity
+      changes, which is exactly right — it is a different agent on a different
+      machine, and carrying one pixel of the old one across is the defect.
+
+      `incarnation` is one for the same reason (PRD #1666 part 2, G-fix7): a
+      restarted deck's agent with the same id is a different agent too.
+    */
+  }, [agentId, deckId, incarnation]);
+
+  // Issue #1042 — reconcile the input gate in place when the lease flips.
+  //
+  // Three seams have to agree, and they are kept in agreement here rather than
+  // by rebuilding the terminal (see `readOnlyRef` above for why a rebuild is
+  // not acceptable on this input):
+  //
+  // 1. `options.disableStdin`, which is what makes xterm ignore keystrokes;
+  // 2. the `onData` guard in the effect above, which reads `readOnlyRef` so it
+  //    can never be one flip behind the other two;
+  // 3. the helper textarea's native `disabled`, which is what stops the input
+  //    taking focus and showing a caret it would swallow.
+  //
+  // The wrapper's `aria-disabled` is React's own render below, so it moves with
+  // this prop by construction. A seam left behind would produce the one failure
+  // worse than the rebuild it replaces: a terminal announcing itself disabled
+  // while still accepting what is typed into it.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    const blocked = Boolean(readOnly);
+    terminal.options.disableStdin = blocked;
+    terminal.options.cursorBlink = !blocked;
+    const textarea = terminal.textarea;
+    if (textarea) textarea.disabled = blocked;
+  }, [readOnly]);
+
+  // A rename changes the accessible name of the input without touching the
+  // terminal, so this reconciles the attribute the effect above wrote at
+  // construction rather than rebuilding the pane to change one string.
+  useEffect(() => {
+    const textarea = terminalRef.current?.textarea;
+    if (textarea) textarea.setAttribute("aria-label", `${label} terminal input`);
+  }, [label]);
+
+  // Issue #1042 — take focus on request. Zero is the never-asked value, so a
+  // freshly mounted deck does not steal focus into a terminal nobody named.
+  useEffect(() => {
+    if (focusToken > 0) terminalRef.current?.focus();
+  }, [focusToken]);
 
   // PRD #882: the daemon changed the applied geometry — because another client
   // attached, detached or resized this agent — so reshape the grid to match.
@@ -218,9 +653,10 @@ export function TerminalViewport({
   // the effect below is authoritative and this one stands down.
   useEffect(() => {
     const terminal = terminalRef.current;
-    if (!terminal || lastStreamRef.current) return;
+    const replay = replayRef.current;
+    if (!terminal || !replay || lastStreamRef.current) return;
     terminal.reset();
-    terminal.write(transcript);
+    replay(transcript);
   }, [transcript]);
 
   // Bytes arrive straight from the bridge feed and go straight into xterm —
@@ -229,10 +665,14 @@ export function TerminalViewport({
     if (!terminalFeed) return;
     const apply = (buffer: TerminalBuffer) => {
       const terminal = terminalRef.current;
-      if (!terminal) return;
+      const replay = replayRef.current;
+      if (!terminal || !replay) return;
       const previous = lastStreamRef.current;
+      // Issue #1705 — every write here is `replay` (history: no OSC 52 copy is
+      // honoured) except the contiguous suffix, which is the only output the
+      // agent produced while this pane was watching.
       if (!previous) {
-        if (buffer.data.byteLength) terminal.write(buffer.data);
+        if (buffer.data.byteLength) replay(buffer.data);
       } else if (buffer !== previous && buffer.generation === previous.generation) {
         // Compare absolute stream offsets, not array lengths: when the rolling
         // buffer trims its head, baseOffset advances while the tail stays
@@ -247,29 +687,35 @@ export function TerminalViewport({
         } else {
           // Non-contiguous jump (daemon restart, missed chunks): rebuild.
           terminal.reset();
-          terminal.write(transcriptRef.current);
-          if (buffer.data.byteLength) terminal.write(buffer.data);
+          replay(transcriptRef.current);
+          if (buffer.data.byteLength) replay(buffer.data);
         }
       } else if (buffer !== previous) {
         // Generation changed: the PTY was respawned — a rebuild is correct.
         terminal.reset();
-        terminal.write(transcriptRef.current);
-        if (buffer.data.byteLength) terminal.write(buffer.data);
+        replay(transcriptRef.current);
+        if (buffer.data.byteLength) replay(buffer.data);
       }
       lastStreamRef.current = buffer;
     };
-    const backlog = terminalFeed.get(agentId);
+    const backlog = terminalFeed.get(deckId, agentId, incarnation);
     if (backlog) apply(backlog);
-    return terminalFeed.subscribe(agentId, apply);
-  }, [agentId, terminalFeed]);
+    return terminalFeed.subscribe(deckId, agentId, incarnation, apply);
+  }, [agentId, deckId, incarnation, terminalFeed]);
 
   return (
     <div
+      ref={wrapperRef}
       className="terminal-viewport"
+      // Focusable only by script (see `onPress` above), so a read-only pane can
+      // receive the copy chord; it adds no tab stop.
+      tabIndex={-1}
       data-testid={`terminal-${agentId}`}
+      data-input-state={inputState}
       onFocusCapture={onFocus}
       role="group"
       aria-label={`${label} terminal`}
+      aria-disabled={Boolean(readOnly)}
     >
       <div ref={hostRef} className="terminal-host" />
     </div>

@@ -1,6 +1,6 @@
-#![cfg(all(feature = "e2e", feature = "e2e-live"))]
+#![cfg(feature = "e2e")]
 
-//! Synthetic recorder coverage for Wrapper-strategy launch paths.
+//! Synthetic coverage through the real wrapper; the real-agent case is lane 2.
 
 mod common;
 
@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{TuiDeck, commit_fixture};
-use dot_agent_deck::event::AgentType;
 use spec::spec;
 
 #[cfg(unix)]
@@ -21,187 +20,228 @@ fn write_executable(path: &Path, contents: &str) {
 }
 
 #[cfg(unix)]
-/// Returns the recorder tempdir, a `$PATH` with it in front, and the path of its
-/// fake `dot-agent-deck`.
-///
-/// The third element is what makes these tests work now that the wrapper rewrite
-/// names the co-located build by absolute path instead of a bare `dot-agent-deck`
-/// for `$PATH` to resolve (so the suite tests the build it compiled, not whatever
-/// is installed). PATH interception no longer reaches the rewrite; the deck needs
-/// `DOT_AGENT_DECK_WRAP_BIN` pointed at the recorder instead.
-fn recorder_path(record: &Path) -> (tempfile::TempDir, String, PathBuf) {
-    let dir = common::harness_tempdir().expect("recorder bin tempdir");
-    write_executable(
-        &dir.path().join("dot-agent-deck"),
-        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_PATH_RECORD\"\nexec cat\n",
-    );
-    write_executable(
-        &dir.path().join("codex"),
-        "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" >> \"$CODEX_PATH_RECORD\"\nexec cat\n",
-    );
-    write_executable(
-        &dir.path().join("devbox"),
-        "#!/bin/sh\nprintf 'BARE devbox %s\\n' \"$*\" >> \"$CODEX_PATH_RECORD\"\nexec cat\n",
-    );
-    let path = format!(
-        "{}:{}",
-        dir.path().display(),
-        std::env::var("PATH").expect("test runner PATH")
-    );
-    std::fs::write(record, "").expect("initialize launch record");
-    let wrap_bin = dir.path().join("dot-agent-deck");
-    (dir, path, wrap_bin)
+struct EmbeddedFixture {
+    root: tempfile::TempDir,
+    config: String,
 }
 
-fn wait_for_launch(record: &Path) -> Vec<String> {
+#[cfg(unix)]
+impl EmbeddedFixture {
+    fn new(user_exporter: bool) -> Self {
+        let root = common::harness_tempdir().expect("embedded Codex fixture");
+        let npm_bin = root.path().join("node_modules/@openai/codex/bin");
+        std::fs::create_dir_all(&npm_bin).unwrap();
+        // The npm-shaped path lets the real telemetry shim recognize this
+        // synthetic executable and exercise its exporter-addition path.
+        write_executable(
+            &npm_bin.join("codex.js"),
+            include_str!("fixtures/codex-embedded.py"),
+        );
+        std::os::unix::fs::symlink(npm_bin.join("codex.js"), root.path().join("codex")).unwrap();
+        write_executable(
+            &root.path().join("dot-agent-deck"),
+            "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_PATH_RECORD\"\nexec \"$EMBEDDED_DECK_BIN\" \"$@\"\n",
+        );
+        write_executable(
+            &root.path().join("devbox"),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LAUNCHER_ARGS_RECORD\"\nprintf 'LAUNCHER_SUCCESS\\n'\nexec \"$SYNTHETIC_CODEX_BIN\" -c 'shell_environment_policy.set={}'\n",
+        );
+        let home = root.path().join("codex-home");
+        std::fs::create_dir(&home).unwrap();
+        let mut config = "model = \"fixture-model\"\n[shell_environment_policy]\nset = { FIXTURE_KEEP = \"kept\", EDITOR = \"fixture-editor\" }\n".to_string();
+        if user_exporter {
+            config.push_str("[otel]\ntrace_exporter = \"none\"\nmetrics_exporter = \"none\"\n");
+        }
+        std::fs::write(home.join("config.toml"), &config).unwrap();
+        Self { root, config }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.path().join(name)
+    }
+
+    fn builder(&self, telemetry: bool) -> common::TuiDeckBuilder {
+        let mut builder = TuiDeck::builder()
+            .without_agent_credentials()
+            .with_pty_size(180, 45)
+            // Do not inherit host agent binaries or telemetry shims.
+            .with_env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.root.path().display()),
+            )
+            .with_env("SHELL", "/bin/sh")
+            .with_env("CODEX_HOME", self.path("codex-home").to_string_lossy())
+            .with_env("CODEX_PATH_RECORD", self.path("wrap.log").to_string_lossy())
+            .with_env(
+                "CODEX_ARGS_RECORD",
+                self.path("args.jsonl").to_string_lossy(),
+            )
+            .with_env(
+                "LAUNCHER_ARGS_RECORD",
+                self.path("launcher.log").to_string_lossy(),
+            )
+            .with_env("SYNTHETIC_CODEX_BIN", self.path("codex").to_string_lossy())
+            .with_env(
+                "EMBEDDED_DECK_BIN",
+                common::contained_deck_binary().to_string_lossy(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_WRAP_BIN",
+                self.path("dot-agent-deck").to_string_lossy(),
+            );
+        if telemetry {
+            builder = builder
+                .with_env("OTEL_SDK_DISABLED", "false")
+                .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9")
+                .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json");
+        } else {
+            builder = builder.with_env("OTEL_SDK_DISABLED", "true");
+        }
+        builder
+    }
+
+    fn observe(&self, deck: &TuiDeck, expected_command: &str) -> (Vec<String>, String) {
+        common::wait_for_file_lines(&self.path("args.jsonl"), 1, Duration::from_secs(15))
+            .unwrap_or_else(|state| {
+                panic!(
+                    "synthetic Codex never started: {state}\n{}",
+                    deck.snapshot_grid()
+                )
+            });
+        let records = std::fs::read_to_string(self.path("args.jsonl")).unwrap();
+        let args: Vec<Vec<String>> = records
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            args.len(),
+            1,
+            "one synthetic Codex launch, no double wrapper"
+        );
+        let wrapped = std::fs::read_to_string(self.path("wrap.log")).unwrap();
+        assert_eq!(
+            wrapped.lines().collect::<Vec<_>>(),
+            [format!("WRAPPED wrap --agent codex -- {expected_command}")]
+        );
+        assert_eq!(
+            std::fs::read(self.path("codex-home/config.toml")).unwrap(),
+            self.config.as_bytes(),
+            "launch must preserve fixture config.toml byte for byte"
+        );
+        // Both modes remain interactive, so RED reflects the missing prefix
+        // rather than a fixture that exited before the pane could be attached.
+        assert!(
+            deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid
+                .contains("EMBEDDED_SUCCESS")
+                || grid.contains("SHARED_SELECTION")),
+            "synthetic mode sentinel never became visible\n{}",
+            deck.snapshot_grid()
+        );
+        deck.send_bytes(b"probe-2002\r");
+        assert!(
+            deck.wait_for_grid_string_within("INPUT_SUCCESS:probe-2002", Duration::from_secs(10)),
+            "pane must remain usable\n{}",
+            deck.snapshot_grid()
+        );
+        let grid = deck.snapshot_grid();
+        (args.into_iter().next().unwrap(), grid)
+    }
+}
+
+#[cfg(unix)]
+fn embedded_failure(label: &str, args: &[String], grid: &str) -> Option<String> {
+    let pair = ["-c", "shell_environment_policy.set={}"];
+    let count = args
+        .windows(2)
+        .filter(|window| window[0] == pair[0] && window[1] == pair[1])
+        .count();
     assert!(
-        common::wait_for_file_substr_count(record, "WRAPPED", 1, Duration::from_secs(10)),
-        "the Codex recorder was never launched"
+        !args.iter().any(|arg| arg == "--no-daemon"),
+        "old-release compatibility: {args:?}"
     );
-    // PRD #20 §4.2.1: startup scoped-trust runs `codex app-server` to read Codex's
-    // own hook hashes, which the PATH recorder also logs. That probe is not an
-    // agent launch, so the launch-path assertion looks past it.
-    common::recorded_agent_launches(record)
-}
-
-fn assert_only_wrapped(record: &Path) {
-    let launched = wait_for_launch(record);
-    assert!(
-        launched
-            .iter()
-            .all(|line| line == "WRAPPED wrap --agent codex -- codex"),
-        "every Codex launch on this path must cross the Wrapper strategy exactly once; observed:\n{}",
-        launched.join("\n")
-    );
-}
-
-fn wait_for_declared_launcher(record: &Path) -> Vec<String> {
-    common::wait_for_file_containing(record, "devbox run codex-big", Duration::from_secs(10))
-        .unwrap_or_else(|state| panic!("the declared launcher was never executed: {state}"));
-    common::recorded_agent_launches(record)
-}
-
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
+    if args.starts_with(&pair.map(String::from))
+        && count == 1
+        && grid.contains("EMBEDDED_SUCCESS")
+        && !grid.contains("SHARED_SELECTION")
+    {
+        None
+    } else {
+        let grid = grid
+            .lines()
+            .filter(|line| {
+                ["SUCCESS", "SELECTION", "Codex", "STDERR_SENTINEL"]
+                    .iter()
+                    .any(|needle| line.contains(needle))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "{label}: missing prepended embedded pair or visible embedded success; argv={args:?}, pair_count={count}\n{grid}"
+        ))
+    }
 }
 
 fn open_form(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
     deck.wait_for_string("No mode");
 }
 
-/// Scenario: Restore a persisted plain pane whose user-facing command is bare
-/// `codex`, with recorder binaries ahead of PATH. The restore spawn must execute
-/// exactly `dot-agent-deck wrap --agent codex -- codex`, never bare Codex.
+/// Scenario: Restore bare and already-prefixed synthetic Codex panes through the real wrapper. Each pane must visibly select embedded mode, remain usable, preserve its config, and receive the embedded pair exactly once.
 #[spec("codex/spawn/001")]
 #[test]
 #[cfg(unix)]
 fn spawn_001_plain_restore_wraps_codex() {
-    let fixture = common::harness_tempdir().expect("plain restore record dir");
-    let record = fixture.path().join("plain-restore.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let _deck = TuiDeck::builder()
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
-        .with_continue_session("restored-codex", "codex")
-        .launch_with_fixture("minimal");
-    assert_only_wrapped(&record);
+    let mut failures = Vec::new();
+    for command in ["codex -c 'shell_environment_policy.set={}'", "codex"] {
+        let fixture = EmbeddedFixture::new(false);
+        let deck = fixture
+            .builder(false)
+            .with_continue_session("restored-codex", command)
+            .launch_with_fixture("minimal");
+        let (args, grid) = fixture.observe(&deck, &command.replace('\'', ""));
+        if let Some(failure) = embedded_failure(command, &args, &grid) {
+            failures.push(failure);
+        } else {
+            eprintln!("PASS restore control: {command}");
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Scenario: Select a configured workload mode through the normal new-pane UI
-/// while the form's bare command is `codex`. The mode shell-injection path must
-/// transform that command through the Wrapper strategy before launch.
-#[spec("codex/spawn/002")]
-#[test]
-#[cfg(unix)]
-fn spawn_002_mode_pane_wraps_codex() {
-    let fixture = common::harness_tempdir().expect("mode record dir");
-    let record = fixture.path().join("mode.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let deck = TuiDeck::builder()
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
-        .launch_with_fixture("codex-spawn-paths");
-    open_form(&deck);
-    deck.send_keys(b"\x1b[C");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"codex");
-    deck.send_keys(b"\r");
-    assert_only_wrapped(&record);
-}
-
-/// Scenario: Select a configured orchestration through the normal new-pane UI
-/// whose start role command is bare `codex`. The orchestration role spawn must
-/// execute the registry Wrapper command rather than launching Codex directly.
+/// Scenario: Select an orchestration whose start role runs synthetic Codex through the real wrapper. The role pane must visibly select embedded mode, accept input, and retain the fixture configuration.
 #[spec("codex/spawn/003")]
 #[test]
 #[cfg(unix)]
 fn spawn_003_orchestration_role_wraps_codex() {
-    let fixture = common::harness_tempdir().expect("orchestration record dir");
-    let record: PathBuf = fixture.path().join("orchestration.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let deck = TuiDeck::builder()
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
+    let fixture = EmbeddedFixture::new(false);
+    let deck = fixture
+        .builder(false)
         .launch_with_fixture("codex-spawn-paths");
     commit_fixture(deck.workdir());
     open_form(&deck);
-    deck.send_keys(b"\x1b[C\x1b[C");
+    deck.send_keys(b"\x1b[C");
     deck.wait_for_absence("Command:");
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
-    assert_only_wrapped(&record);
+    let (args, grid) = fixture.observe(&deck, "codex");
+    assert!(
+        embedded_failure("orchestration", &args, &grid).is_none(),
+        "{}",
+        embedded_failure("orchestration", &args, &grid).unwrap()
+    );
 }
 
-/// Scenario: Restore a persisted mode-backed pane whose saved user-facing
-/// command is bare `codex`. Rebuilding the mode tab must wrap that command
-/// before injecting it into the restored mode agent pane.
-#[spec("codex/spawn/004")]
-#[test]
-#[cfg(unix)]
-fn spawn_004_mode_restore_wraps_codex() {
-    let fixture = common::harness_tempdir().expect("mode restore record dir");
-    let record = fixture.path().join("mode-restore.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let _deck = TuiDeck::builder()
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
-        .with_continue_mode_session("restored-mode-codex", "codex", "wrapped-mode")
-        .launch_with_fixture("codex-spawn-paths");
-    assert_only_wrapped(&record);
-}
-
-/// Scenario: Open an orchestration whose start role declares Codex but runs
-/// through a non-inferable launcher. Without delegating a task or synthesizing a
-/// hook, the role must launch through the Codex wrapper and its card must read Codex.
+/// Scenario: Open a role declaring Codex through a synthetic devbox launcher that chooses embedded mode for its inner invocation. The launcher must keep its original arguments, its pane must accept input, and its card must show Codex before a task or hook.
 #[spec("codex/spawn/009")]
 #[test]
 #[cfg(unix)]
 fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
-    let fixture = common::harness_tempdir().expect("declared orchestration record dir");
-    let record = fixture.path().join("declared-orchestration.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let deck = TuiDeck::builder()
-        .with_pty_size(160, 42)
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    let fixture = EmbeddedFixture::new(false);
+    let deck = fixture.builder(false).launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
     std::fs::write(
         deck.workdir().join(".dot-agent-deck.toml"),
         "[[orchestrations]]\n\
@@ -221,84 +261,41 @@ fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
 
-    let launched = wait_for_declared_launcher(&record);
-    deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
-    // Fork #339 turned the agent-type badge off by default (deck-global
-    // `m` toggle) — PRD fork#405 also moved identity off the title onto its
-    // own body row, so the combined `Codex · <name>` shape this assertion
-    // originally checked is gone either way. Enable the badge the same way
-    // `agent_badge_003` does before looking for the bare type text.
-    deck.send_keys(b"m");
-    deck.wait_for_string("Agent badge: shown");
-    let codex_badge = deck.wait_for_grid_string_within("Codex", Duration::from_secs(5));
-    let grid = deck.snapshot_grid();
-
-    assert!(
-        launched == ["WRAPPED wrap --agent codex -- devbox run codex-big"] && codex_badge,
-        "a declared Codex role must wrap its non-inferable launcher exactly once and render a Codex badge before any delegate or hook event; launches={launched:?}, codex_badge={codex_badge}\nFinal grid:\n{grid}"
+    let (args, pane_grid) = fixture.observe(&deck, "devbox run codex-big");
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("launcher.log")).unwrap(),
+        "run\ncodex-big\n",
+        "declared launcher must receive its original argv without Codex options"
     );
-}
-
-/// Scenario: Select a configured mode whose agent pane declares Codex, then
-/// enter a non-inferable launcher in the form. The shell-injected command must
-/// be wrapped exactly once and the pane's Dashboard card must read Codex.
-#[spec("codex/spawn/011")]
-#[test]
-#[cfg(unix)]
-fn spawn_011_declared_mode_launcher_wraps_and_badges_codex() {
-    let fixture = common::harness_tempdir().expect("declared mode record dir");
-    let record = fixture.path().join("declared-mode.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let deck = TuiDeck::builder()
-        .with_pty_size(160, 42)
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-    std::fs::write(
-        deck.workdir().join(".dot-agent-deck.toml"),
-        "[[modes]]\n\
-         name = \"declared-codex-mode\"\n\
-         agent = \"codex\"\n\
-         reactive_panes = 0\n",
-    )
-    .expect("write declared mode config");
-
-    open_form(&deck);
-    deck.send_keys(b"\x1b[C");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"devbox run codex-big");
-    deck.send_keys(b"\r");
-
-    let launched = wait_for_declared_launcher(&record);
+    assert!(pane_grid.contains("LAUNCHER_SUCCESS"), "{pane_grid}");
+    assert!(embedded_failure("launcher-selected inner mode", &args, &pane_grid).is_none());
     deck.send_bytes(b"\x04");
-    deck.send_bytes(b"\x1b[D");
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     // Fork #339 turned the agent-type badge off by default (deck-global
-    // `m` toggle) — PRD fork#405 also moved identity off the title onto its
-    // own body row, so the combined `Codex · <name>` shape this assertion
-    // originally checked is gone either way. Enable the badge the same way
-    // `agent_badge_003` does before looking for the bare type text.
-    deck.send_keys(b"m");
+    // `b` toggle; `m` is the host-metrics overlay's) — PRD fork#405 also moved
+    // identity off the title onto its own body row, so the combined
+    // `Codex · <name>` shape this assertion originally checked is gone either
+    // way. Enable the badge the same way `agent_badge_003` does before looking
+    // for the bare type text.
+    deck.send_keys(b"b");
     deck.wait_for_string("Agent badge: shown");
     let codex_badge = deck.wait_for_grid_string_within("Codex", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
 
     assert!(
-        launched == ["WRAPPED wrap --agent codex -- devbox run codex-big"] && codex_badge,
-        "a declared Codex mode pane must wrap its shell-injected non-inferable launcher exactly once and render a Codex Dashboard badge; launches={launched:?}, codex_badge={codex_badge}\nFinal grid:\n{grid}"
+        codex_badge,
+        "a declared launcher must render a Codex badge before any task or hook; codex_badge={codex_badge}\nFinal grid:\n{grid}"
     );
 }
 
 /// Scenario: Start a real cheap-model Codex through a bespoke launcher script
-/// used by an orchestration role that declares Codex. Before any prompt is
-/// submitted, the role card must already read Codex and the real CLI must be live.
+/// used by an orchestration role that declares Codex, with the role command
+/// opening on an environment assignment the launcher must see (issue #1685).
+/// Before any prompt is submitted, the role card must already read Codex and the
+/// real CLI must be live.
 #[spec("codex/spawn/012")]
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "e2e-live"))]
 fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
     skip_unless!(common::check_codex_available());
 
@@ -306,25 +303,30 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
         .and_then(|path| {
             std::env::split_paths(&path)
                 .map(|dir| dir.join("codex"))
-                .find(|candidate| candidate.is_file())
+                // Not the deck's telemetry shim, which a deck pane's `PATH`
+                // can carry ahead of the real Codex: this test launches the
+                // real program by absolute path, not the developer's shim.
+                .find(|candidate| {
+                    candidate.is_file() && !dot_agent_deck::telemetry::shim::is_shim_file(candidate)
+                })
         })
         .expect("available Codex binary resolves on PATH");
     let deck = TuiDeck::builder()
         .with_pty_size(160, 42)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("REAL_CODEX_BIN", real_codex.to_string_lossy())
         .with_imported_codex_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let work = deck.workdir().to_path_buf();
     let launch_record = work.join("real-script-codex.log");
     write_executable(
         &work.join("run-codex.sh"),
-        "#!/bin/sh\nprintf 'REAL_CODEX %s\\n' \"$*\" >> real-script-codex.log\nexec \"$REAL_CODEX_BIN\" \"$@\"\n",
+        "#!/bin/sh\nprintf 'REAL_CODEX probe=%s %s\\n' \"${CODEX_LAUNCH_PROBE:-unset}\" \"$*\" >> real-script-codex.log\nexec \"$REAL_CODEX_BIN\" \"$@\"\n",
     );
     let command = format!(
-        "./run-codex.sh --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
+        "CODEX_LAUNCH_PROBE=1685 ./run-codex.sh --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
         common::codex_test_model(),
     );
     std::fs::write(
@@ -352,13 +354,14 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
         .unwrap_or_else(|state| panic!("the bespoke real-Codex launcher never executed: {state}"));
 
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
     // Fork #339 turned the agent-type badge off by default (deck-global
-    // `m` toggle) — PRD fork#405 also moved identity off the title onto its
-    // own body row, so the combined `Codex · <name>` shape this assertion
-    // originally checked is gone either way. Enable the badge the same way
-    // `agent_badge_003` does before looking for the bare type text.
-    deck.send_keys(b"m");
+    // `b` toggle; `m` is the host-metrics overlay's) — PRD fork#405 also moved
+    // identity off the title onto its own body row, so the combined
+    // `Codex · <name>` shape this assertion originally checked is gone either
+    // way. Enable the badge the same way `agent_badge_003` does before looking
+    // for the bare type text.
+    deck.send_keys(b"b");
     deck.wait_for_string("Agent badge: shown");
     let codex_badge = deck.wait_for_grid_string_within("Codex", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
@@ -371,166 +374,86 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
             .is_some_and(|prompt| !prompt.is_empty())
     });
 
+    // Issue #1685: a command opening on an assignment used to hand the wrapper
+    // the assignment as its program, and the launcher never ran.
+    let saw_assignment = real_launch.contains("REAL_CODEX probe=1685 ");
+
     assert!(
-        codex_badge && no_prompt_event && grid.contains("Idle"),
-        "the real script-launched Codex role must render a Codex Idle card before any prompt is submitted; real_launch={real_launch:?}, codex_badge={codex_badge}, no_prompt_event={no_prompt_event}\nFinal grid:\n{grid}"
+        saw_assignment && codex_badge && no_prompt_event && grid.contains("Idle"),
+        "the real script-launched Codex role, started through a leading assignment, must render a Codex Idle card before any prompt is submitted; real_launch={real_launch:?}, saw_assignment={saw_assignment}, codex_badge={codex_badge}, no_prompt_event={no_prompt_event}\nFinal grid:\n{grid}"
     );
 }
 
-/// Click on the first occurrence of `needle` in the deck's rendered grid,
-/// mirroring the row/column math `TuiDeck::visible_text_cell_styles` uses
-/// internally (char count, not byte offset, so a line prefixed with
-/// multi-byte box-drawing borders still resolves the right column).
-#[cfg(unix)]
-fn click_on_grid_text(deck: &TuiDeck, needle: &str) {
-    let grid = deck.snapshot_grid();
-    for (row, line) in grid.lines().enumerate() {
-        if let Some(byte_col) = line.find(needle) {
-            let col = line[..byte_col].chars().count() as u16;
-            deck.click(col, row as u16);
-            return;
-        }
-    }
-    panic!("grid text {needle:?} not found to click on:\n{grid}");
-}
-
-/// Scenario: Select a MODE whose config declares no agent identity, then use the
-/// New Agent form's own "Agent" chip (PRD #20 finding #8 — off the Tab cycle,
-/// click-only) to EXPLICITLY pick Codex before typing a bespoke non-inferable
-/// launcher script wrapping a REAL Codex process. The mode's shell-injection
-/// submit path (`wrap_agent_command`, `src/ui.rs`) now consults the New Agent
-/// form's `agent_selection` (carried forward on `NewPaneRequest.form_agent_type`)
-/// alongside the mode config's static `agent =` declaration via
-/// `resolve_declared_agent_for_wrap` (issue #640) — so the command IS typed in
-/// wrapped: `dot-agent-deck wrap --agent codex --` prefix, per-pane
-/// `codex_spawn_prep`, CODEX_HOME pin, all run. The real, live, fully-booted
-/// interactive Codex session must have its Dashboard card correctly reported as
-/// Codex.
+/// Scenario: Submit direct synthetic Codex commands through Ctrl+N with telemetry off, exporter additions, a user exporter, and an absolute executable path. The pane must visibly select embedded mode and accept input while user config overrides, model, prompt, and config-file bytes survive unchanged.
 #[spec("codex/spawn/013")]
 #[test]
 #[cfg(unix)]
-fn spawn_013_form_agent_selection_ignored_by_mode_pane_wrap_decision() {
-    skip_unless!(common::check_codex_available());
-
-    let real_codex = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join("codex"))
-                .find(|candidate| candidate.is_file())
-        })
-        .expect("available Codex binary resolves on PATH");
-    let deck = TuiDeck::builder()
-        .with_pty_size(160, 42)
-        .with_env("PATH", path_with_binary_dir())
-        .with_env("REAL_CODEX_BIN", real_codex.to_string_lossy())
-        .with_imported_codex_credentials()
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-
-    let work = deck.workdir().to_path_buf();
-    let launch_record = work.join("real-mode-codex.log");
-    write_executable(
-        &work.join("run-codex.sh"),
-        "#!/bin/sh\nprintf 'REAL_CODEX %s\\n' \"$*\" >> real-mode-codex.log\nexec \"$REAL_CODEX_BIN\" \"$@\"\n",
-    );
-    let command = format!(
-        "./run-codex.sh --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
-        common::codex_test_model(),
-    );
-    std::fs::write(
-        work.join(".dot-agent-deck.toml"),
-        "[[modes]]\n\
-         name = \"undeclared-codex-mode\"\n\
-         reactive_panes = 0\n",
-    )
-    .expect("write undeclared mode config");
-
-    let events = deck.subscribe_events();
-    open_form(&deck);
-    deck.send_keys(b"\x1b[C"); // Mode: select the one custom mode
-
-    // PRD #20 finding #8: the Agent chip is off the Tab cycle — click it to
-    // focus + pick the FIRST registry entry (index 0, ClaudeCode), then cycle
-    // Right three times to reach Codex (registry order: ClaudeCode, OpenCode,
-    // Pi, Codex, Devin — `src/agent_registry.rs::ALL`).
-    click_on_grid_text(&deck, "Agent:");
-    deck.wait_for_string("[ClaudeCode]");
-    deck.send_keys(b"\x1b[C\x1b[C\x1b[C");
-    deck.wait_for_string("[Codex]");
-
-    deck.send_keys(b"\r"); // Agent -> Name
-    deck.send_keys(b"\r"); // Name -> Command
-    // Selecting Codex seeded Command with the registry default ("codex" alone
-    // — already inferable by `AgentType::from_command`, not the gap this test
-    // pins). Replace it with the bespoke non-inferable real-Codex launcher so
-    // the EXPLICIT Agent-chip pick is the only signal available.
-    deck.send_keys(&[0x7fu8; 32]);
-    deck.send_keys(command.as_bytes());
-    deck.send_keys(b"\r"); // submit
-
-    common::wait_for_file_containing(&launch_record, "REAL_CODEX", Duration::from_secs(20))
-        .unwrap_or_else(|state| {
-            panic!("the bespoke real-Codex mode launcher never executed: {state}")
-        });
-
-    // Post-fix, this pane's launch line IS wrapped through `dot-agent-deck wrap
-    // --agent codex --`, which pins CODEX_HOME and installs + records scoped
-    // trust for the deck's own hooks before the real Codex process execs (see
-    // `codex_spawn_prep` in `src/wrap.rs`) — the same precondition that lets
-    // `spawn_009`/`spawn_012` (a declared orchestration role's real Codex
-    // launcher) reach their assertions without ever seeing this dialog. This
-    // block is kept purely defensive: it only fires if hook-trust recording
-    // somehow lags or fails in a given environment, or if a live Codex build
-    // shows its own review gate for a reason unrelated to the deck's hooks —
-    // push through it exactly as such a case would need to ("Continue without
-    // trusting"), so the assertions below observe the fully-booted interactive
-    // session rather than an artifact of the trust prompt itself.
-    if deck.wait_for_grid_string_within("Hooks need review", Duration::from_secs(20)) {
-        deck.send_bytes(b"\x1b[B\x1b[B\r"); // Down, Down, Enter -> "Continue without trusting"
+fn spawn_013_plain_new_pane_wraps_codex_once() {
+    let mut failures = Vec::new();
+    for (label, telemetry, exporter, absolute, user_config) in [
+        ("telemetry off", false, false, false, None),
+        ("exporter additions", true, false, false, None),
+        ("user exporter", true, true, false, None),
+        ("absolute Codex", false, false, true, None),
+        (
+            "whole-table user override",
+            false,
+            false,
+            false,
+            Some("shell_environment_policy.set={USER_KEEP=\"whole\"}"),
+        ),
+        (
+            "nested user override",
+            false,
+            false,
+            false,
+            Some("shell_environment_policy.set.USER_KEEP=\"nested\""),
+        ),
+    ] {
+        let fixture = EmbeddedFixture::new(exporter);
+        let program = if absolute {
+            fixture.path("codex").to_string_lossy().into_owned()
+        } else {
+            "codex".into()
+        };
+        let mut user_args = Vec::new();
+        if let Some(config) = user_config {
+            user_args.extend(["-c".to_string(), config.to_string()]);
+        }
+        user_args.extend([
+            "--model".into(),
+            "mini-fixture".into(),
+            "prompt with spaces".into(),
+        ]);
+        let suffix = user_args
+            .iter()
+            .map(|arg| format!("'{arg}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = format!("{program} {suffix}");
+        let deck = fixture.builder(telemetry).launch_with_fixture("minimal");
+        open_form(&deck);
+        deck.send_keys(b"\r"); // Mode → Name
+        deck.send_keys(b"\r"); // Name → Command
+        deck.send_keys(command.as_bytes());
+        deck.send_keys(b"\r");
+        let (args, grid) = fixture.observe(&deck, &format!("{program} {}", user_args.join(" ")));
+        assert!(
+            args.ends_with(&user_args),
+            "{label}: user arguments changed: {args:?}"
+        );
+        let exporters = args.iter().filter(|arg| arg.starts_with("otel.")).count();
+        assert_eq!(
+            exporters,
+            if label == "exporter additions" { 2 } else { 0 },
+            "{label}: exercise the intended telemetry branch: {args:?}"
+        );
+        eprintln!(
+            "PASS {label}: original argv suffix, exporter branch, unchanged config, wrapper once, usable pane, no --no-daemon"
+        );
+        if let Some(failure) = embedded_failure(label, &args, &grid) {
+            failures.push(failure);
+        }
     }
-
-    assert!(
-        deck.wait_for_grid_string_within("Ask Codex", Duration::from_secs(30)),
-        "the real interactive Codex CLI never became ready in the mode pane:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // PRD #84 M4 mode tabs open on their OWN tab, not Dashboard — `Ctrl+D` alone
-    // only leaves pane-typing focus, it does not switch tabs (unlike the
-    // single-pane orchestration path spawn_012 exercises). Left switches to the
-    // previous tab (Dashboard), matching `spawn_011`'s exact pattern.
-    deck.send_bytes(b"\x04");
-    deck.send_bytes(b"\x1b[D");
-    deck.wait_for_string("session(s)");
-    // Fork #339 turned the agent-type badge off by default (deck-global
-    // `m` toggle) — enable it the same way spawn_009/011/012 do so the
-    // panic-message grid dump below shows the badge state too.
-    deck.send_keys(b"m");
-    deck.wait_for_string("Agent badge: shown");
-    // NOTE: unlike spawn_009/011/012's single-focus flow, this mode tab's
-    // Dashboard view renders alongside a still-visible strip of the live
-    // Codex pane's OWN banner ("OpenAI Codex (v0.153.4)"), so a whole-grid
-    // substring search for "Codex" is not a reliable badge check here — it
-    // would pass on that banner text even when the Dashboard card itself
-    // never got a badge. The unambiguous, non-cosmetic signal is whether a
-    // Codex-typed `AgentEvent` ever reached the daemon's broadcast stream —
-    // that only happens via the wrapper's fork-time `SessionStart` or Codex's
-    // own native hooks, both of which require the Wrapper strategy to have
-    // run at all.
-    let grid = deck.snapshot_grid();
-    let codex_event = events
-        .snapshot()
-        .iter()
-        .any(|event| event.agent_type == AgentType::Codex);
-
-    assert!(
-        codex_event,
-        "the New Agent form's explicit Agent: Codex selection (PRD #20 finding #8) must \
-         still wrap a non-inferable mode-pane launcher through the Wrapper strategy — \
-         `wrap_agent_command`'s mode-pane call site only consults the mode config's static \
-         `agent =` declaration, never this form field, so the explicit selection is silently \
-         discarded, no Codex-typed AgentEvent ever reaches the daemon, and a real live Codex \
-         session goes completely unwrapped and unreported; codex_event={codex_event}\n\
-         Final grid:\n{grid}"
-    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

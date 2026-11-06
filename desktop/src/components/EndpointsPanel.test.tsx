@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EndpointsPanel } from "./EndpointsPanel";
 
@@ -50,6 +50,7 @@ import {
   type RemoteEndpointDto,
 } from "../lib/bridge";
 import { SettingsBridgeProvider } from "../lib/settingsBridge";
+import type { SettingsPanelProps } from "../lib/settingsContract";
 import type { RuntimeMode } from "../types";
 
 function deck(overrides: Partial<RemoteEndpointDto> = {}): RemoteEndpointDto {
@@ -78,9 +79,13 @@ function renderPanel(
     mode?: RuntimeMode;
     saveError?: string;
     testEndpoint?: (settings: DesktopSettingsDto, selection: string) => Promise<EndpointTestReportDto>;
+    defaultDeckName?: (host: string, user?: string) => Promise<string>;
+    checkDeckName?: (name: string, id?: string) => Promise<string | null>;
+    renameDeck?: (id: string, name: string) => Promise<DesktopSettingsDto>;
+    onSave?: SettingsPanelProps["onSave"];
   } = {},
 ) {
-  const onSave = vi.fn();
+  const onSave = vi.fn(options.onSave ?? (() => undefined));
   const settings = { ...DEFAULT_DESKTOP_SETTINGS, ...overrides };
   const panel = (
     <EndpointsPanel
@@ -90,9 +95,22 @@ function renderPanel(
       mode={options.mode ?? "live"}
     />
   );
+  const bridge = {
+    testEndpoint: options.testEndpoint ?? vi.fn(async () => report()),
+    defaultDeckName: options.defaultDeckName ?? vi.fn(async () => "build-box"),
+    checkDeckName: options.checkDeckName ?? vi.fn(async () => null),
+    renameDeck: options.renameDeck ?? vi.fn(async () => settings),
+    secretStatus: vi.fn(async () => ({ stored: false })),
+    storeSecret: vi.fn(async () => ({ stored: true })),
+    forgetSecret: vi.fn(async () => ({ stored: false })),
+  };
   const wrap = (element: React.ReactElement) =>
-    options.testEndpoint
-      ? <SettingsBridgeProvider value={{ testEndpoint: options.testEndpoint }}>{element}</SettingsBridgeProvider>
+    (options.testEndpoint || options.defaultDeckName || options.checkDeckName || options.renameDeck)
+      ? (
+        <SettingsBridgeProvider value={bridge}>
+          {element}
+        </SettingsBridgeProvider>
+      )
       : element;
   const { rerender } = render(wrap(panel));
   /**
@@ -100,18 +118,24 @@ function renderPanel(
    * harness holds `settings` fixed otherwise, so nothing else here can model an
    * edit that lands while an async probe is in flight.
    */
-  const update = (next: DesktopSettingsDto) =>
+  const update = (next: DesktopSettingsDto, saveError = options.saveError) =>
     rerender(
       wrap(
         <EndpointsPanel
           settings={next}
           onSave={onSave}
-          saveError={options.saveError}
+          saveError={saveError}
           mode={options.mode ?? "live"}
         />,
       ),
     );
   return { onSave, settings, update };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 describe("EndpointsPanel", () => {
@@ -123,7 +147,7 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: open the Decks section on a fresh install — a document with no
+   * Scenario: open the Daemons section on a fresh install — a document with no
    * `[endpoints]` section at all. The local deck is listed and chosen, and
    * nothing had to be configured for that to be true.
    */
@@ -138,13 +162,13 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: press "Add a deck". A row appears, focused, with its fields ready
-   * to fill in — and **nothing is saved yet**, because a deck with no host is
+   * Scenario: press "Add a daemon". A row appears, focused, with its fields ready
+   * to fill in — and **nothing is saved yet**, because a daemon with no host is
    * not a document Rust will accept (PRD #741, Greptile P2 on #1035). Writing
    * it immediately meant the row lived only in this component's optimistic
    * state and that every unrelated settings save failed while it sat there.
    */
-  it("adds a deck as a local draft, saving nothing until it is valid", () => {
+  it("adds a daemon as a local draft, saving nothing until it is valid", () => {
     const { onSave } = renderPanel({}, { testEndpoint: async () => report() });
     fireEvent.click(screen.getByTestId("add-deck"));
 
@@ -152,26 +176,34 @@ describe("EndpointsPanel", () => {
     // Present, focused, and named for what it is until it has a host.
     expect(screen.getByTestId("deck-detail")).toBeInTheDocument();
     expect(screen.getByLabelText("Host")).toHaveValue("");
-    expect(screen.getByText("New deck")).toBeInTheDocument();
+    expect(screen.getByText("New daemon")).toBeInTheDocument();
     // And it cannot be probed while it is unusable.
     expect(screen.getByTestId("test-connection")).toBeDisabled();
   });
 
   /**
-   * Scenario: fill the draft's Host in. The moment the row is storable it stops
-   * being a draft — it goes into the document with a freshly minted id and
-   * becomes the selection, which is what pressing "Add a deck" was asking for.
+   * Scenario: fill the draft's Host in and accept the derived deck name. The
+   * user confirms the row before it is stored and selected.
    */
-  it("stores a draft and selects it as soon as it is valid", () => {
-    const { onSave } = renderPanel();
+  /// Scenario: The suggested deck name is visible before saving a valid new remote deck.
+  it("stores a draft with its default name and selects it after confirmation", async () => {
+    const defaultDeckName = vi.fn(async () => "build");
+    const { onSave } = renderPanel({}, { defaultDeckName });
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
 
+    await waitFor(() => expect(defaultDeckName).toHaveBeenCalledWith("build-box", undefined));
+    expect(screen.getByLabelText("Deck name")).toHaveValue("build");
+    expect(onSave).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
     const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
     expect(saved.endpoints?.remote).toHaveLength(1);
     const added = saved.endpoints!.remote[0];
     expect(added.id).toMatch(/^[0-9a-f]{16}$/);
     expect(added.host).toBe("build-box");
+    expect(added).toHaveProperty("name", "build");
     expect(added.port).toBe(22);
     expect(saved.endpoints?.selection).toBe(added.id);
     // The whole document travels, not just this section.
@@ -179,14 +211,178 @@ describe("EndpointsPanel", () => {
     expect(saved.zoom).toEqual(DEFAULT_DESKTOP_SETTINGS.zoom);
   });
 
+  /// Scenario: A user replaces the suggested name before saving a new deck; the chosen name reaches the saved row.
+  it("saves a user-chosen name for a new deck", async () => {
+    const defaultDeckName = vi.fn(async () => "deploy-build-box");
+    const { onSave } = renderPanel({}, {
+      defaultDeckName,
+      checkDeckName: vi.fn(async () => null),
+    });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("User"), { target: { value: "deploy" } });
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    await waitFor(() => expect(defaultDeckName).toHaveBeenCalledWith("build-box", "deploy"));
+    expect(screen.getByLabelText("Deck name")).toHaveValue("deploy-build-box");
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave.mock.calls[0][0].endpoints?.remote[0].name).toBe("production");
+  });
+
+  /// Scenario: A delayed suggested name arrives after the user has typed a name, so the typed name stays in the add form.
+  it("keeps a typed draft name when the suggested name arrives late", async () => {
+    const suggestion = deferred<string>();
+    const defaultDeckName = vi.fn(() => suggestion.promise);
+    renderPanel({}, { defaultDeckName, checkDeckName: vi.fn(async () => null) });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    await waitFor(() => expect(defaultDeckName).toHaveBeenCalledWith("build-box", undefined));
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "mine" } });
+
+    await act(async () => { suggestion.resolve("build-box"); });
+    expect(screen.getByLabelText("Deck name")).toHaveValue("mine");
+    expect(screen.getByTestId("save-new-deck")).toBeEnabled();
+  });
+
+  /// Scenario: An old name check finishes after a newer one, so only the newer name's verdict controls the form.
+  it("ignores a stale draft name verdict", async () => {
+    const oldCheck = deferred<string | null>();
+    const newCheck = deferred<string | null>();
+    const checkDeckName = vi.fn((name: string) => name === "old" ? oldCheck.promise : newCheck.promise);
+    renderPanel({}, { defaultDeckName: vi.fn(async () => ""), checkDeckName });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "old" } });
+    await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("old", undefined));
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "new" } });
+    await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("new", undefined));
+
+    await act(async () => { newCheck.resolve("A deck named 'new' already exists."); });
+    expect(screen.getByRole("alert")).toHaveTextContent("A deck named 'new' already exists.");
+    expect(screen.getByTestId("save-new-deck")).toBeDisabled();
+    await act(async () => { oldCheck.resolve(null); });
+    expect(screen.getByRole("alert")).toHaveTextContent("A deck named 'new' already exists.");
+    expect(screen.getByTestId("save-new-deck")).toBeDisabled();
+  });
+
+  /// Scenario: While Add this daemon re-checks the name, the Deck name field is locked, so the name saved is the one checked and on screen.
+  it("locks the draft name while confirming, so the checked name is the one saved", async () => {
+    const confirmCheck = deferred<string | null>();
+    let checks = 0;
+    const checkDeckName = vi.fn(async (name: string) => {
+      checks += 1;
+      return name === "mine" && checks > 1 ? confirmCheck.promise : null;
+    });
+    const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => ""), checkDeckName });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "mine" } });
+    await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("mine", undefined));
+    await waitFor(() => expect(screen.getByTestId("save-new-deck")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+    await waitFor(() => expect(checkDeckName).toHaveBeenCalledTimes(2));
+
+    // The check is in flight: the name it is checking cannot be edited under it.
+    expect(screen.getByLabelText("Deck name")).toBeDisabled();
+    expect(screen.getByTestId("save-new-deck")).toBeDisabled();
+
+    await act(async () => { confirmCheck.resolve(null); });
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect((onSave.mock.calls[0][0] as DesktopSettingsDto).endpoints?.remote[0].name).toBe("mine");
+  });
+
+  /// Scenario: A name taken during the save leaves the complete draft on screen, explains the refusal, and shows the save error.
+  it("restores a refused add when the name is taken during save", async () => {
+    const disk = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [], selection: "local" } };
+    const save = deferred<{ saved: false; disk: DesktopSettingsDto }>();
+    let checks = 0;
+    const checkDeckName = vi.fn(async (name: string) => {
+      if (name !== "mine") return null;
+      checks += 1;
+      return checks >= 3 ? "A deck named 'mine' already exists." : null;
+    });
+    const { onSave, update } = renderPanel({}, {
+      defaultDeckName: vi.fn(async () => "build-box"), checkDeckName,
+      onSave: () => save.promise,
+    });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    fireEvent.change(screen.getByLabelText("User"), { target: { value: "deploy" } });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "mine" } });
+    await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("mine", undefined));
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      update(disk, "The deck list changed while saving.");
+      save.resolve({ saved: false, disk });
+    });
+    await waitFor(() => expect(document.querySelector("p.settings-hint[role=alert]")).toHaveTextContent("A deck named 'mine' already exists."));
+    expect(screen.getByLabelText("Host")).toHaveValue("build-box");
+    expect(screen.getByLabelText("User")).toHaveValue("deploy");
+    expect(screen.getByLabelText("Deck name")).toHaveValue("mine");
+    expect(screen.getByTestId("save-new-deck")).toBeDisabled();
+    expect(document.querySelector("p.settings-error[role=alert]")).toHaveTextContent("The deck list changed while saving.");
+  });
+
+  /// Scenario: A caller that gives no save outcome retains the established behavior and closes the add draft.
+  it("clears the added draft when save returns no outcome", async () => {
+    renderPanel({}, { defaultDeckName: vi.fn(async () => "build-box"), checkDeckName: vi.fn(async () => null) });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    await waitFor(() => expect(screen.getByLabelText("Deck name")).toHaveValue("build-box"));
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+    await waitFor(() => expect(screen.queryByTestId("save-new-deck")).toBeNull());
+  });
+
+  /// Scenario: Clearing the suggested name still lets a user add the deck, leaving its name for the library to derive.
+  it("saves no name when the suggested name is cleared", async () => {
+    const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => "build") });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    await waitFor(() => expect(screen.getByLabelText("Deck name")).toHaveValue("build"));
+
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "" } });
+    expect(screen.getByTestId("save-new-deck")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
+    expect(saved.endpoints?.remote[0]).not.toHaveProperty("name");
+    expect(saved.endpoints?.selection).toBe(saved.endpoints?.remote[0].id);
+  });
+
+  /// Scenario: Invalid and already-taken names show the library's refusal and cannot be saved.
+  it("blocks a new deck name when the shared name check refuses it", async () => {
+    const checkDeckName = vi.fn(async (name: string) => name === "taken"
+      ? "A deck named 'taken' already exists."
+      : "Invalid deck name: a deck name must start with an ASCII letter or digit.");
+    const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => "build-box"), checkDeckName });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    await waitFor(() => expect(screen.getByLabelText("Deck name")).toHaveValue("build-box"));
+
+    for (const [name, refusal] of [
+      ["-bad", "Invalid deck name: a deck name must start with an ASCII letter or digit."],
+      ["taken", "A deck named 'taken' already exists."],
+    ]) {
+      fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: name } });
+      await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(refusal));
+      expect(screen.getByTestId("save-new-deck")).toBeDisabled();
+      expect(onSave).not.toHaveBeenCalled();
+    }
+    expect(checkDeckName).toHaveBeenCalledWith("taken", undefined);
+  });
+
   /**
-   * Scenario: press "Add a deck" and then remove the row again without typing
+   * Scenario: press "Add a daemon" and then remove the row again without typing
    * anything. Nothing was ever written, so nothing has to be unwritten.
    */
   it("drops an abandoned draft without touching the document", () => {
     const { onSave } = renderPanel();
     fireEvent.click(screen.getByTestId("add-deck"));
-    const remove = screen.getByLabelText("Remove New deck");
+    const remove = screen.getByLabelText("Remove New daemon");
     fireEvent.click(remove);
 
     expect(onSave).not.toHaveBeenCalled();
@@ -211,13 +407,13 @@ describe("EndpointsPanel", () => {
   */
 
   /**
-   * Scenario: a document with no `[endpoints]` section. Press "Add a deck",
-   * then abandon the draft by clicking back onto **This machine** — the deck
+   * Scenario: a document with no `[endpoints]` section. Press "Add a daemon",
+   * then abandon the draft by clicking back onto **This machine** — the daemon
    * that was already in force. Nothing about the document changed, so nothing
    * may be written: the section this panel would write is a stand-in it
    * invented, and it would delete rows it was never shown.
    */
-  it("a client that CAN render endpoints does not delete them by re-choosing the deck already in force", () => {
+  it("a client that CAN render endpoints does not delete them by re-choosing the daemon already in force", () => {
     const { onSave } = renderPanel();
     fireEvent.click(screen.getByTestId("add-deck"));
     expect(screen.getByTestId("deck-detail")).toBeInTheDocument();
@@ -232,7 +428,7 @@ describe("EndpointsPanel", () => {
 
   /**
    * Scenario: the same click against a document that DOES declare a section,
-   * with a deck stored and selected. Re-choosing it is still a no-op, so the
+   * with a daemon stored and selected. Re-choosing it is still a no-op, so the
    * rows are never rewritten — the guard is about the change being empty, not
    * about the section being absent.
    */
@@ -252,7 +448,7 @@ describe("EndpointsPanel", () => {
     -------------------------------------------------------------------------
     PRD 742 M6 — a stored fleet selection.
 
-    M1 added **All Decks** to `deckChoices`, which the top bar's Deck selector
+    M1 added **All daemons** to `deckChoices`, which the top bar's Deck selector
     is built from. This panel had a chooser of its own, so with `all` stored its
     `shown` matched no row: no radio checked, no detail form, and a **Test
     connection** button still enabled for a token no probe can answer.
@@ -261,7 +457,7 @@ describe("EndpointsPanel", () => {
 
   /**
    * Scenario: the document stores the fleet selection. The chooser shows **All
-   * Decks** checked and says why there are no fields under it, rather than
+   * Daemons** checked and says why there are no fields under it, rather than
    * rendering a chooser with nothing chosen.
    */
   it("shows a stored fleet selection as chosen, with a reason there are no fields", () => {
@@ -272,7 +468,7 @@ describe("EndpointsPanel", () => {
     expect(screen.getByTestId("deck-choice-deck0000000000aa").querySelector("input")).not.toBeChecked();
     // No fields, and a sentence saying that is correct rather than missing.
     expect(screen.queryByTestId("deck-detail")).toBeNull();
-    expect(screen.getByTestId("deck-fleet-note")).toHaveTextContent("All Decks is every deck at once");
+    expect(screen.getByTestId("deck-fleet-note")).toHaveTextContent("All daemons is every daemon at once");
     // The fleet is not a row, so there is nothing to remove.
     expect(screen.queryByTestId("remove-deck-all")).toBeNull();
   });
@@ -294,7 +490,7 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: choose **All Decks** from this panel on a document that already
+   * Scenario: choose **All daemons** from this panel on a document that already
    * declares a section. It is a real change, so it is written — and the stored
    * rows travel with it rather than being replaced by the chooser's own idea of
    * the list.
@@ -330,11 +526,11 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: remove the deck currently in use. The row goes and the selection
-   * falls back to the local deck — the app always has a deck, and picking a
+   * Scenario: remove the daemon currently in use. The row goes and the selection
+   * falls back to the local deck — the app always has a daemon, and picking a
    * different remote one on the user's behalf is a decision they did not make.
    */
-  it("removes a deck and falls back to local when it was the one in use", () => {
+  it("removes a daemon and falls back to local when it was the one in use", () => {
     const row = deck();
     const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } });
 
@@ -345,27 +541,115 @@ describe("EndpointsPanel", () => {
     expect(saved.endpoints?.selection).toBe("local");
   });
 
-  /**
-   * Scenario: a deck is named by its address, because there is no display name
-   * to give it — a user-chosen label would be exactly the arbitrary `String`
-   * the settings field-type guard refuses.
-   */
-  it("labels a deck from its address, port included when it is not 22", () => {
+  /// Scenario: A named deck is listed under its CLI name with the address beside it, while a legacy name falls back to the address.
+  it("shows a deck name and its address together in settings", () => {
+    const named = { ...deck({ user: "deploy", port: 2222 }), name: "production" };
+    const legacy = { ...deck({ id: "deck0000000000bb", host: "ci-box" }), name: null };
     renderPanel({
       endpoints: {
-        remote: [deck({ user: "deploy", port: 2222 })],
+        remote: [named, legacy],
         selection: "local",
       },
     });
-    expect(screen.getByTestId("deck-choice-deck0000000000aa")).toHaveTextContent("deploy@build-box:2222");
+    const namedChoice = screen.getByTestId("deck-choice-deck0000000000aa");
+    expect(namedChoice).toHaveTextContent("production");
+    expect(namedChoice).toHaveTextContent("deploy@build-box:2222");
+    expect(screen.getByTestId("deck-choice-deck0000000000bb")).toHaveTextContent("ci-box");
+  });
+
+  /// Scenario: Renaming a selected deck updates its visible name without moving the selection or rewriting its address.
+  it("renames a stored deck by id and keeps it selected", async () => {
+    const row = { ...deck(), name: "build" };
+    const changed = { ...row, name: "production" };
+    const next = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [changed], selection: row.id } };
+    const renameDeck = vi.fn(async () => next);
+    const { onSave, update } = renderPanel({ endpoints: { remote: [row], selection: row.id } }, { renameDeck });
+
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.click(screen.getByTestId("rename-deck"));
+    await waitFor(() => expect(renameDeck).toHaveBeenCalledWith(row.id, "production"));
+    update(next);
+
+    expect(screen.getByTestId(`deck-choice-${row.id}`)).toHaveTextContent("production");
+    expect(screen.getByTestId(`deck-choice-${row.id}`).querySelector("input")).toBeChecked();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: A name refused for a selected deck shows the shared validation message before Rename can be pressed.
+  it("pre-validates a rename with the selected deck id", async () => {
+    const row = { ...deck(), name: "build" };
+    const refusal = "A deck named 'taken' already exists.";
+    const checkDeckName = vi.fn(async () => refusal);
+    const renameDeck = vi.fn(async () => DEFAULT_DESKTOP_SETTINGS);
+    renderPanel({ endpoints: { remote: [row], selection: row.id } }, { checkDeckName, renameDeck });
+
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "taken" } });
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(refusal));
+    expect(checkDeckName).toHaveBeenCalledWith("taken", row.id);
+    expect(screen.getByTestId("rename-deck")).toBeDisabled();
+    expect(renameDeck).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: A refused rename shows the bridge's exact sentence and leaves the stored deck selected.
+  it("shows a rename refusal without changing the selected deck", async () => {
+    const row = { ...deck(), name: "build" };
+    const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => { throw "A deck named 'taken' already exists."; });
+    const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } }, { renameDeck });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "taken" } });
+    fireEvent.click(screen.getByTestId("rename-deck"));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("A deck named 'taken' already exists."));
+    expect(screen.getByTestId(`deck-choice-${row.id}`).querySelector("input")).toBeChecked();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: A rename refuses a stale row, explains the refusal, and the panel shows the deck list returned from disk.
+  it("shows a stale rename refusal beside the disk deck list", async () => {
+    const row = deck({ name: "build" });
+    const replacement = deck({ host: "other-host", name: "other" });
+    const disk = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [replacement], selection: row.id } };
+    const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => {
+      throw new Error("That deck changed since this window loaded it.");
+    });
+    const { update } = renderPanel({ endpoints: { remote: [row], selection: row.id } }, { renameDeck });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.click(screen.getByTestId("rename-deck"));
+    await waitFor(() => expect(document.querySelector("p.settings-hint[role=alert]")).toHaveTextContent("That deck changed since this window loaded it."));
+    update(disk);
+
+    expect(screen.getByLabelText("Host")).toHaveValue("other-host");
+    expect(screen.getByLabelText("Deck name")).toHaveValue("other");
+    expect(screen.getByTestId(`deck-choice-${row.id}`)).toHaveTextContent("other");
+  });
+
+  /// Scenario: A deck removed in a terminal is renamed from the window; the removed row leaves the list and the panel says the deck no longer exists.
+  it("says a renamed deck no longer exists once the disk list drops it", async () => {
+    const row = deck({ name: "build" });
+    const other = deck({ id: "deck0000000000bb", host: "ci-box", name: "ci" });
+    const disk = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [other], selection: "local" } };
+    const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => {
+      throw new Error("That deck is no longer in the deck list.");
+    });
+    const { update } = renderPanel({ endpoints: { remote: [row, other], selection: row.id } }, { renameDeck });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.click(screen.getByTestId("rename-deck"));
+    await waitFor(() => expect(renameDeck).toHaveBeenCalled());
+    update(disk);
+
+    expect(screen.queryByTestId(`deck-choice-${row.id}`)).toBeNull();
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("That deck is no longer in the deck list."));
+    // Choosing another deck retires the sentence: it was about the row that went.
+    fireEvent.click(screen.getByTestId(`deck-choice-${other.id}`).querySelector("input")!);
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   /**
    * Scenario: a settings document supplies a host carrying a right-to-left
    * override. The label renders without it, so the character cannot reorder the
-   * text around the deck's name.
+   * text around the daemon's name.
    */
-  it("strips a bidi override from a deck label", () => {
+  it("strips a bidi override from a daemon label", () => {
     renderPanel({
       endpoints: { remote: [deck({ host: "build‮box" })], selection: "local" },
     });
@@ -411,9 +695,9 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: press Test connection against a deck nothing answers on. The
+   * Scenario: press Test connection against a daemon nothing answers on. The
    * panel reports the state and the reason **in place** — the section it is
-   * in is still there, the deck list is still there, and the fields are still
+   * in is still there, the daemon list is still there, and the fields are still
    * editable. A screen that blanked would be the one thing a user cannot
    * recover from without restarting the app.
    */
@@ -500,11 +784,11 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: the user removes the deck while its probe is still running. The
-   * write-back must not resurrect it — a deck that is no longer in the document
+   * Scenario: the user removes the daemon while its probe is still running. The
+   * write-back must not resurrect it — a daemon that is no longer in the document
    * has no socket to learn (PRD #741, Greptile P1 on #1035).
    */
-  it("does not resurrect a deck removed while its probe was running", async () => {
+  it("does not resurrect a daemon removed while its probe was running", async () => {
     let settle: (value: EndpointTestReportDto) => void = () => {};
     const testEndpoint = vi.fn(
       () => new Promise<EndpointTestReportDto>((resolve) => { settle = resolve; }),
@@ -747,10 +1031,26 @@ describe("EndpointsPanel", () => {
   /**
    * Scenario: a save failed. The change is still applied for this session, and
    * the panel says what that means rather than silently reverting.
+   *
+   * The lead-in moved into `useDesktopSettings` at issue #1072, because the same
+   * prop now also carries "your settings file cannot be read" — so the panel
+   * renders whatever it is handed and this passes the composed sentence.
    */
   it("says a failed save will not survive a restart", () => {
-    renderPanel({}, { saveError: "Permission denied" });
+    renderPanel({}, { saveError: "This change is applied, but saving it failed, so it will not survive a restart. Permission denied" });
     expect(screen.getByRole("alert")).toHaveTextContent("will not survive a restart");
     expect(screen.getByRole("alert")).toHaveTextContent("Permission denied");
+  });
+
+  /**
+   * Scenario (issue #1072): the document on disk cannot be read. The deck list
+   * shown is this build's defaults, every save is refused so the user's decks
+   * survive, and the panel says exactly that with no invented preamble.
+   */
+  it("renders an unreadable-document message verbatim", () => {
+    renderPanel({}, { saveError: "The desktop settings file cannot be read: line 4, column 8 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed." });
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("nothing will be saved over the file");
+    expect(alert).not.toHaveTextContent("saving it failed");
   });
 });

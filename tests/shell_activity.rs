@@ -32,6 +32,10 @@
 mod child_lifetime_bound;
 
 #[cfg(unix)]
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
+#[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
 use std::io::Read as _;
@@ -59,9 +63,6 @@ use dot_agent_deck::platform::proc::{ProcessTableOutcome, process_table_async};
 
 use spec::spec;
 
-#[path = "../src/test_temp.rs"]
-mod test_temp;
-
 /// Fork issue #160: every deadline below that polls [`process_table`] must
 /// leave real headroom beyond `unix.rs`'s real [`PS_SAMPLE_BUDGET`] (now
 /// `pub`, so this derives from the actual constant rather than a hand-kept
@@ -79,34 +80,6 @@ mod test_temp;
 /// compile on Windows.
 #[cfg(unix)]
 const PROCESS_TABLE_POLL_WINDOW: Duration = PS_SAMPLE_BUDGET.saturating_mul(4);
-
-/// Fork issue #160 F2: the trailing `sleep` in `shell_activity_004`'s script,
-/// after the detached target is killed, keeps the pane's own shell (and so
-/// its registry entry) alive long enough for the closing falling-edge loop to
-/// find it. **Invariant: script window > poll window.** Once the shell exits,
-/// `shell_activity_candidates` filters it out (no live child pid to read) and
-/// `busy_for_pane` returns `None` forever — no amount of extra deadline can
-/// observe a pane that has already left the table. Derived from
-/// [`PROCESS_TABLE_POLL_WINDOW`] with real margin rather than hard-coded
-/// separately, so the invariant cannot silently stop holding.
-#[cfg(unix)]
-const SCRIPT_TRAILING_WINDOW_SECS: u64 = PROCESS_TABLE_POLL_WINDOW.as_secs() + 7;
-
-/// Fork issue #160 A5: backstops the pane script's `until [ -f … ]` poll loop
-/// (0.05s granularity — 20 iterations/sec) so an orphaned shell cannot spin
-/// forever. `TriggerFile::drop` only runs on unwind; it does **not** run on
-/// nextest's `terminate-after` SIGKILL, on Ctrl-C, or on an OOM kill, so
-/// without a backstop a shell orphaned on one of those paths would poll at
-/// 20 Hz indefinitely, outliving the test process. Derived as `4 *
-/// PROCESS_TABLE_POLL_WINDOW` (32s at the current 8s window) rather than a
-/// bare literal, so it moves if that constant ever does. It cannot fire
-/// during a legitimate run: the falling-edge loop that must observe the idle
-/// reading before `trigger.release()` is ever called bounds its own wait to
-/// `PROCESS_TABLE_POLL_WINDOW` — a single poll window, a quarter of this
-/// backstop — so by the time `release()` runs there is still 3x
-/// `PROCESS_TABLE_POLL_WINDOW` of headroom left on this loop's own budget.
-#[cfg(unix)]
-const TRIGGER_POLL_ITERATION_BOUND: u64 = PROCESS_TABLE_POLL_WINDOW.as_secs() * 4 * 20;
 
 // ---------------------------------------------------------------------------
 // Real-process half (Unix only — spawns and setsid()'s a genuine grandchild).
@@ -491,7 +464,12 @@ fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
         let _ = tx.send(pids);
     });
 
-    let mut pids = rx.recv_timeout(std::time::Duration::from_secs(2)).expect(
+    // A hang detector, not a performance bound: a walk that terminates returns
+    // in microseconds, so the ceiling is paid only by a looping regression. It
+    // was 2 s, which a starved box overran without any loop (`io full` 82% in
+    // PRD #1631's broad `cargo test-e2e` run); this file does not link the
+    // harness's `load_scaled`, so the ceiling is a flat 30 s instead.
+    let mut pids = rx.recv_timeout(std::time::Duration::from_secs(30)).expect(
         "descendants() must terminate on a synthetic ppid cycle instead of looping forever",
     );
     pids.sort_unstable();
@@ -589,6 +567,122 @@ fn bash_tool_descendant_row() -> ProcessInfo {
     }
 }
 
+/// Scenario: Classify fixture process tables with one command session containing many children, then two command sessions and an unmatched detached service. Distinct qualifying sessions are counted once each, nested terminal agents re-root the walk, and unknown root/session samples stay unknown rather than clearing work.
+#[spec("status/background/005")]
+#[test]
+fn background_005_scan_deduplicates_qualifying_sessions_and_reroots() {
+    use dot_agent_deck::platform::proc::qualifying_command_sessions;
+    use std::collections::HashSet;
+
+    let shape = dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
+    let mut table = backbone_rows(false);
+    table.push(bash_tool_descendant_row());
+    for pid in [63121, 63122] {
+        table.push(ProcessInfo {
+            pid,
+            ppid: 63120,
+            session_id: BASH_TOOL_SID,
+            has_controlling_tty: false,
+            session_leader: false,
+            command_line: CommandLine::NotSampled,
+        });
+    }
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID])),
+        "one session with many processes counts once"
+    );
+    let mut second = bash_tool_descendant_row();
+    second.pid = 64120;
+    second.session_id = 64118;
+    table.push(second);
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID, 64118])),
+        "the argv cross-check must visit every qualifying candidate"
+    );
+    table.push(ProcessInfo {
+        pid: 65120,
+        ppid: AGENT_PID,
+        session_id: 65118,
+        has_controlling_tty: false,
+        session_leader: true,
+        command_line: CommandLine::Read("unmatched-detached-service".into()),
+    });
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID, 64118])),
+        "a match must not admit another session whose argv fails"
+    );
+    // Removing one matched session leaves exactly one despite an unmatched
+    // candidate beside it; structural-only agents count all three sessions.
+    table.retain(|row| row.session_id != 64118);
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID]))
+    );
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[]),
+        Some(HashSet::from([BASH_TOOL_SID, 65118]))
+    );
+    let nested = vec![
+        ProcessInfo {
+            pid: 1,
+            ppid: 0,
+            session_id: 1,
+            has_controlling_tty: true,
+            session_leader: true,
+            command_line: CommandLine::NotSampled,
+        },
+        ProcessInfo {
+            pid: 2,
+            ppid: 1,
+            session_id: 2,
+            has_controlling_tty: true,
+            session_leader: true,
+            command_line: CommandLine::NotSampled,
+        },
+        ProcessInfo {
+            pid: 3,
+            ppid: 2,
+            session_id: 2,
+            has_controlling_tty: true,
+            session_leader: false,
+            command_line: CommandLine::NotSampled,
+        },
+        ProcessInfo {
+            pid: 4,
+            ppid: 3,
+            session_id: 4,
+            has_controlling_tty: false,
+            session_leader: true,
+            command_line: CommandLine::NotSampled,
+        },
+    ];
+    assert_eq!(
+        qualifying_command_sessions(&nested[..3], 1, &[]),
+        Some(HashSet::new()),
+        "inner PTY agent is not itself a command"
+    );
+    assert_eq!(
+        qualifying_command_sessions(&nested, 1, &[]),
+        Some(HashSet::from([4])),
+        "inner agent's detached tool is a command"
+    );
+    assert_eq!(qualifying_command_sessions(&[], AGENT_PID, &[]), None);
+    assert_eq!(qualifying_command_sessions(&table, -1, &[]), None);
+    table
+        .iter_mut()
+        .find(|row| row.pid == AGENT_PID)
+        .unwrap()
+        .session_id = 0;
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[]),
+        None,
+        "unknown observation must not become zero"
+    );
+}
+
 /// Scenario: builds three pairs of fixture tables from the measured
 /// `getsid`/`ps` captures in `.dot-agent-deck/386-argv-notes.md` and the
 /// PRD — Table A (backbone plus the Bash-tool descendant), Table B (backbone
@@ -656,7 +750,7 @@ fn shell_activity_003_session_id_discriminator_classifies_the_measured_confounde
 
 /// RAII guard for the detached target's real pid, so a panic between
 /// discovering it and the explicit kill below still reaps it rather than
-/// leaking a 30s `sleep` into the runner's process tree — the same pattern
+/// leaking a 120s `sleep` into the runner's process tree — the same pattern
 /// `SpawnedGrandchild` uses in `status/shell-activity/001`. A second SIGKILL
 /// after the process has already exited just returns ESRCH, which this
 /// ignores.
@@ -677,67 +771,12 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// RAII guard for the trigger file that gates `shell_activity_004`'s script
-/// (fork issue #160 item 1): the pane's script blocks in a POSIX
-/// `until [ -f … ]` poll loop until this file exists, so the idle window
-/// before the detached target launches is bounded only by
-/// [`TRIGGER_POLL_ITERATION_BOUND`] (fork issue #160 A5) rather than a fixed
-/// `sleep` gambling that its duration outlasts one exhausted
-/// [`PS_SAMPLE_BUDGET`] sample. `release` is only called after the test has
-/// *actually observed* the idle reading, so no timing constant below that
-/// backstop is load-bearing for F1 any more.
-///
-/// Fork issue #160 A6: the trigger lives inside its own `tempfile::TempDir`
-/// rather than a pid-derived name under the shared `env::temp_dir()` — a
-/// unique, freshly created, `0700` directory has no predictable path for a
-/// local attacker to plant a file or symlink at ahead of time (CWE-377 /
-/// CWE-59), which removes the pid-derivation and the defensive pre-removal
-/// the old scheme needed along with the hazard itself. `TempDir`'s own
-/// `Drop` — which runs on unwind, exactly as the removed manual `Drop` did;
-/// this workspace sets no `panic = "abort"` profile — recursively removes
-/// the directory and the trigger file inside it together, so a failed run
-/// leaves nothing behind.
-#[cfg(unix)]
-struct TriggerFile {
-    _dir: tempfile::TempDir,
-    path: std::path::PathBuf,
-}
-
-#[cfg(unix)]
-impl TriggerFile {
-    fn new() -> Self {
-        let dir = test_temp::tempdir().unwrap_or_else(|e| panic!("create trigger tempdir: {e}"));
-        let path = dir.path().join("trigger");
-        Self { _dir: dir, path }
-    }
-
-    /// Releases the pane's script by creating the file it polls for.
-    /// Level-triggered (file existence, not a one-shot signal): if this runs
-    /// before the shell has even reached its `until` loop, the file already
-    /// exists by the time the shell gets there, so there is no lost-wakeup
-    /// race (fork #160 round-3 verification, Q2).
-    fn release(&self) {
-        std::fs::write(&self.path, b"")
-            .unwrap_or_else(|e| panic!("write trigger file {:?}: {e}", self.path));
-    }
-}
-
-/// Scenario: spawns a real PTY pane running `/bin/sh` through
-/// `AgentPtyRegistry::spawn_agent` (the same registry path a real agent pane
-/// uses), tagged `agent_type: Some(AgentType::ClaudeCode)` so the shape
-/// catalog actually reaches the scan (`shell_tool_shape_key` filters by
-/// agent kind before the classifier ever sees a shape), whose script blocks
-/// on [`TriggerFile`] before it spawns a `python3` child that calls
-/// `os.setsid()` and `execv`s into `/bin/sleep` — a genuine `setsid`-detached,
-/// marker-tagged, Bash-tool-argv-shaped process on pipes, off the pane's PTY
-/// entirely, exactly the topology `status/shell-activity/386-argv-notes.md`
-/// measured for a real Claude Bash-tool child and the one #370's own test
-/// never exercised. Polls `shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])`
-/// and asserts the pane reads idle before the detached child appears, busy
-/// while it lives — independently confirmed via `process_table()` +
-/// `descendants()` that the found descendant has no controlling terminal, is
-/// its own session leader, and carries a session id different from the
-/// pane's own shell — and idle again once the child is killed.
+/// Scenario: spawns a real PTY shell tagged as a Claude pane and confirms it
+/// reads idle before releasing a gated, Bash-tool-shaped detached child whose
+/// startup deliberately exceeds the old four-second busy poll.
+/// Waits independently for that child's exec and verifies it has no controlling
+/// terminal, leads its own session, and differs from the shell's session;
+/// Asserts the pane reads busy while the child lives and idle after killing it.
 #[cfg(unix)]
 #[spec("status/shell-activity/004")]
 #[test]
@@ -748,45 +787,56 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     child_lifetime_bound::arm();
 
     const PANE_ID: &str = "shell-activity-004-pane";
+    // A real process-table sample has taken 19–20s under build contention
+    // (issue #862). Allow 30s for setup and each signal edge between samples,
+    // while the child outlives those waits; a synchronous sample can overrun
+    // the budget, so this is a polling bound rather than a timeout on ps.
+    const SIGNAL_BUDGET: Duration = Duration::from_secs(30);
     let marker = format!("shell-activity-004-target-{}", std::process::id());
-    // Must be declared before `registry` below: drop order is reverse
-    // declaration order, so declaring `trigger` first makes `registry` drop
-    // (and SIGKILL the pane's process group via `shutdown_all`) before the
-    // trigger file is removed — reversed, the trigger would disappear first
-    // and a shell still polling `until [ -f … ]` would keep spinning until
-    // `TRIGGER_POLL_ITERATION_BOUND` (fork issue #160 A5, PR #206 round-3
-    // verification).
-    let trigger = TriggerFile::new();
-    // Fork issue #160 F1: the script blocks in a POSIX `until [ -f … ]` poll
-    // loop (0.05s granularity, negligible next to the process-table budget)
-    // until `trigger`'s path exists, so the idle window before the detached
-    // child launches is bounded only by `TRIGGER_POLL_ITERATION_BOUND` (fork
-    // issue #160 A5) — the test below only calls `trigger.release()` once it
-    // has actually observed the pane reading idle, rather than racing a
-    // fixed-duration sleep against one exhausted `PS_SAMPLE_BUDGET` sample.
-    // The python3 one-liner setsid()'s itself (detaching from the pane's
+    // A fixed `sleep 0.3` before the detached child launched used to give the
+    // pre-edge assertion below an "observable idle window" to sample inside
+    // — but that window is a race, not a guarantee: once `spawn_agent` +
+    // registry setup is delayed past ~300ms by machine load, the first
+    // successful sample already sees the detached child, and the pre-edge
+    // assertion fails even though the production code is correct (confirmed
+    // by the maintainer's PR #390 review: 5/5 passes in isolation, fails only
+    // under full-tier contention). Gate the child behind a ready-marker file
+    // this process controls instead: the script busy-waits on the marker's
+    // existence, so the detached child structurally cannot exist until this
+    // test has already sampled and asserted the idle state below — the
+    // pre-edge read no longer depends on winning a timing race at all. The
+    // python3 one-liner setsid()'s itself (detaching from the pane's
     // controlling terminal and becoming its own session leader, exactly as
-    // Claude Code's Bash-tool child does) and execv's into `/bin/sleep 30`
+    // Claude Code's Bash-tool child does) and execv's into `/bin/sleep 120`
     // with an argv crafted to carry the measured Bash-tool shape
     // (`shell-snapshots/snapshot-` and `&& eval `) so the argv cross-check is
-    // exercised against a real process, not just a fixture string. 30s is a
-    // generous backstop bound in case the test panics before the explicit
+    // exercised against a real process, not just a fixture string. 120s is a
+    // backstop bound in case the test panics before the explicit
     // kill below runs; `KillOnDrop` and the explicit kill both aim to end it
-    // long before that. Fork issue #160 F2: the trailing `sleep
-    // {SCRIPT_TRAILING_WINDOW_SECS}` keeps the pane's own shell alive (and so
-    // its registry entry) past `PROCESS_TABLE_POLL_WINDOW` following the
-    // detached child's death — without real margin over that window the
-    // shell can exit, and so leave the snapshot, before the closing
-    // falling-edge loop's deadline, which would report `None` forever rather
-    // than the `Some(false)` being asserted.
-    let command = format!(
-        "i=0; until [ -f '{trigger_path}' ] || [ \"$i\" -ge {TRIGGER_POLL_ITERATION_BOUND} ]; \
-         do sleep 0.05; i=$((i + 1)); done; \
-         python3 -c \"import os; os.setsid(); \
-         os.execv('/bin/sleep', ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; \
-         sleep {SCRIPT_TRAILING_WINDOW_SECS}",
-        trigger_path = trigger.path.display(),
+    // long before that. The trailing `sleep 120` keeps the pane's own shell
+    // alive (and so its registry entry) past the detached child's death —
+    // without it the shell has nothing left to run and exits the instant the
+    // killed child is reaped, so the pane disappears from the snapshot
+    // instead of reading idle.
+    let fixture = test_temp::tempdir().expect("shell-activity fixture directory");
+    let ready_marker = fixture.path().join("ready");
+    let target_argv = format!("shell-snapshots/snapshot- && eval {marker}");
+    // The ready path is interpolated inside shell double quotes below.
+    assert!(
+        !ready_marker
+            .to_string_lossy()
+            .contains(['"', '$', '`', '\\', '\n', '\r']),
+        "fixture path cannot be interpolated into the shell command: {ready_marker:?}"
     );
+    let command = format!(
+        "while [ ! -e \"{ready}\" ]; do sleep 0.05; done; python3 -c \"import os, time; time.sleep(5); os.setsid(); \
+         os.execv('/bin/sleep', ['{target_argv}', '120'])\"; sleep 120",
+        ready = ready_marker.display(),
+    );
+    // Keep the five-second startup delay as a regression stimulus: the old
+    // four-second busy poll deterministically said idle before setsid ran.
+    // Readiness must be established independently of how quickly the host
+    // gets around to launching the detached child.
 
     let registry = Arc::new(AgentPtyRegistry::new());
     let id = registry
@@ -826,21 +876,12 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
             .map(|(_, busy)| busy)
     };
 
-    // Falling edge before the rising edge: the script is blocked on
-    // `trigger`, which is not yet released, so the detached child cannot
-    // possibly have appeared — this is no longer a race against a state that
-    // might stop being true while the loop waits (fork issue #160 F1); it
-    // only needs to tolerate a transient process-table sample failure.
-    //
-    // Fork issue #160: `busy_for_pane` returns `None` when the underlying
-    // sample fails (budget exceeded under load) — `shell_foreground_busy_snapshot`
-    // calls the SYNCHRONOUS `process_table()` (`agent_pty.rs`), not
-    // `process_table_async`; the async form has no caller in this test file.
-    // A failure to observe the idle reading within the deadline below still
-    // fails the test with the message on the `assert_eq!`, rather than
-    // hanging silently — the loop's own deadline is the timeout, and the
-    // assertion after it is what turns a timeout into a clear failure.
-    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
+    // Falling edge before the rising edge: the script is blocked on the
+    // ready marker and structurally cannot have launched the detached child
+    // yet, so the pane must read idle. No longer a race against a fixed
+    // sleep — the only thing this loop can observe before the marker is
+    // written below is `None` (pane not registered yet) or `Some(false)`.
+    let deadline = Instant::now() + SIGNAL_BUDGET;
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -849,88 +890,58 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     assert_eq!(
         state,
         Some(false),
-        "must observe the pane reading idle (Some(false)) within {PROCESS_TABLE_POLL_WINDOW:?} \
-         before releasing the trigger — got {state:?}, meaning either every process-table \
-         sample failed within the deadline (None) or the pane read busy (Some(true)) despite \
-         the detached target not having been released yet"
+        "an idle shell with no detached descendant yet must not read busy"
     );
 
-    // Fork issue #160 F1: only now — with the idle reading actually
-    // observed, not merely assumed to hold for some guessed duration —
-    // release the script to launch the detached target. The window before
-    // this point was unbounded, so no timing constant was load-bearing for
-    // it.
-    trigger.release();
+    // Release the gated shell now that the idle read above is confirmed —
+    // only past this point can the detached child come into existence.
+    std::fs::write(&ready_marker, b"go")
+        .expect("write ready marker to release the gated shell script");
 
-    // Rising edge: the detached, setsid()'d, Bash-tool-shaped child appears.
-    // Fork issue #160 N1: needs headroom for the script's `until` poll
-    // granularity (0.05s) + python3/execv startup AND at least one retried
-    // process-table sample, so this window adds a margin on top of
-    // `PROCESS_TABLE_POLL_WINDOW` rather than reusing it as-is. There is no
-    // fixed-duration leading sleep any more (item 1 above removed it), so
-    // unlike the pre-fix `+ 2s` this margin has nothing left to silently
-    // drift out of sync with — it is sized for the short post-release
-    // startup cost alone.
-    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW + Duration::from_secs(2);
-    let mut state = busy_for_pane(&registry);
-    while state != Some(true) && Instant::now() < deadline {
+    // Establish the stimulus BEFORE asking the registry to classify it.
+    // The old 4s busy poll also paid for shell/python startup, and timed out
+    // with Some(false) when no detached child existed yet. Wait on the real
+    // process topology instead. The argv prefix proves execv has completed:
+    // a detached python still running its -c script also contains the marker,
+    // but is not yet the Bash-tool-shaped sleep this test needs.
+    // Issue #862: sample with the shell as a root to obtain candidate argv.
+    let startup = Instant::now();
+    let deadline = startup + SIGNAL_BUDGET;
+    let (own_row, target) = loop {
+        // Fork issue #160: a `None` sample (the budget exceeded, or `ps` failed
+        // under load) is no data at all, not evidence the topology is absent —
+        // keep polling within the window instead of panicking on the first miss.
+        let Some(table) = process_table(&[shell_pid]) else {
+            assert!(
+                Instant::now() < deadline,
+                "process_table() produced no sample within {SIGNAL_BUDGET:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        let own_row = table.iter().find(|p| p.pid == shell_pid);
+        let children = descendants(&table, shell_pid);
+        let target = children.iter().find(|p| {
+            p.command_line.read().is_some_and(|argv| {
+                argv.strip_prefix(&target_argv)
+                    .is_some_and(|tail| tail.starts_with(' '))
+            })
+        });
+        if let (Some(own_row), Some(target)) = (own_row, target) {
+            break (own_row.clone(), (*target).clone());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached child never reached its exec-ready topology; shell={own_row:?}, \
+             descendants={children:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
-        state = busy_for_pane(&registry);
-    }
-    assert_eq!(
-        state,
-        Some(true),
-        "a real detached-on-pipes descendant, off the pane's PTY entirely, in its own POSIX \
-         session, carrying the Bash-tool argv shape, must read busy — this is exactly the #370 \
-         defect: the old tcgetpgrp body compares pgids on the pane's own PTY and can never \
-         observe a child that never touches it"
+    };
+    target_guard.0 = Some(target.pid);
+    eprintln!(
+        "detached child exec-ready after {:?}: {target:?}",
+        startup.elapsed()
     );
-
-    // Independent oracle: confirm this is genuinely the topology #370 could
-    // never see, not just that the snapshot happened to say `true`.
-    // Issue #862: name the pane's shell as the sample's root, so the argv phase
-    // reads the command line of its detached descendants — which is what the
-    // `marker` search below needs.
-    //
-    // Fork issue #160 F5: this used to be a single one-shot `.expect()`,
-    // justified by "`state == Some(true)` already proved a sample succeeded
-    // moments ago" — sound only if sample failures are independent. They are
-    // not: they are load-caused, and this same PR's own new docs
-    // (`docs/develop/shell-activity-signal.md`) say the condition can
-    // "persist for as long as the contention does". A success at t and a
-    // failure at t+20ms are entirely compatible under sustained contention,
-    // so this gets the same bounded retry the polled loops above use rather
-    // than trusting a moments-ago success.
-    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
-    let mut table = process_table(&[shell_pid]);
-    while table.is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-        table = process_table(&[shell_pid]);
-    }
-    let table = table.unwrap_or_else(|| {
-        panic!(
-            "process_table() produced no sample within {PROCESS_TABLE_POLL_WINDOW:?}, even \
-             though a shell-activity sample succeeded moments ago"
-        )
-    });
-    let own_row = table
-        .iter()
-        .find(|p| p.pid == shell_pid)
-        .expect("the pane's own shell must appear in its own process table sample");
-    let target = descendants(&table, shell_pid)
-        .into_iter()
-        .find(|p| {
-            p.command_line
-                .read()
-                .is_some_and(|argv| argv.contains(&marker))
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "detached target carrying marker {marker:?} not found among descendants of \
-                 shell pid {shell_pid}"
-            )
-        })
-        .clone();
     assert!(
         !target.has_controlling_tty,
         "the detached child must have no controlling terminal — it never touches the pane's \
@@ -945,7 +956,20 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
         "the detached child must be in a different POSIX session than the pane's own shell — \
          the load-bearing condition the whole discriminator rests on: {target:?}"
     );
-    target_guard.0 = Some(target.pid);
+
+    // Rising edge: the independently verified child lives throughout this
+    // wait, so a classifier miss is distinct from delayed fixture startup.
+    let deadline = Instant::now() + SIGNAL_BUDGET;
+    let mut state = busy_for_pane(&registry);
+    while state != Some(true) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        state = busy_for_pane(&registry);
+    }
+    assert_eq!(
+        state,
+        Some(true),
+        "a verified detached-on-pipes Bash-tool-shaped child must read busy: {target:?}"
+    );
 
     // Falling edge: kill the detached child and confirm the signal clears. A
     // test that only asserted the rising edge would pass against an
@@ -955,7 +979,7 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     unsafe {
         libc::kill(target.pid, libc::SIGKILL);
     }
-    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
+    let deadline = Instant::now() + SIGNAL_BUDGET;
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -1163,6 +1187,8 @@ fn shell_activity_015_codex_stop_with_outstanding_delegation_stays_idle_after_a_
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     };
 
     for (name, root, rows) in healthy_codex_pane_trees() {

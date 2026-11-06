@@ -35,7 +35,7 @@
 //! on another.
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
-use crate::prompt_delivery::truncate_on_char_boundary;
+use crate::submitted_prompt::truncate_on_char_boundary;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -153,8 +153,10 @@ pub fn escape_control_and_bidi(s: &str) -> String {
 ///
 /// Note the clamp counts BYTES, not display columns. That matches every other
 /// length bound in this project and is not the render budget: the title's own
-/// fit is decided later by `ui::truncate_styled_segments`, whose char-vs-column
-/// accounting is issue #357.
+/// fit is decided later by `ui::truncate_styled_segments`, which budgets display
+/// columns since issue #357. The two bounds are independent — a name well inside
+/// this byte ceiling can still be wider than the title region it is drawn into,
+/// and the render truncator is what ellipsizes it there.
 pub fn sanitize_display_name(raw: &str) -> Option<String> {
     let stripped = strip_control_and_bidi(raw, false);
     let trimmed = stripped.trim();
@@ -236,6 +238,60 @@ pub const MAX_TOOL_TEXT_BYTES: usize = 65536;
 /// formatting of a command line rather than padding around a name.
 pub fn sanitize_tool_text(raw: &str) -> String {
     clamp_including_marker(&strip_control_and_bidi(raw, false), MAX_TOOL_TEXT_BYTES)
+}
+
+/// Byte ceiling for one remote-supplied name shown by a daemon upgrade — an
+/// agent label, a pane id, a role or orchestration name, a version. Twice the
+/// daemon's own [`DISPLAY_NAME_MAX_LEN`], so no name a healthy daemon reports
+/// is ever cut.
+pub const REMOTE_NAME_MAX_BYTES: usize = 2 * DISPLAY_NAME_MAX_LEN;
+
+/// Byte ceiling for a remote-supplied working directory shown by an upgrade.
+pub const REMOTE_PATH_MAX_BYTES: usize = 1024;
+
+/// Byte ceiling for a remote-supplied sentence shown by an upgrade: a refusal
+/// message or a failure reason.
+pub const REMOTE_MESSAGE_MAX_BYTES: usize = 4096;
+
+/// The DISPLAY copy of one remote-supplied value that has to stay on one line
+/// of a terminal (PRD #1487 audit A3): control and bidi characters stripped —
+/// newlines included, so the value cannot add lines of its own to a list the
+/// user is deciding on — then clamped to `max` bytes, the `…` cut marker
+/// included.
+///
+/// Display only. The restart confirmation a client sends back carries the
+/// original values, because the daemon compares identities, not renderings.
+pub fn display_line(raw: &str, max: usize) -> String {
+    clamp_including_marker(&strip_control_and_bidi(raw, false), max)
+}
+
+/// Zero-width and invisible formatting marks (Unicode Cf outside the bidi set
+/// [`is_bidi_format_char`] names): they hide where one word ends and the next
+/// begins, or split a marker so it passes a check, without showing anything.
+pub fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}'
+    )
+}
+
+/// PRD #1666 hardening L1: a producer-supplied NAME for one line of a human
+/// surface — an inbox subject, a pane id, a sender label: controls (newlines
+/// included), bidi and invisible marks stripped, at most `max_chars`
+/// characters. Not clamped with a marker: a label is cut, not quoted.
+pub fn label_line(raw: &str, max_chars: usize) -> String {
+    strip_control_and_bidi(raw, false)
+        .chars()
+        .filter(|c| !is_invisible_format_char(*c))
+        .take(max_chars)
+        .collect()
+}
+
+/// [`display_line`] for a remote-supplied sentence whose own line breaks are
+/// legitimate (a failure reason quoting a remote's stderr): newlines are kept,
+/// every other control and bidi character is stripped.
+pub fn display_message(raw: &str, max: usize) -> String {
+    clamp_including_marker(&strip_control_and_bidi(raw, true), max)
 }
 
 #[cfg(test)]

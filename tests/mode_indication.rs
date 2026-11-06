@@ -22,12 +22,12 @@ use dot_agent_deck::ui::{
     CommandBannerVisibility, ENTER_ALTERNATE_SCREEN, LEAVE_ALTERNATE_SCREEN, ReconcileSeamPane,
     SCROLL_NOTICE_MIN_SCREENFULS, SCROLL_NOTICE_SHORT, SCROLL_NOTICE_TEXT, SCROLL_SEAM_COLS,
     SCROLL_SEAM_ROWS, UiMode, command_banner_tier, observe_command_banner_key_burst,
-    observe_focused_agent_key_scroll, observe_focused_agent_mouse_scroll,
-    observe_focused_agent_without_scroll, observe_pane_input_scrollback_reconcile,
-    observe_pane_input_without_focused_pane, observe_scroll_notice_lifecycle,
-    render_button_bar_for_mode_to_buffer, render_button_bar_to_buffer,
-    render_button_bar_with_bindings_to_buffer, render_card_for_mode_to_buffer,
-    render_card_to_buffer, render_command_banner_pane_to_buffer,
+    observe_dashboard_geometry, observe_focused_agent_key_scroll,
+    observe_focused_agent_mouse_scroll, observe_focused_agent_without_scroll,
+    observe_pane_input_scrollback_reconcile, observe_pane_input_without_focused_pane,
+    observe_scroll_notice_lifecycle, observe_wheel_routing, render_button_bar_for_mode_to_buffer,
+    render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer,
+    render_card_for_mode_to_buffer, render_card_to_buffer, render_command_banner_pane_to_buffer,
     render_focused_pane_cursor_for_mode_to_position, synthetic_decstbm_repaint_stream,
     synthetic_scrollable_history_stream,
 };
@@ -107,28 +107,28 @@ fn nonblank_rows(buffer: &Buffer) -> usize {
         .count()
 }
 
+/// Issue #413: the instant the selected-card fixture is built against and
+/// rendered at. The card seams take `now` instead of reading the clock, so the
+/// card's `Last:` field is a pure function of the fixture's own timestamps.
+fn render_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("a valid fixed instant")
+}
+
 fn selected_card_fixture() -> SessionState {
-    // `last_activity` is nudged 30s into the future of `now` rather than left
-    // equal to it (issue #15): `mode_deck_001_selected_card_accent_tracks_mode`
-    // pins this fixture's rendered card into a color/style-aware `insta`
-    // snapshot, and the bottom border's `Last:` field is computed from
-    // `Utc::now()` at render time (`format_elapsed`, src/ui.rs), not at
-    // fixture build time. Seeding `last_activity == now` raced that
-    // render-time computation across a whole second boundary under any
-    // scheduling delay. A *past* offset (e.g. `now - 500ms`) would only
-    // shrink the safety margin further; nudging forward instead relies on
-    // `format_elapsed`'s existing clamp of a negative elapsed delta to zero
-    // (`delta.num_seconds().max(0)`), so the render-time delta stays negative
-    // (clamped to `0s`) for any render happening within 30s of this instant.
-    let now = chrono::Utc::now();
+    // `mode_deck_001_selected_card_styles` pins this fixture's rendered card
+    // into a color/style-aware snapshot. Activity at the render instant keeps
+    // its bottom border at `Last: 0s`; issue #413 made that exact, where the
+    // 30s forward nudge #350 added only bounded the race.
+    let now = render_now();
     SessionState {
         session_id: "mode-card".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/work/mode-card".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: None,
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
@@ -138,6 +138,8 @@ fn selected_card_fixture() -> SessionState {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -147,6 +149,12 @@ fn selected_card_fixture() -> SessionState {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -289,7 +297,7 @@ fn render_cursor_widget(input_active: bool) -> Buffer {
     const CURSOR_ROW: u16 = 1;
     const CURSOR_COL: u16 = 3;
 
-    let mut parser = vt100::Parser::new(SCREEN_ROWS, SCREEN_COLS, 0);
+    let mut parser = dot_agent_deck::vt_grid::parser(SCREEN_ROWS, SCREEN_COLS, 0);
     parser.process(b"\x1b[2;4H");
     assert_eq!(parser.screen().cursor_position(), (CURSOR_ROW, CURSOR_COL));
 
@@ -375,26 +383,26 @@ fn mode_chip_001_bottom_bar_names_current_mode() {
     );
 }
 
-/// Scenario: Render the global-only Mode-tab bar, the context-rich Dashboard/Orchestration bar, and the PaneInput bar. Every context must keep the chip at the same left edge while retaining the destination-naming Ctrl+D button beside it.
+/// Scenario: Render the global-only bar, the context-rich Dashboard/Orchestration bar, and the PaneInput bar. Every context must keep the chip at the same left edge while retaining the destination-naming Ctrl+D button beside it.
 #[spec("mode/chip/002")]
 #[test]
 fn mode_chip_002_is_universal_and_keeps_destination_button() {
     let config = KeybindingConfig::default();
     let dashboard = render_button_bar_for_mode_to_buffer(&config, UiMode::Normal, 200, 2);
-    let mode_tab = render_button_bar_to_buffer(200);
+    let global_only_bar = render_button_bar_to_buffer(200);
     // Dashboard and Orchestration share the production Cards bottom-bar path;
     // render it independently here so failures name both user-visible contexts.
     let orchestration = render_button_bar_with_bindings_to_buffer(&config, 200, 2);
 
     for (context, buffer) in [
         ("Dashboard", &dashboard),
-        ("Mode tab", &mode_tab),
+        ("Global-only button bar", &global_only_bar),
         ("Orchestration tab", &orchestration),
     ] {
         assert_mode_chip_at_origin(buffer, COMMAND_CHIP, context);
         let text = buffer_to_text(buffer);
         assert!(
-            text.contains("[Back to Pane Ctrl+D]"),
+            text.contains("[Back to Pane d/Ctrl+D]"),
             "{context} must retain the destination button alongside the COMMAND chip\n{text}"
         );
     }
@@ -737,13 +745,14 @@ fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
         40,
         CONTENT,
     );
-    let oversized_render_size = oversized_render
-        .get_screen("oversized-render")
-        .expect("the render seam must register its focused pane")
-        .lock()
-        .expect("the render seam screen lock must remain healthy")
-        .screen()
-        .size();
+    let oversized_render_size = dot_agent_deck::vt_grid::size(
+        oversized_render
+            .get_screen("oversized-render")
+            .expect("the render seam must register its focused pane")
+            .lock()
+            .expect("the render seam screen lock must remain healthy")
+            .screen(),
+    );
     assert_eq!(
         oversized_render_size,
         (24, 80),
@@ -758,13 +767,14 @@ fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
             CONTENT,
             false,
         );
-    let oversized_scroll_size = oversized_scroll
-        .get_screen("oversized-scroll")
-        .expect("the scroll seam must register its focused pane")
-        .lock()
-        .expect("the scroll seam screen lock must remain healthy")
-        .screen()
-        .size();
+    let oversized_scroll_size = dot_agent_deck::vt_grid::size(
+        oversized_scroll
+            .get_screen("oversized-scroll")
+            .expect("the scroll seam must register its focused pane")
+            .lock()
+            .expect("the scroll seam screen lock must remain healthy")
+            .screen(),
+    );
     assert_eq!(
         oversized_scroll_size,
         (24, 80),
@@ -777,13 +787,14 @@ fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
         40,
         CONTENT,
     );
-    let oversized_second_size = oversized_scroll
-        .get_screen("oversized-second")
-        .expect("the second-pane seam must register its pane")
-        .lock()
-        .expect("the second-pane seam screen lock must remain healthy")
-        .screen()
-        .size();
+    let oversized_second_size = dot_agent_deck::vt_grid::size(
+        oversized_scroll
+            .get_screen("oversized-second")
+            .expect("the second-pane seam must register its pane")
+            .lock()
+            .expect("the second-pane seam screen lock must remain healthy")
+            .screen(),
+    );
     assert_eq!(
         oversized_second_size,
         (24, 80),
@@ -1012,6 +1023,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         Some(1),
         density,
         0,
+        render_now(),
         true,
         UiMode::Normal,
         width,
@@ -1024,6 +1036,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         Some(1),
         density,
         0,
+        render_now(),
         true,
         UiMode::PaneInput,
         width,
@@ -1036,6 +1049,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         Some(1),
         density,
         0,
+        render_now(),
         true,
         width,
         height,
@@ -1198,6 +1212,247 @@ fn mode_scroll_006_alternate_screen_pane_is_unreachable_not_empty() {
         !restored.notice_visible,
         "a pane back on the normal screen must not carry a notice: {restored:?}"
     );
+}
+
+/// Scenario: Lay out a real Dashboard frame — deck cards on the left, one focused agent pane on the right — and send wheel events at real screen positions. A wheel inside the pane's content area must reach it carrying the exact pane-relative cell under the pointer; a wheel over a deck card, over the pane's own border, or anywhere else in the frame must be dropped without touching the child or the deck's view; and a sweep of every cell in the frame must never once hand the pane a coordinate the pointer was not at.
+#[spec("mode/scroll/007")]
+#[test]
+fn mode_scroll_007_wheel_is_routed_by_pointer_and_never_clamped() {
+    // The geometry is the production dashboard's own: `compute_frame_layout` →
+    // `resize_panes_to_layout` → `render_frame`, with the rects read back out of
+    // the very `UiState` fields the live mouse arm hit-tests. "Over the card
+    // list" below therefore means cells the deck really painted cards into.
+    let geometry = observe_dashboard_geometry(120, 40, 6);
+    let pane_rect = geometry.focused_pane_rect.unwrap_or_else(|| {
+        panic!("precondition: the dashboard frame must draw a focused agent pane: {geometry:?}")
+    });
+    assert!(
+        !geometry.card_rects.is_empty(),
+        "precondition: the dashboard frame must paint deck cards, or the card-list \
+         case below tests nothing: {geometry:?}"
+    );
+    let inner = pane_content_rect(pane_rect);
+    assert!(
+        inner.width >= 3 && inner.height >= 3,
+        "precondition: the pane needs a content area big enough to distinguish an \
+         interior point from its edges: {geometry:?}"
+    );
+    assert!(
+        geometry
+            .card_rects
+            .iter()
+            .all(|card| rects_disjoint(*card, inner)),
+        "precondition: no deck card may overlap the pane's content area, or 'over a \
+         card' and 'over the pane' would not be different questions: {geometry:?}"
+    );
+
+    // (a) A wheel INSIDE the pane reaches it, carrying the cell under the
+    // pointer. Deliberately an off-centre, asymmetric point: a centre point
+    // would still match under an arithmetic slip that mirrors the axes.
+    let (inside_col, inside_row) = (inner.x + 2, inner.y + 1);
+    let expected = (2_u16, 1_u16);
+    for (mode, mouse_mode_enabled, label) in [
+        (
+            UiMode::PaneInput,
+            true,
+            "PaneInput with child mouse reporting",
+        ),
+        (
+            UiMode::PaneInput,
+            false,
+            "PaneInput without child mouse reporting",
+        ),
+        (
+            UiMode::Normal,
+            true,
+            "command mode with child mouse reporting",
+        ),
+        (
+            UiMode::Normal,
+            false,
+            "command mode without child mouse reporting",
+        ),
+    ] {
+        let observed = observe_wheel_routing(
+            mode,
+            mouse_mode_enabled,
+            true,
+            Some(pane_rect),
+            inside_col,
+            inside_row,
+        );
+        assert_eq!(
+            observed.delivered_coords,
+            Some(expected),
+            "{label}: a wheel inside the pane's content area must reach it with the \
+             cell under the pointer, not merely reach it: {observed:?}"
+        );
+        if mode == UiMode::PaneInput && mouse_mode_enabled {
+            // The child's own encoding is 1-based, so the bytes are the only
+            // place a coordinate can still be wrong after the routing is right.
+            assert_eq!(
+                observed.forwarded_bytes,
+                format!("\x1b[<64;{};{}M", expected.0 + 1, expected.1 + 1).into_bytes(),
+                "{label}: the forwarded report must carry the pointer's own cell: {observed:?}"
+            );
+        } else {
+            assert!(
+                observed.forwarded_bytes.is_empty(),
+                "{label}: the child must see nothing: {observed:?}"
+            );
+            assert!(
+                observed.scrollback_after > observed.scrollback_before,
+                "{label}: a delivered deck-owned wheel must move the deck's own view, \
+                 or the 'did not move' assertions below prove nothing: {observed:?}"
+            );
+        }
+    }
+
+    // (b) A wheel over the CARD LIST does not reach the pane at all. Run in
+    // PaneInput with child mouse reporting on — the cell where the old code
+    // forwarded a fabricated coordinate to the agent — and in command mode,
+    // where it silently moved a view the pointer was nowhere near.
+    for (index, card) in geometry.card_rects.iter().enumerate() {
+        for (col, row) in interesting_points(*card) {
+            for (mode, mouse_mode_enabled) in [(UiMode::PaneInput, true), (UiMode::Normal, false)] {
+                let observed = observe_wheel_routing(
+                    mode,
+                    mouse_mode_enabled,
+                    true,
+                    Some(pane_rect),
+                    col,
+                    row,
+                );
+                assert_eq!(
+                    observed.delivered_coords, None,
+                    "card {index} at ({col},{row}) in {mode:?}: a wheel over the deck's \
+                     card list must not be routed to the agent pane on the right: {observed:?}"
+                );
+                assert!(
+                    observed.forwarded_bytes.is_empty(),
+                    "card {index} at ({col},{row}) in {mode:?}: the agent must receive \
+                     nothing for a wheel the pointer aimed at a card: {observed:?}"
+                );
+                assert_eq!(
+                    observed.scrollback_after, observed.scrollback_before,
+                    "card {index} at ({col},{row}) in {mode:?}: the pane's view must not \
+                     move either: {observed:?}"
+                );
+                assert!(
+                    observed.scrollback_depth > 0,
+                    "card {index} at ({col},{row}) in {mode:?}: the fixture must have \
+                     history to move, or 'the view did not move' is vacuous: {observed:?}"
+                );
+            }
+        }
+    }
+
+    // (c) No event is EVER forwarded with a clamped coordinate. Swept over every
+    // cell of a whole frame rather than over chosen samples, because the defect
+    // was precisely that an unconsidered region reached the child: sampling
+    // would have to guess which region, and guessing is what missed it.
+    //
+    // A smaller frame keeps the sweep exhaustive and quick, and it needs no
+    // knowledge of what the layout put where: it addresses every cell there is,
+    // so the card list, the stats bar, the bottom bar, the pane's border and the
+    // pane's content are all covered by construction rather than by aim.
+    let swept = observe_dashboard_geometry(60, 20, 4);
+    let swept_pane = swept
+        .focused_pane_rect
+        .expect("precondition: the swept frame must draw a focused agent pane too");
+    let swept_inner = pane_content_rect(swept_pane);
+    let mut delivered = 0_usize;
+    for row in swept.frame.y..swept.frame.y + swept.frame.height {
+        for col in swept.frame.x..swept.frame.x + swept.frame.width {
+            // PaneInput + child mouse reporting is the only combination that can
+            // put a coordinate on the wire at all, so it is the one to sweep.
+            let observed =
+                observe_wheel_routing(UiMode::PaneInput, true, true, Some(swept_pane), col, row);
+            let in_content = col >= swept_inner.x
+                && col < swept_inner.x + swept_inner.width
+                && row >= swept_inner.y
+                && row < swept_inner.y + swept_inner.height;
+            if in_content {
+                delivered += 1;
+                let truth = (col - swept_inner.x, row - swept_inner.y);
+                assert_eq!(
+                    observed.delivered_coords,
+                    Some(truth),
+                    "({col},{row}) is inside the pane's content area and must be \
+                     delivered as exactly that cell: {observed:?}"
+                );
+                assert_eq!(
+                    observed.forwarded_bytes,
+                    format!("\x1b[<64;{};{}M", truth.0 + 1, truth.1 + 1).into_bytes(),
+                    "({col},{row}): the report on the wire must encode the pointer's own \
+                     cell — this is the byte sequence the child acts on: {observed:?}"
+                );
+            } else {
+                assert_eq!(
+                    observed.delivered_coords, None,
+                    "({col},{row}) is outside the pane's content area, so there is no \
+                     pane-relative position to deliver — saturating to the nearest edge \
+                     is the fabrication this test exists to forbid: {observed:?}"
+                );
+                assert!(
+                    observed.forwarded_bytes.is_empty(),
+                    "({col},{row}): nothing at all may reach the child from outside the \
+                     pane: {observed:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        delivered,
+        usize::from(swept_inner.width) * usize::from(swept_inner.height),
+        "the sweep must have delivered to every cell of the content area and no other, \
+         or it swept the wrong frame: {swept:?}"
+    );
+
+    // A frame that drew no pane has no rect to hit-test, and must drop the wheel
+    // rather than fall back to the screen coordinates the deleted
+    // `pane_relative_coords` returned for a `None` rect.
+    let no_pane = observe_wheel_routing(UiMode::PaneInput, true, true, None, 5, 5);
+    assert_eq!(
+        no_pane.delivered_coords, None,
+        "with no focused pane rect there is nothing to route to: {no_pane:?}"
+    );
+    assert!(
+        no_pane.forwarded_bytes.is_empty(),
+        "with no focused pane rect the child must see nothing: {no_pane:?}"
+    );
+}
+
+/// A pane's content area: the outer rect minus its one-cell border. Derived here
+/// independently of the production helper so the test pins the geometry rather
+/// than agreeing with whatever the production side happens to compute.
+fn pane_content_rect(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    }
+}
+
+fn rects_disjoint(a: Rect, b: Rect) -> bool {
+    a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y
+}
+
+/// The corners and the centre of `rect` — the points most likely to expose an
+/// off-by-one in a hit test, without paying for every cell of every card.
+fn interesting_points(rect: Rect) -> Vec<(u16, u16)> {
+    // Saturating: a zero-sized rect would otherwise underflow here and report a
+    // panic where the real finding is that the layout painted nothing.
+    let right = rect.x + rect.width.saturating_sub(1);
+    let bottom = rect.y + rect.height.saturating_sub(1);
+    vec![
+        (rect.x, rect.y),
+        (right, rect.y),
+        (rect.x, bottom),
+        (right, bottom),
+        (rect.x + rect.width / 2, rect.y + rect.height / 2),
+    ]
 }
 
 /// Scenario: Feed focused panes either substantial cursor-positioned repaint output, trivial fresh output, or ordinary streamed history, then send wheel-up across the command/PaneInput × child-mouse matrix or render without scrolling. A failed deck-owned scroll on a mature zero-depth pane must explain itself reactively, while child-owned scrolling, fresh panes, successful scrollback, and no-attempt frames remain notice-free.

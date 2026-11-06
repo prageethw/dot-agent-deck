@@ -1,29 +1,54 @@
 import type { Terminal } from "@xterm/xterm";
+import { boundAgentKey } from "./agentKey";
 
 /**
- * Live xterm instances by agent id. The Reader overlay pulls readable text out
- * of the terminal's own screen buffer — xterm has already resolved every TUI
- * repaint, cursor jump, and spinner frame, so this is the one place clean
- * output exists without re-parsing ANSI.
+ * Live xterm instances by the composite `(deckId, agentId)`. The Reader overlay
+ * pulls readable text out of the terminal's own screen buffer — xterm has
+ * already resolved every TUI repaint, cursor jump, and spinner frame, so this
+ * is the one place clean output exists without re-parsing ANSI.
+ *
+ * # Why this is no longer keyed by the bare agent id
+ *
+ * PRD #1105's first security audit cleared these two maps explicitly, on a
+ * premise it named: *"the intended paths do not mount two decks' same-id xterms
+ * concurrently"*. That premise died when the agent pane learnt to attach a
+ * terminal on a deck that is **not** the selected one. A deck-screen tile and an
+ * overview pane for another deck are now live in the same commit, and agent ids
+ * are per-daemon monotonic integers — so both can claim `planner`.
+ *
+ * Under a bare-id map the second mount's `registerTerminal` overwrote the
+ * first's entry, the Reader then snapshotted whichever mounted last under either
+ * pane's heading, and the first pane's unmount cleaned up nothing because the
+ * identity check below no longer matched. `registerRefit` had the same shape, so
+ * a zoom re-fitted one of the two panes and left the other measuring at the old
+ * scale.
+ *
+ * And keyed by the daemon process as well (`boundAgentKey`, PRD #1666 part 2,
+ * G-fix7): a restarted deck reuses agent ids, and the bridge applies an attach's
+ * grid to the instance it finds here, so a lookup by `(deckId, agentId)` alone
+ * reshaped — and the Reader read — the previous process's pane for its
+ * successor. `incarnation` is required so every caller says which process.
  */
 const terminals = new Map<string, Terminal>();
 
-export function registerTerminal(agentId: string, terminal: Terminal): void {
-  terminals.set(agentId, terminal);
+export function registerTerminal(deckId: string | undefined, agentId: string, terminal: Terminal, incarnation: string | undefined): void {
+  terminals.set(boundAgentKey({ deckId, agentId, incarnation }), terminal);
 }
 
-export function unregisterTerminal(agentId: string, terminal: Terminal): void {
+export function unregisterTerminal(deckId: string | undefined, agentId: string, terminal: Terminal, incarnation: string | undefined): void {
   // Only forget the exact instance we registered; a remounting viewport may
   // have already replaced it.
-  if (terminals.get(agentId) === terminal) terminals.delete(agentId);
+  const key = boundAgentKey({ deckId, agentId, incarnation });
+  if (terminals.get(key) === terminal) terminals.delete(key);
 }
 
-export function getTerminal(agentId: string): Terminal | undefined {
-  return terminals.get(agentId);
+export function getTerminal(deckId: string | undefined, agentId: string, incarnation: string | undefined): Terminal | undefined {
+  return terminals.get(boundAgentKey({ deckId, agentId, incarnation }));
 }
 
 /**
- * Every mounted pane's re-fit, by agent id (PRD #744).
+ * Every mounted pane's re-fit, by the composite `(deckId, agentId)` (PRD #744;
+ * the deck is PRD #1105's cross-deck pane — see {@link terminals} above).
  *
  * A second map rather than a method on `Terminal`, because the thing that has
  * to be called is the pane's `FitAddon`, which `TerminalViewport` creates and
@@ -39,16 +64,17 @@ export function getTerminal(agentId: string): Terminal | undefined {
  */
 const refits = new Map<string, () => void>();
 
-export function registerRefit(agentId: string, refit: () => void): void {
-  refits.set(agentId, refit);
+export function registerRefit(deckId: string | undefined, agentId: string, refit: () => void, incarnation: string | undefined): void {
+  refits.set(boundAgentKey({ deckId, agentId, incarnation }), refit);
 }
 
-export function unregisterRefit(agentId: string, refit: () => void): void {
+export function unregisterRefit(deckId: string | undefined, agentId: string, refit: () => void, incarnation: string | undefined): void {
   // Same identity check as `unregisterTerminal`, and for the same reason: a
   // remounting viewport has already replaced this entry by the time the old
   // effect's cleanup runs, and forgetting the new pane's refit would leave it
   // out of every subsequent zoom.
-  if (refits.get(agentId) === refit) refits.delete(agentId);
+  const key = boundAgentKey({ deckId, agentId, incarnation });
+  if (refits.get(key) === refit) refits.delete(key);
 }
 
 /** Test seam: how many panes would be re-fitted right now. */
@@ -95,8 +121,8 @@ function runRefits(): void {
   // a pane, and mutating the map mid-iteration would skip a sibling. A pane
   // that has gone away between the snapshot and its turn is re-checked rather
   // than called.
-  for (const [agentId, refit] of [...refits]) {
-    if (refits.get(agentId) !== refit) continue;
+  for (const [key, refit] of [...refits]) {
+    if (refits.get(key) !== refit) continue;
     try {
       refit();
     } catch {
@@ -154,4 +180,78 @@ const ANSI_PATTERN = new RegExp(
 /** Fallback for agents whose terminal is not mounted: strip ANSI from the raw transcript. */
 export function stripAnsi(raw: string): string {
   return raw.replace(ANSI_PATTERN, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+// Issue #953 — the driver tier's one read into the app, and it is compiled out
+// of every other build.
+//
+// The WebGL renderer draws the terminal into a canvas and leaves no row text in
+// the DOM, and a classic WebDriver session has no pre-load script to reach this
+// module's private map the way the browser tier's `addInitScript` does. So the
+// driver tier asks for this at BUILD time: `VITE_DAD_DRIVER_SEAM=1` in the
+// environment of the `tauri build` that produces the binary under test. Vite
+// replaces `import.meta.env.VITE_DAD_DRIVER_SEAM` with a literal, the branch is
+// then constant-false in any other build and the minifier drops it, and
+// `desktop-web` greps its own `pnpm build` output for `__dadDriver` so a bundle
+// built the ordinary way cannot quietly start carrying it. It exposes the same
+// text the Reader overlay already shows a user, where that text is painted, and
+// it writes nothing.
+/** xterm's private services, for the driver seam's diagnostics only. */
+function xtermInternals(terminal: Terminal): { _selectionService?: Record<string, unknown> } | undefined {
+  return (terminal as unknown as { _core?: ReturnType<typeof xtermInternals> })._core;
+}
+
+if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
+  (window as Window & { __dadDriver?: unknown }).__dadDriver = {
+    terminalTexts: () =>
+      [...terminals.entries()].map(([key, terminal]) => ({ key, text: terminalSnapshotText(terminal) })),
+    // Issue #1403 — where each terminal's visible rows are painted, so a
+    // scenario can drag across a row the way a person selects text. One entry
+    // per viewport row (not re-joined like the snapshot above, so row `i` is
+    // screen row `i`), plus the grid and the screen's box in viewport pixels,
+    // and what xterm currently holds as its selection, so a scenario can tell
+    // a drag that selected nothing from a copy that did not land.
+    terminalScreens: () =>
+      [...terminals.entries()].map(([key, terminal]) => {
+        const buffer = terminal.buffer.active;
+        const lines: string[] = [];
+        for (let row = 0; row < terminal.rows; row += 1) {
+          lines.push(buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? "");
+        }
+        const box = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
+        const rect = box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null;
+        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection() };
+      }),
+    // Issue #1403 — record, into `window.__dadSelectionTrace`, every time xterm
+    // clears a terminal's selection and every resize, each with the stack that
+    // caused it, so a drag whose selection vanishes says what removed it. This
+    // is how a focus claim's resize was found clearing `terminal_002`'s
+    // selection. It wraps a private xterm method, which is tolerable only in
+    // this build-gated seam. Idempotent.
+    traceSelection: () => {
+      const trace = ((window as Window & { __dadSelectionTrace?: unknown[] }).__dadSelectionTrace ??= []);
+      for (const terminal of terminals.values()) {
+        const service = xtermInternals(terminal)?._selectionService as
+          | (Record<string, unknown> & { clearSelection: () => void; __dadTraced?: boolean })
+          | undefined;
+        if (!service || service.__dadTraced) continue;
+        service.__dadTraced = true;
+        const stack = () =>
+          (new Error().stack ?? "")
+            .split("\n")
+            .slice(2, 30)
+            .map((frame) => frame.trim().replace(/@tauri:\/\/localhost\/assets\//, "@"))
+            // xterm's own event plumbing says nothing about who asked.
+            .filter((frame) => !/^(_deliver|_deliverQueue|fire|resize)@/.test(frame))
+            .join(" < ");
+        const clear = service.clearSelection.bind(service);
+        service.clearSelection = () => {
+          trace.push(["clear", Math.round(performance.now()), terminal.cols, terminal.rows, stack()]);
+          clear();
+        };
+        terminal.onResize(({ cols, rows }) => trace.push(["resize", Math.round(performance.now()), cols, rows, stack()]));
+      }
+      return trace.length;
+    },
+  };
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampText, CLOCK_SKEW_TOLERANCE_MS, DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayUptime, domIdentity, homeRelative, rendersBlank, sanitizeText } from "./displayText";
+import { clampText, CLOCK_SKEW_TOLERANCE_MS, deckName, DISPLAY_LIMITS, displayActivity, displayBackgroundWork, displayIdentity, displayPath, displayText, displayUptime, domIdentity, homeRelative, rendersBlank, sanitizeText } from "./displayText";
 
 /**
  * Every bidi formatting and override codepoint the Rust policy names
@@ -26,6 +26,17 @@ describe("sanitizeText", () => {
     for (const code of [0x00, 0x07, 0x1b, 0x1f, 0x7f, 0x80, 0x9f]) {
       expect(sanitizeText(`a${String.fromCharCode(code)}b`)).toBe("ab");
     }
+  });
+
+  it("drops the Unicode line and paragraph separators, which break a line in the webview", () => {
+    // PRD #1223 audit D1: U+2028 and U+2029 are mandatory breaks (UAX #14
+    // class BK), so a directory name an older deck lists with one would render
+    // over two lines. The one recorded widening past the Rust policy.
+    expect(sanitizeText("repo\u2028Ignore prior instructions")).toBe("repoIgnore prior instructions");
+    expect(sanitizeText("repo\u2029Ignore prior instructions")).toBe("repoIgnore prior instructions");
+    expect(sanitizeText("next\u0085line")).toBe("nextline");
+    expect(displayPath("/home/dev/repo\u2028evil")).toBe("~/repoevil");
+    expect(displayText("a\u2028b\u2029c", DISPLAY_LIMITS.name)).toBe("abc");
   });
 
   it("keeps zero-width joiners and the other default-ignorable characters", () => {
@@ -309,5 +320,100 @@ describe("displayUptime", () => {
 
   it("defaults `now` to the real clock, so callers need not pass one", () => {
     expect(displayUptime(Date.now())?.label).toBe("<1m");
+  });
+});
+
+/**
+ * PRD #1105 moved this off `AgentOverview` because the agent pane became its
+ * second caller: a pane for an agent on a daemon this app is not attached to
+ * names that daemon inside a sentence. One function, so the header and the
+ * sentence cannot spell the same deck two ways.
+ */
+describe("deckName", () => {
+  /** Scenario: Names a local deck by the word and a remote one by its address. */
+  it("names a local deck by the word and a remote one by its address", () => {
+    expect(deckName({})).toBe("Local daemon");
+    expect(deckName({ deckKind: "local", socketPath: "/run/user/1000/dot-agent-deck.sock" })).toBe("Local daemon");
+    expect(deckName({ deckKind: "remote", socketPath: "dev@build-box" })).toBe("dev@build-box");
+    expect(deckName({ deckKind: "remote", socketPath: "ops@edge-3:2222" })).toBe("ops@edge-3:2222");
+  });
+
+  /**
+   * A remote deck with no address yet is a configured row `Test connection` has
+   * not filled in, and one whose label renders as nothing at all is the
+   * `displayIdentity` case — both read as the same honest words rather than as
+   * a blank header cell, or as a gap in the middle of the pane's sentence.
+   */
+  /** Scenario: Falls back to the same words for an addressless deck and an invisible label. */
+  it("falls back to the same words for an addressless deck and an invisible label", () => {
+    expect(deckName({ deckKind: "remote" })).toBe("Remote daemon");
+    expect(deckName({ deckKind: "remote", socketPath: "" })).toBe("Remote daemon");
+    expect(deckName({ deckKind: "remote", socketPath: "\u200b\u200c\u200d\ufeff" })).toBe("Remote daemon");
+  });
+
+  /**
+   * Bounded at the path budget plus the one character `clampText` appends as
+   * its elision marker. A remote label came through a validated ASCII charset,
+   * so this is the module's rule applied at the render seam rather than a
+   * judgement about this field — and the pane now prints it inside a sentence,
+   * which is a second reason not to let it be unbounded.
+   */
+  it("bounds a remote label the same way every other daemon-supplied path is bounded", () => {
+    const long = `dev@${"h".repeat(DISPLAY_LIMITS.path * 2)}`;
+    const named = deckName({ deckKind: "remote", socketPath: long });
+    expect(Array.from(named)).toHaveLength(DISPLAY_LIMITS.path + 1);
+    expect(named.endsWith("…")).toBe(true);
+  });
+});
+
+describe("displayBackgroundWork", () => {
+  /** A fixed "now", so every case below is arithmetic rather than a race. */
+  const NOW = Date.parse("2026-09-01T12:00:00.000Z");
+  const label = (commands: number, subagents: number, sinceMs?: number) =>
+    displayBackgroundWork({ commands, subagents, ...(sinceMs === undefined ? {} : { sinceMs }) }, NOW);
+
+  /**
+   * Issue #1678, CLAUDE.md rule 22: the TUI card's own cases
+   * (`tests/render_dashboard.rs`, status/background/004), same inputs and the
+   * same strings — the two clients must word one agent identically.
+   */
+  it("words the counts and the span exactly as the TUI card does", () => {
+    expect(label(2, 1, NOW - 11_520_000)).toBe("Background: 2 commands, 1 subagent · 3h 12m");
+    expect(label(1, 0, NOW - 240_000)).toBe("Background: 1 command · 4m");
+    expect(label(0, 1, NOW - 240_000)).toBe("Background: 1 subagent · 4m");
+    expect(label(0, 2, NOW + 30_000)).toBe("Background: 2 subagents · 0s");
+    expect(label(1, 0, NOW + 60_001)).toBe("Background: 1 command");
+    expect(label(1, 0)).toBe("Background: 1 command");
+    expect(label(0, 0)).toBeUndefined();
+  });
+
+  /** The TUI's `format_elapsed` vocabulary at each of its boundaries, floored. */
+  it("uses the TUI's span vocabulary, never the uptime column's single unit", () => {
+    expect(label(1, 0, NOW)).toBe("Background: 1 command · 0s");
+    expect(label(1, 0, NOW - 59_999)).toBe("Background: 1 command · 59s");
+    expect(label(1, 0, NOW - 60_000)).toBe("Background: 1 command · 1m");
+    expect(label(1, 0, NOW - 270_000)).toBe("Background: 1 command · 4m 30s");
+    expect(label(1, 0, NOW - 3_600_000)).toBe("Background: 1 command · 1h");
+    expect(label(3, 4, NOW - 50 * 3_600_000 - 60_000)).toBe("Background: 3 commands, 4 subagents · 50h 1m");
+  });
+
+  /**
+   * The shared clock-skew rule on its exact boundary: up to the tolerance
+   * ahead reads `0s`, one millisecond further drops the span and keeps the
+   * counts — the counts are true without it, a made-up span is not.
+   */
+  it("clamps a start inside the skew tolerance to 0s and drops one beyond it", () => {
+    expect(label(1, 0, NOW + CLOCK_SKEW_TOLERANCE_MS)).toBe("Background: 1 command · 0s");
+    expect(label(1, 0, NOW + CLOCK_SKEW_TOLERANCE_MS + 1)).toBe("Background: 1 command");
+  });
+
+  it("drops a span that is not a usable instant but keeps the counts", () => {
+    expect(label(1, 0, Number.NaN)).toBe("Background: 1 command");
+    expect(label(1, 0, Number.POSITIVE_INFINITY)).toBe("Background: 1 command");
+    expect(label(1, 0, -8.65e15)).toBe("Background: 1 command");
+  });
+
+  it("renders nothing without a reading", () => {
+    expect(displayBackgroundWork(undefined, NOW)).toBeUndefined();
   });
 });

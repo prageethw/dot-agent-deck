@@ -9,7 +9,6 @@
 //! a UnixStream client, and verifies every message kind round-trips
 //! correctly — including concurrent attach-stream subscribers.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,13 +35,10 @@ mod test_temp;
 // `arm()`.
 #[path = "common/child_lifetime_bound.rs"]
 mod child_lifetime_bound;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
-use dot_agent_deck::build_id::local_build_id;
-use dot_agent_deck::build_version_handshake::ensure_compatible_daemon_or_die;
-use dot_agent_deck::daemon_client::LocalEndpoint;
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, DAEMON_CAPABILITIES, KIND_DETACH, KIND_REQ, KIND_RESP,
     KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROJECT_ERR_INVALID_PATH,
@@ -53,7 +49,7 @@ use dot_agent_deck::daemon_protocol::{
     bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
-    AgentEvent, AgentType, BroadcastMsg, EventType, LiveTarget, SendResult, TargetKind, Writable,
+    AgentEvent, AgentType, BroadcastMsg, EventType, LiveTarget, TargetKind, Writable,
 };
 use dot_agent_deck::state::{AppState, SharedState};
 use spec::spec;
@@ -196,6 +192,9 @@ async fn start_agent(server: &Server, command: &str) -> String {
             agent_type: None,
             seed: None,
             isolated_clone_origin: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -232,6 +231,9 @@ async fn start_agent_for_pane(
             agent_type: Some(AgentType::Codex),
             seed: None,
             isolated_clone_origin: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -244,69 +246,16 @@ async fn start_agent_for_pane(
     (id, pane_id)
 }
 
-async fn start_plain_agent_for_pane(
-    server: &Server,
-    command: &str,
-    proposed_pane_id: &str,
-) -> (String, String) {
-    let mut stream = UnixStream::connect(&server.path).await.unwrap();
-    write_request(
-        &mut stream,
-        &AttachRequest::StartAgent {
-            command: Some(command.into()),
-            cwd: None,
-            display_name: None,
-            rows: 24,
-            cols: 80,
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), proposed_pane_id.into())],
-            tab_membership: None,
-            agent_type: None,
-            seed: None,
-            isolated_clone_origin: None,
-        },
-    )
-    .await;
-    let response = read_response(&mut stream).await;
-    assert!(response.ok, "start-agent failed: {:?}", response.error);
-    let id = response.id.expect("start-agent response missing id");
-    let pane_id = response
-        .pane_id
-        .expect("start-agent response missing daemon-minted pane_id");
-    (id, pane_id)
-}
-
-/// PRD #365 M2: bypasses the wire `StartAgent` handler (which now always
-/// mints its own `pane_id` and strips whatever a client proposes) by calling
-/// `AgentPtyRegistry::spawn_agent` directly, in-process. This is not a test
-/// fabrication — `spawn.rs`'s headless fire path and
-/// `AgentPtyRegistry::respawn_agent_for_pane` are both real, still-live
-/// production callers of exactly this entry point, and `spawn_agent`'s own
-/// `pane_id_env` extraction/validation (`is_valid_pane_id_env`, and the
-/// duplicate-`pane_id_env` rejection) is untouched by PRD #365 — the M1
-/// decision doc calls it out by name as a backstop that stays. A test that
-/// needs a specific, client-chosen `pane_id_env` — to pin that backstop, or
-/// to reconstruct the pre-#365 "same pane, new agent" respawn scenario —
-/// still can, just not by going through the wire, since the wire path no
-/// longer honors a client-proposed value at all (`daemon/pane-id/001`).
-fn spawn_agent_direct_for_pane(server: &Server, command: &str, pane_id: &str) -> String {
-    server
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some(command),
-            env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_id.to_string())],
-            agent_type: Some(AgentType::Codex),
-            ..SpawnOptions::default()
-        })
-        .expect("direct registry spawn_agent failed")
-}
-
-/// Same bypass as [`spawn_agent_direct_for_pane`], but with no
-/// `DOT_AGENT_DECK_PANE_ID` in `env` at all — a genuinely paneless
+/// Spawn an agent straight through `AgentPtyRegistry::spawn_agent`, in-process,
+/// with no `DOT_AGENT_DECK_PANE_ID` in `env` at all — a genuinely paneless
 /// `pane_id_env: None` agent. As of PRD #365 M2 this is no longer
 /// constructible via the wire `StartAgent` path (`daemon_protocol.rs`
 /// unconditionally injects a minted id into every spawn's `env` before
 /// calling `spawn_agent`), so a direct registry call is the only way left to
-/// exercise the `is_paneless` / `agent_writable` fallback this pins.
+/// exercise the `is_paneless` / `agent_writable` fallback this pins. Not a
+/// test fabrication: `spawn.rs`'s headless fire path and
+/// `AgentPtyRegistry::respawn_agent_for_pane` are real, still-live production
+/// callers of exactly this entry point.
 fn spawn_agent_direct_paneless(server: &Server, command: &str) -> String {
     server
         .registry
@@ -326,6 +275,7 @@ async fn connect_attach(server: &Server, id: &str) -> UnixStream {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         },
     )
     .await;
@@ -434,47 +384,6 @@ async fn observe_stream_input_outcome(
     )
 }
 
-/// How long a delivery-count file gets to reach its expected contents.
-/// Generous because it is only ever paid when something is genuinely broken;
-/// the happy path returns on the first poll.
-const DELIVERY_FILE_BUDGET: Duration = Duration::from_secs(20);
-
-/// Bounded poll until `path` holds exactly `want`.
-///
-/// A `SendResult::Applied` means the daemon wrote the payload and the submit CR
-/// to the PTY master and flushed (`deliver_payload_and_submit`) — NOT that the
-/// child shell has read, parsed and run the command. So a test that reads a
-/// `printf x >> file` counter the instant the response arrives is racing the
-/// shell with nothing synchronizing the two: it happens to win by microseconds
-/// on a fast Linux box and can lose on a slower, loaded runner, where the empty
-/// read then masquerades as a double-submit bug. Polling the CONTENTS closes
-/// that window while keeping the assertion exact.
-///
-/// Panics with what the file actually holds — separating "the delivery never
-/// executed" from "it executed more than once", which an unwaited read
-/// conflates. Growth past `want` fails immediately rather than burning the
-/// budget, since these payloads only ever append.
-async fn wait_for_delivery_writes(path: &Path, want: &str, what: &str) {
-    let deadline = tokio::time::Instant::now() + DELIVERY_FILE_BUDGET;
-    loop {
-        let observed = std::fs::read_to_string(path).unwrap_or_default();
-        if observed == want {
-            return;
-        }
-        assert!(
-            observed.len() < want.len(),
-            "{what}: {} holds {observed:?}, which overshot the expected {want:?} — the delivery submitted more than once",
-            path.display()
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{what}: {} never reached {want:?} within {DELIVERY_FILE_BUDGET:?} (last read {observed:?})",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -490,9 +399,10 @@ async fn list_agents_returns_empty_initially() {
 }
 
 // PRD #76 M2.12: `tab_membership` round-trips through the StartAgent →
-// list_agents wire path so the TUI can rebuild mode/orchestration tabs
-// on reconnect instead of stranding every hydrated pane on the
-// dashboard. Two end-to-end paths: Mode tab and Orchestration tab.
+// list_agents wire path so the TUI can rebuild orchestration tabs on
+// reconnect instead of stranding every hydrated pane on the dashboard. Two
+// end-to-end paths: the deprecated `TabMembership::Mode` variant (legacy
+// records an older TUI still sends) and Orchestration.
 
 async fn start_agent_with_membership(server: &Server, membership: TabMembership) -> String {
     let mut s = UnixStream::connect(&server.path).await.unwrap();
@@ -509,6 +419,9 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             agent_type: None,
             seed: None,
             isolated_clone_origin: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -568,11 +481,14 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 is_start_role: false,
                 orchestration_cwd: Some("/proj/\x1b[31m".into()),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             agent_type: None,
             seed: None,
             isolated_clone_origin: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -607,7 +523,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: Some("orch-test-0".to_string()),
         },
     )
     .await;
@@ -626,7 +542,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: Some("orch-test-0".to_string()),
         })
     );
     server.registry.shutdown_all();
@@ -660,6 +576,9 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         agent_type: None,
         seed: None,
         isolated_clone_origin: None,
+        authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
     };
 
     // Wire round-trip: encode + decode via the same serde path the daemon
@@ -772,6 +691,9 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::ClaudeCode),
         seed: None,
         isolated_clone_origin: None,
+        authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -802,6 +724,9 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::OpenCode),
         seed: None,
         isolated_clone_origin: None,
+        authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
     let back_oc: AttachRequest = serde_json::from_str(&json_oc).unwrap();
@@ -832,13 +757,14 @@ fn agent_record_round_trips_explicit_agent_type() {
         cols: 0,
         live: None,
         spawned_at_ms: None,
-        daemon_boot_id: None,
-        registration_generation: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         outstanding_delegation: None,
-        silence_watch: None,
         delegation_commission: None,
+        orchestrator_context_path: None,
+        authoring_kind: None,
+        inbox: None,
     };
     let json = serde_json::to_string(&rec).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -861,13 +787,14 @@ fn agent_record_omits_agent_type_when_none() {
         cols: 0,
         live: None,
         spawned_at_ms: None,
-        daemon_boot_id: None,
-        registration_generation: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         outstanding_delegation: None,
-        silence_watch: None,
         delegation_commission: None,
+        orchestrator_context_path: None,
+        authoring_kind: None,
+        inbox: None,
     };
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
     assert!(
@@ -989,13 +916,14 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             cols: 0,
             live: None,
             spawned_at_ms: None,
-            daemon_boot_id: None,
-            registration_generation: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             outstanding_delegation: None,
-            silence_watch: None,
             delegation_commission: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            inbox: None,
         },
         AgentRecord {
             id: "9".into(),
@@ -1008,13 +936,14 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             cols: 0,
             live: None,
             spawned_at_ms: None,
-            daemon_boot_id: None,
-            registration_generation: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             outstanding_delegation: None,
-            silence_watch: None,
             delegation_commission: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            inbox: None,
         },
     ];
     let summary = RunningAgentsSummary::from_records(&records);
@@ -1042,6 +971,7 @@ async fn hello_response_carries_running_agents_and_daemon_version() {
         &AttachRequest::Hello {
             client_version: 3,
             client_build_version: None,
+            follow_on: false,
         },
     )
     .await;
@@ -1064,94 +994,59 @@ async fn hello_response_carries_running_agents_and_daemon_version() {
     );
 }
 
-/// Bind a minimal Unix-socket "daemon" that answers exactly one
-/// `AttachRequest::Hello` with a caller-supplied `hello_response` and then
-/// drops the connection — mirroring the real daemon's one-shot `Hello`
-/// round-trip (`build_version_handshake::probe_daemon`'s doc comment notes it
-/// always closes its end after replying). Lets a test pin a specific
-/// `server_version` on the wire without building a second binary at a
-/// different `PROTOCOL_VERSION` (fork issue #17). Every other request kind is
-/// ignored — the local-attach probe only ever sends `Hello`.
-async fn run_single_hello_server(listener: UnixListener, hello_response: AttachResponse) {
-    loop {
-        let (mut stream, _) = match listener.accept().await {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let resp = hello_response.clone();
-        tokio::spawn(async move {
-            if let Some((KIND_REQ, payload)) = read_frame(&mut stream).await
-                && let Ok(AttachRequest::Hello { .. }) = serde_json::from_slice(&payload)
-            {
-                let _ = write_resp(&mut stream, &resp).await;
-            }
-        });
-    }
-}
+// PRD #1589 (review on PR #1681): a `Hello` with `follow_on` keeps the
+// connection open for exactly one more request, which the daemon whose reply
+// advertised `hello-follow-on` serves; a `Hello` without it closes after the
+// reply, as it always did.
+#[tokio::test]
+async fn hello_follow_on_serves_one_more_request_on_the_same_connection() {
+    let server = start_server().await;
 
-/// Scenario: Stand up a mock local daemon whose `Hello` reply carries the
-/// SAME `build_version` the test process reports for itself (so the
-/// build-id comparison the local-attach handshake performs today matches)
-/// but a `server_version` one higher than the compiled-in `PROTOCOL_VERSION`
-/// — a newer daemon, exactly the direction fork issue #17's verified
-/// reproduction used (protocol 7 daemon, protocol 6 TUI). Call the real
-/// `build_version_handshake::ensure_compatible_daemon_or_die` — the exact
-/// function `run_tui_session` calls before every local attach, over the
-/// exact wire shape `probe_daemon` speaks — against it, and assert the call
-/// refuses the attach instead of returning `Ok(HandshakeOutcome::Match)` and
-/// leaving the caller to proceed into a dashboard that will silently drop
-/// every event it can't decode.
-#[spec("lifecycle/handshake/009")]
-#[test]
-fn handshake_009_local_attach_refuses_a_protocol_version_mismatch() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build handshake runtime");
-    runtime.block_on(handshake_009_local_attach_refuses_a_protocol_version_mismatch_inner());
-}
-
-async fn handshake_009_local_attach_refuses_a_protocol_version_mismatch_inner() {
-    let local_build = local_build_id();
-    let mismatched_server_version = PROTOCOL_VERSION + 1;
-
-    let hello_response = AttachResponse {
-        ok: true,
-        build_version: Some(local_build),
-        server_version: Some(mismatched_server_version),
-        running_agents: Some(RunningAgentsSummary {
-            count: 0,
-            names: Vec::new(),
-        }),
-        ..Default::default()
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    let hello = AttachRequest::Hello {
+        client_version: PROTOCOL_VERSION,
+        client_build_version: None,
+        follow_on: true,
     };
-
-    let (dir, path, listener) = {
-        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = test_temp::tempdir().unwrap();
-        let path = dir.path().join("attach.sock");
-        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        (dir, path, listener)
-    };
-    let server = tokio::spawn(run_single_hello_server(listener, hello_response));
-
-    let endpoint = LocalEndpoint::at(&path);
-    let result = ensure_compatible_daemon_or_die(&endpoint).await;
-
-    server.abort();
-    drop(dir);
-
+    write_request(&mut s, &hello).await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok);
     assert!(
-        result.is_err(),
-        "local attach must refuse when the daemon's server_version \
-         ({mismatched_server_version}) does not match the client's compiled-in \
-         PROTOCOL_VERSION ({PROTOCOL_VERSION}); got {result:?} instead — the local-attach \
-         handshake never inspects `server_version` at all (fork issue #17), so a \
-         protocol-skewed daemon attaches successfully and the TUI then silently drops every \
-         event it cannot decode"
+        resp.capabilities
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|c| c == dot_agent_deck::daemon_protocol::CAP_HELLO_FOLLOW_ON),
+        "the reply advertises the follow-on: {:?}",
+        resp.capabilities
     );
+    write_request(&mut s, &AttachRequest::ListAgents).await;
+    let listed = read_response(&mut s).await;
+    assert!(listed.ok, "{:?}", listed.error);
+    // One only: the follow-on's own connection closes after its reply, even
+    // when that request is another `Hello` asking for a follow-on.
+    let mut buf = [0u8; 1];
+    assert_eq!(s.read(&mut buf).await.unwrap(), 0, "closed after one");
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &hello).await;
+    read_response(&mut s).await;
+    write_request(&mut s, &hello).await;
+    assert!(read_response(&mut s).await.ok);
+    assert_eq!(s.read(&mut buf).await.unwrap(), 0, "no second follow-on");
+
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            client_build_version: None,
+            follow_on: false,
+        },
+    )
+    .await;
+    read_response(&mut s).await;
+    assert_eq!(s.read(&mut buf).await.unwrap(), 0, "no follow-on asked");
 }
 
 #[tokio::test]
@@ -1187,6 +1082,9 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 agent_type: None,
                 seed: None,
                 isolated_clone_origin: None,
+                authoring_kind: None,
+                client_seeded_kind: None,
+                remember_command: false,
             },
         )
         .await;
@@ -1346,7 +1244,7 @@ async fn project_verbs_are_reachable_and_none_report_unimplemented() {
     );
     assert!(
         resp.workflow_prepared.is_none(),
-        "a refusal carries no PreparedWorkflow"
+        "a refusal carries no PreparedOrchestration"
     );
     let error = resp.error.unwrap_or_default();
     assert!(
@@ -1550,6 +1448,25 @@ command = "cat"
 description = "Implements the requested change"
 "#;
 
+fn published_context_files(project: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(project.join(".dot-agent-deck"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("orchestrator-context"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Scenario: Resolve a project, change its config, and confirm stale preparation
+/// publishes no context; an omitted revision still permits a fresh launch.
+///
 /// PRD #819 M4: `ResolveProject` hands back a revision derived from the config
 /// bytes, `PrepareWorkflow` echoes it, and a revision that no longer matches the
 /// file on disk is refused — **before** anything is published.
@@ -1562,9 +1479,6 @@ description = "Implements the requested change"
 async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
-    let context = project
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
 
     let resp = issue_json_request(
         &server,
@@ -1599,7 +1513,7 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
     assert!(!resp.ok, "a stale revision must be refused");
     assert!(
         resp.workflow_prepared.is_none(),
-        "a refused preparation carries no PreparedWorkflow"
+        "a refused preparation carries no PreparedOrchestration"
     );
     let error = resp.error.unwrap_or_default();
     assert!(
@@ -1607,9 +1521,8 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
         "expected the stable `{PROJECT_ERR_STALE_REVISION}` code, got {error:?}"
     );
     assert!(
-        !context.exists(),
-        "the revision check must run BEFORE the publish, but {} was written",
-        context.display()
+        published_context_files(&project).is_empty(),
+        "the revision check must run BEFORE any context publish"
     );
 
     // An ABSENT revision means "I have no expectation", not "any revision" — the
@@ -1630,9 +1543,15 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
         "a preparation that names no revision must still succeed: {:?}",
         resp.error
     );
-    assert!(context.is_file(), "and it must publish the context");
+    assert!(
+        !published_context_files(&project).is_empty(),
+        "and it must publish a context"
+    );
 }
 
+/// Scenario: Ask the daemon to prepare an unknown orchestration and confirm it
+/// publishes no context file and starts no role.
+///
 /// PRD #819 M4: a preparation that fails publishes nothing and starts nothing.
 ///
 /// The e2e (`project/launch/001`) pins the same claim through a real
@@ -1644,9 +1563,6 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
 async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
-    let context = project
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
 
     assert!(
         server.registry.agent_records().is_empty(),
@@ -1674,9 +1590,8 @@ async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
         "the refusal must not enumerate the orchestrations the config declares: {error:?}"
     );
     assert!(
-        !context.exists(),
-        "a failed preparation must publish nothing, but {} was written",
-        context.display()
+        published_context_files(&project).is_empty(),
+        "a failed preparation must publish no context"
     );
     assert!(
         server.registry.agent_records().is_empty(),
@@ -1684,6 +1599,9 @@ async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
     );
 }
 
+/// Scenario: Symlink the project's context directory elsewhere and confirm the
+/// daemon refuses preparation without publishing through the link.
+///
 /// PRD #819 M4: the publish's symlink refusal is reachable **through the verb**,
 /// not only through a direct call to the publish function.
 ///
@@ -1723,9 +1641,15 @@ async fn prepare_workflow_refuses_a_symlinked_context_directory() {
         "expected `{PROJECT_ERR_PUBLISH_FAILED}`, got {error:?}"
     );
     assert!(
-        !elsewhere.join("orchestrator-context.md").exists(),
-        "nothing may be written through the link, but {} exists",
-        elsewhere.join("orchestrator-context.md").display()
+        std::fs::read_dir(&elsewhere)
+            .expect("list the symlink target")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("orchestrator-context")),
+        "nothing matching orchestrator-context* may be written through the link at {}",
+        elsewhere.display()
     );
     assert!(
         server.registry.agent_records().is_empty(),
@@ -1762,7 +1686,7 @@ enum PreVerbAttachRequest {
 /// role, and whether that role is the orchestration's start role.
 ///
 /// A real launch always sends one (`desktop/src-tauri/src/lib.rs`'s
-/// `workflow_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
+/// `orchestration_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
 /// compares it against the token's binding — so a payload carrying `None` here
 /// can no longer produce a spawn. The cases below that pass `None` are the ones
 /// refused before the identity check is reached: an unknown token, and a payload
@@ -1794,11 +1718,12 @@ fn prepared_start_payload(
                 is_start_role,
                 orchestration_cwd: cwd.map(str::to_string),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }
         }),
         agent_type: None,
         seed: None,
+        use_configured_command: false,
     };
     match serde_json::to_value(&request).expect("a prepared start serializes") {
         serde_json::Value::Object(fields) => fields,
@@ -2050,6 +1975,9 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
         "a refused prepared start must not have spawned a pane"
     );
 
+    // Issue #1045: deliberately the LEGACY spelling — a desktop built before
+    // the rename still sends `prepare-workflow` and reads `workflow_prepared`,
+    // and the token it gets back must spawn exactly as the new op's does.
     let resp = issue_json_request(
         &server,
         serde_json::json!({
@@ -2061,7 +1989,13 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
     )
     .await;
     assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-    let prepared = resp.workflow_prepared.expect("a PreparedWorkflow");
+    assert!(
+        resp.orchestration_prepared.is_none(),
+        "a legacy request is answered on the legacy field only"
+    );
+    let prepared = resp
+        .workflow_prepared
+        .expect("the legacy field carries the PreparedOrchestration");
 
     let resp = issue_json_request(
         &server,
@@ -2097,37 +2031,27 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
 /// this daemon issued and is seconds old, so a refusal carrying the wrong code
 /// would say the token was unknown — which would send an operator looking for a
 /// client bug instead of a replaced artifact.
+///
+/// Scenario: Prepare two launches in one project, replace the first launch's
+/// own context file, and start with its still-live token. The daemon refuses
+/// that token as stale while the second launch's token still starts roles.
 #[tokio::test]
 async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() {
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
 
-    let prepare = |task: &'static str| {
-        let server = &server;
-        let path = project.to_str().unwrap().to_string();
-        async move {
-            let resp = issue_json_request(
-                server,
-                serde_json::json!({
-                    "op": "prepare-workflow",
-                    "path": path,
-                    "orchestration": "loop",
-                    "task": task,
-                }),
-            )
-            .await;
-            assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-            resp.workflow_prepared.expect("a PreparedWorkflow")
-        }
-    };
-
-    let first = prepare("Task A: the first client's brief.").await;
-    let second = prepare("Task B: the second client's brief.").await;
+    let first = prepare_loop(&server, &project, "Task A: the first client's brief.").await;
+    let second = prepare_loop(&server, &project, "Task B: the second client's brief.").await;
     assert_ne!(first.token, second.token);
-    assert_eq!(
+    assert_ne!(
         first.context_path, second.context_path,
-        "both preparations name the same fixed path, which is the shape of the defect"
+        "each preparation must keep its own context path"
     );
+    let replacement = std::path::Path::new(&first.context_path).with_extension("replacement");
+    std::fs::write(&replacement, "This is no longer Task A.")
+        .expect("write a replacement context file");
+    std::fs::rename(&replacement, &first.context_path)
+        .expect("replace the first preparation's context file");
 
     let resp = issue_json_request(
         &server,
@@ -2157,7 +2081,7 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
         "a refused prepared start must not have spawned a pane"
     );
 
-    // The second preparation's token still spawns, which is what stops the
+    // The untouched second preparation's token still spawns, which stops the
     // assertions above from passing against a daemon that refuses every token.
     let resp = issue_json_request(
         &server,
@@ -2225,34 +2149,8 @@ async fn a_prepared_start_refuses_spawn_fields_from_another_project() {
     let (_dir_x, project_x) = mint_project(LAUNCHABLE_PROJECT);
     let (_dir_y, project_y) = mint_project(LAUNCHABLE_PROJECT);
 
-    let prepare = |path: String, task: &'static str| {
-        let server = &server;
-        async move {
-            let resp = issue_json_request(
-                server,
-                serde_json::json!({
-                    "op": "prepare-workflow",
-                    "path": path,
-                    "orchestration": "loop",
-                    "task": task,
-                }),
-            )
-            .await;
-            assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-            resp.workflow_prepared.expect("a PreparedWorkflow")
-        }
-    };
-
-    let x = prepare(
-        project_x.to_str().unwrap().to_string(),
-        "Project X's brief.",
-    )
-    .await;
-    let y = prepare(
-        project_y.to_str().unwrap().to_string(),
-        "Project Y's brief.",
-    )
-    .await;
+    let x = prepare_loop(&server, &project_x, "Project X's brief.").await;
+    let y = prepare_loop(&server, &project_y, "Project Y's brief.").await;
     assert_ne!(
         x.context_path, y.context_path,
         "two projects must publish to two paths, or this would be the staleness case"
@@ -2402,7 +2300,7 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
     // that refuses to send anything at all: a real preparation's token spawns
     // through the same method, capability gate included.
     let prepared = client
-        .prepare_workflow(
+        .prepare_orchestration(
             project.to_str().expect("utf-8 project path"),
             "loop",
             "Mint a token to spawn with.",
@@ -2425,7 +2323,7 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
                     is_start_role: true,
                     orchestration_cwd: Some(prepared.path.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
                 ..StartAgentOptions::default()
             },
@@ -2451,6 +2349,302 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
     assert!(!id.is_empty());
 }
 
+/// PRD #1223 M6: a project whose roles are long-lived `sh` stand-ins with
+/// DECLARED agents, so the configured-command path's seed rule can be observed
+/// without a real agent. `pi_start` decides whether the start role is Pi.
+fn configured_role_project(pi_start: bool) -> String {
+    format!(
+        r#"
+[[orchestrations]]
+name = "loop"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'sleep 600'"
+agent = "{}"
+start = true
+
+[[orchestrations.roles]]
+name = "builder"
+command = "sh -c 'sleep 600'"
+agent = "pi"
+"#,
+        if pi_start { "pi" } else { "opencode" }
+    )
+}
+
+/// An opted-in prepared start for `role` of `configured_role_project`: no
+/// `command`, a pane id to key the seed by, and the flag.
+fn configured_role_payload(
+    token: &str,
+    project: &str,
+    role: &str,
+    is_start_role: bool,
+    pane_id: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut payload =
+        prepared_start_payload(token, Some(project), Some(("loop", role, is_start_role)));
+    payload.remove("command");
+    payload.insert(
+        "env".into(),
+        serde_json::json!([["DOT_AGENT_DECK_PANE_ID", pane_id]]),
+    );
+    payload.insert("use_configured_command".into(), serde_json::json!(true));
+    payload
+}
+
+async fn prepare_loop(
+    server: &Server,
+    project: &Path,
+    task: &str,
+) -> dot_agent_deck::event::PreparedOrchestration {
+    let resp = issue_json_request(
+        server,
+        serde_json::json!({
+            "op": "prepare-orchestration",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": task,
+        }),
+    )
+    .await;
+    assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+    resp.orchestration_prepared
+        .expect("a PreparedOrchestration")
+}
+
+/// PRD #1223 M6: an opted-in prepared start takes its command, agent type and
+/// seed from the role's config, so a request that ALSO supplies any one of them
+/// is refused in the ordinary shape and starts nothing — rather than being
+/// resolved by a precedence rule the caller would have to know. Each field is
+/// probed on its own, and the same request without it then starts, so the
+/// refusal is the conflict and not the preparation.
+#[tokio::test]
+async fn a_configured_prepared_start_refuses_a_supplied_command_agent_type_or_seed() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(&configured_role_project(false));
+    let prepared = prepare_loop(&server, &project, "").await;
+
+    for (field, value) in [
+        ("command", serde_json::json!("/bin/sh")),
+        ("agent_type", serde_json::json!("claude_code")),
+        (
+            "seed",
+            serde_json::json!("a seed the config did not choose"),
+        ),
+    ] {
+        let mut payload = configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "builder",
+            false,
+            "configured-conflict",
+        );
+        payload.insert(field.into(), value);
+        let resp = issue_json_request(&server, serde_json::Value::Object(payload)).await;
+        assert!(!resp.ok, "{field} alongside the flag must be refused");
+        assert!(resp.id.is_none(), "{field}: a refused start reports no id");
+        assert!(
+            resp.error
+                .as_deref()
+                .is_some_and(|e| e.contains("use_configured_command")),
+            "{field}: the refusal is the flag's, in the ordinary shape: {:?}",
+            resp.error
+        );
+        assert!(
+            resp.error.as_deref().is_some_and(|e| !e.contains("  ")),
+            "{field}: the refusal reads with single spaces, not source indentation: {:?}",
+            resp.error
+        );
+        assert!(
+            server.registry.agent_records().is_empty(),
+            "{field}: a refused configured start must not have spawned a pane"
+        );
+    }
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "builder",
+            false,
+            "configured-control",
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the same start without the conflicting field is served: {:?}",
+        resp.error
+    );
+    let record = server
+        .registry
+        .agent_records()
+        .into_iter()
+        .find(|record| Some(&record.id) == resp.id.as_ref())
+        .expect("the served start is listed");
+    assert_eq!(
+        record.display_name.as_deref(),
+        Some("builder"),
+        "an unnamed role pane takes the role's name"
+    );
+    assert_eq!(
+        record.agent_type,
+        Some(AgentType::Pi),
+        "the role's declared agent wins"
+    );
+    server.registry.close_agent(&record.id).unwrap();
+}
+
+/// PRD #1223 audit F7: an opted-in prepared start registers its role and seeds a
+/// Pi start role by the pane id, so one that carries no `DOT_AGENT_DECK_PANE_ID`,
+/// an invalid one, or two of them is refused in the ordinary shape and starts
+/// nothing — rather than spawning the configured command as an agent no
+/// orchestration knows and no prompt reaches. Each shape is probed on its own
+/// against the Pi START role (the one whose seed depends on the id), and the
+/// same start with exactly one valid id then starts, so the refusal is the pane
+/// id and not the preparation.
+#[tokio::test]
+async fn a_configured_prepared_start_refuses_a_missing_invalid_or_duplicated_pane_id() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(&configured_role_project(true));
+    let prepared = prepare_loop(&server, &project, "").await;
+
+    for (shape, env) in [
+        ("missing", serde_json::json!([])),
+        (
+            "invalid",
+            serde_json::json!([["DOT_AGENT_DECK_PANE_ID", "not a pane id!"]]),
+        ),
+        ("empty", serde_json::json!([["DOT_AGENT_DECK_PANE_ID", ""]])),
+        (
+            "duplicated",
+            serde_json::json!([
+                ["DOT_AGENT_DECK_PANE_ID", "configured-first"],
+                ["DOT_AGENT_DECK_PANE_ID", "configured-second"]
+            ]),
+        ),
+    ] {
+        let mut payload = configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "planner",
+            true,
+            "configured-unused",
+        );
+        payload.insert("env".into(), env);
+        let resp = issue_json_request(&server, serde_json::Value::Object(payload)).await;
+        assert!(
+            !resp.ok,
+            "a {shape} pane id alongside the flag must be refused"
+        );
+        assert!(resp.id.is_none(), "{shape}: a refused start reports no id");
+        assert!(
+            resp.error.as_deref().is_some_and(|e| {
+                e.contains("use_configured_command")
+                    && e.contains("DOT_AGENT_DECK_PANE_ID")
+                    && e.ends_with("nothing was started")
+            }),
+            "{shape}: the refusal names the flag and the pane id, in the ordinary shape: {:?}",
+            resp.error
+        );
+        assert!(
+            server.registry.agent_records().is_empty(),
+            "{shape}: a refused configured start must not have spawned a pane"
+        );
+    }
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "planner",
+            true,
+            "configured-sole",
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the same start with exactly one valid pane id is served: {:?}",
+        resp.error
+    );
+    let id = resp.id.expect("the served start's id");
+    server.registry.close_agent(&id).unwrap();
+}
+
+/// PRD #1223 M6: the TUI's PRD #201 rule, on the daemon — an opted-in start of
+/// the configured START role whose resolved type is Pi is seeded natively with
+/// the preparation's coordinator prompt (exactly the line the reply carried),
+/// while a Pi WORKER role and a non-Pi start role are not: the non-Pi start
+/// role's prompt stays the client's to deliver, as on the unflagged verb.
+#[tokio::test]
+async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordinator_prompt() {
+    let server = start_server().await;
+
+    for pi_start in [true, false] {
+        let (_dir, project) = mint_project(&configured_role_project(pi_start));
+        let prepared = prepare_loop(&server, &project, "").await;
+        assert!(!prepared.prompt.trim().is_empty());
+
+        let start_pane = format!("configured-start-{pi_start}");
+        let worker_pane = format!("configured-worker-{pi_start}");
+        let mut ids = Vec::new();
+        for (role, is_start, pane) in [
+            ("planner", true, start_pane.as_str()),
+            ("builder", false, worker_pane.as_str()),
+        ] {
+            let resp = issue_json_request(
+                &server,
+                serde_json::Value::Object(configured_role_payload(
+                    &prepared.token,
+                    &prepared.path,
+                    role,
+                    is_start,
+                    pane,
+                )),
+            )
+            .await;
+            assert!(resp.ok, "pi_start={pi_start} {role}: {:?}", resp.error);
+            ids.push(resp.id.expect("a served start reports its id"));
+        }
+
+        let expected_start_type = if pi_start {
+            AgentType::Pi
+        } else {
+            AgentType::OpenCode
+        };
+        assert_eq!(
+            server.registry.spawn_agent_type(&ids[0]),
+            Some(expected_start_type),
+            "pi_start={pi_start}: the start role runs as its declared agent"
+        );
+        // PRD #1666 S5: the seed is the pane's first inbox message.
+        let start_seed = server
+            .registry
+            .inbox()
+            .rendered(&start_pane)
+            .into_iter()
+            .map(|delivery| delivery.text)
+            .find(|text| text.contains(prepared.prompt.as_str()));
+        assert_eq!(
+            start_seed.is_some(),
+            pi_start,
+            "pi_start={pi_start}: only a Pi start role is seeded by the deck, with the \
+             preparation's own coordinator prompt"
+        );
+        assert!(
+            server.registry.inbox().list(&worker_pane).is_empty(),
+            "pi_start={pi_start}: a Pi worker role is never seeded — it is not the coordinator"
+        );
+        for id in ids {
+            server.registry.close_agent(&id).unwrap();
+        }
+    }
+}
+
 /// PRD #819 M2/M5: the `Hello` reply advertises each project verb explicitly,
 /// and leaves `guarded_send` exactly where PRD #20 put it.
 #[tokio::test]
@@ -2462,6 +2656,7 @@ async fn hello_advertises_the_project_capabilities() {
         &AttachRequest::Hello {
             client_version: PROTOCOL_VERSION,
             client_build_version: None,
+            follow_on: false,
         },
     )
     .await;
@@ -2478,14 +2673,45 @@ async fn hello_advertises_the_project_capabilities() {
         );
     }
 
-    // The PRD #20 boolean is NOT folded into the list: an older client reads
-    // only the boolean, and moving it would break that client for no gain.
-    assert_eq!(resp.guarded_send, Some(true));
+    // PRD #1666 removed the guarded send, so nothing advertises it.
     assert!(
         !advertised
             .iter()
             .any(|c| c == "guarded_send" || c == "guarded-send"),
-        "guarded_send stays its own field: {advertised:?}"
+        "nothing advertises the removed guarded send: {advertised:?}"
+    );
+}
+
+/// PRD #1487: the live `Hello` reply names the daemon process, the same on
+/// every connection to it — an upgrade tells the old daemon from its
+/// successor by it.
+#[tokio::test]
+async fn hello_names_the_daemon_process() {
+    let server = start_server().await;
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let mut s = UnixStream::connect(&server.path).await.unwrap();
+        write_request(
+            &mut s,
+            &AttachRequest::Hello {
+                client_version: PROTOCOL_VERSION,
+                client_build_version: None,
+                follow_on: false,
+            },
+        )
+        .await;
+        let resp = read_response(&mut s).await;
+        assert!(resp.ok);
+        seen.push(
+            resp.instance_id
+                .expect("Hello must name the daemon process"),
+        );
+    }
+    assert_eq!(seen[0], seen[1], "one process, one identity");
+    assert!(!seen[0].is_empty());
+    assert_eq!(
+        seen[0].as_str(),
+        dot_agent_deck::daemon_protocol::daemon_instance_id()
     );
 }
 
@@ -2530,423 +2756,6 @@ fn pane_input_005_stream_rejects_key_and_paste_after_live_transition() {
     runtime.block_on(pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner());
 }
 
-/// Scenario: Queue prompts for paned agents, then omit or replace their agent or
-/// logical-session identity before delivery. The daemon must fail closed without
-/// writing, while exact identities and genuinely sessionless agents still deliver.
-#[spec("prompt/pane-input/009")]
-#[test]
-fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build stale-delivery runtime");
-    runtime.block_on(async {
-        // PRD #365 M2: the wire `StartAgent` path can no longer produce two
-        // agents sharing one `pane_id_env` — the daemon always mints its own,
-        // distinct every time (`daemon/pane-id/001`). This scenario's premise
-        // — a NEW agent taking over the SAME pane after the old one closed —
-        // still needs to exist for the guard below to mean anything, and it
-        // still does in production (`AgentPtyRegistry::respawn_agent_for_pane`
-        // is exactly this: a crashed pane's respawn reuses its `pane_id_env`
-        // so the TUI's existing pane box keeps pointing at the right agent).
-        // Reconstruct it the same way: bypass the wire and spawn both agents
-        // directly against the registry with the identical `pane_id_env`.
-        let server = start_server().await;
-        let pane_id = "pane-rebound-before-delivery";
-        let original_id = spawn_agent_direct_for_pane(&server, "/bin/sh", pane_id);
-        server.registry.close_agent(&original_id).unwrap();
-        let replacement_id = spawn_agent_direct_for_pane(&server, "/bin/sh", pane_id);
-        let mut replacement = connect_attach(&server, &replacement_id).await;
-        let marker = b"STALE-PROMPT-REACHED-REPLACEMENT";
-
-        let response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'STALE-PROMPT-REACHED-REPLACEMENT\\n'",
-                "expected_agent_id": original_id,
-                "expected_session_id": "original-session",
-                "delivery_id": "stale-delivery-009"
-            }),
-        )
-        .await;
-        let reached_replacement =
-            stream_contains_within(&mut replacement, marker, Duration::from_millis(750)).await;
-
-        assert!(
-            matches!(
-                response.send_result,
-                Some(SendResult::WrongSession | SendResult::Stale)
-            ) && !reached_replacement,
-            "identity-bearing stale delivery must return WrongSession/Stale and write no bytes to the replacement; result={:?}, reached_replacement={reached_replacement}",
-            response.send_result
-        );
-
-        server.registry.close_agent(&replacement_id).unwrap();
-
-        let server = start_server().await;
-        let proposed_pane_id = "pane-same-agent-new-session";
-        let (agent_id, pane_id) =
-            start_plain_agent_for_pane(&server, "/bin/sh", proposed_pane_id).await;
-        let pane_id = pane_id.as_str();
-        let event = |session_id: &str, timestamp| AgentEvent {
-            session_id: session_id.to_string(),
-            agent_type: AgentType::Codex,
-            event_type: EventType::SessionStart,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp,
-            user_prompt: None,
-            metadata: Default::default(),
-            pane_id: Some(pane_id.to_string()),
-            agent_id: Some(agent_id.clone()),
-            agent_version: None,
-            schema_version: None,
-            live_target: Some(LiveTarget {
-                kind: TargetKind::Pty,
-                writable: Writable::Live,
-            }),
-            model: None,
-        };
-        {
-            let mut state = server.state.write().await;
-            state.register_pane(pane_id.to_string());
-            state.apply_event(event("old-logical-session", chrono::Utc::now()));
-        }
-        let mut attached = connect_attach(&server, &agent_id).await;
-        {
-            let mut state = server.state.write().await;
-            state.apply_event(event(
-                "new-logical-session",
-                chrono::Utc::now() + chrono::Duration::seconds(1),
-            ));
-        }
-        let response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'OLD-SESSION-PROMPT-LEAKED\\n'",
-                "expected_agent_id": agent_id,
-                "expected_session_id": "old-logical-session",
-                "delivery_id": "same-agent-session-restart-009"
-            }),
-        )
-        .await;
-        let old_prompt_reached_new_session = stream_contains_within(
-            &mut attached,
-            b"OLD-SESSION-PROMPT-LEAKED",
-            Duration::from_millis(750),
-        )
-        .await;
-        let same_agent_restart_rejected = matches!(
-            response.send_result,
-            Some(SendResult::WrongSession | SendResult::Stale)
-        ) && !old_prompt_reached_new_session;
-        let same_agent_result = response.send_result;
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let (agent_id, pane_id) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-missing-current-session").await;
-        let pane_id = pane_id.as_str();
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'MISSING-SESSION-PROMPT-LEAKED\\n'",
-                "expected_agent_id": agent_id,
-                "expected_session_id": "required-session",
-                "delivery_id": "missing-current-session-009"
-            }),
-        )
-        .await;
-        let prompt_reached_sessionless_target = stream_contains_within(
-            &mut attached,
-            b"MISSING-SESSION-PROMPT-LEAKED",
-            Duration::from_millis(750),
-        )
-        .await;
-        let missing_session_rejected = matches!(
-            response.send_result,
-            Some(SendResult::WrongSession | SendResult::Stale)
-        ) && !prompt_reached_sessionless_target;
-        let missing_session_result = response.send_result;
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let pane_id = "pane-missing-expected-agent";
-        let (agent_id, pane_id) = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
-        let pane_id = pane_id.as_str();
-        server.state.write().await.register_pane(pane_id.to_string());
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'MISSING-EXPECTED-AGENT-LEAKED\n'",
-                "delivery_id": "missing-expected-agent-009"
-            }),
-        )
-        .await;
-        let missing_agent_leaked = stream_contains_within(
-            &mut attached,
-            b"MISSING-EXPECTED-AGENT-LEAKED",
-            Duration::from_millis(750),
-        )
-        .await;
-        let missing_agent_observation = (response.send_result, missing_agent_leaked);
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let pane_id = "pane-current-session-requires-expected-session";
-        let (agent_id, pane_id) = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
-        let pane_id = pane_id.as_str();
-        {
-            let mut state = server.state.write().await;
-            state.register_pane(pane_id.to_string());
-            state.apply_event(AgentEvent {
-                session_id: "current-required-session".to_string(),
-                agent_type: AgentType::Codex,
-                event_type: EventType::SessionStart,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::Utc::now(),
-                user_prompt: None,
-                metadata: Default::default(),
-                pane_id: Some(pane_id.to_string()),
-                agent_id: Some(agent_id.clone()),
-                agent_version: None,
-                schema_version: None,
-                live_target: Some(LiveTarget {
-                    kind: TargetKind::Pty,
-                    writable: Writable::Live,
-                }),
-                model: None,
-            });
-        }
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let unnamed_response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'MISSING-EXPECTED-SESSION-LEAKED\n'",
-                "expected_agent_id": agent_id,
-                "delivery_id": "missing-expected-session-009"
-            }),
-        )
-        .await;
-        let unnamed_session_leaked = stream_contains_within(
-            &mut attached,
-            b"MISSING-EXPECTED-SESSION-LEAKED",
-            Duration::from_millis(750),
-        )
-        .await;
-        let matching_response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'MATCHING-IDENTITY-DELIVERED\n'",
-                "expected_agent_id": agent_id,
-                "expected_session_id": "current-required-session",
-                "delivery_id": "matching-identity-009"
-            }),
-        )
-        .await;
-        let matching_identity_reached = stream_contains_within(
-            &mut attached,
-            b"MATCHING-IDENTITY-DELIVERED",
-            Duration::from_millis(750),
-        )
-        .await;
-        let session_guard_observation = (
-            unnamed_response.send_result,
-            unnamed_session_leaked,
-            matching_response.send_result,
-            matching_identity_reached,
-        );
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let pane_id = "pane-unattached-current-session-requires-expected-session";
-        let (agent_id, pane_id) = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
-        let pane_id = pane_id.as_str();
-        {
-            let mut state = server.state.write().await;
-            state.register_pane(pane_id.to_string());
-            state.apply_event(AgentEvent {
-                session_id: "unattached-current-session".to_string(),
-                agent_type: AgentType::Codex,
-                event_type: EventType::SessionStart,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::Utc::now(),
-                user_prompt: None,
-                metadata: Default::default(),
-                pane_id: Some(pane_id.to_string()),
-                agent_id: Some(agent_id.clone()),
-                agent_version: None,
-                schema_version: None,
-                live_target: Some(LiveTarget {
-                    kind: TargetKind::Pty,
-                    writable: Writable::Live,
-                }),
-                model: None,
-            });
-        }
-        assert_eq!(
-            server.registry.receiver_count(&agent_id),
-            Some(0),
-            "the unattached regression case must have no attach subscriber"
-        );
-        let unattached_response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'UNATTACHED-MISSING-EXPECTED-SESSION-LEAKED\n'",
-                "expected_agent_id": agent_id,
-                "delivery_id": "unattached-missing-expected-session-009"
-            }),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(750)).await;
-        let unattached_scrollback = server.registry.snapshot(&agent_id).unwrap();
-        let unattached_marker = b"UNATTACHED-MISSING-EXPECTED-SESSION-LEAKED";
-        let unattached_session_guard_observation = (
-            unattached_response.send_result,
-            unattached_scrollback
-                .windows(unattached_marker.len())
-                .any(|window| window == unattached_marker),
-        );
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let pane_id = "pane-legitimately-sessionless";
-        let (agent_id, pane_id) = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
-        let pane_id = pane_id.as_str();
-        server.state.write().await.register_pane(pane_id.to_string());
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'SESSIONLESS-AGENT-DELIVERED\n'",
-                "expected_agent_id": agent_id,
-                "delivery_id": "sessionless-agent-009"
-            }),
-        )
-        .await;
-        let sessionless_reached = stream_contains_within(
-            &mut attached,
-            b"SESSIONLESS-AGENT-DELIVERED",
-            Duration::from_millis(750),
-        )
-        .await;
-        let sessionless_observation = (response.send_result, sessionless_reached);
-        server.registry.close_agent(&agent_id).unwrap();
-
-        assert!(
-            same_agent_restart_rejected
-                && missing_session_rejected
-                && missing_agent_observation == (Some(SendResult::NoLiveTarget), false)
-                && session_guard_observation
-                    == (
-                        Some(SendResult::Stale),
-                        false,
-                        Some(SendResult::Applied),
-                        true,
-                    )
-                // Fix-round note (14th upstream sync): this sub-scenario omits
-                // `expected_session_id` entirely, so it exercises issue #608's
-                // UNNAMED-session arm, not PRD #20 R20-003 finding #4's NAMED-session
-                // one — the comment that used to sit here invoked finding #4's
-                // original attached-only carve-out, but that carve-out was never
-                // finding #4's to begin with for this arm. `compute_write_and_submit_outcome`'s
-                // own doc (`src/daemon_protocol.rs`) states plainly, and unchanged since
-                // issue #608 predates this sync (commit `83893cc4`), that the unnamed
-                // arm "deliberately does not read" attachment: a pane that HAS a
-                // current hook session is a conversation the daemon knows about that
-                // the caller did not name, so the write is refused (`Stale`)
-                // regardless of whether anything is attached to watch it. This
-                // sub-scenario's fixture applies a genuine `SessionStart`
-                // establishing exactly such a current session, so `Stale`/no-leak is
-                // the correct, already-documented outcome — not `Applied`.
-                && unattached_session_guard_observation == (Some(SendResult::Stale), false)
-                && sessionless_observation == (Some(SendResult::Applied), true),
-            "guarded paned delivery must fail closed on absent identity without weakening valid sends; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target}), missing_agent={missing_agent_observation:?}, session_guard={session_guard_observation:?}, unattached_session_guard={unattached_session_guard_observation:?}, sessionless={sessionless_observation:?}",
-            same_agent_result,
-            missing_session_result
-        );
-    });
-}
-
-/// Scenario: Send guarded write requests whose agent, session, or delivery identity has the wrong JSON type. Every malformed request must be rejected and no submitted marker may reach the pane PTY.
-#[spec("prompt/pane-input/017")]
-#[test]
-fn pane_input_017_malformed_guard_identity_fails_closed() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build malformed-guard runtime");
-    runtime.block_on(async {
-        let malformed_fields = [
-            ("expected_agent_id", serde_json::json!(123)),
-            ("expected_session_id", serde_json::json!(["wrong-type"])),
-            ("delivery_id", serde_json::json!({"wrong": "type"})),
-        ];
-        let mut observations = Vec::new();
-
-        for (field, malformed_value) in malformed_fields {
-            let server = start_server().await;
-            let proposed_pane_id = format!("pane-malformed-{field}");
-            let (agent_id, pane_id) =
-                start_plain_agent_for_pane(&server, "/bin/sh", &proposed_pane_id).await;
-            let mut attached = connect_attach(&server, &agent_id).await;
-            let marker = format!("MALFORMED-{}-LEAKED", field.to_ascii_uppercase());
-            let mut request = serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": format!("printf '{marker}\\n'")
-            });
-            request[field] = malformed_value;
-
-            let response = issue_json_request(&server, request).await;
-            let (leaked, _) = observe_stream_input_outcome(
-                &mut attached,
-                marker.as_bytes(),
-                Duration::from_millis(750),
-            )
-            .await;
-            observations.push((field, response.ok, response.send_result, leaked));
-            server.registry.close_agent(&agent_id).unwrap();
-        }
-
-        assert!(
-            observations.iter().all(|(_, ok, result, leaked)| {
-                (!ok
-                    || !matches!(
-                        result,
-                        Some(SendResult::Applied | SendResult::Queued)
-                    )) && !leaked
-            }),
-            "present-but-malformed guarded-send identity must fail closed and write no bytes; observations={observations:?}"
-        );
-    });
-}
-
 /// Scenario: Attach to a history-only agent that has no pane environment identity, then send stream input. The daemon must return a typed rejection and must not write the submitted marker to the agent PTY.
 #[spec("prompt/pane-input/018")]
 #[test]
@@ -2987,6 +2796,8 @@ fn pane_input_018_paneless_history_target_rejects_stream_input() {
                 writable: Writable::HistoryOnly,
             }),
             model: None,
+            background: None,
+            background_revision: None,
         });
         let mut attached = connect_attach(&server, &agent_id).await;
         let marker = b"PANELESS-HISTORY-INPUT-LEAKED";
@@ -3007,710 +2818,6 @@ fn pane_input_018_paneless_history_target_rejects_stream_input() {
                     .is_some_and(|(kind, reason)| *kind == KIND_STREAM_REJECT && !reason.is_empty()),
             "a pane-less history-only target must reject stream input without writing it; leaked={leaked}, rejection={rejection:?}"
         );
-        server.registry.close_agent(&agent_id).unwrap();
-    });
-}
-
-/// Scenario: Start a newer logical session on a live pane, then deliver delayed activity and end events from an older generation or timestamp. Stale terminal events must preserve the current generation, while a current terminal event clears it and guarded prompts retain the correct routing behavior.
-#[spec("prompt/pane-input/019")]
-#[test]
-fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build monotonic-generation runtime");
-    runtime.block_on(async {
-        let server = start_server().await;
-        let (agent_id, pane_id) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-late-prior-activity").await;
-        let pane_id = pane_id.as_str();
-        let now = chrono::Utc::now();
-        let event = |session_id: &str, event_type, timestamp| AgentEvent {
-            session_id: session_id.to_string(),
-            agent_type: AgentType::Codex,
-            event_type,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp,
-            user_prompt: None,
-            metadata: Default::default(),
-            pane_id: Some(pane_id.to_string()),
-            agent_id: Some(agent_id.clone()),
-            agent_version: None,
-            schema_version: None,
-            live_target: Some(LiveTarget {
-                kind: TargetKind::Pty,
-                writable: Writable::Live,
-            }),
-            model: None,
-        };
-        {
-            let mut state = server.state.write().await;
-            state.register_pane(pane_id.to_string());
-            state.apply_event(event("prior-generation", EventType::SessionStart, now));
-            state.apply_event(event(
-                "current-generation",
-                EventType::SessionStart,
-                now + chrono::Duration::seconds(2),
-            ));
-            state.apply_event(event(
-                "prior-generation",
-                EventType::Thinking,
-                now + chrono::Duration::seconds(1),
-            ));
-        }
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let stale = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'REGRESSED-STALE-PROMPT\\n'",
-                "expected_agent_id": agent_id,
-                "expected_session_id": "prior-generation",
-                "delivery_id": "late-prior-activity-stale"
-            }),
-        )
-        .await;
-        let (stale_leaked, _) = observe_stream_input_outcome(
-            &mut attached,
-            b"REGRESSED-STALE-PROMPT",
-            Duration::from_millis(500),
-        )
-        .await;
-        let current = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'CURRENT-PROMPT-AFTER-LATE-ACTIVITY\\n'",
-                "expected_agent_id": agent_id,
-                "expected_session_id": "current-generation",
-                "delivery_id": "late-prior-activity-current"
-            }),
-        )
-        .await;
-        let (current_reached, _) = observe_stream_input_outcome(
-            &mut attached,
-            b"CURRENT-PROMPT-AFTER-LATE-ACTIVITY",
-            Duration::from_millis(750),
-        )
-        .await;
-        let activity_observation = (
-            stale.send_result,
-            stale_leaked,
-            current.send_result,
-            current_reached,
-        );
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let (agent_id, pane_id) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-late-prior-end").await;
-        let pane_id = pane_id.as_str();
-        let event = |session_id: &str, event_type, timestamp| AgentEvent {
-            session_id: session_id.to_string(),
-            agent_type: AgentType::Codex,
-            event_type,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp,
-            user_prompt: None,
-            metadata: Default::default(),
-            pane_id: Some(pane_id.to_string()),
-            agent_id: Some(agent_id.clone()),
-            agent_version: None,
-            schema_version: None,
-            live_target: Some(LiveTarget {
-                kind: TargetKind::Pty,
-                writable: Writable::Live,
-            }),
-            model: None,
-        };
-        {
-            let mut state = server.state.write().await;
-            state.register_pane(pane_id.to_string());
-            state.apply_event(event("prior-generation", EventType::SessionStart, now));
-            state.apply_event(event(
-                "current-generation",
-                EventType::SessionStart,
-                now + chrono::Duration::seconds(2),
-            ));
-            state.apply_event(event(
-                "prior-generation",
-                EventType::SessionEnd,
-                now + chrono::Duration::seconds(1),
-            ));
-        }
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let current_after_end = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'CURRENT-PROMPT-AFTER-LATE-END\\n'",
-                "expected_agent_id": agent_id,
-                "expected_session_id": "current-generation",
-                "delivery_id": "late-prior-end-current"
-            }),
-        )
-        .await;
-        let (current_after_end_reached, _) = observe_stream_input_outcome(
-            &mut attached,
-            b"CURRENT-PROMPT-AFTER-LATE-END",
-            Duration::from_millis(750),
-        )
-        .await;
-        let end_observation = (current_after_end.send_result, current_after_end_reached);
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let pane_id = "pane-stale-same-session-end";
-        let session_id = "same-session-generation";
-        let mut state = AppState::default();
-        state.register_pane(pane_id.to_string());
-        let event = |event_type, timestamp| AgentEvent {
-            session_id: session_id.to_string(),
-            agent_type: AgentType::Codex,
-            event_type,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp,
-            user_prompt: None,
-            metadata: Default::default(),
-            pane_id: Some(pane_id.to_string()),
-            agent_id: Some("same-session-agent".to_string()),
-            agent_version: None,
-            schema_version: None,
-            live_target: Some(LiveTarget {
-                kind: TargetKind::Pty,
-                writable: Writable::Live,
-            }),
-            model: None,
-        };
-        state.apply_event(event(EventType::SessionStart, now));
-        state.apply_event(event(
-            EventType::Thinking,
-            now + chrono::Duration::seconds(2),
-        ));
-        state.apply_event(event(
-            EventType::SessionEnd,
-            now + chrono::Duration::seconds(1),
-        ));
-        assert_eq!(
-            state.pane_hook_session_id(pane_id).as_deref(),
-            Some(session_id),
-            "an older SessionEnd for the same session must not clear its newer generation"
-        );
-        state.apply_event(event(
-            EventType::SessionEnd,
-            now + chrono::Duration::seconds(2),
-        ));
-        assert_eq!(
-            state.pane_hook_session_id(pane_id),
-            None,
-            "a SessionEnd matching the stored generation timestamp must clear it"
-        );
-
-        assert!(
-            !matches!(
-                activity_observation.0,
-                Some(SendResult::Applied | SendResult::Queued)
-            ) && !activity_observation.1
-                && activity_observation.2 == Some(SendResult::Applied)
-                && activity_observation.3
-                && end_observation.0 == Some(SendResult::Applied)
-                && end_observation.1,
-            "late prior-generation events must not restore or clear the current guarded-send generation; activity={activity_observation:?}, end={end_observation:?}"
-        );
-    });
-}
-
-/// Scenario: Send guarded prompts to pane-less agents through the no-pane sentinel. A missing agent identity and declared history-only targets must reject without bytes, including after the writer lock, while an identified live target still receives its prompt.
-#[spec("prompt/pane-input/020")]
-#[test]
-fn pane_input_020_paneless_guarded_send_resolves_writability_by_agent() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build pane-less guarded-send runtime");
-    runtime.block_on(async {
-        let paneless_event = |agent_id: &str,
-                               session_id: &str,
-                               event_type,
-                               timestamp,
-                               writable| AgentEvent {
-            session_id: session_id.to_string(),
-            agent_type: AgentType::Codex,
-            event_type,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp,
-            user_prompt: None,
-            metadata: Default::default(),
-            pane_id: None,
-            agent_id: Some(agent_id.to_string()),
-            agent_version: None,
-            schema_version: None,
-            live_target: Some(LiveTarget {
-                kind: TargetKind::Process,
-                writable,
-            }),
-            model: None,
-        };
-
-        let server = start_server().await;
-        let agent_id = start_agent(&server, "/bin/sh").await;
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let unidentified_response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": "<no-pane>",
-                "text": "printf 'PANELESS-UNIDENTIFIED-LEAKED\n'",
-                "delivery_id": "paneless-unidentified-020"
-            }),
-        )
-        .await;
-        let unidentified_leaked = stream_contains_within(
-            &mut attached,
-            b"PANELESS-UNIDENTIFIED-LEAKED",
-            Duration::from_millis(500),
-        )
-        .await;
-        let unidentified_observation = (unidentified_response.send_result, unidentified_leaked);
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let agent_id = start_agent(&server, "/bin/sh").await;
-        server.state.write().await.apply_event(paneless_event(
-            &agent_id,
-            "paneless-pre-lock-history",
-            EventType::SessionStart,
-            chrono::Utc::now(),
-            Writable::HistoryOnly,
-        ));
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let history_response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": "<no-pane>",
-                "text": "printf 'PANELESS-PRELOCK-HISTORY-LEAKED\\n'",
-                "expected_agent_id": agent_id,
-                "delivery_id": "paneless-pre-lock-history-020"
-            }),
-        )
-        .await;
-        let history_leaked = stream_contains_within(
-            &mut attached,
-            b"PANELESS-PRELOCK-HISTORY-LEAKED",
-            Duration::from_millis(500),
-        )
-        .await;
-        let history_observation = (history_response.send_result, history_leaked);
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let agent_id = start_agent(&server, "/bin/sh").await;
-        let now = chrono::Utc::now();
-        server.state.write().await.apply_event(paneless_event(
-            &agent_id,
-            "paneless-post-lock-history",
-            EventType::SessionStart,
-            now,
-            Writable::Live,
-        ));
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let writer = server.registry.subscribe(&agent_id).unwrap().writer;
-        let writer_guard = writer.lock().await;
-        let path = server.path.clone();
-        let request_agent_id = agent_id.clone();
-        let mut request_task = tokio::spawn(async move {
-            let mut stream = UnixStream::connect(path).await.unwrap();
-            let payload = serde_json::to_vec(&serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": "<no-pane>",
-                "text": "printf 'PANELESS-POSTLOCK-HISTORY-LEAKED\\n'",
-                "expected_agent_id": request_agent_id,
-                "delivery_id": "paneless-post-lock-history-020"
-            }))
-            .unwrap();
-            write_frame(&mut stream, KIND_REQ, &payload).await;
-            read_response(&mut stream).await
-        });
-        let early_response = tokio::time::timeout(Duration::from_millis(250), &mut request_task)
-            .await
-            .ok()
-            .map(|result| result.unwrap());
-        let waited_for_writer = early_response.is_none();
-        server.state.write().await.apply_event(paneless_event(
-            &agent_id,
-            "paneless-post-lock-history",
-            EventType::Thinking,
-            now + chrono::Duration::seconds(1),
-            Writable::HistoryOnly,
-        ));
-        drop(writer_guard);
-        let post_lock_response = match early_response {
-            Some(response) => response,
-            None => request_task.await.unwrap(),
-        };
-        let post_lock_leaked = stream_contains_within(
-            &mut attached,
-            b"PANELESS-POSTLOCK-HISTORY-LEAKED",
-            Duration::from_millis(500),
-        )
-        .await;
-        let post_lock_observation = (
-            waited_for_writer,
-            post_lock_response.send_result,
-            post_lock_leaked,
-        );
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let agent_id = start_agent(&server, "/bin/sh").await;
-        server.state.write().await.apply_event(paneless_event(
-            &agent_id,
-            "paneless-live",
-            EventType::SessionStart,
-            chrono::Utc::now(),
-            Writable::Live,
-        ));
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let live_response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": "<no-pane>",
-                "text": "printf 'PANELESS-LIVE-DELIVERED\\n'",
-                "expected_agent_id": agent_id,
-                "delivery_id": "paneless-live-020"
-            }),
-        )
-        .await;
-        let live_reached = stream_contains_within(
-            &mut attached,
-            b"PANELESS-LIVE-DELIVERED",
-            Duration::from_millis(750),
-        )
-        .await;
-        let live_observation = (live_response.send_result, live_reached);
-        server.registry.close_agent(&agent_id).unwrap();
-
-        assert!(
-            unidentified_observation == (Some(SendResult::NoLiveTarget), false)
-                && history_observation == (Some(SendResult::HistoryOnly), false)
-                && post_lock_observation.0
-                && !matches!(
-                    post_lock_observation.1,
-                    Some(SendResult::Applied | SendResult::Queued)
-                )
-                && !post_lock_observation.2
-                && live_observation == (Some(SendResult::Applied), true),
-            "guarded sends must resolve pane-less writability and routing by agent identity; unidentified={unidentified_observation:?}, pre_lock={history_observation:?}, post_lock={post_lock_observation:?}, live={live_observation:?}"
-        );
-    });
-}
-
-/// Scenario: Retry identical deliveries sequentially and concurrently, then reuse
-/// an ID with a different payload or target. Identical work must submit once,
-/// while conflicting fingerprints must never replay a false successful result.
-/// The sequential case omits a session assertion because session authorization is
-/// covered separately; this scenario isolates delivery idempotency.
-#[spec("prompt/pane-input/010")]
-#[test]
-fn pane_input_010_retry_after_lost_response_is_idempotent() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build idempotency runtime");
-    runtime.block_on(async {
-        let server = start_server().await;
-        let (agent_id, pane_id) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-idempotent-delivery").await;
-        let pane_id = pane_id.as_str();
-        let counter_path = server._dir.path().join("delivery-count");
-        let request = serde_json::json!({
-            "op": "write-and-submit",
-            "pane_id": pane_id,
-            "text": format!("printf x >> {}", counter_path.display()),
-            "expected_agent_id": agent_id,
-            "delivery_id": "stable-delivery-010"
-        });
-
-        let first = issue_json_request(&server, request.clone()).await;
-        // The consumer loses `first` and retries the exact same delivery ID.
-        let retry = issue_json_request(&server, request).await;
-        // Wait for the one legitimate write to actually execute, then hold still
-        // long enough for a second one to show up if the retry wrongly submitted.
-        // Without the wait, an "Applied" response says only that bytes reached
-        // the PTY, so an empty read here is indistinguishable from a double
-        // submit — which is how this arm failed on a macOS CI runner.
-        wait_for_delivery_writes(
-            &counter_path,
-            "x",
-            "the first delivery must reach the shell exactly once",
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let writes = std::fs::read_to_string(&counter_path).unwrap_or_default();
-
-        assert_eq!(
-            writes,
-            "x",
-            "retrying one applied delivery must not submit twice; first={:?}, retry={:?}, file={writes:?}",
-            first.send_result,
-            retry.send_result
-        );
-
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let (agent_id, pane_id) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-concurrent-idempotent-delivery")
-                .await;
-        let pane_id = pane_id.as_str();
-        let counter_path = server._dir.path().join("concurrent-delivery-count");
-        let request = serde_json::json!({
-            "op": "write-and-submit",
-            "pane_id": pane_id,
-            "text": format!("printf x >> {}", counter_path.display()),
-            "expected_agent_id": agent_id,
-            "delivery_id": "concurrent-delivery-010"
-        });
-        let writer = server.registry.subscribe(&agent_id).unwrap().writer;
-        let writer_guard = writer.lock().await;
-        let path = server.path.clone();
-        let first_request = request.clone();
-        let mut first_task = tokio::spawn(async move {
-            let mut stream = UnixStream::connect(path).await.unwrap();
-            let payload = serde_json::to_vec(&first_request).unwrap();
-            write_frame(&mut stream, KIND_REQ, &payload).await;
-            read_response(&mut stream).await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), &mut first_task)
-                .await
-                .is_err(),
-            "precondition: first delivery must be waiting on the held writer"
-        );
-        let path = server.path.clone();
-        let mut second_task = tokio::spawn(async move {
-            let mut stream = UnixStream::connect(path).await.unwrap();
-            let payload = serde_json::to_vec(&request).unwrap();
-            write_frame(&mut stream, KIND_REQ, &payload).await;
-            read_response(&mut stream).await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), &mut second_task)
-                .await
-                .is_err(),
-            "precondition: concurrent duplicate must also be waiting on the held writer"
-        );
-        drop(writer_guard);
-        let concurrent_first = first_task.await.unwrap();
-        let concurrent_second = second_task.await.unwrap();
-        // Same reasoning as the sequential arm: wait for the single legitimate
-        // write to execute before giving a duplicate its chance to appear. The
-        // fixed sleep alone assumed the shell had already run.
-        wait_for_delivery_writes(
-            &counter_path,
-            "x",
-            "the admitted concurrent delivery must reach the shell exactly once",
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let concurrent_writes = std::fs::read_to_string(&counter_path).unwrap_or_default();
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let (agent_id, pane_id) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-payload-fingerprint").await;
-        let pane_id = pane_id.as_str();
-        let fingerprint_path = server._dir.path().join("payload-fingerprint");
-        let first = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": format!("printf a >> {}", fingerprint_path.display()),
-                "expected_agent_id": agent_id,
-                "delivery_id": "fingerprint-delivery-010"
-            }),
-        )
-        .await;
-        let conflicting_payload = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": format!("printf b >> {}", fingerprint_path.display()),
-                "expected_agent_id": agent_id,
-                "delivery_id": "fingerprint-delivery-010"
-            }),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let payload_writes = std::fs::read_to_string(&fingerprint_path).unwrap_or_default();
-        let payload_conflict_not_replayed = !matches!(
-            conflicting_payload.send_result,
-            Some(SendResult::Applied | SendResult::Queued)
-        ) || payload_writes == "ab";
-        server.registry.close_agent(&agent_id).unwrap();
-
-        let server = start_server().await;
-        let (first_agent, first_pane) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-target-fingerprint-a").await;
-        let (second_agent, second_pane) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-target-fingerprint-b").await;
-        let first_pane = first_pane.as_str();
-        let second_pane = second_pane.as_str();
-        let first_path = server._dir.path().join("target-a");
-        let second_path = server._dir.path().join("target-b");
-        let _ = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": first_pane,
-                "text": format!("printf a >> {}", first_path.display()),
-                "expected_agent_id": first_agent,
-                "delivery_id": "target-fingerprint-delivery-010"
-            }),
-        )
-        .await;
-        let conflicting_target = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": second_pane,
-                "text": format!("printf b >> {}", second_path.display()),
-                "expected_agent_id": second_agent,
-                "delivery_id": "target-fingerprint-delivery-010"
-            }),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let target_writes = std::fs::read_to_string(&second_path).unwrap_or_default();
-        let target_conflict_not_replayed = !matches!(
-            conflicting_target.send_result,
-            Some(SendResult::Applied | SendResult::Queued)
-        ) || target_writes == "b";
-        server.registry.close_agent(&first_agent).unwrap();
-        server.registry.close_agent(&second_agent).unwrap();
-
-        assert!(
-            concurrent_writes == "x"
-                && payload_conflict_not_replayed
-                && target_conflict_not_replayed,
-            "delivery IDs must be atomic and fingerprint-bound; concurrent=(first={:?}, second={:?}, writes={concurrent_writes:?}), payload=(first={:?}, conflict={:?}, writes={payload_writes:?}), target=(conflict={:?}, writes={target_writes:?})",
-            concurrent_first.send_result,
-            concurrent_second.send_result,
-            first.send_result,
-            conflicting_payload.send_result,
-            conflicting_target.send_result
-        );
-    });
-}
-
-/// Scenario: Hold a live pane's PTY writer, begin an atomic prompt delivery so
-/// authorization completes and the write blocks, then make the session
-/// history-only before releasing the writer. No bytes may pass that stale check.
-#[spec("prompt/pane-input/013")]
-#[test]
-fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build liveness barrier runtime");
-    runtime.block_on(async {
-        let server = start_server().await;
-        let (agent_id, pane_id) =
-            start_plain_agent_for_pane(&server, "/bin/sh", "pane-liveness-barrier").await;
-        let now = chrono::Utc::now();
-        let event = |event_type, writable| AgentEvent {
-            session_id: "liveness-barrier-session".to_string(),
-            agent_type: AgentType::Codex,
-            event_type,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp: now,
-            user_prompt: None,
-            metadata: Default::default(),
-            pane_id: Some(pane_id.clone()),
-            agent_id: Some(agent_id.clone()),
-            agent_version: None,
-            schema_version: None,
-            live_target: Some(LiveTarget {
-                kind: TargetKind::Pty,
-                writable,
-            }),
-            model: None,
-        };
-        {
-            let mut state = server.state.write().await;
-            state.register_pane(pane_id.clone());
-            state.apply_event(event(EventType::SessionStart, Writable::Live));
-        }
-
-        let mut attached = connect_attach(&server, &agent_id).await;
-        let writer = server.registry.subscribe(&agent_id).unwrap().writer;
-        let writer_guard = writer.lock().await;
-        let path = server.path.clone();
-        let request_agent_id = agent_id.clone();
-        let request_pane_id = pane_id.clone();
-        let mut request_task = tokio::spawn(async move {
-            let mut stream = UnixStream::connect(path).await.unwrap();
-            let payload = serde_json::to_vec(&serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": request_pane_id,
-                "text": "printf 'STALE-LIVENESS-WRITE\\n'",
-                "expected_agent_id": request_agent_id,
-                "expected_session_id": "liveness-barrier-session",
-                "delivery_id": "liveness-barrier-013"
-            }))
-            .unwrap();
-            write_frame(&mut stream, KIND_REQ, &payload).await;
-            read_response(&mut stream).await
-        });
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), &mut request_task)
-                .await
-                .is_err(),
-            "precondition: delivery must be waiting on the held PTY writer"
-        );
-        {
-            let mut state = server.state.write().await;
-            state.apply_event(event(EventType::Thinking, Writable::HistoryOnly));
-        }
-        drop(writer_guard);
-
-        let response = request_task.await.unwrap();
-        let stale_bytes_reached_target = stream_contains_within(
-            &mut attached,
-            b"STALE-LIVENESS-WRITE",
-            Duration::from_millis(750),
-        )
-        .await;
-        assert!(
-            !matches!(
-                response.send_result,
-                Some(SendResult::Applied | SendResult::Queued)
-            ) && !stale_bytes_reached_target,
-            "a target that became history-only while waiting for its writer must reject delivery; result={:?}, bytes_reached_target={stale_bytes_reached_target}",
-            response.send_result
-        );
-
         server.registry.close_agent(&agent_id).unwrap();
     });
 }
@@ -3754,6 +2861,8 @@ fn stream_write_revalidates_liveness_after_writer_lock() {
                 writable,
             }),
             model: None,
+            background: None,
+            background_revision: None,
         };
         {
             let mut state = server.state.write().await;
@@ -3820,6 +2929,8 @@ async fn pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner
         schema_version: None,
         live_target: Some(live_target),
         model: None,
+        background: None,
+        background_revision: None,
     };
     {
         let mut state = server.state.write().await;
@@ -3928,6 +3039,8 @@ fn pane_input_014_stream_liveness_race_returns_typed_rejection() {
                     writable,
                 }),
                 model: None,
+                background: None,
+                background_revision: None,
             };
             {
                 let mut state = server.state.write().await;
@@ -4097,6 +3210,7 @@ async fn attach_unknown_agent_returns_err() {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         },
     )
     .await;
@@ -4124,6 +3238,9 @@ async fn start_agent_rejects_blank_command() {
             agent_type: None,
             seed: None,
             isolated_clone_origin: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -4328,6 +3445,7 @@ async fn slow_client_dropped_within_bounded_time() {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         },
     )
     .await;
@@ -4870,6 +3988,8 @@ fn filler_event(n: usize) -> AgentEvent {
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -4927,4 +4047,140 @@ async fn protocol_001_lagged_receiver_ends_the_stream_with_the_documented_reason
         "the documented tear-down reason must be exactly \"lagged\" — got {:?}",
         String::from_utf8_lossy(&reason)
     );
+}
+
+/// Issue #1396 item 2: a plain `start-agent` whose `cwd` is not a directory —
+/// a regular file, or a path that does not exist — is refused, and nothing is
+/// spawned. portable-pty's `as_command` replaces such a cwd with `$HOME`
+/// without a word, so before this the agent was started in the home directory
+/// and the deck recorded the path the caller asked for. `HOME` is pinned to a
+/// sandbox directory through the request's own env, which is the value that
+/// fallback reads, so a regression shows up as a marker there instead of in
+/// the developer's real home.
+#[tokio::test]
+async fn start_agent_refuses_a_cwd_that_is_not_a_directory() {
+    let server = start_server().await;
+    let sandbox = test_temp::tempdir().unwrap();
+    let home = sandbox.path().join("home");
+    let project = sandbox.path().join("project");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    let file = sandbox.path().join("a-file");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let missing = sandbox.path().join("missing");
+
+    let start = |cwd: &Path| AttachRequest::StartAgent {
+        command: Some("echo x > marker".into()),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        display_name: None,
+        rows: 24,
+        cols: 80,
+        env: vec![
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("SHELL".into(), "/bin/sh".into()),
+        ],
+        tab_membership: None,
+        agent_type: None,
+        seed: None,
+        authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
+        isolated_clone_origin: None,
+    };
+
+    for (what, cwd) in [("a regular file", &file), ("a missing path", &missing)] {
+        let spawned_before = server.registry.agent_records().len();
+        let mut stream = UnixStream::connect(&server.path).await.unwrap();
+        write_request(&mut stream, &start(cwd)).await;
+        let resp = read_response(&mut stream).await;
+        // A served start runs its command asynchronously; give `echo` the time
+        // it needs before looking for where it ran.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !home.join("marker").exists(),
+            "{what}: the agent was started in $HOME instead of being refused; response = {resp:?}"
+        );
+        assert!(
+            !resp.ok && resp.id.is_none(),
+            "{what}: a start-agent whose cwd is not a directory must be refused; response = {resp:?}"
+        );
+        let error = resp.error.unwrap_or_default();
+        assert!(
+            error.contains("not a directory"),
+            "{what}: the refusal must say why: {error:?}"
+        );
+        assert_eq!(
+            server.registry.agent_records().len(),
+            spawned_before,
+            "{what}: a refused start-agent must not have spawned a pane"
+        );
+    }
+
+    // Control: the same request with a real directory is served, and runs there.
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut stream, &start(&project)).await;
+    let resp = read_response(&mut stream).await;
+    assert!(
+        resp.ok,
+        "control: a directory cwd must be served: {:?}",
+        resp.error
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !project.join("marker").exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        project.join("marker").exists(),
+        "control: the agent must have run in the requested directory"
+    );
+    assert!(!home.join("marker").exists());
+
+    // A pane a prepared start created, re-created by a plain `start-agent`
+    // after its project directory was deleted (agent review, PR #1557): the same
+    // not-a-directory refusal, not the stale-preparation one. "Prepare again" is
+    // the remedy for a directory that was REPLACED; for one that is gone it
+    // would only send the user round the loop.
+    const PANE: &str = "prepared-deleted-1396";
+    let prepared = sandbox.path().join("prepared");
+    std::fs::create_dir(&prepared).unwrap();
+    let verified = dot_agent_deck::project_resolve::VerifiedProjectDir::open(&prepared).unwrap();
+    let prepared_id = server
+        .registry
+        .spawn_agent_in(
+            dot_agent_deck::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(prepared.to_str().unwrap()),
+                env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE.into())],
+                ..Default::default()
+            },
+            &verified,
+        )
+        .unwrap();
+    drop(verified);
+    server.registry.close_agent(&prepared_id).unwrap();
+    std::fs::remove_dir(&prepared).unwrap();
+
+    let mut request = start(&prepared);
+    if let AttachRequest::StartAgent { env, .. } = &mut request {
+        env.push(("DOT_AGENT_DECK_PANE_ID".into(), PANE.into()));
+    }
+    let spawned_before = server.registry.agent_records().len();
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut stream, &request).await;
+    let resp = read_response(&mut stream).await;
+    assert!(
+        !resp.ok && resp.id.is_none(),
+        "a prepared pane whose directory was deleted must be refused; response = {resp:?}"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(&format!(
+            "{}:",
+            dot_agent_deck::daemon_protocol::START_ERR_CWD_NOT_A_DIRECTORY
+        )),
+        "a deleted prepared directory gets the not-a-directory refusal, not a stale-preparation \
+         one: {error:?}"
+    );
+    assert_eq!(server.registry.agent_records().len(), spawned_before);
+    server.registry.shutdown_all();
 }

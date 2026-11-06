@@ -34,16 +34,24 @@ use dot_agent_deck::ui::{
 };
 use spec::spec;
 
+/// Issue #413: the instant `fixture_session` is built against and rendered at. The card
+/// seams take `now` instead of reading the clock, so the card's `Last:` field is
+/// a pure function of the fixture's own timestamps.
+fn render_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("a valid fixed instant")
+}
+
 /// A minimal live session for the card seams. Only the geometry matters here —
 /// no assertion in this file reads a rendered cell — so the fields carry
 /// whatever keeps `render_session_card` on its ordinary path.
 fn fixture_session() -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     SessionState {
         session_id: "sess-bound".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -56,6 +64,8 @@ fn fixture_session() -> SessionState {
         agent_id: Some("1".to_string()),
         display_name: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -65,6 +75,12 @@ fn fixture_session() -> SessionState {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -108,7 +124,7 @@ fn bounded_seams() -> Vec<Seam> {
         // Group A — through the shared `draw_to_buffer` helper.
         seam("render_stats_bar_to_buffer", |w, h| {
             let stats = DashboardStats::default();
-            let buffer = render_stats_bar_to_buffer(&stats, None, w, h);
+            let buffer = render_stats_bar_to_buffer(&stats, w, h);
             dims(&buffer)
         }),
         seam("render_quit_confirm_to_buffer", |w, h| {
@@ -123,7 +139,7 @@ fn bounded_seams() -> Vec<Seam> {
         // Group C — seams that build their own `TestBackend`.
         seam("render_help_overlay_with_bindings_to_buffer", |w, h| {
             let keybindings = KeybindingConfig::default();
-            let buffer = render_help_overlay_with_bindings_to_buffer(&keybindings, None, w, h);
+            let buffer = render_help_overlay_with_bindings_to_buffer(&keybindings, w, h);
             dims(&buffer)
         }),
         seam("render_hints_bar_to_buffer", |w, h| {
@@ -144,6 +160,7 @@ fn bounded_seams() -> Vec<Seam> {
                 Some(1),
                 CardDensityKind::Normal,
                 0,
+                render_now(),
                 false,
                 w,
                 h,
@@ -158,6 +175,7 @@ fn bounded_seams() -> Vec<Seam> {
                 Some(1),
                 CardDensityKind::Normal,
                 0,
+                render_now(),
                 false,
                 UiMode::Normal,
                 None,
@@ -170,7 +188,8 @@ fn bounded_seams() -> Vec<Seam> {
         seam("render_card_grid_to_buffer", |w, h| {
             let session = fixture_session();
             let cards = [(&session, None)];
-            let (buffer, _probe) = render_card_grid_to_buffer(&cards, Some(0), 0, w, h);
+            let (buffer, _probe) =
+                render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), w, h);
             dims(&buffer)
         }),
         seam("render_button_bar_with_bindings_to_buffer", |w, h| {
@@ -296,7 +315,7 @@ fn seam_bound_001_dashboard_cards_clamps_derived_height() {
 
     // In range on both axes: one card, honoured exactly.
     let one = [(&session, None)];
-    let buffer = render_dashboard_cards_to_buffer(&one, Some(0), density, 0, 80);
+    let buffer = render_dashboard_cards_to_buffer(&one, Some(0), density, 0, render_now(), 80);
     assert_eq!(
         dims(&buffer),
         (80, density.rendered_height()),
@@ -305,7 +324,8 @@ fn seam_bound_001_dashboard_cards_clamps_derived_height() {
 
     // An absurd width with a single card: unbounded this is ~0.5M cells, so a
     // missing clamp fails the assertion rather than the allocator.
-    let buffer = render_dashboard_cards_to_buffer(&one, Some(0), density, 0, u16::MAX);
+    let buffer =
+        render_dashboard_cards_to_buffer(&one, Some(0), density, 0, render_now(), u16::MAX);
     assert_eq!(
         dims(&buffer),
         (cap, density.rendered_height()),
@@ -320,7 +340,7 @@ fn seam_bound_001_dashboard_cards_clamps_derived_height() {
     let over_cap = usize::from(cap / density.rendered_height()) + 2;
     let cards: Vec<(&SessionState, Option<&str>)> =
         (0..over_cap).map(|_| (&session, None)).collect();
-    let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), density, 0, 24);
+    let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), density, 0, render_now(), 24);
     assert_eq!(
         dims(&buffer),
         (24, cap),
@@ -332,7 +352,8 @@ fn seam_bound_001_dashboard_cards_clamps_derived_height() {
     // capped 1024x1024 — not the 68 MILLION cells `u16::MAX` by 130 cards' worth
     // of rows asks for unbounded. Same ordering as the sibling test: a
     // regression is diagnosed by an assertion above, never by the allocator.
-    let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), density, 0, u16::MAX);
+    let buffer =
+        render_dashboard_cards_to_buffer(&cards, Some(0), density, 0, render_now(), u16::MAX);
     assert_eq!(
         dims(&buffer),
         (cap, cap),

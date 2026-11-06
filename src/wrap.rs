@@ -30,8 +30,8 @@
 //! `run_wrap` is a compiling stub (a ConPTY port is #163/#164, matching the
 //! daemon/attach story). The PURE detection layer ([`classify_line`],
 //! [`Detector`], [`RuleSet`], [`CODEX`]) and the pure command rewrite
-//! ([`wrap_launch_command`], called by the cross-platform `agent_pty`/`ui` spawn
-//! seams) stay cross-platform. On non-Unix the Unix-only helpers compile out, so
+//! ([`wrap_launch_command`], called by the cross-platform `agent_pty` spawn
+//! seam) stay cross-platform. On non-Unix the Unix-only helpers compile out, so
 //! the pure helpers they alone consume are dead there — hence the conditional
 //! `allow` below (Unix keeps full linting).
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
@@ -52,9 +52,8 @@ use chrono::Utc;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
-    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, CODEX_HOOK_TRUST_METADATA_KEY, EventType,
-    LiveTarget, SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN,
-    Writable,
+    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget,
+    SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN, Writable,
 };
 // Issue #243: the interface-origin values are named only by `InterfaceFact`,
 // which reads the inner pty's termios and so exists only where `run_wrap_pty`
@@ -103,21 +102,8 @@ pub struct RuleSet {
     /// Case-insensitive substrings that mark a line as an error/failure.
     /// Checked first, so an error line is never misread as generic activity.
     pub error_markers: &'static [&'static str],
-    /// Case-insensitive substrings that mark a *segment* as unambiguously
-    /// mid-activity, checked after `error_markers` but **before**
-    /// `idle_markers` (issue #638 round 3). A classification unit here is not
-    /// necessarily one visual line — `tee` flushes on `\n`/`\r`/the 64 KiB cap,
-    /// and a full-screen TUI repaint batch (cursor-addressed, not
-    /// newline-delimited) can land as one segment carrying both an
-    /// active-turn signal and an idle marker together. Without this
-    /// precedence, `idle_markers`' plain `contains()` would win on such a
-    /// segment and falsely report the agent idle mid-turn. Empty for the
-    /// generic set (no agent-specific active-turn hint to key off); a
-    /// per-agent set may populate it.
-    pub active_markers: &'static [&'static str],
     /// Case-insensitive substrings that mark a line as an explicit
-    /// idle/completion signal. Only consulted when no `active_markers` entry
-    /// matches the same segment. Empty for the generic set (which relies on
+    /// idle/completion signal. Empty for the generic set (which relies on
     /// process-exit quiescence instead); a per-agent set may populate it.
     pub idle_markers: &'static [&'static str],
 }
@@ -129,125 +115,51 @@ pub struct RuleSet {
 /// quiescence rather than guessed from a single line.
 pub static GENERIC: RuleSet = RuleSet {
     error_markers: &["error", "panic", "traceback", "exception", "fatal"],
-    active_markers: &[],
     idle_markers: &[],
 };
 
-/// PRD #20 M7 — the Codex (`codex exec --json`) rule set.
+/// The Codex rule set: every non-blank line is activity, and nothing else.
 ///
-/// Codex emits one compact JSON object per line on stdout (JSONL). Rather than
-/// wait for process-exit quiescence like the generic set, we key card state off
-/// the record's `type` discriminator: a `turn.completed` record ends the turn
-/// (Idle) while the process is still alive, an `error` record is a failure, and
-/// every other record (`turn.started`, `item.started` reasoning /
-/// `command_execution`, …) is active work via the generic non-blank fallback.
-/// The JSON-discriminator marker matches the compact `"type":"…"` shape
-/// specifically so incidental occurrences of the word "error" inside
-/// reasoning/command text never flip the card.
+/// **Since issue #1493 that activity is not a Codex card's status.** While the
+/// deck's Codex hooks are trusted, the card follows those hooks and treats these
+/// events as liveness only (`crate::state::AppState::apply_event`); when the
+/// prompt hook is not running, the wrapper also reports the output going quiet
+/// as Idle ([`QuietOutputIdle`]), so the card reads Thinking only while Codex is
+/// drawing.
 ///
-/// Issue #638: the interactive `codex` TUI mixes in plain redraw text that is
-/// never valid single-line JSON, so [`classify_codex_line`]'s non-JSON
-/// fallback lands here via [`classify_line_with`] instead of the JSON branch
-/// above — and plain text can never contain the JSON-shaped idle marker.
-/// Without a real idle signal in the fallback, the card enters `Working` on
-/// the first redraw line and can never leave it, wedging at "Thinking"
-/// forever even once the session has gone quiet. `idle_markers` gives the
-/// fallback its own route back to `Idle`: the composer's own idle placeholder
-/// text.
+/// **It deliberately recognises no error and no idle line, and that is the
+/// whole of its content** (issue #540). What the wrapper spawns for Codex is
+/// the interactive `codex` TUI ([`wrap_launch_command`]), and that process
+/// paints ANSI redraws: issue #540's direct PTY captures of a 12 s idle boot and
+/// of a full submit-and-respond turn contained no `"type":…` JSON record at all. This set
+/// used to match the `"type":"error"` / `"type":"turn.completed"` markers of
+/// `codex exec --json` — a mode the deck never selects itself — so it read as a
+/// working classification path while matching nothing the pane's process ever
+/// printed, and every line fell through to `Working` exactly as it does now.
 ///
-/// Round 2 correction (issue #638): round 1 shipped `"waiting for input"` and
-/// `"press enter to send"`, guessed rather than confirmed against the real
-/// binary — `strings` on the installed `codex-cli` native binary shows
-/// neither exists anywhere in it, so they never matched real interactive
-/// output and the wedge they were meant to fix was still live. Replaced with
-/// `"ask codex to do anything"`, the composer's before-first-turn placeholder
-/// recovered via `strings` from `codex-cli 0.150.1`.
+/// It is still its own set rather than [`GENERIC`], because [`GENERIC`]'s word
+/// markers would be WRONG here: the TUI redraws the conversation, so a reply or
+/// a command that merely mentions "error" would flip a working Codex card to
+/// `Error`. What a wrapped Codex card shows beyond "printed something" comes
+/// from elsewhere — tool, prompt, turn-end and error detail from Codex's native
+/// hooks (`crate::codex_hooks_manage`), a quota block from its rollout log
+/// (`crate::codex_rollout_tail`), and `Idle`/`Error` at process exit from this
+/// wrapper's reap loop. Matching the TUI's rendered text instead was rejected:
+/// it is fragile against reflow and redraw, and every such line would still
+/// only ever prove output, which is why the events it produces are marked
+/// (`crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`) and prove nothing
+/// about a submitted prompt (issue #559).
 ///
-/// Round 3 correction (issue #638): round 2 also shipped `"ask a follow-up
-/// question"` and gave `idle_markers` no precedence against co-resident
-/// active-turn evidence. Both were wrong, independently:
-///
-/// - **`"ask a follow-up question"` is dropped.** A live capture against the
-///   real `codex-cli 0.150.1` TUI (`tmux` + `pipe-pane`, raw bytes, two full
-///   turns) never once rendered it — the composer read `"Ask Codex to do
-///   anything"` both before the first turn *and* after a turn completed. It
-///   is present in the binary's string table but unreachable in practice, the
-///   same category round 1's dropped pair was in — dead weight with a latent
-///   false-idle risk (it also reads as ordinary agent narration, "I'll ask a
-///   follow-up question about…"), not a harmless extra.
-/// - **The composer placeholder is not an at-rest signal — it is rendered on
-///   every frame the input buffer is empty, including throughout an active
-///   turn** (the buffer clears on submit). The same live capture measured a
-///   single `tee` classification segment (`tee` flushes on `\n`/`\r`/the
-///   64 KiB cap; a ratatui repaint batch is cursor-addressed, not
-///   newline-delimited, so one segment commonly spans an entire frame) that
-///   was 65,455 bytes and contained *both* the active-turn spinner
-///   (`"Working (0s • esc to interrupt)"`) and the idle composer placeholder
-///   together. `classify_line_with` used to have no precedence for that case
-///   — `idle_markers`' plain `contains()` won, so the card read `Idle` while
-///   Codex was actively mid-turn: a fail-open regression strictly worse than
-///   the original fail-safe wedge this fix set out to close. `active_markers`
-///   fixes this: `"esc to interrupt"` — Codex's own UI hint for interrupting
-///   a running task, rendered as part of the same spinner line as the
-///   `Working (Ns • …)` status throughout a turn's entire duration, and
-///   present in *every* co-resident segment the live capture produced —
-///   is checked in [`classify_line_with`] before `idle_markers`, so a segment
-///   carrying both classifies `Working`, not `Idle`. It does not appear in
-///   the binary's static string table (`strings` on `codex-cli` returns zero
-///   hits — the composer's individual `Span`s are separate string constants,
-///   joined only at render time) even though it renders reliably; the live
-///   capture is the only way to confirm it, which is why this correction
-///   leans on one rather than `strings` alone.
-///
-/// Accepted risk (not new, see issue #638 round-3 audit finding F5): the
-/// wrapped process already fully controls its own status signal (same-uid,
-/// no privilege boundary crossed — pane status is advisory display only, it
-/// gates no permission or credential decision). Using plain English prose as
-/// markers rather than a JSON discriminator widens the *accidental* trigger
-/// surface, not a new risk class: a Codex pane that runs `git grep`/`cat` on
-/// this very source file, or renders this issue's own PR diff, would see its
-/// own marker strings in its output and could misclassify. Documented here
-/// as a known, accepted tradeoff rather than left implicit.
-///
-/// **Round 4 (issue #638): this ruleset is no longer the primary source of
-/// interactive Codex status.** Rounds 1–3 kept trying to make `active_markers`
-/// / `idle_markers` reliable in both directions and could not: round 3's own
-/// review and audit passes independently replayed real captured turns and
-/// found (a) a segment carrying ONLY the composer placeholder — no co-resident
-/// spinner text, because a repaint batch commonly repaints the composer rows
-/// without the spinner row — still classifies `Idle` mid-turn, and (b) a
-/// turn's closing footer (e.g. `Worked for 1m 03s`) carries neither marker, so
-/// a session that goes quiet right after it stays wedged at `Working` forever
-/// — issue #638's own original symptom, recurring at the other end of a turn.
-/// Both are the same root cause: there is no reliable TEXT signal for "the
-/// turn is genuinely, stably over" in a full-screen TUI's raw redraw stream —
-/// only for "some activity happened."
-///
-/// The real fix is to stop guessing: Codex's own native hooks
-/// (`UserPromptSubmit` → [`EventType::Thinking`], `Stop` → [`EventType::Idle`]
-/// in `src/hook.rs`'s `map_event_type`) are unconditionally installed for
-/// exactly this scenario (`codex_spawn_prep`, `src/wrap.rs`) and fire on REAL
-/// turn boundaries at the Codex engine level, not on redraw noise. When
-/// `CodexSpawnPrep::hook_trust_confirmed` is `true` for an interactive session
-/// (the common/default case), [`classify_and_emit`] suppresses this ruleset's
-/// `Working`/`Idle` output entirely and lets the hook channel be the sole
-/// source of truth — see its doc comment for the exact mechanism. This
-/// ruleset (and its `active_markers` precedence guard) remains live ONLY as
-/// the best-effort fallback for the narrower case where hook trust could not
-/// be confirmed; that fallback still carries the residual mid-turn-flicker and
-/// end-of-turn-wedge limitations described above, accepted and tracked in
-/// issue #640.
-///
-/// Selected by [`ruleset_for`] when the resolved agent is [`AgentType::Codex`];
-/// no change to the wrapper runtime.
+/// A user who configures `codex exec --json` as a pane command gets the same
+/// rules: its `turn.completed` / `error` records read as activity, and the card
+/// settles when the process exits, which for `exec` follows its final record.
 pub static CODEX: RuleSet = RuleSet {
-    error_markers: &["\"type\":\"error\""],
-    active_markers: &["esc to interrupt"],
-    idle_markers: &["\"type\":\"turn.completed\"", "ask codex to do anything"],
+    error_markers: &[],
+    idle_markers: &[],
 };
 
 /// Select the line-classification [`RuleSet`] for a resolved agent type. Codex
-/// gets its JSONL-aware [`CODEX`] rules; every other (or unknown) agent falls
+/// gets its activity-only [`CODEX`] rules; every other (or unknown) agent falls
 /// back to the agent-agnostic [`GENERIC`] rules. This is the M7 seam that keeps
 /// per-agent patterns as data — a new agent adds a `RuleSet` and an arm here,
 /// not new runtime control flow.
@@ -270,19 +182,9 @@ pub fn classify_line(line: &str) -> Option<DetectedEvent> {
 /// Classify a single line against an explicit [`RuleSet`]. [`classify_line`]
 /// is the generic-ruleset shorthand; M7's Codex path calls this directly with
 /// its own rules. Matching is case-insensitive substring containment.
-///
-/// Precedence (issue #638 round 3): `error_markers` > `active_markers` >
-/// `idle_markers` > the generic non-blank fallback. `active_markers` is
-/// checked, and wins outright, before `idle_markers` is ever consulted — a
-/// segment carrying both an active-turn signal and an idle marker together
-/// (a real possibility: the classification unit is a `tee`-flushed segment,
-/// not necessarily one visual line) must resolve `Working`, not `Idle`. See
-/// [`CODEX`]'s doc comment for the real-world case this precedence exists
-/// for.
 pub fn classify_line_with(line: &str, rules: &RuleSet) -> Option<DetectedEvent> {
     debug_assert!(
         markers_are_lowercase_ascii(rules.error_markers)
-            && markers_are_lowercase_ascii(rules.active_markers)
             && markers_are_lowercase_ascii(rules.idle_markers),
         "RuleSet markers must be pre-lowercased ASCII: matching lowercases the \
          input with to_ascii_lowercase() and does a plain contains(), so an \
@@ -296,9 +198,6 @@ pub fn classify_line_with(line: &str, rules: &RuleSet) -> Option<DetectedEvent> 
     let lower = trimmed.to_ascii_lowercase();
     if rules.error_markers.iter().any(|m| lower.contains(m)) {
         return Some(DetectedEvent::Error);
-    }
-    if rules.active_markers.iter().any(|m| lower.contains(m)) {
-        return Some(DetectedEvent::Working);
     }
     if rules.idle_markers.iter().any(|m| lower.contains(m)) {
         return Some(DetectedEvent::Idle);
@@ -367,11 +266,10 @@ impl Detector {
         self.observe_detected(classify_line_with(line, self.rules))
     }
 
-    /// Debounce an already-classified event. The JSON-aware Codex path
-    /// ([`classify_codex_line`]) classifies the line itself and feeds the
-    /// result here so it shares the same one-event-per-state-change debouncing
-    /// as the generic substring path. `None` (blank / unclassifiable line)
-    /// never changes state.
+    /// Debounce an already-classified event, so a caller that classifies a line
+    /// itself shares the same one-event-per-state-change debouncing as
+    /// [`Self::observe`]. `None` (blank / unclassifiable line) never changes
+    /// state.
     pub fn observe_detected(&mut self, detected: Option<DetectedEvent>) -> Option<DetectedEvent> {
         let detected = detected?;
         if self.last == Some(detected) {
@@ -381,31 +279,6 @@ impl Detector {
             Some(detected)
         }
     }
-}
-
-/// The JSON-only half of [`classify_codex_line`]: parse `line` as a JSON
-/// object and map its top-level `type` discriminator, returning `None` when
-/// the line is blank, isn't valid JSON, or has no string `type` field (the
-/// caller then falls back to substring classification). Split out (issue
-/// #638 round 5) so the two branches can be tested independently — but as of
-/// round 6 (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1) this branch is
-/// no longer specially exempted from suppression: it's just the first half of
-/// [`classify_codex_line`]'s JSON-first-then-substring-fallback flow, called
-/// unconditionally like every other branch. The real suppression logic lives
-/// entirely in [`classify_and_emit`]'s final `emitter.emit()` gate — see its
-/// doc comment for the round-6 design.
-fn classify_codex_json(line: &str) -> Option<DetectedEvent> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let value = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
-    let kind = value.get("type").and_then(|t| t.as_str())?;
-    Some(match kind {
-        "turn.completed" | "task.completed" => DetectedEvent::Idle,
-        "turn.failed" | "task.failed" | "error" => DetectedEvent::Error,
-        _ => DetectedEvent::Working,
-    })
 }
 
 /// One real truecolor SGR span (RGB 246,226,183, a warm tan) that Codex's
@@ -550,32 +423,6 @@ fn extract_codex_status_bar_model(line: &str) -> Option<String> {
     }
 }
 
-/// PRD #20 finding #11: classify one line of Codex output. Codex emits JSONL
-/// (`codex exec --json` writes one compact JSON object per line) and the
-/// interactive `codex` TUI mixes JSON events with plain redraw text. Try the
-/// JSON `type`-discriminator branch first ([`classify_codex_json`] — robust
-/// to insignificant whitespace and field reordering, unlike a raw substring
-/// match). A non-JSON line (the interactive channel's plain text) falls back
-/// to the substring [`CODEX`] rules, so bare `codex` still surfaces activity
-/// instead of staying stuck until process exit — and (issue #638) can also
-/// resolve back to `Idle` from [`CODEX`]'s verified composer-idle markers,
-/// since plain redraw text can never contain the JSON idle marker. That
-/// fallback goes through [`classify_line_with`], whose
-/// error > active-override > idle > generic-fallback precedence (issue #638
-/// round 3) keeps a segment that carries both an active-turn signal and an
-/// idle marker — a real case for a whole repaint batch, not just a
-/// hypothetical one — classified `Working`, not `Idle`.
-pub fn classify_codex_line(line: &str) -> Option<DetectedEvent> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(ev) = classify_codex_json(trimmed) {
-        return Some(ev);
-    }
-    classify_line_with(trimmed, &CODEX)
-}
-
 impl Default for Detector {
     fn default() -> Self {
         Self::new()
@@ -590,6 +437,9 @@ struct Emitter {
     session_id: String,
     pane_id: Option<String>,
     agent_id: Option<String>,
+    /// Issue #318: the hook capability token this wrapper inherited from its
+    /// pane, presented on every event it sends. `None` for a standalone wrap.
+    token: Option<String>,
     cwd: Option<String>,
     /// PRD #20 M3: the live-target descriptor every event this wrapper emits
     /// carries. A wrapped session is the first place the live/history-only
@@ -598,9 +448,52 @@ struct Emitter {
     /// — the session is `history-only`. Stamped on the card so a wrapped Codex
     /// pane renders view-only and refuses live input (M4).
     live_target: LiveTarget,
+    /// Issue #559: stamp
+    /// [`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] on every
+    /// event, because this wrapper could not get the hooks that would report a
+    /// submitted prompt trusted for the agent it hosts. Decided once, before the first emit, by
+    /// [`codex_spawn_prep`]; see [`CodexSpawnPrep::prompt_reports_unavailable`].
+    prompt_reports_unavailable: bool,
+    /// Issue #1493: where this wrapper's output-classified frames go when it
+    /// hosts a Codex whose prompt hook is not running — the one mode in which
+    /// they move the card. `None` everywhere else, where they are sent inline as
+    /// before. See [`LatestSend`].
+    classified_sender: Option<Arc<LatestSend>>,
 }
 
 impl Emitter {
+    /// Discard any output-derived frame still waiting and send no more.
+    fn close_classified(&self) {
+        if let Some(sender) = &self.classified_sender {
+            sender.close();
+        }
+    }
+
+    /// Send one frame derived from the child's output, decided while `det` was
+    /// held. Through [`Self::classified_sender`] when there is one, POSTED BEFORE
+    /// `det` is released (Qodo on PR #1523): the sender keeps only the newest
+    /// frame, so posting after the release would let an older decision replace
+    /// a newer one that slipped in between. Posting is a slot write, so holding
+    /// the detector for it costs nothing. Inline otherwise — a socket write,
+    /// which must not happen under the detector lock.
+    fn send_classified(&self, event: &AgentEvent, det: std::sync::MutexGuard<'_, Detector>) {
+        // With the pane's capability token, as every other frame this wrapper
+        // sends (issue #318): without it the daemon reads the frame as
+        // unproven and it moves no card.
+        let json = crate::event::agent_event_line(event, self.token.as_deref()).ok();
+        match (&self.classified_sender, json) {
+            (Some(sender), Some(json)) => {
+                sender.post(json);
+                drop(det);
+            }
+            (None, Some(json)) => {
+                drop(det);
+                let _ = crate::hook::send_to_socket(&json);
+            }
+            (_, None) => drop(det),
+        }
+    }
+
     /// Build an [`AgentEvent`] for `event_type` and send it to the daemon over
     /// the existing raw-`AgentEvent` hook socket, stamping `model` when known.
     /// Send failures are ignored so the wrapper stays a transparent
@@ -619,49 +512,37 @@ impl Emitter {
     /// `cmd.spawn()` returns. Its ONLY job is to surface the dashboard card so a
     /// slow-booting agent isn't invisible — the child is typically just the
     /// launcher (`devbox`, a shell) at this point, seconds away from the real
-    /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets readiness
-    /// gates tell this apart from a genuine "the session is up and accepting
-    /// input" signal; see [`crate::state::wait_for_session_start`].
-    ///
-    /// PRD #254: for a Codex-identity pane, also stamps
-    /// [`crate::event::CODEX_HOOK_TRUST_METADATA_KEY`] with `codex_spawn_prep`'s
-    /// REAL install/trust outcome — known by this point, since it runs before
-    /// spawn — so the daemon can defer `ConfirmationCapability::Reports` until
-    /// the hook is known-successful for this specific pane rather than
-    /// resolving it from agent type alone. Omitted for every other agent type:
-    /// the field is Codex-specific and stamping it elsewhere would be noise.
-    fn emit_fork_session_start(&self, codex_hook_trust_confirmed: bool) {
+    /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets a reader
+    /// tell this apart from a genuine "the session is up and accepting input"
+    /// signal.
+    fn emit_fork_session_start(&self) {
         let mut metadata = HashMap::new();
         metadata.insert(
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
         );
-        if self.agent_type == AgentType::Codex {
-            metadata.insert(
-                CODEX_HOOK_TRUST_METADATA_KEY.to_string(),
-                codex_hook_trust_confirmed.to_string(),
-            );
-        }
         self.emit_with_metadata(EventType::SessionStart, metadata, None);
     }
 
     /// Issue #243: the INTERFACE-READY `SessionStart` this wrapper emits once it
-    /// has observed the wrapped child's interface come up — the pre-prompt
-    /// readiness signal a delegate/scheduler gate can actually wait for.
+    /// has observed the wrapped child's interface come up — the deck's only
+    /// sign that a wrapped agent is up before its first prompt. Its `Idle` is
+    /// what the card and the doorbell go by until the agent's own hooks report
+    /// (see [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]).
     ///
     /// Distinct from BOTH the events that existed before it. It is not
     /// [`Self::emit_fork_session_start`], which fires at `cmd.spawn()` when the
     /// child is typically still a launcher; and it is not the agent's own native
     /// `SessionStart`, which for codex-cli fires when the first TURN starts — a
-    /// consequence of the very prompt the gate is withholding, which is why the
-    /// gate never fast-pathed and every Codex delegate cost ~31 s.
+    /// consequence of the first prompt, so it cannot announce the agent before
+    /// one.
     ///
     /// It carries the origin value of the FACT that fired
     /// ([`InterfaceFact::origin`]) rather than arriving unmarked, so a consumer
     /// can tell "the deck WATCHED this interface come up" from "an agent session
     /// announced itself" — and, since issue #243's review, can also tell the
-    /// strong observation (raw input mode) from the weak guess (output settled)
-    /// and price them differently. This event carries the WRAPPER's session id,
+    /// strong observation (raw input mode) from the weak guess (output settled).
+    /// This event carries the WRAPPER's session id,
     /// not the agent's, so it must never bind a conversation. See
     /// [`crate::event::AgentEvent::is_wrapper_session_start`].
     ///
@@ -684,9 +565,10 @@ impl Emitter {
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             fact.origin().to_string(),
         );
-        let Ok(json) =
-            serde_json::to_string(&self.build_event(EventType::SessionStart, metadata, None))
-        else {
+        let Ok(json) = crate::event::agent_event_line(
+            &self.build_event(EventType::SessionStart, metadata, None),
+            self.token.as_deref(),
+        ) else {
             return;
         };
         std::thread::spawn(move || {
@@ -701,7 +583,7 @@ impl Emitter {
         model: Option<String>,
     ) {
         let event = self.build_event(event_type, metadata, model);
-        if let Ok(json) = serde_json::to_string(&event) {
+        if let Ok(json) = crate::event::agent_event_line(&event, self.token.as_deref()) {
             let _ = crate::hook::send_to_socket(&json);
         }
     }
@@ -712,9 +594,18 @@ impl Emitter {
     fn build_event(
         &self,
         event_type: EventType,
-        metadata: HashMap<String, String>,
+        mut metadata: HashMap<String, String>,
         model: Option<String>,
     ) -> AgentEvent {
+        // Issue #559: here, the one funnel every emit shares, so no event this
+        // wrapper sends — the fork-time start included, which is what surfaces
+        // the card before anything else — can reach the deck without it.
+        if self.prompt_reports_unavailable {
+            metadata.insert(
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+            );
+        }
         AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
@@ -739,6 +630,8 @@ impl Emitter {
             // side is STICKY on this field, so `None` never regresses an
             // already-known model.
             model,
+            background: None,
+            background_revision: None,
         }
     }
 }
@@ -829,20 +722,101 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
 /// returned unchanged (never double-wrapped), so restoring an already-bare saved
 /// command re-wraps exactly once. Non-Wrapper agents (and the neutral unknown
 /// type) are returned unchanged.
-pub fn wrap_launch_command(command: &str, agent_type: &AgentType) -> String {
+///
+/// Issue #1685: the `<command>` after `--` is split into the wrapper's argv by
+/// the shell that runs the rewritten line, and the wrapper execs the first word.
+/// That is right for a plain program invocation and wrong for anything the
+/// shell has to run itself: a leading `FOO=1` became the program the wrapper
+/// tried to spawn, and a leading `( … )` was a syntax error before the wrapper
+/// ran at all. Such a command ([`runs_as_plain_argv`] is false) comes back as
+/// [`LaunchCommand::Argv`] instead — the wrapper with `shell`, the shell the
+/// seam would run any agent's command line under, running the command
+/// verbatim. An argv rather than a line, so the command is never quoted for
+/// an outer shell, whose dialect (fish) need not match POSIX quoting.
+///
+/// Such a command can also move Codex away from what `codex_spawn_prep`
+/// prepared: `CODEX_HOME=… codex` and `cd … && codex` start, but in a home or
+/// directory the wrapper did not install and trust its hooks for, as
+/// `env CODEX_HOME=… codex` and launcher scripts already did (#1703).
+pub fn wrap_launch_command(command: &str, agent_type: &AgentType, shell: &str) -> LaunchCommand {
     let spec = crate::agent_registry::spec(agent_type);
-    if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper)
-        || is_wrap_invocation(command)
-    {
-        return command.to_string();
+    if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper) {
+        return LaunchCommand::Line(command.to_string());
+    }
+    let deck = deck_binary_for_wrap();
+    if is_wrap_invocation(command, &deck) {
+        return LaunchCommand::Line(command.to_string());
     }
     // Prefer the registry detection basename (the stable `--agent` alias the
     // wrapper resolves back through `detect_from_basename`); fall back to the
     // label only if an entry somehow ships without one.
     let name = spec.detect_basenames.first().copied().unwrap_or(spec.label);
-    let deck = deck_binary_for_wrap();
-    format!("{deck} wrap --agent {name} -- {command}")
+    if runs_as_plain_argv(command) {
+        return LaunchCommand::Line(format!("{deck} wrap --agent {name} -- {command}"));
+    }
+    LaunchCommand::Argv(
+        [
+            deck.as_str(),
+            "wrap",
+            "--agent",
+            name,
+            "--",
+            shell,
+            crate::platform::shell::shell_command_flag(),
+            command,
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    )
 }
+
+/// What the spawn seam runs for an agent's command, from [`wrap_launch_command`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchCommand {
+    /// A command line, run the way the seam runs any command: exec'd directly
+    /// when it is one word, otherwise under `<shell> -c`.
+    Line(String),
+    /// An argv the seam execs as it stands, without a shell in front.
+    Argv(Vec<String>),
+}
+
+/// Whether the shell that runs `<deck> wrap … -- <command>` hands the wrapper
+/// the argv the user meant (issue #1685): no control operator, grouping or
+/// newline that would end the wrapper's arguments early, and a first word the
+/// wrapper can exec — not a `NAME=value` assignment and not a word only the
+/// shell runs ([`SHELL_ONLY_WORDS`]).
+///
+/// A redirection (`>log`, `2>&1`, `&>log`) does not count. That shell applies
+/// it to the wrapper, whose per-descriptor routing hands it on to the agent
+/// while still reading the agent's output (PRD #20 finding #11); inside the
+/// wrapper it would send that output past it.
+///
+/// Errs towards `false`: a command that fails it is run by the user's shell
+/// inside the wrapper, which is correct for a plain invocation too, only a
+/// different launch shape. A quoted `;` therefore counts, and so does any
+/// `$( … )`.
+fn runs_as_plain_argv(command: &str) -> bool {
+    let without_redirections = command
+        .replace("&>", ">")
+        .replace(">&", ">")
+        .replace("<&", "<");
+    if without_redirections.contains(['\n', ';', '&', '|', '(', ')']) {
+        return false;
+    }
+    command.split_whitespace().next().is_none_or(|first| {
+        !crate::event::is_env_assignment(first) && !SHELL_ONLY_WORDS.contains(&first)
+    })
+}
+
+/// Reserved words, and builtins with no executable of their own, that can open
+/// an agent's launch command — words a wrapper handed them as a program could
+/// not exec. Not exhaustive: a word missing here keeps the plain launch, which
+/// is what every command had before issue #1685.
+const SHELL_ONLY_WORDS: &[&str] = &[
+    "!", "{", "[[", "if", "case", "for", "select", "while", "until", "function", "time", "coproc",
+    "exec", "cd", ".", "source", "eval", "export", "set", "unset", "umask", "ulimit", "trap",
+    "readonly", "local", "declare", "typeset", "alias", "builtin", "command",
+];
 
 /// Test-only override for the binary [`wrap_launch_command`] names. Set to an
 /// absolute path so a test can point the rewrite at a recorder instead of the
@@ -868,40 +842,7 @@ pub const DOT_AGENT_DECK_WRAP_BIN: &str = "DOT_AGENT_DECK_WRAP_BIN";
 ///
 /// Same rationale (and the same fix) as [`crate::daemon_attach`] locating the
 /// daemon via `current_exe` rather than `$PATH`.
-///
-/// Falls back to the bare name when the resolved path is unusable, so behaviour
-/// only ever improves on what `$PATH` would have found:
-/// - a test-harness executable — those live in `target/<profile>/deps/`, so a
-///   sibling `dot-agent-deck` one level up is preferred when present, which is
-///   what lets in-process tests drive the build they just compiled;
-/// - a path that no longer exists: Linux reports a replaced binary as
-///   `<path> (deleted)`, routine while rebuilding during development;
-/// - a path containing whitespace, which the shell would re-split (nothing
-///   quotes this command string).
-///
-/// Filename-agnostic (issue #642): this fork's installed binary is named
-/// `worker-agent-deck`, not `dot-agent-deck` (CLAUDE.md rule 21) — requiring
-/// an exact filename match here meant `current_exe()` was *never* accepted on
-/// a stock fork install, so every wrap rewrite silently fell through to the
-/// bare-name `$PATH` lookup and picked up whatever `dot-agent-deck` happened
-/// to be installed (in the reported case, six releases of upstream drift).
-/// The test-harness exclusion above still has to hold by directory, not name,
-/// since the harness binary is now just as "usable" by content as the real
-/// build — see the `deps`/`examples` check below.
 fn deck_binary_for_wrap() -> String {
-    // The one remaining route to issue #642's original defect: silent because
-    // nothing else on this path logs. Warn so a future occurrence is a log
-    // line, not a six-release mystery.
-    fn bare_fallback() -> String {
-        tracing::warn!(
-            "deck_binary_for_wrap: could not resolve this build's own binary; \
-             falling back to the bare name {} for a login shell's $PATH to \
-             resolve, which may silently pick up a different install (issue #642)",
-            crate::platform::paths::DEFAULT_BINARY_NAME
-        );
-        crate::platform::paths::DEFAULT_BINARY_NAME.to_string()
-    }
-
     // Explicit override, consulted first. Resolving the co-located build is what
     // makes the suite honest, but it also takes away the one seam a test had for
     // observing the rewrite: planting a fake `dot-agent-deck` on `$PATH`. This is
@@ -913,100 +854,166 @@ fn deck_binary_for_wrap() -> String {
     {
         return explicit;
     }
+    resolve_deck_binary_for_wrap(std::env::current_exe())
+}
 
-    let Ok(exe) = std::env::current_exe() else {
+/// Pure seam behind [`deck_binary_for_wrap`], with `current_exe()` injected so a
+/// build under a non-default file name is testable without renaming the test
+/// binary.
+///
+/// Issue #533: this used to gate the running executable on its file name being
+/// the literal `dot-agent-deck`. That rejected a renamed build's OWN executable
+/// (a release asset run as downloaded, `dot-agent-deck-linux-amd64`; any
+/// `dot-agent-deck.exe` on Windows), which then fell through to a co-located
+/// `dot-agent-deck` — a different build — or to a bare name `$PATH` resolves.
+/// The executable is now taken by whatever name it has, the way
+/// [`crate::platform::paths::binary_name`] takes it.
+///
+/// The name check was standing in for "is this process the deck binary", and
+/// in production it always is: the caller of [`wrap_launch_command`] is the
+/// daemon's spawn seam (`agent_pty`), a subcommand of the one `dot-agent-deck`
+/// binary. The process that is NOT the deck is a cargo
+/// test harness, and that is now recognised by cargo's own signature for one:
+/// it lives in a `deps` directory (`target/<profile>/deps/`) AND its file stem
+/// ends in cargo's `-<16 hex digits>` metadata hash (`dot_agent_deck-3f…`).
+/// Both are required, so a real deck that merely sits in a directory called
+/// `deps` still names itself.
+///
+/// Falls back when the running executable is unusable, so behaviour only ever
+/// improves on what `$PATH` would have found:
+/// - a test-harness executable — those live in `target/<profile>/deps/`, so a
+///   sibling `dot-agent-deck` one level up is preferred when present, which is
+///   what lets in-process tests drive the build they just compiled;
+/// - a path that no longer exists: Linux reports a replaced binary as
+///   `<path> (deleted)`, routine while rebuilding during development;
+/// - a path the shell would not read back as the same file — nothing quotes
+///   this command string, so it is rejected rather than quoted, the posture
+///   [`crate::platform::paths::binary_name`] takes for the same reason. The
+///   file name must pass `is_safe_binary_name` (ASCII alphanumerics plus
+///   `-_.+`, no leading `-`), and every character of the path must be in
+///   [`is_shell_inert_path_char`]'s allowlist, which excludes whitespace,
+///   quotes, `$`, backticks, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `*`, `?`,
+///   `[`, `#`, `!`, and `~` except in a Windows path. Before issue #533 the file name was pinned to
+///   `dot-agent-deck` and only whitespace was checked; accepting a renamed
+///   build's own file name is what made the allowlist necessary.
+///
+/// The sibling looked for is the package's own file name
+/// ([`crate::platform::paths::durable_binary_file_name`], `.exe` on Windows),
+/// because that is what cargo names the bin target it builds next to its tests.
+fn resolve_deck_binary_for_wrap(current_exe: std::io::Result<std::path::PathBuf>) -> String {
+    use crate::platform::paths::{DEFAULT_BINARY_NAME, durable_binary_file_name};
+    fn usable(path: &std::path::Path) -> Option<String> {
+        let text = path.to_str()?;
+        let name = path.file_name()?.to_str()?;
+        (crate::platform::paths::is_safe_binary_name(name)
+            && text
+                .chars()
+                .all(|c| is_shell_inert_path_char(c, cfg!(windows)))
+            && path.is_file())
+        .then(|| text.to_string())
+    }
+    fn in_deps_dir(dir: &std::path::Path) -> bool {
+        dir.file_name() == Some(std::ffi::OsStr::new("deps"))
+    }
+    fn has_cargo_hash_suffix(exe: &std::path::Path) -> bool {
+        exe.file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.rsplit_once('-'))
+            .is_some_and(|(_, hash)| {
+                hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+    }
+
+    // Issue #642 (fork): falling back to the bare name leaves a login shell's
+    // `$PATH` to pick the binary, which can silently be a different install.
+    // Nothing else on this path logs, so warn: a future occurrence is a log
+    // line, not a mystery.
+    fn bare_fallback() -> String {
+        tracing::warn!(
+            "deck_binary_for_wrap: could not resolve this build's own binary; \
+             falling back to the bare name {DEFAULT_BINARY_NAME} for a login \
+             shell's $PATH to resolve, which may silently pick up a different \
+             install (issue #642)"
+        );
+        DEFAULT_BINARY_NAME.to_string()
+    }
+
+    let Ok(exe) = current_exe else {
         return bare_fallback();
     };
     let Some(dir) = exe.parent() else {
         return bare_fallback();
     };
-    // A `cargo test`/nextest harness binary lives directly in
-    // `target/<profile>/deps/`, and `cargo run --example <name>` builds to
-    // `target/<profile>/examples/<name>` — both are real, usable files by
-    // content, but wrapping through either would be meaningless, so both are
-    // excluded by location rather than by name and the sibling product build
-    // one level up is preferred instead, exactly as before this fix.
-    let in_harness_dir = matches!(
-        dir.file_name().and_then(std::ffi::OsStr::to_str),
-        Some("deps" | "examples")
-    );
-    if !in_harness_dir && let Some(found) = usable_wrap_binary(&exe) {
+    let is_test_harness = in_deps_dir(dir) && has_cargo_hash_suffix(&exe);
+    if !is_test_harness && let Some(found) = usable(&exe) {
         return found;
     }
-    usable_wrap_binary(&dir.join(crate::platform::paths::DEFAULT_BINARY_NAME))
+    let sibling = durable_binary_file_name();
+    usable(&dir.join(&sibling))
         .or_else(|| {
-            in_harness_dir
-                .then(|| {
-                    dir.parent()
-                        .map(|up| up.join(crate::platform::paths::DEFAULT_BINARY_NAME))
-                })
+            in_deps_dir(dir)
+                .then(|| dir.parent().map(|up| up.join(&sibling)))
                 .flatten()
                 .as_deref()
-                .and_then(usable_wrap_binary)
+                .and_then(usable)
         })
         .unwrap_or_else(bare_fallback)
 }
 
-/// Whether `path` is a regular file the wrap rewrite can name verbatim: it
-/// exists, is a regular file, and its text form has no whitespace (nothing
-/// quotes the rewritten command string, so the shell would re-split it).
-/// Deliberately does **not** check the executable bit — same gap the old
-/// nested `usable()` this was extracted from had — so a resolved-but-not-
-/// executable file of that name is still accepted and fails at spawn time
-/// with "Permission denied" rather than being rejected here. Deliberately
-/// filename-agnostic (issue #642) — a free function rather than nested in
-/// [`deck_binary_for_wrap`] so a test can probe it directly against a
-/// synthetic path, since `current_exe()` inside a `cargo test` process is
-/// always the test harness binary and can't be renamed mid-test.
-fn usable_wrap_binary(path: &std::path::Path) -> Option<String> {
-    let text = path.to_str()?;
-    (!text.chars().any(char::is_whitespace) && path.is_file()).then(|| text.to_string())
+/// Whether `c` can appear UNQUOTED in the wrapper's command word and still be
+/// read back by the spawning shell as itself: ASCII alphanumerics plus
+/// `/ . _ - + = : @ % ,` — the set `platform::paths::shell_quote_if_needed`
+/// leaves unquoted — and, only when `windows_host`, the `\` separator, which a
+/// POSIX shell would instead consume as an escape, and `~`, which every 8.3
+/// short name carries (`C:\Users\RUNNER~1\…`, the GitHub runner's own temp
+/// directory) and which a POSIX shell could tilde-expand at the start of a
+/// relative path. A parameter rather than a `#[cfg]` so both dialects are
+/// unit-testable from any host.
+fn is_shell_inert_path_char(c: char, windows_host: bool) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '/' | '.' | '_' | '-' | '+' | '=' | ':' | '@' | '%' | ',')
+        || (windows_host && matches!(c, '\\' | '~'))
 }
 
-/// Whether `command` is already a `dot-agent-deck wrap …` invocation — the
-/// idempotency guard for [`wrap_launch_command`]. Tolerant of a leading path on
-/// the binary (`/usr/local/bin/dot-agent-deck wrap …`).
+/// Whether `command` is already a `wrap` invocation of a deck — the idempotency
+/// guard for [`wrap_launch_command`]. `deck` is the program the rewrite would
+/// name ([`deck_binary_for_wrap`]'s result). Tolerant of a leading path on the
+/// binary (`/usr/local/bin/dot-agent-deck wrap …`).
 ///
-/// Matches on two names, not one: the literal
-/// [`crate::platform::paths::DEFAULT_BINARY_NAME`] (`"dot-agent-deck"`), for a
-/// hand-written role/mode command such as `src/agent_pty.rs`'s documented
-/// `dot-agent-deck wrap --agent codex -- …` shape, which names the binary by
-/// its cargo package name regardless of what this build is actually installed
-/// as; and separately, whatever [`deck_binary_for_wrap`] would itself resolve
-/// to right now, so the guard always recognises `wrap_launch_command`'s OWN
-/// output. Before issue #642 both names always coincided — `deck_binary_for_wrap`
-/// could only ever emit something named `dot-agent-deck` — so a single literal
-/// check was enough; making that resolution filename-agnostic broke that
-/// coincidence on a fork install (`worker-agent-deck`, CLAUDE.md rule 21) and
-/// a guard keyed on the literal alone stopped recognising its own output,
-/// producing a double-wrapped command (`src/agent_pty.rs`'s second
-/// `wrap_launch_command` call, R20-009).
+/// Issue #533: the program's file name used to be compared against the literal
+/// `dot-agent-deck` only. That held while [`deck_binary_for_wrap`] could name
+/// nothing else; now that a renamed build names itself, a literal-only guard
+/// would miss the invocation the build had itself produced and wrap it a second
+/// time. The file name of `deck` is therefore accepted too, alongside the
+/// package name (with and without the platform's executable suffix), which a
+/// command from a default-named build carries.
 ///
-/// `pub(crate)` (issue #644 round 2, reviewer F3 / auditor F2): also the
-/// basename check `crate::platform::proc::scan::descendant_shell_activity`
-/// uses to decide whether a candidate process is genuinely a `wrap`
-/// invocation rather than an unrelated command that merely carries the
-/// literal token `wrap` in the same position — one check, not two
-/// independently-maintained copies that could drift.
-pub(crate) fn is_wrap_invocation(command: &str) -> bool {
+/// This guard can only know the names of the build it runs in, which is why
+/// the TUI's new-pane path no longer pre-wraps a command it hands to the daemon
+/// (`ui.rs`, the `StartAgent` spawn): a renamed TUI's rewrite reaching a daemon
+/// of a different build would not be recognised there. The daemon wraps it
+/// instead, naming its own binary. What remains is a command that already
+/// carries some OTHER renamed build's `wrap` invocation — typed or configured
+/// that way by hand — which is not recognised and gets a second wrapper.
+fn is_wrap_invocation(command: &str, deck: &str) -> bool {
+    use crate::platform::paths::{DEFAULT_BINARY_NAME, durable_binary_file_name};
+    let file_name = |program: &str| -> Option<String> {
+        Some(
+            std::path::Path::new(program)
+                .file_name()?
+                .to_str()?
+                .to_string(),
+        )
+    };
     let mut tokens = command.split_whitespace();
-    let (Some(program), Some(subcommand)) = (tokens.next(), tokens.next()) else {
-        return false;
-    };
-    if subcommand != "wrap" {
-        return false;
+    match (tokens.next(), tokens.next()) {
+        (Some(program), Some("wrap")) => file_name(program).is_some_and(|name| {
+            name == DEFAULT_BINARY_NAME
+                || name == durable_binary_file_name()
+                || file_name(deck).as_deref() == Some(name.as_str())
+        }),
+        _ => false,
     }
-    let Some(name) = std::path::Path::new(program)
-        .file_name()
-        .and_then(|s| s.to_str())
-    else {
-        return false;
-    };
-    name == crate::platform::paths::DEFAULT_BINARY_NAME
-        || std::path::Path::new(&deck_binary_for_wrap())
-            .file_name()
-            .and_then(|s| s.to_str())
-            == Some(name)
 }
 
 /// Resolve the agent identity emitted events should carry.
@@ -1143,6 +1150,53 @@ fn program_is_codex(program: &str) -> bool {
         == Some("codex")
 }
 
+/// Issue #2002: the two arguments that start a direct Codex in embedded mode.
+///
+/// Without them a Codex can attach to a shared background app-server that
+/// another pane started, and that server runs the deck's hooks with the
+/// starter pane's identity, so two Codex panes report as one. A CLI config
+/// override of this key excludes implicit server discovery, reuse and
+/// auto-start (checked against Codex 0.156.0, 0.160.0 and 0.164.0 source; the
+/// guarantee rests on that exclusion rule of Codex's), and an empty `set`
+/// table merges into the user's own `config.toml` policy without removing an
+/// entry. 0.155.0, the checked compatibility control, also accepts it, which
+/// `--no-daemon` (0.156.0 and later) does not. A server that is already
+/// running is left running; a new direct deck session no longer selects it.
+///
+/// They go FIRST: within Codex's CLI layer a later override at the same path
+/// replaces an earlier one, so in front of the user's own `-c` arguments the
+/// empty table cannot erase them.
+pub(crate) const CODEX_EMBEDDED_ARGS: [&str; 2] = ["-c", "shell_environment_policy.set={}"];
+
+/// Whether `args` already open with [`CODEX_EMBEDDED_ARGS`].
+pub(crate) fn opens_with_codex_embedded_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> bool {
+    args.len() >= CODEX_EMBEDDED_ARGS.len()
+        && args
+            .iter()
+            .zip(CODEX_EMBEDDED_ARGS)
+            .all(|(arg, want)| arg.as_ref() == want)
+}
+
+/// The arguments the wrapper starts `program` with (issue #2002): a direct
+/// Codex (by basename, [`program_is_codex`]) gets [`CODEX_EMBEDDED_ARGS`] in
+/// front of `args` unless they already open with them, so a command that
+/// carries the pair itself is not given a second one. Every other program —
+/// a launcher declared as Codex included, where the pair would reach
+/// `devbox` or a shell rather than Codex — gets `args` unchanged.
+#[cfg(unix)]
+fn launch_args<'a>(program: &str, args: &'a [String]) -> std::borrow::Cow<'a, [String]> {
+    if !program_is_codex(program) || opens_with_codex_embedded_args(args) {
+        return std::borrow::Cow::Borrowed(args);
+    }
+    std::borrow::Cow::Owned(
+        CODEX_EMBEDDED_ARGS
+            .iter()
+            .map(|arg| arg.to_string())
+            .chain(args.iter().cloned())
+            .collect(),
+    )
+}
+
 /// The outcome of [`codex_spawn_prep`]: the vetted `CODEX_HOME` (resolved ONCE) to
 /// PIN on the spawned child so the home the deck installed into and trusted is
 /// exactly the home Codex loads.
@@ -1150,17 +1204,33 @@ struct CodexSpawnPrep {
     /// `CODEX_HOME` to set explicitly on the spawned child's environment (finding
     /// #2). `None` when this invocation installs no Codex hooks / resolves no home.
     pinned_home: Option<std::path::PathBuf>,
-    /// PRD #254: whether this invocation's native hook install/trust is KNOWN
-    /// to have succeeded — a pinned home resolved AND
-    /// [`crate::codex_hooks_manage::trust_deck_hooks_in`] returned `Ok`.
-    /// `false` covers every other case (no hooks installed for this
-    /// invocation, no home resolved, or trust recording returned `Err`) —
-    /// previously discarded after a `tracing::warn!` and unobservable outside
-    /// the log. Stamped onto the wrapper-fork `SessionStart`
-    /// ([`Emitter::emit_fork_session_start`]) so the daemon can defer
-    /// `ConfirmationCapability::Reports` until the outcome is actually
-    /// known-successful for this specific pane.
-    hook_trust_confirmed: bool,
+    /// Issue #559: this wrapper hosts a Codex whose native hooks it could not get
+    /// TRUSTED in this spawn, so no submitted-prompt report can be counted on —
+    /// Codex runs none of the deck's hooks until they are trusted, and
+    /// `UserPromptSubmit` is one of them. The wrapper's own
+    /// events cannot stand in: they never carry a prompt. Every event is then
+    /// marked ([`Emitter::prompt_reports_unavailable`]) so the deck stops reading
+    /// "this pane is Codex" as "this pane can confirm a delivery".
+    ///
+    /// `true` for a Codex identity whenever the trust step did not trust the
+    /// deck's own `UserPromptSubmit` hook with the user's toggle on
+    /// ([`crate::codex_hooks_manage::TrustOutcome::reports_prompts`]): the step
+    /// was skipped (no pane and a non-`codex` program), the install produced
+    /// nothing to trust, `codex app-server` could not be run — the ordinary
+    /// `devbox run codex-big` host, where `codex` exists only inside the
+    /// launcher — it recorded nothing, or it recorded only OTHER hooks, or the
+    /// user has switched the prompt hook off in Codex's `/hooks` browser.
+    ///
+    /// **It reports what THIS spawn could establish, and can be wrong in the
+    /// safe direction.** A trust record an earlier `hooks install` wrote from a
+    /// shell that could reach `codex` still makes Codex run the hooks, and this
+    /// spawn cannot see that without the very app-server it failed to reach. The
+    /// cost of that case is a delivery that is written once and not retried —
+    /// the pre-#548 behaviour — rather than one retyped into a pane that took it. `false` for every
+    /// other identity: the wrapper installs nothing for them and so knows
+    /// nothing about their channels, and the deck keeps answering those from
+    /// the type as it always has.
+    prompt_reports_unavailable: bool,
 }
 
 /// PRD #20 W1 spawn wiring. Decides, for this wrap invocation, whether to install
@@ -1189,12 +1259,7 @@ struct CodexSpawnPrep {
 ///   `./launcher.sh`, `devbox run codex-big` all behave identically) and strictly
 ///   narrower than the old bypass: a third-party hook in the same `hooks.json`
 ///   stays untrusted. Any failure is warned and the spawn continues — Codex then
-///   won't run the hooks and events degrade to stdout classification
-///   (fail-closed). PRD #254: this outcome is no longer just a log line —
-///   [`CodexSpawnPrep::hook_trust_confirmed`] carries it back to the caller,
-///   which stamps it on the wrapper-fork `SessionStart` so the daemon can
-///   defer `ConfirmationCapability::Reports` on this pane until the hook is
-///   actually known-successful.
+///   won't run the hooks and events degrade to stdout classification (fail-closed).
 fn codex_spawn_prep(
     program: &str,
     agent_type: &AgentType,
@@ -1208,9 +1273,10 @@ fn codex_spawn_prep(
     // calls it, and `active_codex_home()` calls it again — but both reads happen
     // in this process from the same environment, so they agree. The BINARY half
     // is the one that is structurally pinned: `auto_install()` returns the very
-    // path it installed with, and that value is what reaches the trust write
-    // below (issue #730).
+    // paths its definitions name, and those values are what reach the trust
+    // write below (issue #730).
     let mut installed_binary = None;
+    let mut prompt_hook_live = false;
     let pinned_home = if installs_hooks {
         installed_binary = crate::codex_hooks_manage::auto_install();
         crate::codex_hooks_manage::active_codex_home()
@@ -1223,26 +1289,44 @@ fn codex_spawn_prep(
     // means nothing was installed, so there is nothing of ours to trust — fail
     // closed rather than trusting by signature alone.
     // The child's cwd is the wrapper's cwd, which is what Codex resolves hooks for.
-    //
-    // PRD #254 H1: `hook_trust_confirmed` is `count > 0`, not true on any
-    // `Ok(_)` — `Ok(0)` (`TrustOutcome::NothingListed`/`Unrecognised`) means
-    // zero deck-owned hook entries were trusted, the genuine
-    // hook-install-failed case, and must not read as success.
-    let mut hook_trust_confirmed = false;
-    if let (Some(home), Some(binary_path)) = (pinned_home.as_deref(), installed_binary.as_deref()) {
+    if let (Some(home), Some(binary_paths)) = (pinned_home.as_deref(), installed_binary.as_deref())
+    {
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
-        match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd, binary_path) {
+        // The longer `hooks/list` wait: this launch is the one the trust is for
+        // (PRD #1631; see `SPAWN_HOOKS_LIST_TIMEOUT`).
+        match crate::codex_hooks_manage::trust_deck_hooks_for_within(
+            home,
+            &cwd,
+            binary_paths,
+            crate::codex_hooks_manage::SPAWN_HOOKS_LIST_TIMEOUT,
+        ) {
             // A zero that means "our own entry was unrecognisable" has already
             // warned from inside `trust_deck_hooks_in`; nothing here reports to a
             // user, so the count is all this path needs.
-            Ok(outcome) => {
-                let count = outcome.trusted();
-                tracing::debug!(count, "codex: recorded scoped trust for deck hooks");
-                hook_trust_confirmed = count > 0;
+            //
+            // A NON-zero is `info!` rather than `debug!` because the failure
+            // beside it is `warn!`, and an asymmetry there costs a diagnosis:
+            // issue #1033 had to say "zero successes cannot be proven from the
+            // log alone" about a box carrying thousands of these warnings, since
+            // the only thing that would have refuted it was logged below the
+            // level anyone runs. One line per Codex spawn, on a path that
+            // already writes one when it fails.
+            Ok(outcome) if outcome.trusted() > 0 => {
+                prompt_hook_live = outcome.reports_prompts();
+                tracing::info!(
+                    count = outcome.trusted(),
+                    prompt_hook_live,
+                    "codex: recorded scoped trust for deck hooks"
+                )
             }
+            Ok(outcome) => tracing::debug!(
+                count = outcome.trusted(),
+                "codex: recorded scoped trust for deck hooks"
+            ),
             Err(e) => tracing::warn!(
                 "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
-                 classification"
+                 classification, and this pane's automatic prompts are written once and not \
+                 retried, since the deck cannot tell whether one arrived"
             ),
         }
 
@@ -1266,7 +1350,7 @@ fn codex_spawn_prep(
 
     CodexSpawnPrep {
         pinned_home,
-        hook_trust_confirmed,
+        prompt_reports_unavailable: codex_identity && !prompt_hook_live,
     }
 }
 
@@ -1500,6 +1584,14 @@ fn inject_lifetime_tag(cmd: &mut StdCommand) -> Option<crate::lifetime_tag::Life
 ///
 /// It is itself bounded by deadline + grace and holds no descriptor, so it can
 /// never become the leak it exists to prevent.
+///
+/// **It is forked after `spawn` returns, so there is a window with no reaper.**
+/// The child is already running by then, and a wrapper `SIGKILL`ed before this
+/// fork completes leaves nothing holding the deadline. On the PTY path the
+/// inner master's hangup still ends the child; on the pipe path the child sees
+/// at most an EOF on its stdin, which ends only a child that reads it.
+/// The window is one scheduling gap wide rather than zero, and issue #963 is a
+/// test that used to land its `SIGKILL` inside it under CI load.
 ///
 /// **Telling a reaper apart from the leak it hunts.** It is a `fork` of this
 /// wrapper, so it keeps the wrapper's argv and shows up in `ps` looking like a
@@ -2017,34 +2109,38 @@ fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
 /// post-exit drain/kill path below.
 #[cfg(unix)]
 fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    let mut ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: `openpty` fills both descriptors on success; each is turned into an
-    // `OwnedFd` exactly once so ownership (and close-on-drop) is unambiguous.
-    let rc = unsafe {
-        // macOS declares `termp`/`winp` as `*mut` while Linux uses `*const`;
-        // `null_mut()` and `&mut ws` satisfy the `*mut` signature and coerce to
-        // `*const` on Linux, so this call compiles on both.
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::addr_of_mut!(ws),
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `openpty` returned two fresh, valid descriptors; each becomes an
-    // `OwnedFd` exactly once here, so close-on-drop is unambiguous from now on.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // Issue #1884: on macOS the allocation alone is retried on a transient
+    // failure, never the `cloexec` setup below it.
+    let (master, slave) = crate::pty_open_retry::open_raw(|| {
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        let mut ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `openpty` fills both descriptors on success; each is turned into an
+        // `OwnedFd` exactly once so ownership (and close-on-drop) is unambiguous.
+        let rc = unsafe {
+            // macOS declares `termp`/`winp` as `*mut` while Linux uses `*const`;
+            // `null_mut()` and `&mut ws` satisfy the `*mut` signature and coerce to
+            // `*const` on Linux, so this call compiles on both.
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(ws),
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `openpty` returned two fresh, valid descriptors; each becomes an
+        // `OwnedFd` exactly once here, so close-on-drop is unambiguous from now on.
+        Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
+    })?;
     // Owned first, then flagged: if either fails, both descriptors are already
     // owned and close on the early return instead of leaking (the ordering
     // `portable_pty` uses at `unix.rs:52-58`, and for the same reason). Both
@@ -2116,22 +2212,25 @@ const INTERFACE_SETTLE_WINDOW: Duration = Duration::from_millis(750);
 /// session either.
 ///
 /// Five seconds, the same budget `crate::hook`'s request/response paths give a
-/// daemon that is merely busy. Losing the event costs latency and nothing else —
-/// the readiness gate falls back to the behaviour it has without this signal —
-/// so the bound is deliberately generous rather than tight.
+/// daemon that is merely busy, and deliberately generous rather than tight:
+/// losing the event is not free. The card and the doorbell then wait for the
+/// agent's own hooks, and for Codex those are first-turn-driven (its native
+/// `SessionStart` arrives with the first turn), so an inbox task delivered to a
+/// fresh Codex whose announcement was lost stays pending until a native event
+/// or someone typing into the pane starts a turn. Nothing bounds that wait: no
+/// readiness fallback stands behind this event (PRD #1666).
 #[cfg(unix)]
 const INTERFACE_READY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Issue #243 (review finding 1): WHICH of [`InterfaceWatch`]'s two facts fired.
 ///
 /// Reported rather than collapsed to a bool because the two are not equally
-/// strong and are priced differently by the daemon — see [`InterfaceWatch`] for
-/// what each one is worth and why.
+/// strong — see [`InterfaceWatch`] for what each one is worth and why.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InterfaceFact {
     /// The child cleared `ICANON`/`ECHO` on the inner PTY — fact 1, an
-    /// observation of input-readiness.
+    /// observation that the child reads raw keystrokes.
     RawInputMode,
     /// The child wrote at least one byte and then stayed quiet for
     /// [`INTERFACE_SETTLE_WINDOW`] — fact 2, a guess.
@@ -2141,8 +2240,7 @@ enum InterfaceFact {
 #[cfg(unix)]
 impl InterfaceFact {
     /// The `session_start_origin` value this fact rides to the daemon. Distinct
-    /// per fact so the daemon can price them separately; see
-    /// [`InterfaceWatch`].
+    /// per fact so the event records which one fired; see [`InterfaceWatch`].
     fn origin(self) -> &'static str {
         match self {
             Self::RawInputMode => WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
@@ -2150,8 +2248,9 @@ impl InterfaceFact {
         }
     }
 
-    /// A short, stable label for the log line — the answer to "why did readiness
-    /// fire on this pane?", which used to be computed and then discarded.
+    /// A short, stable label for the log line — the answer to "why did the
+    /// interface event fire on this pane?", which used to be computed and then
+    /// discarded.
     fn reason(self) -> &'static str {
         match self {
             Self::RawInputMode => "raw-input-mode",
@@ -2170,8 +2269,8 @@ impl InterfaceFact {
 ///
 /// TWO independent facts are accepted — [`InterfaceFact`] — and they are NOT
 /// equally strong, which is why the watch reports WHICH one fired rather than a
-/// bare bool. They ride distinct `session_start_origin` values so the daemon can
-/// price them separately (issue #243 review finding 1), and they are latched
+/// bare bool. They ride distinct `session_start_origin` values so the event
+/// records which one fired (issue #243 review finding 1), and they are latched
 /// SEPARATELY so a session that produces the weak one can still produce the
 /// strong one afterwards — which, for the production launch shape, is every
 /// session (see [`InterfaceWatch::claim`]):
@@ -2193,9 +2292,8 @@ impl InterfaceFact {
 ///    measured on real codex-cli 0.149.0 at 85 ms after a direct exec, and by
 ///    `orchestration/delegate/009` at fork + 100 ms, where a prompt written on it
 ///    parked unsubmitted in the composer and no turn ever started. So this fact
-///    is the best RELEASE signal the deck has and still owes a post-readiness
-///    buffer on the daemon side; see
-///    `crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`.
+///    does not prove the composer is listening, which is why, until Codex's own
+///    hooks report, the doorbell's writer also waits for Codex's composer.
 /// 2. **Output SETTLED** ([`InterfaceFact::OutputSettled`]) — the child wrote
 ///    something and then stopped for [`INTERFACE_SETTLE_WINDOW`]. The fallback
 ///    for an interface that stays in cooked mode (a line-oriented REPL, and the
@@ -2216,11 +2314,8 @@ impl InterfaceFact {
 ///    after announcing it ([`InterfaceWatch::claim`] latches per fact, not per
 ///    session), so if the launcher was merely slow the strong fact follows later
 ///    on the same wrapper session — a few seconds warm, and a measured ~15 s on a
-///    cold `devbox` that installs packages first — and the daemon holds an upgrade
-///    window on fact 2 for exactly that reason rather than releasing on it
-///    immediately. See
-///    `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN` and
-///    `crate::state::INTERFACE_UPGRADE_WINDOW`.
+///    cold `devbox` that installs packages first. See
+///    `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`.
 ///
 /// What is deliberately NOT accepted: elapsed time since `exec`, and the child's
 /// FIRST byte. A wall-clock timer fires for a child that has not started, and a
@@ -2228,7 +2323,7 @@ impl InterfaceFact {
 /// deck straight back into writing a prompt into something that is not an agent.
 /// A child that writes nothing and never leaves cooked mode is never announced
 /// ready by this watch at all, which is correct: nothing about it is observable,
-/// so the gate falls back to the behaviour it has today.
+/// so the card and the doorbell wait for the agent's own hooks.
 ///
 /// **What this watch observes is the inner PTY, which is not private to the
 /// child.** A same-uid process can find it (`/proc/<wrapper-pid>/fd` → the pts
@@ -2305,9 +2400,9 @@ impl InterfaceWatch {
     /// [`InterfaceFact::RawInputMode`] has been claimed.
     ///
     /// The identity of the fact is part of the answer, not a diagnostic
-    /// afterthought: the two are priced differently downstream (see
-    /// [`InterfaceWatch`]), so a caller that collapses them back to a bool
-    /// reintroduces the launcher-settle hazard fact 2 carries.
+    /// afterthought: the two are not equally strong (see [`InterfaceWatch`]),
+    /// so a caller that collapses them back to a bool loses the difference
+    /// anything granting more to the strong fact would need.
     ///
     /// **Per fact, not per session** (issue #243 regression fix). This used to
     /// latch once for the whole wrapper, which made whichever fact happened to
@@ -2400,120 +2495,232 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// master pump and the redirected-descriptor pipe pumps) so one coherent session
 /// state drives the card.
 ///
-/// Issue #638 round 4: `suppress_text_status` is `true` for an interactive Codex
-/// session whose native hooks are confirmed installed AND trusted
-/// (`CodexSpawnPrep::hook_trust_confirmed`). Rounds 1–3 tried to make the raw
-/// redraw-stream text heuristic reliable in both directions and could not: a
-/// full-screen TUI repaint has no text signal for "the turn is genuinely,
-/// stably over" (round 3's audit found both a mid-turn false `Idle`, when a
-/// repaint batch carries the composer placeholder without the co-resident
-/// spinner text, and an end-of-turn wedge at `Working`, when the final segment
-/// is a completion footer with no marker at all — see
-/// `.dot-agent-deck/638-audit-findings-r3.md` F1/F2). For a hook-trusted
-/// session there is no need to guess: Codex's own `UserPromptSubmit`/`Stop`
-/// hooks (`src/hook.rs`'s `map_event_type`) already fire on the real turn
-/// boundary and ride the SAME `AgentEvent` pipeline via a different code path
-/// (`src/hook.rs`'s `handle_hook`).
-///
-/// Round 5 (`.dot-agent-deck/638-audit-findings-r4.md` R4-F1;
-/// `638-review-findings-r4.md` F2) tried narrowing the suppression to skip
-/// only the non-JSON, plain-text substring fallback, keeping the JSON
-/// `type`-discriminator branch ([`classify_codex_json`]) exempt from
-/// suppression unconditionally. That design regressed on real bytes: the
-/// interactive TUI's error turn arrives ANSI-decorated, and a strict
-/// `serde_json::from_str` never parses it (0 of 214 real captured segments
-/// did — `.dot-agent-deck/638-audit-findings-r5.md` R5-F1), so the exempted
-/// JSON branch was exempting a channel real traffic never reaches.
-///
-/// Round 6 (`638-audit-findings-r5.md` R5-F1; `638-review-findings-r5.md`
-/// F1/F3) moves the suppression entirely off the classification path: raw
-/// classification via [`classify_codex_line`] (both its JSON and substring
-/// branches) now runs unconditionally, so the shared `Detector`'s internal
-/// debounce state always tracks reality — including a state change that is
-/// itself never emitted, which is what lets a *later* state change (e.g. a
-/// second, separate error turn) correctly register as a change and re-emit
-/// instead of being silently swallowed because `.last` never left
-/// `Some(Error)`. The suppression gate moves entirely to the final
-/// `emitter.emit()` call: under `suppress_text_status`, only an
-/// `Error`-classified event is actually sent to the daemon; everything else
-/// is classified (for bookkeeping) but discarded. It is specifically the
-/// **substring** `error_markers` rule (via [`classify_line_with`]), not the
-/// JSON discriminator, that resolves the real ANSI-decorated interactive
-/// error case — the JSON branch never sees it. The
-/// `active_markers`/`idle_markers` heuristic itself always runs, unchanged;
-/// it only still has effect — its results still reach the daemon — for the
-/// narrower case where hook trust is NOT confirmed, or when it classifies as
-/// `Error` regardless of trust state (see [`CODEX`]'s doc comment for that
-/// path's accepted residual limitation).
-///
-/// Round 7 (issue #652 reviewer F1 / auditor A1): round 6 left one gap —
-/// under `suppress_text_status`, a hook-trusted session that never errors
-/// (the overwhelming majority of real sessions) had NO surviving carrier for
-/// the model it just read off the composer footer, since every non-`Error`
-/// event was discarded outright. The suppression gate itself is unchanged
-/// (still only `Error` carries real status under suppression); what's new is
-/// that a freshly-observed model (this call's own
-/// [`extract_codex_status_bar_model`] result, not merely still-sticky from
-/// an earlier call) rides a status-neutral [`EventType::Unknown`] event
-/// through the gate instead of being dropped with it. `Unknown` is
-/// `apply_event`'s no-status-change catch-all (`state.rs`), so this cannot
-/// perturb the pane's status — only the model reaches the daemon, exactly as
-/// the two untouched session-end `emit()` calls already do unconditionally.
-fn classify_and_emit(
-    line: &str,
-    detector: &Arc<Mutex<Detector>>,
-    emitter: &Emitter,
-    is_codex: bool,
-    suppress_text_status: bool,
-) {
-    let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-    // Issue #652: try to read the model off this segment's status bar before
-    // classifying — independent of what this segment classifies as, since a
-    // status-bar repaint and a state-change event don't necessarily land on
-    // the same segment. `fresh_model` (this call's own extraction result, as
-    // opposed to `Detector.model`, which is sticky and may only reflect an
-    // earlier call) distinguishes a genuinely new observation from a merely
-    // still-sticky one — round 7 needs that distinction below.
-    let fresh_model = if is_codex {
+/// Issue #652 (fork): for a wrapped Codex, the model id is also read off this
+/// segment's TUI status bar ([`extract_codex_status_bar_model`]) before
+/// classifying, independent of what the segment classifies as — a status-bar
+/// repaint and a state change do not necessarily land on the same segment.
+/// The model rides on the classified event when there is one; a model freshly
+/// observed on a segment that produces no transition (issue #657) is sent on a
+/// status-neutral `Unknown` carrier so it is not lost. The daemon side is
+/// STICKY on `model`, so a `None` never regresses an already-known model.
+fn classify_and_emit(line: &str, detector: &Arc<Mutex<Detector>>, emitter: &Emitter) {
+    let fresh_model = if emitter.agent_type == AgentType::Codex {
         extract_codex_status_bar_model(line)
     } else {
         None
     };
+    let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
     det.note_model(fresh_model.clone());
-    let ev = if is_codex {
-        det.observe_detected(classify_codex_line(line))
-    } else {
-        det.observe(line)
+    let Some(ev) = det.observe(line) else {
+        drop(det);
+        if let Some(model) = fresh_model {
+            emitter.emit_with_metadata(
+                EventType::Unknown,
+                output_classified_metadata(),
+                Some(model),
+            );
+        }
+        return;
     };
     let model = det.model.clone();
-    drop(det);
-    match ev {
-        Some(ev) => {
-            if suppress_text_status && ev != DetectedEvent::Error {
-                // Round 7 (issue #652 reviewer F1 / auditor A1): the
-                // suppressed classification itself still doesn't reach the
-                // daemon, but a model freshly observed on THIS call rides a
-                // status-neutral carrier through instead of being dropped
-                // with it — see this function's doc comment. No fresh model
-                // on this call: nothing changed since the last check, so
-                // stay silent exactly as before.
-                if let Some(fresh_model) = fresh_model {
-                    emitter.emit_with_model(EventType::Unknown, Some(fresh_model));
-                }
-                return;
+    // Issue #1493: stamped while the detector is held, so the producer
+    // timestamps of the tee's frames and `QuietOutputIdle`'s follow the order
+    // the two decided in — which is what the deck orders them by.
+    let event = emitter.build_event(ev.event_type(), output_classified_metadata(), model);
+    emitter.send_classified(&event, det);
+}
+
+/// Issue #1493: how long [`LatestSend`] waits on one send — the bound
+/// `INTERFACE_READY_SEND_TIMEOUT` uses, for the same reason; not shared with
+/// it because that one exists only where the interface watch does (Unix).
+const CLASSIFIED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Issue #1493: a sender that keeps only the NEWEST frame waiting, on one
+/// thread of its own. Used for a wrapped Codex's output-derived status frames
+/// while its prompt hook is not running: they come from the tee and from the
+/// supervisory loop, which must not wait on the daemon (see
+/// [`Emitter::emit_interface_ready`]), so they are handed here instead. One
+/// thread keeps them in order; keeping only the newest means a daemon that is
+/// not reading cannot make the wrapper hold a growing backlog of statuses
+/// nobody wants any more — the card only ever needs the latest.
+struct LatestSend {
+    slot: Mutex<Option<String>>,
+    ready: std::sync::Condvar,
+    closed: AtomicBool,
+}
+
+impl LatestSend {
+    fn spawn() -> Arc<Self> {
+        let sender = Arc::new(Self {
+            slot: Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+            closed: AtomicBool::new(false),
+        });
+        let worker = Arc::clone(&sender);
+        std::thread::spawn(move || {
+            loop {
+                let json = {
+                    let mut slot = worker.slot.lock().unwrap_or_else(|p| p.into_inner());
+                    loop {
+                        if let Some(json) = slot.take() {
+                            break json;
+                        }
+                        slot = worker.ready.wait(slot).unwrap_or_else(|p| p.into_inner());
+                    }
+                };
+                crate::hook::send_to_socket_bounded(&json, CLASSIFIED_SEND_TIMEOUT);
             }
-            emitter.emit_with_model(ev.event_type(), model);
+        });
+        sender
+    }
+
+    /// A sender with no worker thread, so a test can read what is waiting.
+    #[cfg(test)]
+    fn unspawned() -> Arc<Self> {
+        Arc::new(Self {
+            slot: Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Replace whatever is waiting with `json` — unless [`Self::close`] ran.
+    fn post(&self, json: String) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closed.load(Ordering::SeqCst) {
+            return;
         }
-        None => {
-            // Issue #657: a freshly-observed model must reach the daemon
-            // even when THIS segment doesn't also produce a status
-            // transition — the transition and the status-bar repaint don't
-            // necessarily land on the same segment, so this can't be
-            // folded into the `Some(ev)` arm above.
-            if let Some(fresh_model) = fresh_model {
-                emitter.emit_with_model(EventType::Unknown, Some(fresh_model));
+        *slot = Some(json);
+        drop(slot);
+        self.ready.notify_one();
+    }
+
+    /// Drop whatever is waiting, and every later [`Self::post`].
+    fn close(&self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        self.closed.store(true, Ordering::SeqCst);
+        *slot = None;
+    }
+}
+
+/// Issue #714: the mark on every event this wrapper derives from the child's
+/// output, because those events prove output, not work, and must not clear a
+/// Blocked card. See `WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`.
+fn output_classified_metadata() -> HashMap<String, String> {
+    HashMap::from([(
+        crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+        crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+    )])
+}
+
+/// Issue #1493: how long a wrapped Codex whose prompt hook is not running must
+/// draw nothing before the wrapper reports it Idle. Measured against Codex
+/// 0.160.0 on a pty: the idle TUI is silent once its boot paint ends (~3 s),
+/// while a running turn redraws its elapsed-time header at least once a second.
+#[cfg(unix)]
+const CODEX_QUIET_OUTPUT_IDLE: Duration = Duration::from_secs(3);
+
+/// Issue #1493: the classification output going quiet (or resuming) calls
+/// for, given the detector's last state, the monotonic time of the child's last
+/// byte (`0` = none yet), the time of the last byte before the wrapper last
+/// reported quiet, and now. Pure, so the rule is testable without a pty.
+fn quiet_output_transition(
+    last: Option<DetectedEvent>,
+    last_output_ms: i64,
+    quiet_reported_at_output_ms: Option<i64>,
+    now_ms: i64,
+    quiet: Duration,
+) -> Option<DetectedEvent> {
+    if last_output_ms <= 0 {
+        return None;
+    }
+    match last {
+        Some(DetectedEvent::Working)
+            if now_ms.saturating_sub(last_output_ms) >= quiet.as_millis() as i64 =>
+        {
+            Some(DetectedEvent::Idle)
+        }
+        // Bytes since the quiet report: drawing again. A TUI redraw seldom
+        // ends a line, so the line classifier cannot be relied on to notice.
+        Some(DetectedEvent::Idle)
+            if quiet_reported_at_output_ms.is_some_and(|at| last_output_ms > at) =>
+        {
+            Some(DetectedEvent::Working)
+        }
+        None => Some(DetectedEvent::Working),
+        _ => None,
+    }
+}
+
+/// Issue #1493: the degraded status a wrapped Codex gets when the deck could not
+/// get its prompt hook trusted — the case where nothing will ever announce a
+/// turn. Without it the card stayed busy from the first painted line until
+/// Codex exited. With it, the card reads Thinking while Codex is drawing and Idle
+/// once its output has been quiet for [`CODEX_QUIET_OUTPUT_IDLE`].
+///
+/// Ticked from the supervisory loop, the only thread awake when the output
+/// stops. It shares the tee's [`Detector`], so the two never report the same
+/// state twice, and in this mode both send through the emitter's
+/// [`LatestSend`], so their frames leave in order and this loop — which
+/// forwards the user's signals — never waits on the daemon.
+#[cfg(unix)]
+struct QuietOutputIdle {
+    quiet_reported_at_output_ms: Option<i64>,
+}
+
+#[cfg(unix)]
+impl QuietOutputIdle {
+    fn new() -> Self {
+        Self {
+            quiet_reported_at_output_ms: None,
+        }
+    }
+
+    /// The wrapper announced its child's output settled, which the card reads as
+    /// Idle: record the quiet. When that moves the detector off Working, also
+    /// send the Idle as a classified frame (Qodo on PR #1523): the start was
+    /// stamped before this lock was taken, so a Thinking the tee classified in
+    /// between is newer than it and the deck drops the start as stale. Stamped
+    /// here, under the lock, this Idle is newer than that Thinking and leaves
+    /// through the same ordered sender after it.
+    fn note_settled(
+        &mut self,
+        detector: &Mutex<Detector>,
+        watch: &InterfaceWatch,
+        emitter: &Emitter,
+    ) {
+        let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = det.observe_detected(Some(DetectedEvent::Idle));
+        self.quiet_reported_at_output_ms = Some(watch.last_output_ms.load(Ordering::SeqCst));
+        match changed {
+            Some(idle) => {
+                let event =
+                    emitter.build_event(idle.event_type(), output_classified_metadata(), None);
+                emitter.send_classified(&event, det);
             }
+            None => drop(det),
         }
+    }
+
+    fn tick(&mut self, detector: &Mutex<Detector>, watch: &InterfaceWatch, emitter: &Emitter) {
+        let last_output_ms = watch.last_output_ms.load(Ordering::SeqCst);
+        let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(next) = quiet_output_transition(
+            det.last,
+            last_output_ms,
+            self.quiet_reported_at_output_ms,
+            monotonic_millis(),
+            CODEX_QUIET_OUTPUT_IDLE,
+        ) else {
+            return;
+        };
+        det.observe_detected(Some(next));
+        // Stamped under the detector, as in `classify_and_emit`.
+        let event = emitter.build_event(next.event_type(), output_classified_metadata(), None);
+        if next == DetectedEvent::Idle {
+            self.quiet_reported_at_output_ms = Some(last_output_ms);
+        }
+        emitter.send_classified(&event, det);
     }
 }
 
@@ -2598,15 +2805,6 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         }
     };
 
-    let emitter = Arc::new(Emitter {
-        agent_type,
-        session_id,
-        pane_id,
-        agent_id,
-        cwd,
-        live_target,
-    });
-
     // PRD #20 W1: install the deck's native Codex hooks into the active
     // CODEX_HOME (for a `codex` program OR a deck-spawned Codex-identity launcher)
     // and record SCOPED, hash-pinned trust for exactly those hooks so Codex runs
@@ -2615,10 +2813,28 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // PRD #20 Greptile finding #2: the returned `pinned_home` is set explicitly
     // on the spawned child so the home the deck installed into and trusted is
     // exactly the home Codex loads.
+    // Issue #559: before the emitter exists, because its outcome decides what
+    // every event — the first one included — says about prompt reports.
     let CodexSpawnPrep {
         pinned_home,
-        hook_trust_confirmed,
-    } = codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
+        prompt_reports_unavailable,
+    } = codex_spawn_prep(program, &agent_type, pane_id.as_deref());
+
+    let agent_type_is_codex = agent_type == AgentType::Codex;
+    let emitter = Arc::new(Emitter {
+        agent_type,
+        session_id,
+        pane_id,
+        agent_id,
+        token: crate::hook_provenance::token_from_env(),
+        cwd,
+        live_target,
+        prompt_reports_unavailable,
+        // Issue #1493: the quiet-output fallback's frames and the tee's must
+        // leave in the order they were decided, from one thread.
+        classified_sender: (agent_type_is_codex && prompt_reports_unavailable)
+            .then(LatestSend::spawn),
+    });
 
     // R20-012 / finding #11: genuine per-descriptor routing. Detect the
     // tty-or-redirected nature of EACH standard descriptor independently. If any
@@ -2633,23 +2849,12 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         unsafe { libc::isatty(libc::STDERR_FILENO) == 1 },
     ];
 
+    // Issue #2002: decided once, so both paths start the same argv.
+    let args = launch_args(program, args);
     if tty.iter().any(|&t| t) {
-        run_wrap_pty(
-            program,
-            args,
-            &emitter,
-            pinned_home.as_deref(),
-            hook_trust_confirmed,
-            tty,
-        )
+        run_wrap_pty(program, &args, &emitter, pinned_home.as_deref(), tty)
     } else {
-        run_wrap_pipe(
-            program,
-            args,
-            &emitter,
-            pinned_home.as_deref(),
-            hook_trust_confirmed,
-        )
+        run_wrap_pipe(program, &args, &emitter, pinned_home.as_deref())
     }
 }
 
@@ -2669,7 +2874,6 @@ fn run_wrap_pty(
     args: &[String],
     emitter: &Arc<Emitter>,
     pinned_codex_home: Option<&std::path::Path>,
-    codex_hook_trust_confirmed: bool,
     tty: [bool; 3],
 ) -> ExitCode {
     let [stdin_tty, stdout_tty, stderr_tty] = tty;
@@ -2787,10 +2991,10 @@ fn run_wrap_pty(
     // The session has begun — surface the card immediately. PRD #225 M3: this is
     // a CARD-SURFACING signal, not a readiness signal (the child may still be
     // `devbox`/a shell for seconds before the agent TUI exists), so it carries
-    // the wrapper-fork origin marker. PRD #254: it also carries the real Codex
-    // hook install/trust outcome, since `codex_spawn_prep` has already run by
-    // this point.
-    emitter.emit_fork_session_start(codex_hook_trust_confirmed);
+    // the wrapper-fork origin marker. Keep it AFTER `arm_child_group_backstop`:
+    // `tests/wrap_io.rs`'s stranded-child probe reads it as proof the reaper is
+    // forked before it SIGKILLs this wrapper (issue #963).
+    emitter.emit_fork_session_start();
 
     // Raw-mode the outer terminal ONLY when stdin is itself a terminal, so
     // keystrokes (incl. Ctrl+C and CR) reach the inner PTY unmodified; restored
@@ -2799,22 +3003,11 @@ fn run_wrap_pty(
 
     // One shared detector across every tee so the card reflects a single
     // coherent session state. PRD #20 M7: the rule set is keyed off the resolved
-    // agent type; Codex uses JSON-aware classification, any other command keeps
-    // the generic fallback. Recover from a poisoned mutex instead of panicking.
-    let is_codex = emitter.agent_type == AgentType::Codex;
+    // agent type ([`ruleset_for`]). Recover from a poisoned mutex instead of
+    // panicking.
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
-    // Issue #638 round 4: this is the ONLY path a wrapped agent's stdio is a
-    // real interactive terminal (the non-interactive `run_wrap_pipe` path never
-    // sets this). When Codex's own hooks are confirmed installed and trusted,
-    // they are the authoritative turn-boundary signal (see
-    // `classify_and_emit`'s doc comment) — the text heuristic below would be
-    // dead weight AND a source of false transitions for this session, so
-    // (round 6) every text-derived classification except `Error` is discarded
-    // at the emit gate rather than raced against the hook channel; see
-    // `classify_and_emit`.
-    let suppress_text_status = is_codex && codex_hook_trust_confirmed;
 
     // Terminal-output pump: the inner master carries whatever the child wrote to
     // the slave. Copy it to the real terminal fd (prefer stdout, else stderr),
@@ -2852,7 +3045,7 @@ fn run_wrap_pty(
                     watch,
                 },
                 |line| {
-                    classify_and_emit(line, &detector, &emitter, is_codex, suppress_text_status);
+                    classify_and_emit(line, &detector, &emitter);
                 },
             );
             output_done.store(true, Ordering::SeqCst);
@@ -2862,28 +3055,10 @@ fn run_wrap_pty(
     };
 
     // Redirected output descriptors: tee each pipe to the matching real fd.
-    let out_pipe_thread = pipe_out.map(|r| {
-        spawn_pipe_tee(
-            r,
-            libc::STDOUT_FILENO,
-            emitter,
-            &detector,
-            is_codex,
-            suppress_text_status,
-            Some(&interface),
-        )
-    });
-    let err_pipe_thread = pipe_err.map(|r| {
-        spawn_pipe_tee(
-            r,
-            libc::STDERR_FILENO,
-            emitter,
-            &detector,
-            is_codex,
-            suppress_text_status,
-            Some(&interface),
-        )
-    });
+    let out_pipe_thread = pipe_out
+        .map(|r| spawn_pipe_tee(r, libc::STDOUT_FILENO, emitter, &detector, Some(&interface)));
+    let err_pipe_thread = pipe_err
+        .map(|r| spawn_pipe_tee(r, libc::STDERR_FILENO, emitter, &detector, Some(&interface)));
 
     // Input pump (outer stdin → inner master when stdin is a terminal, else →
     // the child's stdin pipe). Detached: on child exit the main loop returns and
@@ -2933,6 +3108,13 @@ fn run_wrap_pty(
     let mut last_size = (rows, cols);
     let mut output_gone_at: Option<Instant> = None;
     let mut fwd = SignalForwarder::new(child_pid);
+    // Issue #1493: only a Codex whose prompt hook this spawn could not vouch
+    // for; with the hooks running, they decide its status and output does not.
+    // Not gated on a terminal output: a redirected stdout/stderr is teed with
+    // the same `interface`, which records its bytes too (Qodo on PR #1523).
+    let mut quiet_output_idle = (emitter.agent_type == AgentType::Codex
+        && emitter.prompt_reports_unavailable)
+        .then(QuietOutputIdle::new);
     let status = loop {
         if let Some(size) = terminal_size(libc::STDIN_FILENO)
             .or_else(|| terminal_size(libc::STDOUT_FILENO))
@@ -2946,7 +3128,7 @@ fn run_wrap_pty(
         // finding #12: forward a pending signal to the child group and escalate.
         fwd.tick();
 
-        // Issue #243: the pre-prompt readiness signal. Polled here rather than
+        // Issue #243: the interface-ready `SessionStart`. Polled here rather than
         // pushed from the tee threads because one of the two facts it reads —
         // the inner PTY's line discipline — is state, not an event, and because
         // the settle window has to be noticed by SOMEBODY once the output stops
@@ -2981,6 +3163,18 @@ fn run_wrap_pty(
                 "wrap: observed the child's interface; announcing pre-prompt readiness"
             );
             emitter.emit_interface_ready(fact);
+            // Issue #1493: that start reads Idle on the card, and it says the
+            // output went quiet, so the quiet-output detector agrees with it —
+            // or the next burst of drawing would find it still "working" and
+            // report nothing.
+            if fact == InterfaceFact::OutputSettled
+                && let Some(quiet) = quiet_output_idle.as_mut()
+            {
+                quiet.note_settled(&detector, &interface, emitter);
+            }
+        }
+        if let Some(quiet) = quiet_output_idle.as_mut() {
+            quiet.tick(&detector, &interface, emitter);
         }
 
         // R20-001: the terminal output pump ended while the child is still alive
@@ -3039,10 +3233,14 @@ fn run_wrap_pty(
         Some(s) => (s.success(), s.code().unwrap_or(1) as u8),
         None => (false, 1),
     };
+    // Issue #1493 (Qodo on PR #1523): nothing derived from the child's output
+    // may follow its exit status — a frame still waiting would repaint a
+    // finished pane. One already on the wire is stamped before this one and
+    // the deck drops it as stale.
+    emitter.close_classified();
     // Issue #652 reviewer F2: stamp the model here unconditionally — this
-    // call fires on every session end regardless of `suppress_text_status`,
-    // so it's a guaranteed-once-per-session carrier for whatever `detector`
-    // last observed, independent of round 7's suppressed-path carrier above.
+    // call fires on every session end, so it's a guaranteed-once-per-session
+    // carrier for whatever `detector` last observed.
     let model = detector
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -3072,7 +3270,6 @@ fn run_wrap_pipe(
     args: &[String],
     emitter: &Arc<Emitter>,
     pinned_codex_home: Option<&std::path::Path>,
-    codex_hook_trust_confirmed: bool,
 ) -> ExitCode {
     let mut cmd = StdCommand::new(program);
     cmd.args(args);
@@ -3114,9 +3311,9 @@ fn run_wrap_pipe(
     arm_child_group_backstop(child_pid, lifetime_tag);
 
     // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
-    // same marker — it says "a session exists", not "the agent is ready". PRD
-    // #254: same hook-trust outcome as the PTY path too.
-    emitter.emit_fork_session_start(codex_hook_trust_confirmed);
+    // same marker — it says "a session exists", not "the agent is ready".
+    // After the arm above for the same reason as there (issue #963).
+    emitter.emit_fork_session_start();
 
     let child_stdout = child.stdout.take().expect("piped child stdout");
     let child_stderr = child.stderr.take().expect("piped child stderr");
@@ -3124,42 +3321,21 @@ fn run_wrap_pipe(
 
     // One shared detector across both output streams so the card reflects a
     // single coherent state (mirrors the PTY path).
-    let is_codex = emitter.agent_type == AgentType::Codex;
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
 
-    // Issue #638 round 4: `suppress_text_status` is always `false` here — this
-    // is the non-interactive path (`codex exec --json` and friends; no
-    // descriptor is a real terminal), where the JSONL `type`-discriminator
-    // branch of `classify_codex_line` already classifies correctly and the
-    // round-1–3 heuristic's residual limitations don't apply (they are
-    // specific to the interactive TUI's plain-text redraw stream).
-    // Classification itself is identical either way — `classify_and_emit`'s
-    // JSON-discriminator branch runs regardless of `suppress_text_status` —
-    // but round 6 makes the hardcoded `false` load-bearing again for
-    // *emission*: on the PTY-host path with hook trust confirmed, a
-    // `{"type":"turn.completed"}` record classifies `Idle` and is discarded
-    // at the emit gate, whereas this path (where the gate is always open)
-    // emits it. `codex/wrap/011` pins exactly that difference.
-    let out_thread = spawn_pipe_tee(
-        child_stdout,
-        libc::STDOUT_FILENO,
-        emitter,
-        &detector,
-        is_codex,
-        false,
-        None,
-    );
-    let err_thread = spawn_pipe_tee(
-        child_stderr,
-        libc::STDERR_FILENO,
-        emitter,
-        &detector,
-        is_codex,
-        false,
-        None,
-    );
+    // Issue #1493 (Qodo on PR #1523): a Codex whose prompt hook is not running
+    // still needs its output's quiet noticed here, or its card holds the first
+    // Thinking until the process exits. The watch is used for its last-output
+    // time only — `claim` is never called on this path, so it announces no
+    // interface readiness (see `spawn_pipe_tee`).
+    let quiet = (emitter.agent_type == AgentType::Codex && emitter.prompt_reports_unavailable)
+        .then(|| (QuietOutputIdle::new(), Arc::new(InterfaceWatch::new(None))));
+    let watch = quiet.as_ref().map(|(_, watch)| watch);
+    let out_thread = spawn_pipe_tee(child_stdout, libc::STDOUT_FILENO, emitter, &detector, watch);
+    let err_thread = spawn_pipe_tee(child_stderr, libc::STDERR_FILENO, emitter, &detector, watch);
+    let mut quiet = quiet;
 
     // Input pump (outer stdin → child stdin, verbatim). On EOF/close of our
     // stdin, dropping `child_stdin` closes it so an EOF-sensitive child finishes.
@@ -3197,6 +3373,9 @@ fn run_wrap_pipe(
     let mut fwd = SignalForwarder::new(child_pid);
     let status = loop {
         fwd.tick();
+        if let Some((quiet, watch)) = quiet.as_mut() {
+            quiet.tick(&detector, watch, emitter);
+        }
         match child.try_wait() {
             Ok(Some(s)) => break Ok(s),
             Ok(None) => {}
@@ -3217,10 +3396,14 @@ fn run_wrap_pipe(
         Ok(s) => (s.success(), s.code().unwrap_or(1) as u8),
         Err(_) => (false, 1),
     };
+    // Issue #1493 (Qodo on PR #1523): nothing derived from the child's output
+    // may follow its exit status — a frame still waiting would repaint a
+    // finished pane. One already on the wire is stamped before this one and
+    // the deck drops it as stale.
+    emitter.close_classified();
     // Issue #652 reviewer F2: stamp the model here unconditionally — this
-    // call fires on every session end regardless of `suppress_text_status`,
-    // so it's a guaranteed-once-per-session carrier for whatever `detector`
-    // last observed, independent of round 7's suppressed-path carrier above.
+    // call fires on every session end, so it's a guaranteed-once-per-session
+    // carrier for whatever `detector` last observed.
     let model = detector
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -3248,17 +3431,17 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
     out_fd: RawFd,
     emitter: &Arc<Emitter>,
     detector: &Arc<Mutex<Detector>>,
-    is_codex: bool,
-    suppress_text_status: bool,
     interface: Option<&Arc<InterfaceWatch>>,
 ) -> std::thread::JoinHandle<()> {
     let emitter = Arc::clone(emitter);
     let detector = Arc::clone(detector);
     // Issue #243: `Some` on the interactive path, where a redirected descriptor
     // is still one of the ways a wrapped child's interface can reach the user, so
-    // its bytes count as the child painting. `None` on the wholly non-interactive
-    // pipe path: there is no terminal there for an interface to exist on, and a
-    // batch `codex exec --json` run is never the target of a readiness gate.
+    // its bytes count as the child painting. On the wholly non-interactive pipe
+    // path it is `None`, except for a Codex whose prompt hook is not running,
+    // where the watch only records when output last arrived for its quiet-output
+    // Idle (issue #1493): nothing there ever asks it about readiness, since
+    // there is no terminal for an interface to exist on.
     let interface = interface.map(Arc::clone);
     std::thread::spawn(move || match interface {
         Some(watch) => tee(
@@ -3268,11 +3451,11 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
                 watch,
             },
             |line| {
-                classify_and_emit(line, &detector, &emitter, is_codex, suppress_text_status);
+                classify_and_emit(line, &detector, &emitter);
             },
         ),
         None => tee(reader, FdWriter(out_fd), |line| {
-            classify_and_emit(line, &detector, &emitter, is_codex, suppress_text_status);
+            classify_and_emit(line, &detector, &emitter);
         }),
     })
 }
@@ -3281,6 +3464,28 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #2002: only a direct Codex gets the embedded pair, once, in front.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_direct_codex_gets_the_embedded_pair_once() {
+        let own = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let user = own(&["--model", "m", "a b"]);
+        let embedded = own(&[
+            CODEX_EMBEDDED_ARGS[0],
+            CODEX_EMBEDDED_ARGS[1],
+            "--model",
+            "m",
+            "a b",
+        ]);
+        for program in ["codex", "/opt/bin/codex"] {
+            assert_eq!(*launch_args(program, &user), embedded[..], "{program}");
+            assert_eq!(*launch_args(program, &embedded), embedded[..], "{program}");
+        }
+        for program in ["devbox", "/bin/sh", "codex-big", "opencode"] {
+            assert_eq!(*launch_args(program, &user), user[..], "{program}");
+        }
+    }
 
     // Pure-data pattern-detection tests — plain `#[test]` unit tests (no
     // `#[spec]` / CATALOG reproducer needed: these assert a pure function, not
@@ -3398,7 +3603,6 @@ mod tests {
     fn explicit_ruleset_detects_idle_marker() {
         static CUSTOM: RuleSet = RuleSet {
             error_markers: &["boom"],
-            active_markers: &[],
             idle_markers: &["done", "waiting for input"],
         };
         assert_eq!(
@@ -3427,6 +3631,109 @@ mod tests {
         assert_eq!(DetectedEvent::Idle.event_type(), EventType::Idle);
     }
 
+    /// Issue #1493 (Qodo on PR #1523): the latest-wins sender ends up holding
+    /// the LAST decision, whichever path made it — the tee classifying a line
+    /// or the settled-output Idle — because both post while still holding the
+    /// detector. Posting after the release let an older Idle replace a newer
+    /// Thinking that slipped in between, leaving a drawing pane Idle.
+    #[cfg(unix)]
+    #[test]
+    fn the_classified_sender_holds_the_last_decision() {
+        let waiting = |sender: &LatestSend| -> EventType {
+            let json = sender
+                .slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .expect("a frame is waiting");
+            serde_json::from_str::<AgentEvent>(&json)
+                .expect("a frame")
+                .event_type
+        };
+        for settled_last in [true, false] {
+            let sender = LatestSend::unspawned();
+            let emitter = Emitter {
+                agent_type: AgentType::Codex,
+                session_id: "wrap-test".to_string(),
+                pane_id: None,
+                agent_id: None,
+                token: None,
+                cwd: None,
+                live_target: LiveTarget {
+                    kind: TargetKind::Process,
+                    writable: Writable::HistoryOnly,
+                },
+                prompt_reports_unavailable: true,
+                classified_sender: Some(Arc::clone(&sender)),
+            };
+            let detector = Arc::new(Mutex::new(Detector::with_rules(&CODEX)));
+            let watch = InterfaceWatch::new(None);
+            watch.note_output();
+            let mut quiet = QuietOutputIdle::new();
+            classify_and_emit("> Ask Codex to do anything", &detector, &emitter);
+            assert_eq!(waiting(&sender), EventType::Thinking);
+            if settled_last {
+                quiet.note_settled(&detector, &watch, &emitter);
+                assert_eq!(waiting(&sender), EventType::Idle);
+            } else {
+                quiet.note_settled(&detector, &watch, &emitter);
+                classify_and_emit("  gpt-test low  ~/work", &detector, &emitter);
+                assert_eq!(waiting(&sender), EventType::Thinking);
+            }
+        }
+    }
+
+    /// Issue #1493 (Qodo on PR #1523): once closed for the child's exit, the
+    /// output-derived sender holds nothing and takes nothing more, so no stale
+    /// Thinking can follow the exit status.
+    #[test]
+    fn a_closed_classified_sender_keeps_nothing() {
+        let sender = LatestSend::spawn();
+        sender.close();
+        sender.post("{}".to_string());
+        assert!(
+            sender
+                .slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+    }
+
+    /// Issue #1493: for a wrapped Codex with no prompt hook, output going quiet
+    /// for the window reports Idle exactly once, and only bytes drawn AFTER that
+    /// report bring Working back — so a quiet TUI cannot flap, and one that
+    /// starts drawing again is noticed even if it never ends a line.
+    #[test]
+    fn quiet_output_reports_idle_once_and_new_output_reports_working() {
+        let quiet = Duration::from_secs(3);
+        let w = Some(DetectedEvent::Working);
+        let i = Some(DetectedEvent::Idle);
+        // Nothing drawn yet: nothing to say.
+        assert_eq!(quiet_output_transition(None, 0, None, 10_000, quiet), None);
+        // Drawn, but no line classified yet: drawing is activity.
+        assert_eq!(quiet_output_transition(None, 500, None, 600, quiet), w);
+        // Drawing within the window: still working.
+        assert_eq!(quiet_output_transition(w, 1_000, None, 3_999, quiet), None);
+        // Quiet for the whole window: Idle.
+        assert_eq!(quiet_output_transition(w, 1_000, None, 4_000, quiet), i);
+        // Idle and still quiet: no repeat, however long it stays quiet.
+        assert_eq!(
+            quiet_output_transition(i, 1_000, Some(1_000), 60_000, quiet),
+            None
+        );
+        // A byte after the quiet report: drawing again.
+        assert_eq!(
+            quiet_output_transition(i, 1_001, Some(1_000), 1_002, quiet),
+            w
+        );
+        // An Error the wrapper did not derive from silence is never touched.
+        assert_eq!(
+            quiet_output_transition(Some(DetectedEvent::Error), 1_000, None, 60_000, quiet),
+            None
+        );
+    }
+
     /// The detector debounces: a burst of activity lines yields exactly one
     /// `Working` transition, an error line flips to `Error`, and a return to
     /// activity flips back — blank lines never change state.
@@ -3447,173 +3754,18 @@ mod tests {
         );
     }
 
-    /// Scenario: an interactive `codex` TUI's plain-text idle redraw line —
-    /// the composer's own verified placeholder — drives the card back to
-    /// `Idle`, resolving the wedge where `classify_codex_line`'s non-JSON
-    /// fallback used to only recognize the literal `"type":"turn.completed"`
-    /// substring that plain redraw text can never contain (issue #638).
-    ///
-    /// Issue #638: an interactive `codex` TUI's startup redraw is plain
-    /// text, not JSONL — `classify_codex_line`'s non-JSON fallback routes it
-    /// through the substring `CODEX` ruleset. The very first startup line
-    /// correctly drives the card to `Working`; once the interactive session
-    /// has gone quiet again (redrawn its composer, no further real
-    /// task/error output), the card must be able to settle back to `Idle`.
-    /// This pins the fix for the permanently-stuck-at-Thinking symptom
-    /// reported before any task is ever delegated to the pane. The idle
-    /// line is the **verified real composer placeholder text** recovered
-    /// via `strings` from the actual `codex-cli 0.150.1` native binary (not
-    /// a guess) — `"Ask Codex to do anything"` — rendered inside an
-    /// incidental box-drawing frame the way the real TUI redraws its
-    /// composer.
-    #[spec("codex/wrap/007")]
-    #[test]
-    fn wrap_007_interactive_codex_idle_lines_recover_to_idle() {
-        let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
-
-        // Plausible interactive-TUI startup redraw lines: plain prose /
-        // box-drawing text, never single-line JSON, and none containing an
-        // idle or error marker.
-        let startup_lines = [
-            "╭─────────────────────────────────────────╮",
-            "│ >_ OpenAI Codex (research preview)        │",
-            "╰─────────────────────────────────────────╯",
-            "Connecting to model...",
-        ];
-        let mut saw_working = false;
-        for line in startup_lines {
-            if d.observe_detected(classify_codex_line(line)) == Some(DetectedEvent::Working) {
-                saw_working = true;
-            }
-        }
-        assert!(
-            saw_working,
-            "precondition failed: expected the startup redraw to drive the \
-             card to Working at all"
-        );
-
-        // The session goes quiet again: verified real Codex composer
-        // placeholder text (recovered via `strings` on the actual
-        // codex-cli 0.150.1 native binary — not invented), still plain
-        // text, still no idle/error marker. Asserted directly against
-        // `classify_codex_line` rather than through the `d` `Detector`
-        // above: `Detector` debounces and only reports a *change*, so
-        // routing this through it would hide a wrong-but-different
-        // classification, and routing more than one line through it would
-        // silently leave every line but the first untested (`observe`
-        // returns `None` once the state stops changing). The direct
-        // assertion pins the exact classification of this one line.
-        assert_eq!(
-            classify_codex_line("│ Ask Codex to do anything                  │"),
-            Some(DetectedEvent::Idle),
-            "issue #638: the verified real Codex composer placeholder text \
-             must resolve the card back to Idle, not stay wedged at \
-             Working/Thinking forever"
-        );
-    }
-
-    /// Scenario: the JSONL path the `CODEX` ruleset was actually built for
-    /// still classifies correctly — `codex exec --json`'s `turn.started`
-    /// record is `Working` and `turn.completed` resolves to `Idle` — so the
-    /// recovery pinned by `codex/wrap/007` is isolated to non-JSON
-    /// interactive lines and a fix must not break this path. Also proves a
-    /// JSON record whose payload TEXT (not its `type` field) contains a
-    /// marker phrase still classifies via the `type` discriminator, not the
-    /// substring markers (issue #638).
-    ///
-    /// Control (reproduce-first): the JSONL path the `CODEX` ruleset was
-    /// actually built for still classifies correctly — `codex exec --json`'s
-    /// `turn.started` record is `Working` and `turn.completed` resolves to
-    /// `Idle`. This isolates the recovery above to "non-JSON interactive
-    /// lines drive this state machine through the substring markers",
-    /// without implicating the JSONL path a fix must not break. A third case
-    /// adds a JSON record whose `type` is not a completion signal but whose
-    /// payload TEXT contains an idle marker phrase — it must still resolve
-    /// via the `type` discriminator (`Working`), proving `classify_codex_line`'s
-    /// `serde_json` early-return shields `idle_markers` from payload text,
-    /// not just from the top-level `type` field.
-    #[spec("codex/wrap/008")]
-    #[test]
-    fn wrap_008_codex_jsonl_turn_lifecycle_still_classifies_correctly() {
-        let mut d = Detector::with_rules(ruleset_for(&AgentType::Codex));
-        assert_eq!(
-            d.observe_detected(classify_codex_line(r#"{"type":"turn.started"}"#)),
-            Some(DetectedEvent::Working)
-        );
-        assert_eq!(
-            d.observe_detected(classify_codex_line(r#"{"type":"turn.completed"}"#)),
-            Some(DetectedEvent::Idle)
-        );
-
-        // A JSON record whose `type` is not a completion signal, but whose
-        // payload TEXT happens to contain an idle marker phrase, must still
-        // classify via the `type` discriminator — the marker phrase never
-        // reaches `idle_markers` at all.
-        assert_eq!(
-            classify_codex_line(
-                r#"{"type":"item.completed","item":{"text":"go ahead and ask codex to do anything else"}}"#
-            ),
-            Some(DetectedEvent::Working)
-        );
-    }
-
-    /// Scenario: a single repaint batch carrying BOTH the active-turn
-    /// spinner and the idle composer placeholder must classify as `Working`,
-    /// not `Idle` — Codex is still actively running the turn (issue #638
-    /// round 3).
-    ///
-    /// Round 3 (issue #638): live capture against the real `codex-cli
-    /// 0.150.1` TUI proved the composer placeholder `"Ask Codex to do
-    /// anything"` is on screen for the ENTIRE duration of an active turn (it
-    /// tracks an empty input box, not turn completion), and `tee`'s
-    /// classification unit is a whole repaint batch (split on `\n`/`\r`/the
-    /// 64 KiB cap), not a visual line — ratatui repaints via cursor
-    /// positioning, not newlines. A real 65,455-byte segment from one active
-    /// turn was measured containing BOTH `"Working (0s • esc to interrupt)"`
-    /// (the active-turn spinner) and `"Ask Codex to do anything"` (the
-    /// composer placeholder) together. `classify_line_with` does a plain
-    /// first-match `contains()` scan over `idle_markers` with no precedence
-    /// against active-turn evidence co-resident in the same segment, so this
-    /// segment resolves `Idle` today — a fail-open regression that falsely
-    /// reports the pane idle/available while Codex is actively working,
-    /// which is worse than the original fail-safe wedge (`codex/wrap/007`)
-    /// this fix set out to close. This test joins the two verified real
-    /// phrases the way one `tee` segment actually joins them in practice —
-    /// via a cursor-position escape sequence, not `\n`/`\r`, since those are
-    /// rare in a ratatui repaint stream.
-    #[spec("codex/wrap/009")]
-    #[test]
-    fn wrap_009_mixed_active_and_idle_segment_stays_working() {
-        // One realistic `tee` classification segment: the verified real
-        // active-turn spinner text and the verified real idle composer
-        // placeholder, joined by an ANSI cursor-position escape the way a
-        // real ratatui repaint batch joins rows — not by `\n`/`\r`.
-        let segment = "Working (17s \u{2022} esc to interrupt)\x1b[14;1HAsk Codex to do anything";
-        assert_eq!(
-            classify_codex_line(segment),
-            Some(DetectedEvent::Working),
-            "issue #638 round 3: a segment carrying both the active-turn \
-             spinner and the idle composer placeholder must classify as \
-             Working — an active-turn signal co-resident in the same \
-             segment must override an idle marker, not lose to it"
-        );
-    }
-
-    /// (Issue #638 round 6, auditor round-5 R5-F1) A throwaway daemon-socket
-    /// stand-in for `codex/wrap/010`–`013`. Round 6 makes "the shared
-    /// `Detector`'s state changed" and "`classify_and_emit` reached the
-    /// daemon" two different facts: raw classification now always runs (so
-    /// `Detector.last` moves regardless of suppression), and only an `Error`
-    /// classification is let through the emit gate under suppression — so
-    /// `.last` moving is no longer proof that anything reached the daemon
-    /// (see `wrap_010`'s doc comment for the full trace). Points
+    /// A throwaway daemon-socket stand-in for the model tests below
+    /// (`codex/wrap/015`, `016`, `018`): "the shared `Detector`'s state
+    /// changed" and "`classify_and_emit` reached the daemon" are different
+    /// facts (a no-transition call can still emit a model carrier), so these
+    /// tests observe what actually arrived. Points
     /// `DOT_AGENT_DECK_SOCKET` at a temp Unix socket, serialized against
     /// other env-var-mutating tests via the same `STATE_DIR_ENV_LOCK`
     /// convention `config.rs` already uses for this exact env var, and
     /// collects every line a real `Emitter::emit` call writes. `cfg(unix)`
     /// only, matching the established convention for every other
     /// real-socket-level test in this codebase (`hook.rs`'s `socket_003`
-    /// through `socket_010`) — there is no portable substitute for observing
+    /// through `socket_016`) — there is no portable substitute for observing
     /// an unmockable `Emitter::emit` short of standing up a real listener.
     #[cfg(unix)]
     struct CapturedSocket {
@@ -3696,479 +3848,6 @@ mod tests {
         }
     }
 
-    /// Scenario: for a hook-trusted interactive Codex session, raw
-    /// classification always runs against the shared `Detector` — `.last`
-    /// moves for every line, suppression or not — but only an `Error`
-    /// classification may reach the daemon; `Working`/`Idle` classify (state
-    /// moves) yet are discarded before `emitter.emit()`, because the native
-    /// `UserPromptSubmit`/`Stop` hooks are the sole source of `Thinking`/
-    /// `Idle` for such a session (issue #638 round 4/6).
-    ///
-    /// Both control lines reproduce round 3's own residual defects (round-3
-    /// review/audit, `.dot-agent-deck/638-audit-findings-r3.md` F1/F2), so
-    /// this test exercises the real failure modes the round-4 fix exists for,
-    /// not lines the round-3 heuristic already handled correctly:
-    /// - a composer-repaint segment carrying ONLY the idle placeholder (no
-    ///   co-resident spinner text) still misclassifies `Idle` mid-turn under
-    ///   the untrusted-hook fallback — reproduced here as a precondition;
-    /// - a turn-completion footer carries neither marker and falls through to
-    ///   the generic non-blank fallback (`Working`), the exact shape of the
-    ///   end-of-turn wedge — also reproduced as a precondition.
-    ///
-    /// Round 6 correction (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1,
-    /// `638-review-findings-r5.md` F1): this test previously asserted that
-    /// with `suppress_text_status = true` neither line may change the
-    /// detector's state from its initial `None` at all. That assertion is no
-    /// longer true, on purpose, and the reason is measured, not stylistic.
-    /// Round 5 tried to keep that "untouched" property by special-casing the
-    /// JSON discriminator branch (`classify_codex_json`) to survive
-    /// suppression unconditionally, on the theory that it was the one branch
-    /// that mattered — but round 5's own capture replay showed 0 of 214 real
-    /// interactive segments ever reach that branch (ANSI decoration always
-    /// breaks the strict `serde_json::from_str` parse), so the real
-    /// error-turn wedge R4-F1 was about stayed live. The fix that actually
-    /// resolves on real bytes (`codex/wrap/012`) keeps `classify_codex_line`
-    /// (JSON-then-substring-fallback) feeding the shared `Detector`
-    /// UNCONDITIONALLY via `observe_detected`, so `.last` always tracks the
-    /// true raw classification — suppression or not. That is load-bearing,
-    /// not incidental: it is what lets a *second* consecutive error turn
-    /// still register as a state *change* and re-emit (`codex/wrap/013`)
-    /// instead of being silently swallowed because `.last` never left
-    /// `Some(Error)`. What suppression narrows is only the final
-    /// `emitter.emit()` call: under suppression, an `Error` classification is
-    /// still let through; a `Working`/`Idle` classification updates `.last`
-    /// but is discarded, never emitted. Because `.last` moving is no longer
-    /// proof that anything reached the daemon, this test now asserts the
-    /// no-emission property directly against a throwaway capture socket
-    /// (`CapturedSocket`, above) instead of reading `.last` as a stand-in for
-    /// it.
-    #[spec("codex/wrap/010")]
-    #[test]
-    #[cfg(unix)]
-    fn wrap_010_hook_trusted_codex_suppresses_text_derived_status() {
-        let emitter = Emitter {
-            agent_type: AgentType::Codex,
-            session_id: "test-session".to_string(),
-            pane_id: None,
-            agent_id: None,
-            cwd: None,
-            live_target: LiveTarget {
-                kind: TargetKind::Process,
-                writable: Writable::HistoryOnly,
-            },
-        };
-
-        // Round 3's residual mid-turn false-idle shape (audit F1): the
-        // composer placeholder alone, with no co-resident spinner text.
-        let mid_turn_composer_only = "Ask Codex to do anything";
-        // Round 3's residual end-of-turn wedge shape (audit F2): a completion
-        // footer carrying neither marker.
-        let end_of_turn_footer = "─ Worked for 1m 03s ───────────────────────────────────";
-
-        // Precondition (audit F1): with hook trust NOT confirmed, the
-        // untrusted-hook fallback still exhibits the known residual — a
-        // composer-only repaint mid-turn classifies Idle.
-        let fallback_mid_turn = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
-            &AgentType::Codex,
-        ))));
-        classify_and_emit(
-            mid_turn_composer_only,
-            &fallback_mid_turn,
-            &emitter,
-            true,
-            false,
-        );
-        assert_eq!(
-            fallback_mid_turn.lock().unwrap().last,
-            Some(DetectedEvent::Idle),
-            "precondition failed: the untrusted-hook fallback must still \
-             exhibit round 3's known mid-turn false-Idle residual, or this \
-             test is not exercising the real defect"
-        );
-
-        // Precondition (audit F2): with hook trust NOT confirmed, a
-        // turn-completion footer classifies Working (the generic non-blank
-        // fallback), not Idle — the end-of-turn wedge shape.
-        let fallback_footer = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
-            &AgentType::Codex,
-        ))));
-        classify_and_emit(end_of_turn_footer, &fallback_footer, &emitter, true, false);
-        assert_eq!(
-            fallback_footer.lock().unwrap().last,
-            Some(DetectedEvent::Working),
-            "precondition failed: the untrusted-hook fallback must still \
-             exhibit round 3's known end-of-turn wedge residual, or this \
-             test is not exercising the real defect"
-        );
-
-        // The round-6 fix: with hook trust confirmed, raw classification
-        // still updates the shared Detector for both lines (round 5's
-        // "untouched" property is gone — see the doc comment above for why),
-        // but NEITHER line's Working/Idle classification may reach the
-        // daemon.
-        let capture = CapturedSocket::bind();
-        let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
-            &AgentType::Codex,
-        ))));
-        classify_and_emit(mid_turn_composer_only, &trusted, &emitter, true, true);
-        assert_eq!(
-            trusted.lock().unwrap().last,
-            Some(DetectedEvent::Idle),
-            "issue #638 round 6: raw classification must still update the shared \
-             Detector's state under suppression (this composer-only line \
-             classifies Idle, per codex/wrap/007) — round 6 gates the emit, not \
-             the classify"
-        );
-        classify_and_emit(end_of_turn_footer, &trusted, &emitter, true, true);
-        assert_eq!(
-            trusted.lock().unwrap().last,
-            Some(DetectedEvent::Working),
-            "issue #638 round 6: raw classification must still update the shared \
-             Detector's state under suppression (this completion footer \
-             classifies Working via the generic fallback) — round 6 gates the \
-             emit, not the classify"
-        );
-        let emitted = capture.drain();
-        assert!(
-            emitted.is_empty(),
-            "issue #638 round 4/6: a hook-trusted Codex session must not let a \
-             text-derived Working/Idle classification reach the daemon — the \
-             native Stop/UserPromptSubmit hooks are the sole source of \
-             Thinking/Idle for this session; got {emitted:?}"
-        );
-    }
-
-    /// Scenario: a bare (non-ANSI-decorated) JSON error record still
-    /// classifies `Error` and reaches the daemon under suppression, and a
-    /// normal JSON turn-lifecycle pair still updates the shared `Detector`'s
-    /// state under suppression even though — as of round 6 — it is no longer
-    /// emitted. This is the control that isolates "the JSON discriminator
-    /// classifies correctly on the shape it CAN parse" from "the interactive
-    /// TUI's real bytes ever reach it" (they don't — `codex/wrap/012` covers
-    /// the real ANSI-decorated shape and is RED at head `1724f138`, where
-    /// this test is already GREEN).
-    ///
-    /// Round-6 corrections to this test's own prose
-    /// (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1's table, measured):
-    /// this doc comment previously credited the JSON discriminator branch
-    /// with "surviving ANSI rendering" and called round 4's fix "a regression
-    /// against this branch's own prior head, where the JSON error
-    /// discriminator resolved the same turn to Error." Both were wrong. The
-    /// pre-round-4 head resolved that turn via the SUBSTRING
-    /// `CODEX.error_markers` rule (`classify_line_with`), which is what
-    /// tolerates ANSI decoration — a strict `serde_json::from_str` never has.
-    ///
-    /// Round-6 correction to this test's assertions
-    /// (`638-audit-findings-r5.md` R5-F1, "forgo one round-5 property"):
-    /// round 4/5 asserted a `{"type":"turn.started"}`/`{"type":"turn.completed"}`
-    /// pair "must still classify AND EMIT" under suppression, "proving the
-    /// JSON discriminator branch as a whole survives the gate, not just the
-    /// error case." That is no longer the design — round 6 narrows the emit
-    /// gate itself (not just the non-JSON fallback) to `Error` only under
-    /// suppression, so `turn.started`/`turn.completed` still classify (the
-    /// `Detector`'s internal state moves, asserted below via `.last`) but are
-    /// no longer emitted. This test now asserts that split explicitly at the
-    /// emission level (`CapturedSocket`, defined above `codex/wrap/010`)
-    /// rather than repeating the stale "still emits" claim: exactly one event
-    /// — the `Error` record — may reach the daemon across this whole test.
-    #[spec("codex/wrap/011")]
-    #[test]
-    #[cfg(unix)]
-    fn wrap_011_json_discriminator_survives_suppression() {
-        let emitter = Emitter {
-            agent_type: AgentType::Codex,
-            session_id: "test-session".to_string(),
-            pane_id: None,
-            agent_id: None,
-            cwd: None,
-            live_target: LiveTarget {
-                kind: TargetKind::Process,
-                writable: Writable::HistoryOnly,
-            },
-        };
-
-        let capture = CapturedSocket::bind();
-
-        // A realistic error-turn JSON record (issue #638 round-4 audit:
-        // shape of the real HTTP 400 payload Codex emits for a
-        // server-rejected turn) — bare and undecorated, the one shape
-        // `classify_codex_json`'s strict parse CAN see. Even with hook trust
-        // confirmed (`suppress_text_status = true`), this must still resolve
-        // to `Error` and reach the daemon.
-        let error_turn = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
-            &AgentType::Codex,
-        ))));
-        classify_and_emit(
-            r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"boom"}}"#,
-            &error_turn,
-            &emitter,
-            true,
-            true,
-        );
-        assert_eq!(
-            error_turn.lock().unwrap().last,
-            Some(DetectedEvent::Error),
-            "issue #638 round 4 audit R4-F1: a JSON error-turn record must \
-             still classify and emit as Error under suppression — Codex \
-             fires no Stop hook for a server-side-error turn ending, so \
-             suppressing this channel too leaves the card wedged at \
-             Thinking forever, reproducing #638's own symptom"
-        );
-
-        // Reinforcement: a normal JSON turn-lifecycle record still
-        // CLASSIFIES under suppression (round 6: raw classification always
-        // runs, so the Detector's internal state keeps tracking reality),
-        // but — unlike round 4/5's design — must NOT itself reach the
-        // daemon: only Error is let through the round-6 emit gate under
-        // suppression.
-        let lifecycle = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
-            &AgentType::Codex,
-        ))));
-        classify_and_emit(
-            r#"{"type":"turn.started"}"#,
-            &lifecycle,
-            &emitter,
-            true,
-            true,
-        );
-        assert_eq!(
-            lifecycle.lock().unwrap().last,
-            Some(DetectedEvent::Working),
-            "issue #638 round 6: a JSON turn.started record must still classify \
-             under suppression (internal Detector state keeps tracking reality) \
-             even though — unlike round 4/5 — it is no longer itself emitted"
-        );
-        classify_and_emit(
-            r#"{"type":"turn.completed"}"#,
-            &lifecycle,
-            &emitter,
-            true,
-            true,
-        );
-        assert_eq!(
-            lifecycle.lock().unwrap().last,
-            Some(DetectedEvent::Idle),
-            "issue #638 round 6: a JSON turn.completed record must still classify \
-             under suppression, same reasoning as turn.started above"
-        );
-
-        let emitted = capture.drain();
-        assert_eq!(
-            emitted.len(),
-            1,
-            "exactly one event may reach the daemon across this whole test: the \
-             Error record. turn.started/turn.completed must classify (proven \
-             above via Detector.last) but never emit under suppression — round \
-             6 narrows the emit gate to Error only; got {emitted:?}"
-        );
-        assert!(
-            emitted[0].contains("\"event_type\":\"error\""),
-            "the one event that reached the daemon must be the Error record, \
-             got {:?}",
-            emitted[0]
-        );
-    }
-
-    /// Scenario: a hook-trusted interactive Codex session that hits a
-    /// server-side error must still surface `Error` — not stay wedged at
-    /// `Thinking` — even though the real TUI never delivers that error as a
-    /// bare JSON line the way `codex/wrap/011`'s fixture does.
-    ///
-    /// Round 6 (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1,
-    /// `638-review-findings-r5.md` F1/F3, both independently measured against
-    /// the same preserved capture): round 5's fix spared only
-    /// `classify_codex_json`'s strict `serde_json::from_str`, but the real
-    /// interactive TUI never emits a bare JSON line — the error record
-    /// arrives embedded in an ANSI-decorated repaint segment (SGR color
-    /// codes, a `■ ` bullet, then ~500 bytes of cursor-addressing/composer
-    /// repaint after the JSON payload). `from_str` fails on byte 0 of that
-    /// segment, every time — a census across all four preserved real
-    /// captures found 0 of 214 segments parse as bare JSON-with-`type`
-    /// (`638-audit-findings-r5.md`). The fixture below is the exact byte
-    /// sequence — segment 20, 699 bytes, split the same way `tee` (`:585`)
-    /// splits on `\n`/`\r` — of a real HTTP-400-terminated interactive turn
-    /// captured live against `codex-cli` 0.150.1
-    /// (`.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`), not
-    /// a hand-written approximation. It also carries the composer's idle
-    /// placeholder (`"Ask Codex to do anything"`) in the SAME segment as the
-    /// error marker, so this doubles as a regression pin for round 3's
-    /// error-over-idle precedence (`classify_line_with`) surviving into the
-    /// suppressed path.
-    ///
-    /// RED at head `1724f138` (round 5): the JSON branch fails to parse, and
-    /// round 5's blanket `if suppress_text_status { return; }` for the
-    /// non-JSON fallback means NOTHING classifies this segment at all — the
-    /// shared `Detector` never moves off its initial `None`, and nothing
-    /// reaches the daemon. That is issue #638's own symptom (wedged at
-    /// `Thinking` forever), reopened through the mechanism round 5 shipped as
-    /// its fix.
-    #[spec("codex/wrap/012")]
-    #[test]
-    #[cfg(unix)]
-    fn wrap_012_ansi_decorated_error_segment_survives_suppression() {
-        let emitter = Emitter {
-            agent_type: AgentType::Codex,
-            session_id: "test-session".to_string(),
-            pane_id: None,
-            agent_id: None,
-            cwd: None,
-            live_target: LiveTarget {
-                kind: TargetKind::Process,
-                writable: Writable::HistoryOnly,
-            },
-        };
-
-        // Verbatim segment 20 (699 bytes) of
-        // `.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin` — a
-        // real HTTP-400 error-turn repaint from an interactive `codex-cli
-        // 0.150.1` TUI, not a hand-written approximation. ANSI SGR-decorated,
-        // never valid bare JSON.
-        let decorated_error_segment = "\x1b[39;49m\x1b[K\x1b[38;5;1;49m\u{25a0} {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.1-codex-mini' model is not supported when using Codex with a ChatGPT account.\"}}\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[23;3H\x1b[21;2H\x1b[0m\x1b[49m\x1b[K\x1b[22;2H\x1b[0m\x1b[49m\x1b[K\x1b[23;27H\x1b[0m\x1b[49m\x1b[K\x1b[24;2H\x1b[0m\x1b[49m\x1b[K\x1b[25;146H\x1b[0m\x1b[49m\x1b[K\x1b[21;1H \x1b[22;1H \x1b[23;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[24;1H\x1b[22m \x1b[25;1H  \x1b[38;2;246;226;183;49mgpt-5.1-codex-mini low\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;171;223;167;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/45e45f1a-4a0d-4f8f-ba83-27ee7d6ea88b/scratchpad/r4/work\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l";
-        assert_eq!(
-            decorated_error_segment.len(),
-            699,
-            "fixture drift: this must stay byte-for-byte the captured segment \
-             (`.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`, \
-             segment 20)"
-        );
-
-        let capture = CapturedSocket::bind();
-        let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
-            &AgentType::Codex,
-        ))));
-        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
-        assert_eq!(
-            trusted.lock().unwrap().last,
-            Some(DetectedEvent::Error),
-            "issue #638 round 6 (audit R5-F1 / review F1): a hook-trusted \
-             session's real ANSI-decorated error segment must still classify \
-             Error under suppression — round 5's strict JSON parse never \
-             matches this shape (0/214 real segments do), so only the \
-             substring error_markers rule (which survives ANSI decoration) can \
-             see it"
-        );
-        let emitted = capture.drain();
-        assert_eq!(
-            emitted.len(),
-            1,
-            "the Error classification must actually reach the daemon, not just \
-             update internal Detector state — got {emitted:?}"
-        );
-        assert!(
-            emitted[0].contains("\"event_type\":\"error\""),
-            "expected an Error event on the wire, got {:?}",
-            emitted[0]
-        );
-    }
-
-    /// Scenario: a SECOND consecutive error turn, separated by a real
-    /// captured non-error segment, must also resolve to `Error` and reach the
-    /// daemon — not be silently swallowed by the shared `Detector`'s
-    /// debounce.
-    ///
-    /// This is the exact class of bug reviewer's round-5 simpler proposed fix
-    /// (`.dot-agent-deck/638-review-findings-r5.md` F1: feed ONLY the `Error`
-    /// classification into the `Detector` under suppression, filtering
-    /// everything else before it ever reaches `observe_detected`) would NOT
-    /// catch: if nothing but `Error` ever touches `Detector.last` under
-    /// suppression, the first error sets `last = Some(Error)` and it never
-    /// leaves that state while suppression holds — a second, later error turn
-    /// then classifies to `Error` again, but `observe_detected` sees no state
-    /// CHANGE (`self.last == Some(detected)` already), returns `None`, and
-    /// the second error is silently debounced away. The auditor's round-5 fix
-    /// (`.dot-agent-deck/638-audit-findings-r5.md` R5-F1) avoids this by
-    /// keeping raw classification running unconditionally (gating only the
-    /// final `emitter.emit()` call), so a real intervening turn's
-    /// Working/Idle classification moves `last` away from `Some(Error)` even
-    /// though it is itself never emitted, and the second error is seen as a
-    /// genuine state change again.
-    ///
-    /// The intervening segment is segment 13 (25 bytes) of the SAME preserved
-    /// real capture the error segment comes from — the actual real segment
-    /// `tee` classified shortly before the error turn, not an invented shape
-    /// (`.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`, per
-    /// the round-5 audit's own segment-by-segment replay). It carries no
-    /// error/active/idle marker and resolves via the generic non-blank
-    /// fallback to `Working`.
-    #[spec("codex/wrap/013")]
-    #[test]
-    #[cfg(unix)]
-    fn wrap_013_second_consecutive_error_turn_still_emits() {
-        let emitter = Emitter {
-            agent_type: AgentType::Codex,
-            session_id: "test-session".to_string(),
-            pane_id: None,
-            agent_id: None,
-            cwd: None,
-            live_target: LiveTarget {
-                kind: TargetKind::Process,
-                writable: Writable::HistoryOnly,
-            },
-        };
-
-        // Verbatim segment 20 (699 bytes), same fixture as `codex/wrap/012`.
-        let decorated_error_segment = "\x1b[39;49m\x1b[K\x1b[38;5;1;49m\u{25a0} {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.1-codex-mini' model is not supported when using Codex with a ChatGPT account.\"}}\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[23;3H\x1b[21;2H\x1b[0m\x1b[49m\x1b[K\x1b[22;2H\x1b[0m\x1b[49m\x1b[K\x1b[23;27H\x1b[0m\x1b[49m\x1b[K\x1b[24;2H\x1b[0m\x1b[49m\x1b[K\x1b[25;146H\x1b[0m\x1b[49m\x1b[K\x1b[21;1H \x1b[22;1H \x1b[23;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[24;1H\x1b[22m \x1b[25;1H  \x1b[38;2;246;226;183;49mgpt-5.1-codex-mini low\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;171;223;167;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/45e45f1a-4a0d-4f8f-ba83-27ee7d6ea88b/scratchpad/r4/work\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l";
-        // Segment 13 of the same preserved capture — the real, non-error
-        // segment `tee` classified shortly before the error turn.
-        let real_intervening_segment = "\x1b[39;49m\x1b[K\x1b[39m\x1b[49m\x1b[0m";
-
-        let capture = CapturedSocket::bind();
-        let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
-            &AgentType::Codex,
-        ))));
-
-        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
-        assert_eq!(
-            trusted.lock().unwrap().last,
-            Some(DetectedEvent::Error),
-            "precondition: the first error must classify Error"
-        );
-
-        classify_and_emit(real_intervening_segment, &trusted, &emitter, true, true);
-        assert_eq!(
-            trusted.lock().unwrap().last,
-            Some(DetectedEvent::Working),
-            "issue #638 round 6 (audit R5-F1): a real intervening non-error \
-             segment must move the Detector's internal state away from Error \
-             even though it is never itself emitted under suppression — this \
-             is what lets a SECOND error turn register as a genuine state \
-             change rather than being debounced away. Under reviewer's \
-             round-5 simpler proposal (only Error classifications ever touch \
-             the Detector under suppression), this assertion would fail: \
-             `last` would still read Error here"
-        );
-
-        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
-        assert_eq!(
-            trusted.lock().unwrap().last,
-            Some(DetectedEvent::Error),
-            "the second error turn must also classify Error"
-        );
-
-        let emitted = capture.drain();
-        let error_count = emitted
-            .iter()
-            .filter(|l| l.contains("\"event_type\":\"error\""))
-            .count();
-        assert_eq!(
-            error_count, 2,
-            "issue #638 round 6: BOTH the first and second error turn must \
-             reach the daemon as separate Error events — a design that only \
-             feeds Error classifications into the Detector's debounce would \
-             silently swallow the second one (last never having left \
-             Some(Error)), reproducing the wedge on a second consecutive \
-             error turn; got {emitted:?}"
-        );
-        assert!(
-            !emitted
-                .iter()
-                .any(|l| l.contains("\"event_type\":\"thinking\"")
-                    || l.contains("\"event_type\":\"idle\"")),
-            "the real intervening segment must never itself reach the daemon \
-             under suppression, only move internal state; got {emitted:?}"
-        );
-    }
-
     /// Scenario: a real, ANSI-decorated Codex TUI segment carrying the
     /// composer status bar (`gpt-5.1-codex-mini low · <cwd>`) must produce an
     /// `AgentEvent` whose `model` field is `Some("gpt-5.1-codex-mini")` — not
@@ -4181,19 +3860,19 @@ mod tests {
     /// `Emitter::build_event` (`:538`) never carries a model at all. This is
     /// the wrap integration's own root defect: the interactive TUI's status
     /// bar clearly carries the active model on screen (verified by this
-    /// fixture, the same real captured bytes `codex/wrap/012` uses — a real
+    /// fixture, real captured bytes of a
     /// HTTP-400 error-turn repaint from `codex-cli 0.150.1`, whose composer
     /// footer segment reads `gpt-5.1-codex-mini low` followed by a middle-dot
     /// separator and the cwd), but nothing in `wrap.rs` ever reads it back
     /// out and stamps it on the event the daemon receives.
     ///
-    /// Reuses the exact `codex/wrap/012` fixture and call shape (same
-    /// `classify_and_emit` entry point, same `is_codex`/`suppress_text_status`
-    /// arguments) rather than a hand-written approximation, per this repo's
-    /// established convention for wrap classifier changes — this segment is
-    /// already known to classify `Error` and reach the daemon as exactly one
-    /// event under suppression (`codex/wrap/012`), so that one captured event
-    /// is the one this test inspects for `model`. The daemon side
+    /// Uses a real captured segment (the fixture below) rather than a
+    /// hand-written approximation, per this repo's established convention for
+    /// wrap classifier changes. A Codex pane's output carries no error or
+    /// idle markers of its own any more (issue #1493 / #540), so this segment
+    /// classifies as ordinary activity and reaches the daemon as exactly one
+    /// `Working` event, which is the one this test inspects for `model`. The
+    /// daemon side
     /// (`state.rs::apply_event`) already treats `model` as STICKY — a later
     /// `None` does not clear a previously-known model — so the wrap side only
     /// needs to report the model once, on whichever event first carries it;
@@ -4207,21 +3886,22 @@ mod tests {
             session_id: "test-session".to_string(),
             pane_id: None,
             agent_id: None,
+            token: None,
             cwd: None,
             live_target: LiveTarget {
                 kind: TargetKind::Process,
                 writable: Writable::HistoryOnly,
             },
+            prompt_reports_unavailable: false,
+            classified_sender: None,
         };
 
         // Verbatim segment 20 (699 bytes) of
-        // `.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin` —
-        // the same real captured bytes `codex/wrap/012` uses. Its composer
-        // footer carries the status-bar text
+        // `.dot-agent-deck/638-captures/auditor-r4-errorturn-capture.bin`.
+        // Its composer footer carries the status-bar text
         // `gpt-5.1-codex-mini low \u{b7} <cwd>` (ANSI SGR-decorated), which is
         // what this test is really after; the leading error payload is
-        // incidental to this test but is what makes the segment classify and
-        // actually emit under suppression.
+        // incidental to this test.
         let decorated_error_segment = "\x1b[39;49m\x1b[K\x1b[38;5;1;49m\u{25a0} {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.1-codex-mini' model is not supported when using Codex with a ChatGPT account.\"}}\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[23;3H\x1b[21;2H\x1b[0m\x1b[49m\x1b[K\x1b[22;2H\x1b[0m\x1b[49m\x1b[K\x1b[23;27H\x1b[0m\x1b[49m\x1b[K\x1b[24;2H\x1b[0m\x1b[49m\x1b[K\x1b[25;146H\x1b[0m\x1b[49m\x1b[K\x1b[21;1H \x1b[22;1H \x1b[23;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[24;1H\x1b[22m \x1b[25;1H  \x1b[38;2;246;226;183;49mgpt-5.1-codex-mini low\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;171;223;167;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/45e45f1a-4a0d-4f8f-ba83-27ee7d6ea88b/scratchpad/r4/work\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[23;3H\x1b[?25h\x1b[?2026l";
         assert_eq!(
             decorated_error_segment.len(),
@@ -4235,14 +3915,14 @@ mod tests {
         let trusted = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
             &AgentType::Codex,
         ))));
-        classify_and_emit(decorated_error_segment, &trusted, &emitter, true, true);
+        classify_and_emit(decorated_error_segment, &trusted, &emitter);
 
         let emitted = capture.drain();
         assert_eq!(
             emitted.len(),
             1,
-            "precondition (same as codex/wrap/012): exactly one Error event \
-             must reach the daemon for this segment; got {emitted:?}"
+            "precondition: exactly one event must reach the daemon for this \
+             segment; got {emitted:?}"
         );
         let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
             panic!(
@@ -4261,7 +3941,7 @@ mod tests {
     }
 
     /// A second real Codex TUI segment, at a DIFFERENT composer-footer accent
-    /// color than `codex/wrap/012`/`015`'s fixture (RGB 228,49,113 vs the
+    /// color than `codex/wrap/015`'s fixture (RGB 228,49,113 vs the
     /// tan 246,226,183 `CODEX_STATUS_BAR_MODEL_SGR` anchors on), must still
     /// yield the model it visibly carries. Auditor A1: two real interactive
     /// Codex v0.150.1 PTY captures on this machine (`.dot-agent-deck/652-captures/`)
@@ -4270,17 +3950,10 @@ mod tests {
     /// silently returns `None` for both, which is issue #652's exact
     /// symptom recurring on a healthy session.
     ///
-    /// `suppress_text_status = false` here (unlike `wrap_015`'s hook-trusted
-    /// `true`) deliberately bypasses the separate suppression-gate defect
-    /// (`codex/wrap/017`, Blocker 2) so this test isolates the anchor/
-    /// extraction bug alone: if only Blocker 1 were fixed, this test would
-    /// go green on its own, independent of whatever `classify_and_emit`'s
-    /// emit gate does.
-    ///
     /// Scenario: a real, non-error Codex TUI segment whose status bar is
     /// painted in a different accent color than the existing fixture is fed
-    /// through `classify_and_emit` with suppression off, and the emitted
-    /// event's `model` must still be the raw id the bar shows.
+    /// through `classify_and_emit`, and the emitted event's `model` must
+    /// still be the raw id the bar shows.
     #[spec("codex/wrap/016")]
     #[test]
     #[cfg(unix)]
@@ -4290,11 +3963,14 @@ mod tests {
             session_id: "test-session".to_string(),
             pane_id: None,
             agent_id: None,
+            token: None,
             cwd: None,
             live_target: LiveTarget {
                 kind: TargetKind::Process,
                 writable: Writable::HistoryOnly,
             },
+            prompt_reports_unavailable: false,
+            classified_sender: None,
         };
 
         // Verbatim mid-session segment (6994 bytes) at byte offset 6844 of a
@@ -4319,7 +3995,7 @@ mod tests {
         let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
             &AgentType::Codex,
         ))));
-        classify_and_emit(mid_session_segment, &detector, &emitter, true, false);
+        classify_and_emit(mid_session_segment, &detector, &emitter);
 
         let emitted = capture.drain();
         assert_eq!(
@@ -4327,8 +4003,7 @@ mod tests {
             1,
             "precondition: this segment must classify Working (a state \
              change from the fresh detector's initial None) and reach the \
-             daemon since suppress_text_status is false here; got \
-             {emitted:?}"
+             daemon; got {emitted:?}"
         );
         let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
             panic!(
@@ -4346,113 +4021,22 @@ mod tests {
         );
     }
 
-    /// The SAME real mid-session segment as `codex/wrap/016`, this time fed
-    /// through `classify_and_emit` with `suppress_text_status = true` — the
-    /// hook-trusted default this file's own doc comment (`:232`) calls "the
-    /// common/default case". Reviewer F1 / auditor A1 combined: even once
-    /// extraction itself is fixed, `classify_and_emit`'s emit gate discards
-    /// every non-`Error` classification under suppression, so a healthy,
-    /// non-erroring Codex session — the overwhelming majority of real
-    /// sessions — never reaches the daemon carrying a model at all. Every
-    /// other spec in this file that exercises suppression
-    /// (`codex/wrap/010`\u{2013}`013`, `015`) does so with an
-    /// ERROR-classified segment, the one classification that survives the
-    /// gate; this is the first test in the suite to run a genuinely
-    /// `Working`-classified real segment through the same gate.
+    /// Issue #657 (historical bug, now fixed): the model used to ride only
+    /// on a call whose classification also produced a status *transition*.
+    /// A segment that carried a freshly repainted model but did NOT change
+    /// the pane's classified status (the pane was already `Working` and
+    /// stayed `Working`, the common case for a mid-session model switch
+    /// after the very first turn) never reached that branch at all, so the
+    /// fresh model was silently dropped even though
+    /// `extract_codex_status_bar_model` read it just fine. `classify_and_emit`
+    /// now has an explicit no-transition arm that still emits the
+    /// freshly-observed model on a status-neutral carrier.
     ///
-    /// Scenario: the same real non-error Codex segment as `codex/wrap/016`
-    /// is fed through `classify_and_emit` with the hook-trusted default
-    /// suppression on, and an event carrying the model must still reach the
-    /// daemon despite the segment classifying `Working`, not `Error`.
-    #[spec("codex/wrap/017")]
-    #[test]
-    #[cfg(unix)]
-    fn wrap_017_non_error_model_survives_suppression() {
-        let emitter = Emitter {
-            agent_type: AgentType::Codex,
-            session_id: "test-session".to_string(),
-            pane_id: None,
-            agent_id: None,
-            cwd: None,
-            live_target: LiveTarget {
-                kind: TargetKind::Process,
-                writable: Writable::HistoryOnly,
-            },
-        };
-
-        // Same verbatim mid-session segment as `codex/wrap/016` — see that
-        // test's comment for provenance.
-        let mid_session_segment = "\x1b[39;49m\x1b[K\x1b[2m\u{2022} \x1b[22mYou have 1 usage limit reset available. Run /usage to use one.\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[13;3H\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;7H\x1b[1m\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2827} codexcwd\x07\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;138;138;138;49m\u{2022}\x1b[12;8H\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;9H\x1b[1m\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;63H\x1b[0m\x1b[49m\x1b[K\x1b[12;6H\x1b[1m\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mt\x1b[38;2;202;202;202;49mi\x1b[38;2;231;231;231;49mn\x1b[38;2;242;242;242;49mg\x1b[38;2;231;231;231;49m \x1b[12;13H\x1b[38;2;167;167;167;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;128;128;128;49m ser\x1b[12;25H2\x1b[12;33Hntext7\x1b[22m\x1b[39;49m \x1b[2m(0s \u{2022} esc to interrupt)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;6H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mt\x1b[38;2;167;167;167;49mi\x1b[38;2;202;202;202;49mn\x1b[38;2;231;231;231;49mg\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;138;138;138;49m \x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;167;167;167;49m\u{2022}\x1b[12;7H\x1b[38;2;128;128;128;49mt\x1b[38;2;138;138;138;49mi\x1b[38;2;167;167;167;49mn\x1b[38;2;202;202;202;49mg\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2807} codexcwd\x07\x1b[?2026h\x1b[12;8H\x1b[1m\x1b[38;2;128;128;128;49mi\x1b[38;2;138;138;138;49mn\x1b[38;2;167;167;167;49mg\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49mM\x1b[38;2;242;242;242;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;202;202;202;49m\u{2022}\x1b[12;9H\x1b[38;2;128;128;128;49mn\x1b[38;2;138;138;138;49mg\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49mM\x1b[38;2;231;231;231;49mC\x1b[38;2;242;242;242;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280f} codexcwd\x07\x1b[?2026h\x1b[12;10H\x1b[1m\x1b[38;2;128;128;128;49mg\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49mM\x1b[38;2;202;202;202;49mC\x1b[38;2;231;231;231;49mP\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49mv\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;11H\x1b[1m\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49mM\x1b[38;2;167;167;167;49mC\x1b[38;2;202;202;202;49mP\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;138;138;138;49me\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;12H\x1b[38;2;128;128;128;49mM\x1b[38;2;138;138;138;49mC\x1b[38;2;167;167;167;49mP\x1b[38;2;202;202;202;49m \x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;138;138;138;49mr\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{280b} codexcwd\x07\x1b[?2026h\x1b[12;13H\x1b[1m\x1b[38;2;128;128;128;49mC\x1b[38;2;138;138;138;49mP\x1b[38;2;167;167;167;49m \x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;138;138;138;49ms\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;14H\x1b[1m\x1b[38;2;128;128;128;49mP\x1b[38;2;138;138;138;49m \x1b[38;2;167;167;167;49ms\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;167;167;167;49ms\x1b[38;2;138;138;138;49m \x1b[12;41H\x1b[22m\x1b[2m\x1b[2m\x1b[39;49m1\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;242;242;242;49m\u{2022}\x1b[12;15H\x1b[38;2;128;128;128;49m \x1b[38;2;138;138;138;49ms\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49mv\x1b[38;2;242;242;242;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;167;167;167;49m \x1b[38;2;138;138;138;49m(\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2819} codexcwd\x07\x1b[?2026h\x1b[12;16H\x1b[1m\x1b[38;2;128;128;128;49ms\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49mv\x1b[38;2;231;231;231;49me\x1b[38;2;242;242;242;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;202;202;202;49m \x1b[38;2;167;167;167;49m(\x1b[38;2;138;138;138;49m2\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;1H\x1b[1m\x1b[38;2;231;231;231;49m\u{2022}\x1b[12;17H\x1b[38;2;128;128;128;49me\x1b[38;2;138;138;138;49mr\x1b[38;2;167;167;167;49mv\x1b[38;2;202;202;202;49me\x1b[38;2;231;231;231;49mr\x1b[38;2;242;242;242;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;202;202;202;49m(\x1b[38;2;167;167;167;49m2\x1b[38;2;138;138;138;49m/\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[12;18H\x1b[1m\x1b[38;2;128;128;128;49mr\x1b[38;2;138;138;138;49mv\x1b[38;2;167;167;167;49me\x1b[38;2;202;202;202;49mr\x1b[38;2;231;231;231;49ms\x1b[38;2;242;242;242;49m \x1b[38;2;231;231;231;49m(\x1b[38;2;202;202;202;49m2\x1b[38;2;167;167;167;49m/\x1b[38;2;138;138;138;49m3\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;\u{2839} codexcwd\x07\x1b[?2026h\x1b[12;19H\x1b[1m\x1b[38;2;128;128;128;49mv\x1b[38;2;138;138;138;49me\x1b[38;2;167;167;167;49mr\x1b[38;2;202;202;202;49ms\x1b[38;2;231;231;231;49m \x1b[38;2;242;242;242;49m(\x1b[38;2;231;231;231;49m2\x1b[38;2;202;202;202;49m/\x1b[38;2;167;167;167;49m3\x1b[38;2;138;138;138;49m)\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[15;3H\x1b[?25h\x1b[?2026l\x1b]0;codexcwd\x07\x1b[?2026h\x1b[11;1H\x1b[J\x1b[11;2H\x1b[0m\x1b[49m\x1b[K\x1b[12;2H\x1b[0m\x1b[49m\x1b[K\x1b[13;27H\x1b[0m\x1b[49m\x1b[K\x1b[14;2H\x1b[0m\x1b[49m\x1b[K\x1b[15;145H\x1b[0m\x1b[49m\x1b[K\x1b[11;1H \x1b[12;1H \x1b[13;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mAsk Codex to do anything\x1b[14;1H\x1b[22m \x1b[15;1H  \x1b[38;2;228;49;113;49mgpt-5.6-terra medium\x1b[2m\x1b[39;49m \u{b7} \x1b[22m\x1b[38;2;227;218;130;49m/tmp/claude-1000/-home-prageeth-workspaces-dot-agent-deck-bugs/73b541f2-52f4-46a2-913b-c1f611a5282d/scratchpad/codexcwd\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[13;3HWrite the numbers 1 through\x1b[13;31H45,\x1b[13;35Hone\x1b[13;39Hper\x1b[13;43Hline,\x1b[13;49Heach\x1b[13;54Hfollowed\x1b[13;63Hby\x1b[13;66Ha\x1b[13;68Hsingle\x1b[13;75HEnglish\x1b[13;83Hword\x1b[13;88Hstarting\x1b[13;97Hwith\x1b[13;102Hthat\x1b[13;107Hmany\x1b[13;112Hletters\x1b[13;120His\x1b[13;123Hnot\x1b[13;127Hrequired\x1b[13;136H-\x1b[13;138Hjust\x1b[13;143Hany\x1b[13;147Hword.\x1b[13;153HDo\x1b[13;156Hnot\x1b[13;160Huse\x1b[13;164Hany\x1b[13;168Htools.\x1b[39m\x1b[49m\x1b[0m\x1b[0 q\x1b[13;174H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[11;50r\x1b[11;1H\x1bM\x1bM\x1bM\x1bM\x1b[r\x1b[1;14r\x1b[10;1H";
-        assert_eq!(
-            mid_session_segment.len(),
-            6994,
-            "fixture drift: this must stay byte-for-byte the captured \
-             segment (`.dot-agent-deck/652-captures/audit-capture.bin`, \
-             offset 6844, length 6994)"
-        );
-
-        let capture = CapturedSocket::bind();
-        let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
-            &AgentType::Codex,
-        ))));
-        classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
-
-        let emitted = capture.drain();
-        assert_eq!(
-            emitted.len(),
-            1,
-            "issue #652 reviewer F1 / auditor A1: a healthy, non-erroring \
-             Codex session (this segment classifies Working, not Error) \
-             must still reach the daemon carrying its model under the \
-             hook-trusted default (`suppress_text_status = true`) — today \
-             `classify_and_emit`'s emit gate (`if suppress_text_status && \
-             ev != DetectedEvent::Error {{ return; }}`) discards it \
-             entirely, so zero events reach the capture socket for this \
-             segment; got {emitted:?}"
-        );
-        let event: AgentEvent = serde_json::from_str(&emitted[0]).unwrap_or_else(|e| {
-            panic!(
-                "captured line was not a valid AgentEvent: {e}; line={:?}",
-                emitted[0]
-            )
-        });
-        assert_eq!(
-            event.model,
-            Some("gpt-5.6-terra".to_string()),
-            "the event that does reach the daemon under the fix must carry \
-             the model this segment's status bar shows"
-        );
-        assert_eq!(
-            event.event_type,
-            EventType::Unknown,
-            "round-2 reviewer M3: status-neutrality is the entire \
-             justification for using EventType::Unknown as the carrier \
-             (fixing Blocker 2) — this event must ride a status-neutral \
-             carrier, not a text-derived status assertion, or issue #638's \
-             suppression design is silently undone even though `model` \
-             still comes through"
-        );
-    }
-
-    /// Issue #657 (historical bug, now fixed): the model carrier round 7
-    /// added (`classify_and_emit`'s doc comment above, and `codex/wrap/017`)
-    /// used to live entirely inside `if let Some(ev) = ev { ... }` — it only
-    /// fired when THIS call's classification also produced a status
-    /// *transition* on `det.observe_detected(...)`. A segment that carried a
-    /// freshly repainted model but did NOT change the pane's classified
-    /// status (the pane was already `Working` and stayed `Working`, the
-    /// common case for a mid-session model switch after the very first
-    /// turn) never reached that branch at all, so the fresh model was
-    /// silently dropped even though `extract_codex_status_bar_model` read it
-    /// just fine. The fix restructured the `if let` into a `match ev {
-    /// Some(ev) => { ... } None => { ... } }`, adding a `None` arm that
-    /// still emits the freshly-observed model.
-    ///
-    /// Scenario: the same real non-error Codex segment `codex/wrap/016`/
-    /// `017` use is fed to `classify_and_emit` twice in a row. The first
+    /// Scenario: the same real non-error Codex segment `codex/wrap/016`
+    /// uses is fed to `classify_and_emit` twice in a row. The first
     /// call establishes `Working` as the detector's last-seen state (and,
     /// as an incidental side effect of that real transition, already
-    /// carries the model — that path is `codex/wrap/017`'s, not this
+    /// carries the model — that path is `codex/wrap/016`'s, not this
     /// test's). The second call reclassifies the identical line as
     /// `Working` again, so `Detector::observe_detected` returns `None`
     /// (no transition) — but `extract_codex_status_bar_model` still
@@ -4467,11 +4051,14 @@ mod tests {
             session_id: "test-session".to_string(),
             pane_id: None,
             agent_id: None,
+            token: None,
             cwd: None,
             live_target: LiveTarget {
                 kind: TargetKind::Process,
                 writable: Writable::HistoryOnly,
             },
+            prompt_reports_unavailable: false,
+            classified_sender: None,
         };
 
         // Same verbatim mid-session segment as `codex/wrap/016`/`017` — see
@@ -4492,10 +4079,10 @@ mod tests {
 
         // First call establishes `Working` as the detector's last-seen
         // state. The real transition on THIS call already carries the
-        // model as a side effect (`codex/wrap/017`'s scenario) — drain and
+        // model as a side effect (`codex/wrap/016`'s scenario) — drain and
         // discard it here since this test isolates the SECOND call's
         // behavior, not the first's.
-        classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
+        classify_and_emit(mid_session_segment, &detector, &emitter);
         capture.drain();
 
         // Confirm this test's own premise directly, rather than only inferring
@@ -4508,7 +4095,7 @@ mod tests {
         // branch doesn't mutate `last` further).
         {
             let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-            let premise = det.observe_detected(classify_codex_line(mid_session_segment));
+            let premise = det.observe_detected(classify_line_with(mid_session_segment, &CODEX));
             assert_eq!(
                 premise, None,
                 "test premise: reclassifying the identical segment must NOT \
@@ -4517,12 +4104,12 @@ mod tests {
             );
         }
 
-        // Second call, SAME line: `classify_codex_line` reclassifies it as
+        // Second call, SAME line: the `CODEX` rules reclassify it as
         // `Working` again, so `Detector::observe_detected` returns `None`
         // (no transition, confirmed above) — issue #657's historical gap.
         // `extract_codex_status_bar_model` still freshly re-extracts the same
         // model from this call's own line regardless.
-        classify_and_emit(mid_session_segment, &detector, &emitter, true, true);
+        classify_and_emit(mid_session_segment, &detector, &emitter);
 
         let emitted = capture.drain();
         assert_eq!(
@@ -4554,8 +4141,7 @@ mod tests {
             event.event_type,
             EventType::Unknown,
             "the model-only carrier for a no-transition call must stay \
-             status-neutral, exactly as the transition-carrying case does \
-             (`codex/wrap/017`)"
+             status-neutral so it cannot move the pane's classified status"
         );
     }
 
@@ -4755,24 +4341,23 @@ mod tests {
     /// the registry detection basename as the `--agent` alias.
     #[test]
     fn wrap_launch_command_wraps_wrapper_strategy() {
-        // The binary is resolved by content, not by name (see
-        // `deck_binary_for_wrap` / `usable_wrap_binary` — issue #642 removed
-        // the filename requirement), so this pins the `cargo test` shape
-        // specifically: under `cargo test` the test-harness binary is excluded
-        // by directory (it lives in `target/<profile>/deps/`), and the sibling
-        // product build the test harness resolves to really is named
-        // `dot-agent-deck` there (the cargo package/bin-target name is
-        // unchanged — only an *installed, renamed* copy is `worker-agent-deck`),
-        // so this is usually an absolute path.
-        let rewritten = wrap_launch_command("codex", &AgentType::Codex);
+        // The binary is resolved, not hardcoded (see `deck_binary_for_wrap`), so
+        // assert the shape: some `dot-agent-deck` followed by the exact wrap
+        // invocation. Under `cargo test` the resolved binary is the sibling the
+        // build just produced, so this is usually an absolute path.
+        let rewritten = line(wrap_launch_command("codex", &AgentType::Codex, "/bin/sh"));
         let (program, rest) = rewritten
             .split_once(' ')
             .expect("rewritten command has a program and arguments");
-        assert_eq!(
-            std::path::Path::new(program)
-                .file_name()
-                .and_then(|n| n.to_str()),
-            Some("dot-agent-deck"),
+        // The co-located build carries the platform's executable suffix; the
+        // bare `$PATH` fallback does not.
+        let name = std::path::Path::new(program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+        assert!(
+            name.as_deref() == Some(crate::platform::paths::DEFAULT_BINARY_NAME)
+                || name == Some(crate::platform::paths::durable_binary_file_name()),
             "the rewrite must name a dot-agent-deck binary; got {rewritten:?}"
         );
         assert_eq!(rest, "wrap --agent codex -- codex");
@@ -4789,16 +4374,17 @@ mod tests {
     /// `dot-agent-deck` in general.
     #[test]
     fn wrap_launch_command_names_this_build_not_path() {
-        let rewritten = wrap_launch_command("codex", &AgentType::Codex);
+        let rewritten = line(wrap_launch_command("codex", &AgentType::Codex, "/bin/sh"));
         let program = rewritten.split_once(' ').expect("program present").0;
+        let sibling_name = crate::platform::paths::durable_binary_file_name();
         let sibling = std::env::current_exe().ok().and_then(|exe| {
             let dir = exe.parent()?;
-            let direct = dir.join("dot-agent-deck");
+            let direct = dir.join(&sibling_name);
             if direct.is_file() {
                 return Some(direct);
             }
             (dir.file_name() == Some(std::ffi::OsStr::new("deps")))
-                .then(|| dir.parent().map(|up| up.join("dot-agent-deck")))
+                .then(|| dir.parent().map(|up| up.join(&sibling_name)))
                 .flatten()
                 .filter(|p| p.is_file())
         });
@@ -4814,48 +4400,23 @@ mod tests {
         }
     }
 
-    /// Scenario: a real, resolvable binary must be accepted by name
-    /// resolution regardless of its filename, not only one literally named
-    /// `dot-agent-deck`.
-    ///
-    /// The old check hardcoded a literal `"dot-agent-deck"` filename match,
-    /// so this fork's installed `worker-agent-deck` build (CLAUDE.md rule 21)
-    /// was never accepted and every wrap rewrite silently fell back to a bare
-    /// `$PATH` lookup — resolving to whatever `dot-agent-deck` happened to be
-    /// installed instead of the running build (issue #642). Probes the
-    /// extracted function directly with a synthetic non-`dot-agent-deck`-named
-    /// file, since `current_exe()` inside a `cargo test` process is always
-    /// the test harness binary and can't be renamed mid-test.
-    #[spec("codex/wrap/014")]
-    #[test]
-    fn wrap_014_usable_wrap_binary_accepts_any_filename() {
-        let dir = tempfile::tempdir().expect("tempdir for synthetic binary");
-        let renamed = dir.path().join("worker-agent-deck");
-        std::fs::write(&renamed, b"").expect("create synthetic binary file");
-
-        assert_eq!(
-            usable_wrap_binary(&renamed).as_deref(),
-            renamed.to_str(),
-            "a real, whitespace-free, existing file must be accepted \
-             regardless of filename, not just one literally named \
-             \"dot-agent-deck\""
-        );
-    }
-
     /// Non-Wrapper agents (and the neutral unknown type) launch bare — the
     /// transform only fires for the Wrapper strategy.
     #[test]
     fn wrap_launch_command_leaves_non_wrapper_agents_bare() {
-        assert_eq!(
-            wrap_launch_command("claude", &AgentType::ClaudeCode),
-            "claude"
-        );
-        assert_eq!(
-            wrap_launch_command("opencode", &AgentType::OpenCode),
-            "opencode"
-        );
-        assert_eq!(wrap_launch_command("pi", &AgentType::Pi), "pi");
-        assert_eq!(wrap_launch_command("cat", &AgentType::None), "cat");
+        for (command, agent) in [
+            ("claude", AgentType::ClaudeCode),
+            ("opencode", AgentType::OpenCode),
+            ("pi", AgentType::Pi),
+            ("cat", AgentType::None),
+            // Shell syntax is not a reason to wrap a non-Wrapper agent either.
+            ("FOO=1 claude", AgentType::ClaudeCode),
+        ] {
+            assert_eq!(
+                wrap_launch_command(command, &agent, "/bin/sh"),
+                LaunchCommand::Line(command.to_string())
+            );
+        }
     }
 
     /// Idempotent: a command that is already a `dot-agent-deck wrap …`
@@ -4863,33 +4424,282 @@ mod tests {
     /// restore never double-wraps.
     #[test]
     fn wrap_launch_command_is_idempotent() {
-        assert_eq!(
-            wrap_launch_command(
-                "dot-agent-deck wrap --agent codex -- codex",
-                &AgentType::Codex
-            ),
-            "dot-agent-deck wrap --agent codex -- codex"
+        for command in [
+            "dot-agent-deck wrap --agent codex -- codex",
+            "/usr/local/bin/dot-agent-deck wrap --agent codex -- codex",
+            // Issue #1685: a wrapped command that is shell syntax is still not
+            // wrapped a second time.
+            "dot-agent-deck wrap --agent codex -- FOO=1 codex",
+        ] {
+            assert_eq!(
+                wrap_launch_command(command, &AgentType::Codex, "/bin/sh"),
+                LaunchCommand::Line(command.to_string())
+            );
+        }
+    }
+
+    /// Issue #1685: a Codex command the shell has to run itself is handed to
+    /// the given shell inside the wrapper, verbatim and as one argument, while
+    /// a plain invocation keeps the line form `codex/spawn/006`–`010` pin.
+    #[test]
+    fn wrap_launch_command_hands_shell_syntax_to_the_shell_inside_the_wrapper() {
+        for command in [
+            "CODEX_WRAPPER_PROBE=1 codex",
+            "(umask 077; mkdir -p x); exec codex",
+            "exec codex --model 'o4 mini'",
+        ] {
+            let LaunchCommand::Argv(argv) =
+                wrap_launch_command(command, &AgentType::Codex, "/usr/bin/fish")
+            else {
+                panic!("{command:?} must reach the wrapper through the shell");
+            };
+            assert_eq!(
+                argv[1..],
+                [
+                    "wrap",
+                    "--agent",
+                    "codex",
+                    "--",
+                    "/usr/bin/fish",
+                    crate::platform::shell::shell_command_flag(),
+                    command,
+                ],
+                "{command:?}"
+            );
+        }
+        let plain = line(wrap_launch_command(
+            "devbox run codex-big",
+            &AgentType::Codex,
+            "/bin/sh",
+        ));
+        assert!(
+            plain.ends_with(" wrap --agent codex -- devbox run codex-big"),
+            "{plain:?}"
         );
-        assert_eq!(
-            wrap_launch_command(
-                "/usr/local/bin/dot-agent-deck wrap --agent codex -- codex",
-                &AgentType::Codex
-            ),
-            "/usr/local/bin/dot-agent-deck wrap --agent codex -- codex"
-        );
+    }
+
+    /// Issue #1685: the classification behind the two launch shapes.
+    #[test]
+    fn runs_as_plain_argv_rejects_what_only_a_shell_can_run() {
+        for plain in [
+            "codex",
+            "codex --model mini -c 'model_reasoning_effort=\"low\"'",
+            "/opt/bin/codex --cd /tmp/a=b",
+            "\"/opt/OpenAI Codex/codex\" --model mini",
+            "env FOO=1 codex",
+            "devbox run codex-big",
+            "sh -c 'codex'",
+            "codex 2>/dev/null",
+            "codex >log 2>&1",
+            "codex &>log </dev/null",
+            "",
+        ] {
+            assert!(runs_as_plain_argv(plain), "{plain:?}");
+        }
+        for shell_syntax in [
+            "FOO=1 codex",
+            "_X=a=b codex",
+            "(umask 077; true); exec codex",
+            "cd /tmp && codex",
+            "codex; echo done",
+            "codex | tee log",
+            "codex |& tee log",
+            "codex & wait",
+            "codex\necho done",
+            "exec codex",
+            "{ codex; }",
+            "if true; then codex; fi",
+            "codex --prompt \"$(cat prompt)\"",
+        ] {
+            assert!(!runs_as_plain_argv(shell_syntax), "{shell_syntax:?}");
+        }
+    }
+
+    fn line(launch: LaunchCommand) -> String {
+        match launch {
+            LaunchCommand::Line(line) => line,
+            LaunchCommand::Argv(argv) => panic!("expected a command line, got argv {argv:?}"),
+        }
     }
 
     /// The idempotency guard recognises a `dot-agent-deck wrap` invocation (with
     /// or without a leading path) and rejects anything else.
     #[test]
     fn is_wrap_invocation_matches_only_wrap() {
+        let deck = "dot-agent-deck";
         assert!(is_wrap_invocation(
-            "dot-agent-deck wrap --agent codex -- codex"
+            "dot-agent-deck wrap --agent codex -- codex",
+            deck
         ));
-        assert!(is_wrap_invocation("/opt/bin/dot-agent-deck wrap -- codex"));
-        assert!(!is_wrap_invocation("codex"));
-        assert!(!is_wrap_invocation("dot-agent-deck daemon serve"));
-        assert!(!is_wrap_invocation(""));
+        assert!(is_wrap_invocation(
+            "/opt/bin/dot-agent-deck wrap -- codex",
+            deck
+        ));
+        assert!(!is_wrap_invocation("codex", deck));
+        assert!(!is_wrap_invocation("dot-agent-deck daemon serve", deck));
+        assert!(!is_wrap_invocation("", deck));
+    }
+
+    /// Issue #533: a build under a non-default file name names ITSELF as the
+    /// wrapper. It used to be rejected by name and lose to a co-located
+    /// `dot-agent-deck` — a different build — planted here to prove it.
+    #[test]
+    fn resolve_deck_binary_for_wrap_takes_a_renamed_build_itself() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let renamed = root.path().join("dot-agent-deck-linux-amd64");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        std::fs::write(
+            root.path()
+                .join(crate::platform::paths::durable_binary_file_name()),
+            b"",
+        )
+        .expect("seed co-located default-named build");
+
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(renamed.clone())),
+            renamed.to_str().expect("tempdir path is UTF-8"),
+            "a renamed build must name its own executable, not a sibling build"
+        );
+    }
+
+    /// Nothing quotes the wrapper's command word, so a renamed executable (or
+    /// a directory above it) the shell would reinterpret is refused, never
+    /// quoted: the resolution falls back as it does for any unusable path.
+    ///
+    /// Unix-only because several of these names (`"`, `|`) cannot be created on
+    /// Windows at all; the Windows dialect of the allowlist is covered by
+    /// `is_shell_inert_path_char_admits_backslash_and_tilde_only_for_windows`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_deck_binary_for_wrap_refuses_shell_syntax_in_the_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let hostile_names = [
+            "deck$(touch pwned)",
+            "deck`id`",
+            "deck;id",
+            "deck'q",
+            "deck\"q",
+            "deck&id",
+            "deck|id",
+            "deck (1)",
+            "-deck",
+        ];
+        for name in hostile_names {
+            let exe = root.path().join(name);
+            std::fs::write(&exe, b"").expect("seed hostile build");
+            assert_eq!(
+                resolve_deck_binary_for_wrap(Ok(exe)),
+                crate::platform::paths::DEFAULT_BINARY_NAME,
+                "{name:?} must not reach the unquoted command word"
+            );
+        }
+
+        // A hostile DIRECTORY is refused too, including for a default-named
+        // build — the sibling lookup shares the directory, so it falls back to
+        // the bare name rather than to a sibling.
+        let dir = root.path().join("d$(id)");
+        std::fs::create_dir(&dir).expect("hostile dir");
+        let exe = dir.join(crate::platform::paths::durable_binary_file_name());
+        std::fs::write(&exe, b"").expect("seed build in hostile dir");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(exe)),
+            crate::platform::paths::DEFAULT_BINARY_NAME
+        );
+    }
+
+    #[test]
+    fn is_shell_inert_path_char_admits_backslash_and_tilde_only_for_windows() {
+        assert!(is_shell_inert_path_char('\\', true));
+        assert!(!is_shell_inert_path_char('\\', false));
+        // 8.3 short names (`RUNNER~1`) are ordinary Windows paths.
+        assert!(is_shell_inert_path_char('~', true));
+        assert!(!is_shell_inert_path_char('~', false));
+        for c in ['/', '.', '_', '-', '+', ':', 'a', 'Z', '0'] {
+            assert!(is_shell_inert_path_char(c, false), "{c:?}");
+        }
+        for c in [
+            ' ', '$', '`', ';', '\'', '"', '&', '|', '(', ')', '*', '#', '!',
+        ] {
+            assert!(!is_shell_inert_path_char(c, false), "{c:?}");
+            assert!(!is_shell_inert_path_char(c, true), "{c:?}");
+        }
+    }
+
+    /// A real deck that merely sits in a directory named `deps` is not a test
+    /// harness: without cargo's `-<16 hex>` hash on its stem it names itself.
+    #[test]
+    fn resolve_deck_binary_for_wrap_takes_a_renamed_build_in_a_deps_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let deps = root.path().join("deps");
+        std::fs::create_dir(&deps).expect("deps dir");
+        let renamed = deps.join("dot-agent-deck-linux-amd64");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(renamed.clone())),
+            renamed.to_str().expect("tempdir path is UTF-8")
+        );
+    }
+
+    /// The name check #533 removed was what kept a cargo test harness from
+    /// naming itself as the wrapper. It still cannot: an executable inside a
+    /// `deps` directory is passed over for the build one level up, whatever its
+    /// name — including one that happens to look like a deck.
+    #[test]
+    fn resolve_deck_binary_for_wrap_passes_over_a_test_harness() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let profile = root.path().join("target").join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).expect("deps dir");
+        let harness = deps.join("dot_agent_deck-0123456789abcdef");
+        std::fs::write(&harness, b"").expect("seed harness");
+        let built = profile.join(crate::platform::paths::durable_binary_file_name());
+
+        // No build beside the harness yet: the bare name, never the harness.
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(harness.clone())),
+            crate::platform::paths::DEFAULT_BINARY_NAME
+        );
+
+        std::fs::write(&built, b"").expect("seed built deck");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(harness)),
+            built.to_str().expect("tempdir path is UTF-8")
+        );
+    }
+
+    /// Issue #533: a renamed build recognises the `wrap` invocation it produced
+    /// itself, so re-applying the rewrite does not stack a second wrapper. The
+    /// rewrite and the
+    /// guard are driven through the same resolved program, exactly as
+    /// [`wrap_launch_command`] drives them.
+    #[test]
+    fn is_wrap_invocation_recognises_a_renamed_build() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let renamed = root.path().join("deck-beta");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        let deck = resolve_deck_binary_for_wrap(Ok(renamed));
+
+        let wrapped = format!("{deck} wrap --agent codex -- codex");
+        assert!(
+            is_wrap_invocation(&wrapped, &deck),
+            "a renamed build must recognise its own wrap invocation: {wrapped:?}"
+        );
+        // Also by bare name, as a saved command from that build would carry it.
+        assert!(is_wrap_invocation(
+            "deck-beta wrap --agent codex -- codex",
+            &deck
+        ));
+        // A default-named build's saved command is still recognised.
+        assert!(is_wrap_invocation(
+            "dot-agent-deck wrap --agent codex -- codex",
+            &deck
+        ));
+        // And recognising the renamed build does not widen to other programs.
+        assert!(!is_wrap_invocation(
+            "other wrap --agent codex -- codex",
+            &deck
+        ));
+        assert!(!is_wrap_invocation("deck-beta daemon serve", &deck));
     }
 
     /// Serializes tests in this module that set [`DOT_AGENT_DECK_WRAP_BIN`] —
@@ -4947,12 +4757,12 @@ mod tests {
         let bin_str = bin.to_str().expect("temp path is UTF-8");
         let _override = WrapBinTestOverride::pointing_at(bin_str);
 
-        let once = wrap_launch_command("codex", &AgentType::Codex);
+        let once = line(wrap_launch_command("codex", &AgentType::Codex, "/bin/sh"));
         assert!(
             once.starts_with(bin_str),
             "first wrap must name the synthetic binary: {once}"
         );
-        let twice = wrap_launch_command(&once, &AgentType::Codex);
+        let twice = line(wrap_launch_command(&once, &AgentType::Codex, "/bin/sh"));
         assert_eq!(
             twice, once,
             "wrapping an already-wrapped command must be a no-op"
@@ -5130,12 +4940,12 @@ mod tests {
     /// that home -- the genuine "the hook failed to install/trust" case (an
     /// unwritable `CODEX_HOME`, a full disk, a partial write; `auto_install()`
     /// swallows every one of those behind a `tracing::warn!`, so no error
-    /// reaches this point). `codex_spawn_prep` now sets `hook_trust_confirmed
-    /// = count > 0` in the `Ok(count)` arm, so this exact failure is recorded
-    /// as unconfirmed rather than as success. This pins that fix: it was
-    /// proven RED against the pre-fix `hook_trust_confirmed = true` for ANY
-    /// `Ok(_)`, confirming this is a genuine regression test and not a
-    /// tautology.
+    /// reaches this point). `codex_spawn_prep` only sets `prompt_hook_live`
+    /// when the trust outcome reports the prompt hook trusted
+    /// (`outcome.trusted() > 0` and `reports_prompts()`), so this exact failure
+    /// leaves `prompt_reports_unavailable` set rather than reading as success.
+    /// Fork PRD #254 H1, re-pointed at upstream's issue #559 mechanism: the
+    /// guarantee (zero trusted hooks never counts as a live hook) is the same.
     #[test]
     #[cfg(unix)]
     fn codex_spawn_prep_ok_zero_hooks_is_not_confirmed() {
@@ -5161,10 +4971,11 @@ mod tests {
              pinned home before hook trust is even attempted"
         );
         assert!(
-            !prep.hook_trust_confirmed,
+            prep.prompt_reports_unavailable,
             "H1: trust_deck_hooks_in returning Ok(0) -- zero deck-owned hook \
              entries found, the genuine 'hook failed to install/trust' case \
-             -- must be recorded as NOT confirmed, not confirmed"
+             -- must leave the prompt hook NOT live (prompt reports unavailable), \
+             not read as success"
         );
     }
 }

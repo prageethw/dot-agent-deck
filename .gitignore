@@ -18,11 +18,13 @@ tmp/
 # tests + `cargo xtask docs --tests` locally.
 .dot-agent-deck/
 .claude/scheduled_tasks.lock
+# `task run` / `run-desktop` / `run-all`'s default sandbox (sockets, state,
+# logs), created in whichever directory they are invoked from.
+.dad-sandbox/
 
-# Documentation site
-site/node_modules/
+# Documentation site: `cargo xtask site site/build/public --nginx-redirects
+# site/build/nginx-redirects.conf`, the layout CI builds and site/Dockerfile copies.
 site/build/
-site/.docusaurus/
 
 # Demo-reel build artifacts (regenerated each build; reel lives on YouTube)
 /reel.mp4
@@ -35,3 +37,10 @@ site/.docusaurus/
 # or py_compile over them. Regenerated on demand and version-specific.
 __pycache__/
 *.pyc
+
+# devbox's generated per-project shell scripts. `devbox run` / `devbox shell`
+# regenerate these on demand from devbox.json, and each one embeds the absolute
+# path of the checkout it was generated in — so they are machine-specific and
+# differ per worktree. Never belonged in the repo; committed by accident in an
+# agent's `git add -A` after a `devbox run`, which is what prompted this entry.
+.devbox/

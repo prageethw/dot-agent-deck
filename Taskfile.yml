@@ -1,103 +1,110 @@
 version: "3"
 
 tasks:
-  docs-install:
-    desc: Install documentation site dependencies
-    dir: site
-    cmds:
-      - npm install
-
-  docs-dev:
-    desc: Start documentation site in dev mode with live reload
-    dir: site
-    cmds:
-      - npm start
-
   docs-build:
-    desc: Build documentation site for production
-    dir: site
+    desc: >-
+      Build the documentation site into site/build (the layout CI builds and
+      site/Dockerfile copies). Replaces any previous build.
     cmds:
-      - npm run build
+      - rm -rf site/build
+      - cargo xtask site site/build/public --nginx-redirects site/build/nginx-redirects.conf
 
   docs-serve:
-    desc: Serve the built documentation site locally
-    dir: site
+    desc: Serve the built site locally from the nginx image, on http://localhost:8080
+    deps: [docs-build]
     cmds:
-      - npm run serve
+      - docker build -f site/Dockerfile -t dot-agent-deck-docs:local .
+      - docker run --rm -p 8080:8080 dot-agent-deck-docs:local
 
   run:
     desc: >-
       Build this checkout and start the TUI against an ISOLATED sandbox daemon, so
       trying a branch build never bounces your everyday deck. Run it from the
       directory holding your .dot-agent-deck.toml. Vars: DIR (config dir, default
-      the dir you invoke from), SANDBOX (isolation state dir, default DIR/.dad-sandbox),
+      the dir you invoke from), SANDBOX (isolation state dir, default one per branch,
+      DIR/.dad-sandbox/branch-<slug>: the branch name with anything outside
+      A-Za-z0-9._- made `-`, plus a hash when it was changed, holds an uppercase
+      letter or was cut to fit; DIR/.dad-sandbox/commit-<sha> on a detached HEAD),
       PROFILE (release|debug, default release).
+      See docs/develop/local-run.md.
     vars:
       DIR: '{{.DIR | default .USER_WORKING_DIR}}'
+      SANDBOX: '{{.SANDBOX | default ""}}'
       PROFILE: '{{.PROFILE | default "release"}}'
+    env:
+      DAD_TASKFILE_DIR: '{{.TASKFILE_DIR}}'
+      DAD_RUN_DIR: '{{.DIR}}'
+      DAD_RUN_SANDBOX: '{{.SANDBOX}}'
+      DAD_RUN_PROFILE: '{{.PROFILE}}'
     cmds:
       # Build from the Taskfile's own checkout, so the binary always matches the
       # branch you are sitting on rather than whatever is installed on PATH.
       - cargo build {{if eq .PROFILE "release"}}--release{{end}}
-      - |
-        set -eu
-        dir="{{.DIR}}"
-        sandbox="${SANDBOX:-$dir/.dad-sandbox}"
-        bin="{{.TASKFILE_DIR}}/target/{{.PROFILE}}/dot-agent-deck"
+      # The isolation itself — every override, and why — lives in the script, so
+      # run, run-desktop, run-all and run-stop cannot drift apart on it.
+      - bash "$DAD_TASKFILE_DIR/scripts/sandbox-run.sh" tui "$DAD_TASKFILE_DIR" "$DAD_RUN_DIR" "$DAD_RUN_SANDBOX" "$DAD_RUN_PROFILE"
 
-        if [ ! -f "$dir/.dot-agent-deck.toml" ]; then
-          echo "note: no .dot-agent-deck.toml in $dir — the deck will start with no" >&2
-          echo "      modes/orchestrations configured. Pass DIR=<dir> to point elsewhere." >&2
-        fi
-        mkdir -p "$sandbox"
-
-        # Isolation. Without these, a branch build's build-version handshake
-        # (PRD #103/#161) SIGTERMs the daemon your installed build is using —
-        # silently when no agents are live — and switching back bounces it again.
-        # These four are the documented production overrides (src/config.rs).
-        export DOT_AGENT_DECK_ATTACH_SOCKET="$sandbox/attach.sock"
-        export DOT_AGENT_DECK_SOCKET="$sandbox/hook.sock"
-        export DOT_AGENT_DECK_STATE_DIR="$sandbox/state"
-        export DOT_AGENT_DECK_SESSION="$sandbox/session.toml"
-
-        # Panes inherit this PATH, so an agent inside the sandbox that types a
-        # bare `dot-agent-deck` must reach the branch build — not whatever is
-        # installed. Without this the release binary on PATH wins and the miss is
-        # SILENT for every verb that exists in both builds, so a pane can "test
-        # the branch" while actually exercising the installed release.
-        export PATH="$(dirname "$bin"):$PATH"
-
-        # ...and the PATH prepend above is NOT enough on its own. Agents here are
-        # launched through `devbox run <script>` (see .dot-agent-deck.toml's role
-        # commands), and a NESTED devbox re-derives PATH from its own environment:
-        # the prepend above is DISCARDED, and devbox.json's init_hook then puts
-        # $HOME/.local/bin first — so a bare `dot-agent-deck` in a pane reaches the
-        # INSTALLED RELEASE. Measured: level-1 PATH starts with the build dir,
-        # level-2 (the agent) starts with $HOME/.local/bin and has no build dir at
-        # all. Ordinary env vars DO survive that nesting, so hand the dir over as
-        # one and let init_hook re-prepend it inside every devbox layer.
-        export DAD_DEV_BIN="$(dirname "$bin")"
-
-        echo "deck:    $bin"
-        echo "config:  $dir"
-        echo "sandbox: $sandbox   (task run-stop to shut its daemon down)"
-        cd "$dir" && exec "$bin"
-
-  run-stop:
-    desc: Stop the sandbox daemon started by `task run` (leaves your real daemon alone). Same DIR/SANDBOX vars.
+  run-desktop:
+    desc: >-
+      Build this checkout and start the desktop GUI (pnpm tauri dev, from THIS
+      checkout's desktop/) against the same isolated sandbox as `task run`, with
+      its own desktop.toml. Its Start deck launches the sandbox daemon. Same
+      DIR/SANDBOX vars; PROFILE defaults to debug, the profile tauri dev builds.
+      Do not run it from a worktree agents are editing — vite reloads the window
+      on every save.
     vars:
       DIR: '{{.DIR | default .USER_WORKING_DIR}}'
-      PROFILE: '{{.PROFILE | default "release"}}'
+      SANDBOX: '{{.SANDBOX | default ""}}'
+      PROFILE: '{{.PROFILE | default "debug"}}'
+    env:
+      DAD_TASKFILE_DIR: '{{.TASKFILE_DIR}}'
+      DAD_RUN_DIR: '{{.DIR}}'
+      DAD_RUN_SANDBOX: '{{.SANDBOX}}'
+      DAD_RUN_PROFILE: '{{.PROFILE}}'
     cmds:
-      - |
-        set -eu
-        dir="{{.DIR}}"
-        sandbox="${SANDBOX:-$dir/.dad-sandbox}"
-        export DOT_AGENT_DECK_ATTACH_SOCKET="$sandbox/attach.sock"
-        export DOT_AGENT_DECK_SOCKET="$sandbox/hook.sock"
-        export DOT_AGENT_DECK_STATE_DIR="$sandbox/state"
-        export DOT_AGENT_DECK_SESSION="$sandbox/session.toml"
-        "{{.TASKFILE_DIR}}/target/{{.PROFILE}}/dot-agent-deck" daemon stop "$@"
+      - cargo build {{if eq .PROFILE "release"}}--release{{end}}
+      - bash "$DAD_TASKFILE_DIR/scripts/sandbox-run.sh" desktop "$DAD_TASKFILE_DIR" "$DAD_RUN_DIR" "$DAD_RUN_SANDBOX" "$DAD_RUN_PROFILE"
+
+  run-all:
+    desc: >-
+      Build this checkout and run the TUI AND the desktop GUI against ONE isolated
+      sandbox daemon — the TUI in this terminal, the desktop in the background with
+      its output in SANDBOX/desktop.log, and the desktop stopped when the TUI exits.
+      Same DIR/SANDBOX vars as `task run`; PROFILE defaults to debug, the profile
+      tauri dev builds. Do not run it from a worktree agents are editing — vite
+      reloads the window on every save. See docs/develop/local-run.md.
+    vars:
+      DIR: '{{.DIR | default .USER_WORKING_DIR}}'
+      SANDBOX: '{{.SANDBOX | default ""}}'
+      PROFILE: '{{.PROFILE | default "debug"}}'
+    env:
+      DAD_TASKFILE_DIR: '{{.TASKFILE_DIR}}'
+      DAD_RUN_DIR: '{{.DIR}}'
+      DAD_RUN_SANDBOX: '{{.SANDBOX}}'
+      DAD_RUN_PROFILE: '{{.PROFILE}}'
+    cmds:
+      - cargo build {{if eq .PROFILE "release"}}--release{{end}}
+      - bash "$DAD_TASKFILE_DIR/scripts/sandbox-run.sh" all "$DAD_TASKFILE_DIR" "$DAD_RUN_DIR" "$DAD_RUN_SANDBOX" "$DAD_RUN_PROFILE"
+
+  run-stop:
+    desc: >-
+      Stop what `task run`, `task run-desktop` or `task run-all` started in the
+      sandbox — a background desktop, then the sandbox daemon — and leave your real
+      daemon alone. Same DIR/SANDBOX vars; PROFILE defaults to the build that
+      started the sandbox. With no SANDBOX it reaches the sandbox of the branch
+      this checkout is on. Arguments after -- go to `daemon stop`, e.g.
+      `task run-stop -- --force` to stop a sandbox daemon that still has agents.
+    vars:
+      DIR: '{{.DIR | default .USER_WORKING_DIR}}'
+      SANDBOX: '{{.SANDBOX | default ""}}'
+      PROFILE: '{{.PROFILE | default ""}}'
+    env:
+      DAD_TASKFILE_DIR: '{{.TASKFILE_DIR}}'
+      DAD_RUN_DIR: '{{.DIR}}'
+      DAD_RUN_SANDBOX: '{{.SANDBOX}}'
+      DAD_RUN_PROFILE: '{{.PROFILE}}'
+    cmds:
+      - bash "$DAD_TASKFILE_DIR/scripts/sandbox-run.sh" stop "$DAD_TASKFILE_DIR" "$DAD_RUN_DIR" "$DAD_RUN_SANDBOX" "$DAD_RUN_PROFILE" {{.CLI_ARGS}}
 
   reel-smoke:
     desc: Build a demo reel from a tiny fixture and assert the stitched MP4 with ffprobe (local-only; no network, no upload)
@@ -115,89 +122,112 @@ tasks:
     cmds:
       - shasum -a 256 dot-agent-deck-* > checksums.txt
 
+  # The four release tasks below run in release.yml's `finalize` job, two of
+  # them holding cross-repo tokens. None of them splices a task variable into
+  # its shell text (issue #324): go-task substitutes `{{.VAR}}` before the shell
+  # parses the command, so a crafted value would run as code. Each binds its
+  # values through `env:` instead, and scripts/release-channel-vars.sh
+  # validates them before any is used and derives the rest.
   homebrew-formula:
-    desc: Generate Homebrew formula from release binaries (NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to publish a parallel pre-release formula)
+    desc: Generate Homebrew formula from release binaries (VERSION is the v-prefixed release tag; NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to publish a parallel pre-release formula)
     requires:
       vars: [VERSION]
     vars:
       NAME: '{{.NAME | default "dot-agent-deck"}}'
-      CLASS_NAME:
-        sh: echo "{{.NAME | default "dot-agent-deck"}}" | awk -F'-' '{for(i=1;i<=NF;i++) printf "%s", toupper(substr($i,1,1)) substr($i,2)}'
-      # Each channel declares conflicts_with the other channel's formula name
-      # so a user installing one is forced to uninstall the other. The invoked
-      # binary is always `dot-agent-deck` regardless of channel — no CLI surface
-      # divergence between stable and beta.
-      CONFLICTS_WITH: '{{if eq .NAME "dot-agent-deck-beta"}}dot-agent-deck{{else}}dot-agent-deck-beta{{end}}'
-      VERSION_NO_V:
-        sh: echo "{{.VERSION}}" | sed 's/^v//'
-      BASE_URL: https://github.com/vfarcic/dot-agent-deck/releases/download/{{.VERSION}}
-      SHA_DARWIN_ARM64:
-        sh: grep 'dot-agent-deck-darwin-arm64$' dist/checksums.txt | awk '{print $1}'
-      SHA_DARWIN_AMD64:
-        sh: grep 'dot-agent-deck-darwin-amd64$' dist/checksums.txt | awk '{print $1}'
-      SHA_LINUX_ARM64:
-        sh: grep 'dot-agent-deck-linux-arm64$' dist/checksums.txt | awk '{print $1}'
-      SHA_LINUX_AMD64:
-        sh: grep 'dot-agent-deck-linux-amd64$' dist/checksums.txt | awk '{print $1}'
+    env:
+      DAD_RELEASE_VERSION: '{{.VERSION}}'
+      DAD_CHANNEL_NAME: '{{.NAME}}'
+      DAD_TASKFILE_DIR: '{{.TASKFILE_DIR}}'
     cmds:
       - |
-        for var in "SHA_DARWIN_ARM64:{{.SHA_DARWIN_ARM64}}" "SHA_DARWIN_AMD64:{{.SHA_DARWIN_AMD64}}" "SHA_LINUX_ARM64:{{.SHA_LINUX_ARM64}}" "SHA_LINUX_AMD64:{{.SHA_LINUX_AMD64}}"; do
-          name="${var%%:*}"
-          value="${var#*:}"
-          if [ -z "$value" ]; then
-            echo "Error: $name is empty — check dist/checksums.txt" >&2
-            exit 1
-          fi
-        done
-        cat > dist/{{.NAME}}.rb << 'FORMULA'
-        class {{.CLASS_NAME}} < Formula
+        . "$DAD_TASKFILE_DIR/scripts/release-channel-vars.sh"
+        SHA_DARWIN_ARM64=$(dad_checksum dot-agent-deck-darwin-arm64) || exit 1
+        SHA_DARWIN_AMD64=$(dad_checksum dot-agent-deck-darwin-amd64) || exit 1
+        SHA_LINUX_ARM64=$(dad_checksum dot-agent-deck-linux-arm64) || exit 1
+        SHA_LINUX_AMD64=$(dad_checksum dot-agent-deck-linux-amd64) || exit 1
+        # PRD #1859's resource collector ships as a Linux asset only (on macOS it
+        # is a stub that exits), so it is a Linux-only resource below and the
+        # macOS install is unchanged (issue #1906).
+        SHA_COLLECTOR_LINUX_ARM64=$(dad_checksum dot-agent-deck-collector-linux-arm64) || exit 1
+        SHA_COLLECTOR_LINUX_AMD64=$(dad_checksum dot-agent-deck-collector-linux-amd64) || exit 1
+        # Each channel declares conflicts_with the other channel's formula name
+        # so a user installing one is forced to uninstall the other. The invoked
+        # binary is always `dot-agent-deck` regardless of channel — no CLI surface
+        # divergence between stable and beta.
+        cat > "dist/${DAD_CHANNEL_NAME}.rb" << FORMULA
+        class ${CLASS_NAME} < Formula
           desc "TUI dashboard for monitoring AI agent sessions"
           homepage "https://github.com/vfarcic/dot-agent-deck"
-          version "{{.VERSION_NO_V}}"
+          version "${VERSION_NO_V}"
           license "MIT"
-
-          conflicts_with "{{.CONFLICTS_WITH}}",
-            because: "both install a `dot-agent-deck` binary; only one channel can be active at a time"
 
           on_macos do
             if Hardware::CPU.arm?
-              url "{{.BASE_URL}}/dot-agent-deck-darwin-arm64"
-              sha256 "{{.SHA_DARWIN_ARM64}}"
+              url "${BASE_URL}/dot-agent-deck-darwin-arm64"
+              sha256 "${SHA_DARWIN_ARM64}"
             else
-              url "{{.BASE_URL}}/dot-agent-deck-darwin-amd64"
-              sha256 "{{.SHA_DARWIN_AMD64}}"
+              url "${BASE_URL}/dot-agent-deck-darwin-amd64"
+              sha256 "${SHA_DARWIN_AMD64}"
             end
           end
 
           on_linux do
             if Hardware::CPU.arm?
-              url "{{.BASE_URL}}/dot-agent-deck-linux-arm64"
-              sha256 "{{.SHA_LINUX_ARM64}}"
+              url "${BASE_URL}/dot-agent-deck-linux-arm64"
+              sha256 "${SHA_LINUX_ARM64}"
+
+              resource "collector" do
+                url "${BASE_URL}/dot-agent-deck-collector-linux-arm64"
+                sha256 "${SHA_COLLECTOR_LINUX_ARM64}"
+              end
             else
-              url "{{.BASE_URL}}/dot-agent-deck-linux-amd64"
-              sha256 "{{.SHA_LINUX_AMD64}}"
+              url "${BASE_URL}/dot-agent-deck-linux-amd64"
+              sha256 "${SHA_LINUX_AMD64}"
+
+              resource "collector" do
+                url "${BASE_URL}/dot-agent-deck-collector-linux-amd64"
+                sha256 "${SHA_COLLECTOR_LINUX_AMD64}"
+              end
             end
           end
 
+          conflicts_with "${CONFLICTS_WITH}",
+            because: "both install a \`dot-agent-deck\` binary; only one channel can be active at a time"
+
           def install
             bin.install Dir["dot-agent-deck-*"].first => "dot-agent-deck"
+            if OS.linux?
+              resource("collector").stage do
+                bin.install Dir["dot-agent-deck-collector-*"].first => "dot-agent-deck-collector"
+              end
+            end
           end
 
           test do
             assert_match "dot-agent-deck", shell_output("#{bin}/dot-agent-deck --help")
+            assert_match "dot-agent-deck-collector", shell_output("#{bin}/dot-agent-deck-collector --help") if OS.linux?
           end
         end
         FORMULA
-        sed -i.bak -e 's/^        //' dist/{{.NAME}}.rb && rm -f dist/{{.NAME}}.rb.bak
+        # No dedent pass: the YAML block scalar has already removed the
+        # command's own indentation, so the heredoc is the formula as written.
+        # The `sed 's/^        //'` this task used to run changed no line while
+        # nothing nested deeper than 6 spaces, and flattened the `resource`
+        # blocks once something did (issue #1906).
 
   homebrew-publish:
-    desc: Push Homebrew formula to the tap repository (NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to update the parallel pre-release formula)
+    desc: Push Homebrew formula to the tap repository (VERSION is the v-prefixed release tag; NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to update the parallel pre-release formula)
     requires:
       vars: [VERSION]
     vars:
       NAME: '{{.NAME | default "dot-agent-deck"}}'
+    env:
+      DAD_RELEASE_VERSION: '{{.VERSION}}'
+      DAD_CHANNEL_NAME: '{{.NAME}}'
+      DAD_TASKFILE_DIR: '{{.TASKFILE_DIR}}'
     cmds:
       - |
+        . "$DAD_TASKFILE_DIR/scripts/release-channel-vars.sh"
         if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
           echo "Error: HOMEBREW_TAP_TOKEN environment variable is required"
           exit 1
@@ -207,36 +237,39 @@ tasks:
         cd "$WORK_DIR"
         git clone --quiet "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/vfarcic/homebrew-tap.git" .
         mkdir -p Formula
-        cp {{.TASKFILE_DIR}}/dist/{{.NAME}}.rb Formula/{{.NAME}}.rb
-        git add Formula/{{.NAME}}.rb
+        cp "$DAD_TASKFILE_DIR/dist/${DAD_CHANNEL_NAME}.rb" "Formula/${DAD_CHANNEL_NAME}.rb"
+        git add "Formula/${DAD_CHANNEL_NAME}.rb"
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git diff --cached --quiet || git commit -m "Update {{.NAME}} formula to {{.VERSION}}"
+        git diff --cached --quiet || git commit -m "Update ${DAD_CHANNEL_NAME} formula to ${DAD_RELEASE_VERSION}"
         git push origin main
 
   scoop-manifest:
-    desc: Generate Scoop manifest from release binaries (NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to publish a parallel pre-release manifest)
+    desc: Generate Scoop manifest from release binaries (VERSION is the v-prefixed release tag; NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to publish a parallel pre-release manifest)
     requires:
       vars: [VERSION]
     vars:
       NAME: '{{.NAME | default "dot-agent-deck"}}'
-      VERSION_NO_V:
-        sh: echo "{{.VERSION}}" | sed 's/^v//'
-      BASE_URL: https://github.com/vfarcic/dot-agent-deck/releases/download/{{.VERSION}}
-      SHA_WINDOWS_AMD64:
-        sh: grep 'dot-agent-deck-windows-amd64.exe$' dist/checksums.txt | awk '{print $1}'
+    env:
+      DAD_RELEASE_VERSION: '{{.VERSION}}'
+      DAD_CHANNEL_NAME: '{{.NAME}}'
+      DAD_TASKFILE_DIR: '{{.TASKFILE_DIR}}'
     cmds:
       - |
-        cat > dist/{{.NAME}}.json << MANIFEST
+        . "$DAD_TASKFILE_DIR/scripts/release-channel-vars.sh"
+        # Optional: no release builds a Windows binary yet, and the manifest has
+        # always been written with an empty hash in that case (see the helper).
+        SHA_WINDOWS_AMD64=$(dad_checksum dot-agent-deck-windows-amd64.exe optional) || exit 1
+        cat > "dist/${DAD_CHANNEL_NAME}.json" << MANIFEST
         {
-            "version": "{{.VERSION_NO_V}}",
+            "version": "${VERSION_NO_V}",
             "description": "TUI dashboard for monitoring AI agent sessions",
             "homepage": "https://github.com/vfarcic/dot-agent-deck",
             "license": "MIT",
             "architecture": {
                 "64bit": {
-                    "url": "{{.BASE_URL}}/dot-agent-deck-windows-amd64.exe",
-                    "hash": "{{.SHA_WINDOWS_AMD64}}"
+                    "url": "${BASE_URL}/dot-agent-deck-windows-amd64.exe",
+                    "hash": "${SHA_WINDOWS_AMD64}"
                 }
             },
             "bin": [["dot-agent-deck-windows-amd64.exe", "dot-agent-deck"]],
@@ -250,16 +283,21 @@ tasks:
             }
         }
         MANIFEST
-        sed -i.bak -e 's/^        //' dist/{{.NAME}}.json && rm -f dist/{{.NAME}}.json.bak
+        sed -i.bak -e 's/^        //' "dist/${DAD_CHANNEL_NAME}.json" && rm -f "dist/${DAD_CHANNEL_NAME}.json.bak"
 
   scoop-publish:
-    desc: Push Scoop manifest to the bucket repository (NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to update the parallel pre-release manifest)
+    desc: Push Scoop manifest to the bucket repository (VERSION is the v-prefixed release tag; NAME defaults to dot-agent-deck; pass NAME=dot-agent-deck-beta to update the parallel pre-release manifest)
     requires:
       vars: [VERSION]
     vars:
       NAME: '{{.NAME | default "dot-agent-deck"}}'
+    env:
+      DAD_RELEASE_VERSION: '{{.VERSION}}'
+      DAD_CHANNEL_NAME: '{{.NAME}}'
+      DAD_TASKFILE_DIR: '{{.TASKFILE_DIR}}'
     cmds:
       - |
+        . "$DAD_TASKFILE_DIR/scripts/release-channel-vars.sh"
         if [ -z "$SCOOP_BUCKET_TOKEN" ]; then
           echo "Error: SCOOP_BUCKET_TOKEN environment variable is required"
           exit 1
@@ -268,9 +306,9 @@ tasks:
         trap 'rm -rf "$WORK_DIR"' EXIT
         cd "$WORK_DIR"
         git clone --quiet "https://x-access-token:$SCOOP_BUCKET_TOKEN@github.com/vfarcic/scoop-bucket.git" .
-        cp {{.TASKFILE_DIR}}/dist/{{.NAME}}.json {{.NAME}}.json
-        git add {{.NAME}}.json
+        cp "$DAD_TASKFILE_DIR/dist/${DAD_CHANNEL_NAME}.json" "${DAD_CHANNEL_NAME}.json"
+        git add "${DAD_CHANNEL_NAME}.json"
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git diff --cached --quiet || git commit -m "Update {{.NAME}} manifest to {{.VERSION}}"
+        git diff --cached --quiet || git commit -m "Update ${DAD_CHANNEL_NAME} manifest to ${DAD_RELEASE_VERSION}"
         git push origin main

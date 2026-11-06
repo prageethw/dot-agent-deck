@@ -30,6 +30,10 @@ fn invoke_codex_hook(payload: &serde_json::Value) -> AgentEvent {
         .env("DOT_AGENT_DECK_SOCKET", &socket)
         .env("DOT_AGENT_DECK_PANE_ID", "codex-hook-pane")
         .env("DOT_AGENT_DECK_AGENT_ID", "codex-hook-agent")
+        // A developer running this from a deck pane inherits that pane's
+        // capability token; with one, the hook's inbox calls (PRD #1666 S7)
+        // would reach this socket ahead of the event it reads.
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -59,7 +63,16 @@ fn invoke_codex_hook(payload: &serde_json::Value) -> AgentEvent {
                 stream
                     .read_to_string(&mut line)
                     .expect("read emitted Codex AgentEvent");
-                return serde_json::from_str(line.trim()).expect("parse emitted Codex AgentEvent");
+                // PRD #1631 (audit A9): a frame carrying a question leaves the
+                // hook as an unheld `question` message, so it goes through the
+                // daemon's provenance gate; its event is what is asserted.
+                let mut frame: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse emitted Codex frame");
+                if frame["message_type"] == "question" {
+                    assert_eq!(frame["hold"], false, "a keys-answered question is not held");
+                    frame = frame["event"].take();
+                }
+                return serde_json::from_value(frame).expect("parse emitted Codex AgentEvent");
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(

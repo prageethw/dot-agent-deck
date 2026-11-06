@@ -16,10 +16,11 @@
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
-    DOT_AGENT_DECK_REGISTRATION_GENERATION, PaneRecreateIdentity, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, PaneRecreateIdentity, SpawnOptions, TabMembership,
 };
-use dot_agent_deck::event::{RestartRoleResponse, RestartRoleSignal};
+use dot_agent_deck::event::{
+    DelegateResponse, DelegateSignal, RestartRoleResponse, RestartRoleSignal,
+};
 use dot_agent_deck::state::OrchestrationIdentity;
 use spec::spec;
 
@@ -99,7 +100,7 @@ async fn fixture(worker_command: &str) -> Fixture {
 
     {
         let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
+        let identity = OrchestrationIdentity {
             id: ORCHESTRATION_ID.to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -153,6 +154,7 @@ async fn restart_role(
         role: role.to_string(),
         force,
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     dot_agent_deck::state::handle_restart_role_with_state(
         signal,
@@ -404,11 +406,11 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
 
     {
         let mut state = daemon.state.write().await;
-        let identity_a = OrchestrationIdentity::Instance {
+        let identity_a = OrchestrationIdentity {
             id: "restart-iso-instance-a".to_string(),
             name: ORCHESTRATION.to_string(),
         };
-        let identity_b = OrchestrationIdentity::Instance {
+        let identity_b = OrchestrationIdentity {
             id: "restart-iso-instance-b".to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -447,6 +449,7 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
         role: WORKER_ROLE.to_string(),
         force: true,
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     let response = dot_agent_deck::state::handle_restart_role_with_state(
         signal,
@@ -669,6 +672,7 @@ async fn pane_restart_010_recheck_under_dispatch_lock_prevents_killing_a_concurr
         role: WORKER_ROLE.to_string(),
         force: false,
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     let mut restart_future = Box::pin(dot_agent_deck::state::handle_restart_role_with_state(
         signal,
@@ -800,6 +804,7 @@ async fn pane_restart_011_force_bypasses_the_post_dispatch_lock_recheck_too() {
         role: WORKER_ROLE.to_string(),
         force: true,
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     let mut restart_future = Box::pin(dot_agent_deck::state::handle_restart_role_with_state(
         signal,
@@ -875,182 +880,443 @@ async fn pane_restart_011_force_bypasses_the_post_dispatch_lock_recheck_too() {
     );
 }
 
-/// Issue #706: an env-dumping worker stand-in — logs the vars that decide
-/// whether a recreated worker's `work-done` can pass the daemon's
-/// generation/boot-id staleness gate, then behaves like `cat`.
-fn write_env_dump_worker(path: &std::path::Path, log: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let script = format!(
-        "#!/bin/sh\n\
-         {{\n\
-         echo \"gen=$DOT_AGENT_DECK_REGISTRATION_GENERATION\"\n\
-         echo \"boot=$DOT_AGENT_DECK_DAEMON_BOOT_ID\"\n\
-         echo \"pane=$DOT_AGENT_DECK_PANE_ID\"\n\
-         echo \"---\"\n\
-         }} >> \"{log}\"\n\
-         exec cat\n",
-        log = log.display()
-    );
-    std::fs::write(path, script).expect("write env-dump worker stand-in");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod env-dump worker stand-in");
-}
-
-/// The env-dump worker's per-invocation blocks (mirrors
-/// `delegate_respawn_recovery.rs`'s `recorded_launches`).
-fn recorded_env_blocks(log: &std::path::Path) -> Vec<String> {
-    std::fs::read_to_string(log)
-        .unwrap_or_default()
-        .split("---\n")
-        .map(str::trim)
-        .filter(|block| !block.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Scenario: issue #706 — the worker pane's registry record is closed out
-/// from under it (the same deterministic technique `agent_detection.rs`'s
-/// `spawn_010_declared_identity_wins_spawn_recreate_and_learning` fixture
-/// uses to force `recreated: true`, rather than racing an in-flight close),
-/// then the orchestrator force-restarts the role via
-/// `handle_restart_role_with_state`'s recreate branch. The recreated
-/// worker's actual environment must carry the SAME registration generation
-/// and daemon boot id that `pane_registration_generation` ends up holding
-/// for its pane, not just `DOT_AGENT_DECK_PANE_ID`.
-#[tokio::test(flavor = "multi_thread")]
-#[spec("pane/restart/012")]
-async fn pane_restart_012_recreate_leg_injects_matching_registration_generation() {
-    let script_dir = common::race_safe_tempdir();
-    let script_path = script_dir.path().join("env-dump-worker.sh");
-    let log_path = script_dir.path().join("env-dump.log");
-    write_env_dump_worker(&script_path, &log_path);
-
-    let fx = fixture(&script_path.to_string_lossy()).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while recorded_env_blocks(&log_path).is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the worker stand-in never recorded its initial launch"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    fx.daemon
-        .registry
-        .close_agent(&fx.worker_agent_id)
-        .expect("remove the worker's registry record to force the recreate leg (issue #606)");
-
-    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
-    assert!(
-        response.restarted,
-        "force-restarting a pane whose registry record is gone must still recreate it; \
-         response = {response:?}"
-    );
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while recorded_env_blocks(&log_path).len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the recreated worker never recorded a second launch; blocks = {:?}",
-            recorded_env_blocks(&log_path)
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    let blocks = recorded_env_blocks(&log_path);
-    let recreated_block = blocks.last().expect("a second launch block exists");
-    let field = |name: &str| -> String {
-        recreated_block
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name}=")))
-            .unwrap_or_default()
-            .to_string()
+/// The pointer line `dispatch_one_owned` writes into the `coder` worker's PTY.
+/// PRD #1666 S5: how many delegated tasks the worker pane's inbox holds for
+/// whatever agent owns the pane now — what a delegate posts instead of typing
+/// a pointer.
+fn pointers_in_worker_pane(registry: &AgentPtyRegistry) -> usize {
+    let Some(agent) = registry.pane_current_agent_id(WORKER_PANE) else {
+        return 0;
     };
-    let injected_gen = field("gen");
-    let injected_boot = field("boot");
+    registry
+        .inbox()
+        .list(WORKER_PANE)
+        .into_iter()
+        .filter(|message| {
+            message.bind_agent.as_deref() == Some(agent.as_str())
+                && message.subject.starts_with("task from the orchestrator")
+        })
+        .count()
+}
 
-    // `handle_restart_role_with_state`'s `if recreated { ... }` re-registration
-    // now runs SYNCHRONOUSLY, inside the same `pane_dispatch_lock` scope as
-    // the reservation, so the map is already settled by the time the restart
-    // call returns; this poll loop is vestigial (harmless) rather than load-bearing.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !fx
-        .daemon
+/// Poll until the worker pane's current agent has been posted at least `count`
+/// tasks, or `timeout` passes. Returns whether it got there.
+async fn wait_for_pointers(registry: &AgentPtyRegistry, count: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pointers_in_worker_pane(registry) >= count {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn delegate_to_worker(fx: &Fixture, supersede: bool) -> DelegateResponse {
+    let signal = DelegateSignal {
+        pane_id: ORCH_PANE.to_string(),
+        task: "Probe task for the busy-worker refusal.".to_string(),
+        to: vec![WORKER_ROLE.to_string()],
+        supersede,
+        timestamp: chrono::Utc::now(),
+        token: None,
+    };
+    fx.daemon
         .state
         .read()
         .await
-        .pane_registration_generation
-        .contains_key(WORKER_PANE)
-        && tokio::time::Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let state = fx.daemon.state.read().await;
-    let map_generation = state.pane_registration_generation.get(WORKER_PANE).copied();
-    let daemon_boot_id = state.daemon_boot_id().to_string();
-    drop(state);
+        .handle_delegate_with_state(
+            signal,
+            &fx.daemon.registry,
+            &fx.daemon.event_tx,
+            Some(&fx.daemon.state),
+        )
+        .await
+}
 
+/// Scenario: the orchestrator delegates to a healthy `cat` worker, waits for the
+/// task to reach its inbox, and delegates to it again before any work-done —
+/// that second delegate must be refused as busy and never reach the worker
+/// (issue #580). The orchestrator then cancels the task with `pane restart --force`,
+/// and a plain delegate to the restarted role must go through, because the
+/// restart retired the commission only the replaced agent could have answered
+/// (issue #590).
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/012")]
+async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() {
+    let fx = fixture("cat").await;
+    // `clear = false`, so a delegate writes into the live `cat` rather than
+    // respawning it and waiting out a `SessionStart` a `cat` never sends. The
+    // config is read on every delegate, so rewriting it here is enough.
+    tokio::fs::write(
+        fx._dir.path().join(".dot-agent-deck.toml"),
+        format!("{}clear = false\n", config("cat")),
+    )
+    .await
+    .expect("rewrite the orchestration config with a clear = false worker");
+
+    let first = delegate_to_worker(&fx, false).await;
+    assert_eq!(
+        first.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "the first delegate to an idle worker must be dispatched; response = {first:?}"
+    );
+    // One delivery shows the pointer twice: the pty echoes the typed line, and
+    // `cat` writes it back once the submit CR lands. The CR follows the text by
+    // at least `SUBMIT_DELAY` and, while the daemon's echo watch lags a loaded
+    // box, by up to `SUBMIT_ECHO_BOUND` (2 s), so the second copy is waited
+    // for rather than given a fixed settle. A fixed 500 ms settle here let
+    // `cat`'s copy land inside the negative window below on a loaded box,
+    // reading as a second pointer the refusal never wrote.
     assert!(
-        !injected_gen.is_empty() && injected_gen != "0",
-        "the recreated worker's env carried no DOT_AGENT_DECK_REGISTRATION_GENERATION \
-         (issue #706); block = {recreated_block:?}"
+        wait_for_pointers(
+            &fx.daemon.registry,
+            1,
+            common::load_scaled(Duration::from_secs(20))
+        )
+        .await,
+        "precondition: the first task never reached the worker"
+    );
+    let delivered_once = pointers_in_worker_pane(&fx.daemon.registry);
+
+    let refused = delegate_to_worker(&fx, false).await;
+    assert!(
+        refused.delivered.is_empty(),
+        "a delegate to a worker that still owes a work-done must not be dispatched; \
+         response = {refused:?}"
     );
     assert_eq!(
-        injected_gen.parse::<u64>().ok(),
-        map_generation,
-        "the generation injected into the recreated worker's env must match what \
-         `pane_registration_generation` ends up holding for its pane, or the worker's own \
-         `work-done` fails the daemon's staleness gate (issue #706); block = \
-         {recreated_block:?}, map = {map_generation:?}"
+        refused
+            .busy
+            .iter()
+            .map(|b| b.role.as_str())
+            .collect::<Vec<_>>(),
+        vec![WORKER_ROLE],
+        "the busy worker must be named; response = {refused:?}"
     );
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("--supersede")),
+        "the refusal must be an error naming the remedy; response = {refused:?}"
+    );
+    // Give a (wrongly) dispatched second pointer the time the first one took
+    // and then some, before asserting it never came.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
-        injected_boot, daemon_boot_id,
-        "the recreated worker's env must carry this daemon's own boot id (issue #706); block = \
-         {recreated_block:?}"
+        pointers_in_worker_pane(&fx.daemon.registry),
+        delivered_once,
+        "the refused delegate must not have posted a second task to the busy worker"
+    );
+
+    let restarted = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    assert!(
+        restarted.restarted,
+        "precondition: the forced restart must succeed; response = {restarted:?}"
+    );
+
+    let after_restart = delegate_to_worker(&fx, false).await;
+    assert_eq!(
+        after_restart.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "after `pane restart --force` the role takes a plain delegate again — the cancelled \
+         task's commission went with the agent that owed it; response = {after_restart:?}"
+    );
+    assert!(
+        after_restart.busy.is_empty() && after_restart.superseded.is_empty(),
+        "nothing was outstanding to refuse or supersede; response = {after_restart:?}"
+    );
+    assert!(
+        wait_for_pointers(
+            &fx.daemon.registry,
+            1,
+            common::load_scaled(Duration::from_secs(20))
+        )
+        .await,
+        "the delegate after the restart must reach the replacement agent"
     );
 }
 
-/// Scenario: issue #706 fix-round (reviewer B1 / auditor A1) — the ORDINARY
-/// (non-recreate) respawn leg of `handle_restart_role_with_state`, exercised
-/// with `--force` against a HEALTHY worker pane whose registry record is left
-/// INTACT — the opposite of `pane_restart_012`, which forces `recreated:
-/// true` by closing the record first. A record present means
-/// `respawn_or_recreate_agent_for_pane` never falls through to the recreate
-/// branch, so simply not closing the agent (as this test does, mirroring
-/// `pane_restart_003`'s healthy-pane `--force` technique) selects this leg
-/// deterministically. This handler reserves a fresh registration generation
-/// unconditionally before EVERY respawn attempt — and
-/// `reserve_registration_generation` writes that value into
-/// `pane_registration_generation` immediately, not only once confirmed — but
-/// the respawn itself replays the previous child's `spawn_env` verbatim and
-/// never consumes the freshly reserved generation. On this leg
-/// (`recreated == false`) the handler restores the map to the
-/// pre-reservation value synchronously, under the same `pane_dispatch_lock`
-/// guard, instead of confirming — keeping `pane_registration_generation` in
-/// sync with what that worker's own `work-done` will report, closing the
-/// same failure #706 fixed on the recovery path, on `pane restart --force`'s
-/// ordinary (non-recovery) case too.
-#[tokio::test(flavor = "multi_thread")]
+/// Sets environment variables and puts back what was there before when
+/// dropped, including on a panic. For `pane/restart/013`, which needs a
+/// sub-minute silent-worker window and has only the environment to ask for it.
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvRestore {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        common::env_write::assert_no_tokio_runtime("EnvRestore::set");
+        for (key, value) in vars {
+            // SAFETY: a stated residual, not a proof (issue #1516). Called
+            // before the test builds its runtime, which the assertion above
+            // checks, so no deck code is running. The threads that can exist:
+            // this test's own, libtest's runner thread waiting for it, and the
+            // harness's `load-context` heartbeat once a harness temp dir exists,
+            // which sleeps and reads `/proc`, never the environment. Under plain
+            // `cargo test` the other tests of this file race it (issue #245).
+            unsafe { std::env::set_var(key, value) };
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("EnvRestore::drop");
+        }
+        for (key, value) in &self.0 {
+            // SAFETY: as for `EnvRestore::set`. Dropped after the runtime, whose
+            // drop joins its threads. What can still be running besides the
+            // threads named there is the detached PTY reader of an agent whose
+            // PTY has not reached EOF yet (`agent_pty::pump_reader`), which
+            // reads its PTY and updates the registry, and reads no environment
+            // variable.
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
+/// PRD #1666 S5: whether the orchestrator's inbox holds a notice that a task
+/// did not reach its worker — the undelivered notice that replaced the
+/// silent-worker watch, or the undeliverable one.
+fn orchestrator_shows_silence_notice(registry: &AgentPtyRegistry) -> bool {
+    registry
+        .inbox()
+        .rendered(ORCH_PANE)
+        .into_iter()
+        .any(|delivery| {
+            delivery.text.contains("has not reached the worker")
+                || delivery.text.contains("is undeliverable")
+        })
+}
+
+/// Scenario: with a short undelivered-notice window and the idle detector off,
+/// the orchestrator delegates to a `cat` worker (which never takes its task),
+/// the task reaches the worker's inbox, and the orchestrator cancels it at once
+/// with `pane restart --force`. No notice that the task did not reach the worker
+/// may appear in the orchestrator's inbox for that cancelled task. A second,
+/// uncancelled delegate afterwards must produce the notice, proving the notice
+/// was on and observable all along (Greptile and Qodo on PR #1285).
+#[test]
 #[spec("pane/restart/013")]
-async fn pane_restart_013_ordinary_respawn_leg_keeps_registration_generation_in_sync() {
+fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
+    // Set before the runtime starts and restored by `_env` after it has shut
+    // down — on a panic too — so no runtime thread of this test is reading the
+    // environment while it changes. Every cargo alias in this repo runs nextest,
+    // which gives each test its own process, so no other test sees these values.
+    // Under plain `cargo test` the other tests of this file may run concurrently
+    // in the same process; for them the values only switch the idle detector off
+    // and shorten the silent-worker window, and none of them asserts on either.
+    let _env = EnvRestore::set(&[
+        ("DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS", "1000"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build the pane/restart/013 runtime")
+        .block_on(async {
+            let fx = fixture("cat").await;
+            tokio::fs::write(
+                fx._dir.path().join(".dot-agent-deck.toml"),
+                format!("{}clear = false\n", config("cat")),
+            )
+            .await
+            .expect("rewrite the orchestration config with a clear = false worker");
+
+            let first = delegate_to_worker(&fx, false).await;
+            assert_eq!(first.delivered, vec![WORKER_ROLE.to_string()], "{first:?}");
+            assert!(
+                wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
+                "precondition: the first task never reached the worker"
+            );
+            let restarted = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+            assert!(restarted.restarted, "{restarted:?}");
+
+            // Three windows: long enough for an uncancelled watch to have fired.
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+            assert!(
+                !orchestrator_shows_silence_notice(&fx.daemon.registry),
+                "the restart cancelled the task, so its silent-worker notice must not appear"
+            );
+
+            // Control: the same detector reports a task nobody cancelled.
+            let second = delegate_to_worker(&fx, false).await;
+            assert_eq!(
+                second.delivered,
+                vec![WORKER_ROLE.to_string()],
+                "{second:?}"
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            while !orchestrator_shows_silence_notice(&fx.daemon.registry)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                orchestrator_shows_silence_notice(&fx.daemon.registry),
+                "control: an uncancelled delegate to the silent worker must be reported, or the \
+                 negative above proved nothing"
+            );
+        });
+}
+
+/// Scenario: Type an unsent draft into a worker pane and delegate a task. The
+/// draft holds back no post: the task reaches the worker's inbox at once and
+/// nothing is typed into the drafted pane. A forced pane restart must reply
+/// promptly; the task it cancelled is retired with the replaced agent rather
+/// than handed to the replacement, and the old draft does not reach the
+/// replacement pane.
+#[test]
+#[spec("pane/restart/015")]
+fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
+    let _env = EnvRestore::set(&[("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build draft-and-restart runtime")
+        .block_on(async {
+            use std::io::Write as _;
+
+            const DRAFT: &str = "restart-draft-must-stay-with-old-worker";
+            let fx = fixture("cat").await;
+            tokio::fs::write(
+                fx._dir.path().join(".dot-agent-deck.toml"),
+                format!("{}clear = false\n", config("cat")),
+            )
+            .await
+            .expect("configure delivery to the current worker");
+
+            let handle = fx
+                .daemon
+                .registry
+                .subscribe(&fx.worker_agent_id)
+                .expect("subscribe to worker input");
+            {
+                let mut writer = handle.writer.lock().await;
+                writer
+                    .write_all(DRAFT.as_bytes())
+                    .expect("type worker draft");
+                writer.flush().expect("flush worker draft");
+            }
+            assert!(
+                fx.daemon.registry.draft_pending(WORKER_PANE),
+                "precondition: the worker has no unsent draft"
+            );
+
+            let queued = delegate_to_worker(&fx, false).await;
+            assert_eq!(
+                queued.delivered,
+                vec![WORKER_ROLE.to_string()],
+                "precondition: the delegate was not queued; response = {queued:?}"
+            );
+            // PRD #1666 S5: posted at once, bound to the drafted worker.
+            assert!(
+                wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(5)).await,
+                "precondition: the task never reached the drafted worker's inbox"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let old_snapshot = fx
+                .daemon
+                .registry
+                .snapshot(&fx.worker_agent_id)
+                .expect("snapshot drafted worker");
+            assert!(
+                old_snapshot
+                    .windows(DRAFT.len())
+                    .any(|bytes| bytes == DRAFT.as_bytes())
+                    && !String::from_utf8_lossy(&old_snapshot).contains("worker-task-coder.md"),
+                "nothing may be typed into the drafted pane; snapshot = {:?}",
+                String::from_utf8_lossy(&old_snapshot)
+            );
+
+            let restarted = tokio::time::timeout(
+                Duration::from_secs(8),
+                restart_role(&fx, ORCH_PANE, WORKER_ROLE, true),
+            )
+            .await
+            .expect("pane restart did not reply within eight seconds while a task waited");
+            assert!(
+                restarted.restarted && restarted.error.is_none(),
+                "pane restart must succeed while a task waits; response = {restarted:?}"
+            );
+            let replacement = fx
+                .daemon
+                .registry
+                .pane_current_agent_id(WORKER_PANE)
+                .expect("restart left no worker in the pane");
+            assert_ne!(
+                replacement, fx.worker_agent_id,
+                "restart did not replace the worker"
+            );
+
+            let tasks = fx.daemon.registry.inbox().list(WORKER_PANE);
+            assert!(
+                tasks
+                    .iter()
+                    .all(|message| { message.bind_agent.as_deref() != Some(replacement.as_str()) }),
+                "the cancelled task must not be handed to the replacement; inbox = {tasks:?}"
+            );
+            assert!(
+                tasks.iter().any(|message| {
+                    message.bind_agent.as_deref() == Some(fx.worker_agent_id.as_str())
+                        && message.undeliverable_reason
+                            == Some(dot_agent_deck::inbox::UndeliverableReason::Superseded)
+                }),
+                "the restart must retire the replaced worker's task as superseded, not leave it \
+                 waiting or report it undeliverable; inbox = {tasks:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let replacement_snapshot = fx
+                .daemon
+                .registry
+                .snapshot(&replacement)
+                .unwrap_or_default();
+            assert!(
+                !replacement_snapshot
+                    .windows(DRAFT.len())
+                    .any(|bytes| bytes == DRAFT.as_bytes()),
+                "old worker draft reached the replacement pane: {:?}",
+                String::from_utf8_lossy(&replacement_snapshot)
+            );
+        });
+}
+
+/// The orchestrator and worker of [`fixture`], with the worker started the way
+/// a prepared launch starts it: through `spawn_agent_in`, in the project
+/// directory opened and identified as a `VerifiedProjectDir` (issue #1233).
+/// `project` is a subdirectory of the returned tempdir, so a test can rename it
+/// away and put a replacement at its path.
+async fn prepared_fixture(
+    worker_restart_command: &str,
+) -> (
+    common::InProcDaemon,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+) {
     let daemon = common::spawn_inprocess_daemon().await;
-    let initial_boot_id = daemon.state.read().await.daemon_boot_id().to_string();
-
-    let script_dir = common::race_safe_tempdir();
-    let script_path = script_dir.path().join("env-dump-worker.sh");
-    let log_path = script_dir.path().join("env-dump.log");
-    write_env_dump_worker(&script_path, &log_path);
-    let worker_command = script_path.to_string_lossy().into_owned();
-
-    let dir = common::race_safe_tempdir();
+    let root = common::race_safe_tempdir();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).expect("create the project dir");
     std::fs::write(
-        dir.path().join(".dot-agent-deck.toml"),
-        config(&worker_command),
+        project.join(".dot-agent-deck.toml"),
+        config(worker_restart_command),
     )
     .expect("write orchestration config");
-    let cwd = dir.path().to_string_lossy().into_owned();
+    let cwd = project.to_string_lossy().into_owned();
 
     daemon
         .registry
@@ -1063,39 +1329,27 @@ async fn pane_restart_013_ordinary_respawn_leg_keeps_registration_generation_in_
             ..SpawnOptions::default()
         })
         .expect("spawn orchestrator stand-in");
-
-    // The initial worker's env already carries a registration generation and
-    // this daemon's boot id, the same as a REAL production spawn would
-    // (`crate::spawn::spawn`'s `pane_env`, `src/spawn.rs`), which this
-    // in-process fixture bypasses by calling `registry.spawn_agent` directly.
-    // `"1"` is not arbitrary: it is the exact value
-    // `reserve_registration_generation` computes for a pane_id it has never
-    // seen before (`.or_insert(0) += 1`), which is what
-    // `register_orchestration_role` below performs for `WORKER_PANE`. So the
-    // env and the map start out GENUINELY in sync — the precondition an
-    // ordinary respawn is supposed to preserve.
+    let verified = dot_agent_deck::project_resolve::VerifiedProjectDir::open(&project)
+        .expect("verify the project dir");
     let worker_agent_id = daemon
         .registry
-        .spawn_agent(SpawnOptions {
-            command: Some(&worker_command),
-            cwd: Some(&cwd),
-            display_name: Some(WORKER_ROLE),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
-                    "1".to_string(),
-                ),
-                (DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(), initial_boot_id),
-            ],
-            tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
-            ..SpawnOptions::default()
-        })
-        .expect("spawn worker stand-in");
+        .spawn_agent_in(
+            SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&cwd),
+                display_name: Some(WORKER_ROLE),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
+                ..SpawnOptions::default()
+            },
+            &verified,
+        )
+        .expect("spawn the prepared worker stand-in");
+    drop(verified);
 
     {
         let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
+        let identity = OrchestrationIdentity {
             id: ORCHESTRATION_ID.to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -1108,82 +1362,93 @@ async fn pane_restart_013_ordinary_respawn_leg_keeps_registration_generation_in_
         );
         state.register_orchestration_role(WORKER_PANE, WORKER_ROLE, false, identity, Some(&cwd));
     }
+    (daemon, root, project, worker_agent_id)
+}
 
+/// Scenario: a worker role is started as a prepared launch in a verified
+/// project directory, which is then moved away, and `pane restart --force` of
+/// that role is refused as "not a directory" with the worker left running. A
+/// different directory with its own config is then put at the same path, and
+/// the restart is refused again rather than run there; once the verified
+/// directory is back, the same restart succeeds and runs in it (issue #1396).
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/016")]
+async fn pane_restart_016_a_prepared_role_is_not_restarted_in_a_replaced_directory() {
+    const MARKER: &str = "restarted-here";
+    let (daemon, root, project, worker_agent_id) =
+        prepared_fixture(&format!("touch {MARKER} && exec cat")).await;
     let fx = Fixture {
         daemon,
-        _dir: dir,
+        _dir: root,
         worker_agent_id,
     };
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while recorded_env_blocks(&log_path).is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the worker stand-in never recorded its initial launch"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(
-        fx.daemon
-            .registry
-            .pane_current_agent_id(WORKER_PANE)
-            .as_deref(),
-        Some(fx.worker_agent_id.as_str()),
-        "precondition: the worker's registry record must stay INTACT through this test — never \
-         closed — which is what selects the ORDINARY respawn leg rather than pane_restart_012's \
-         forced recreate leg"
-    );
-
+    // Deleted: the verified directory is moved away and nothing takes its
+    // path. The restart is refused as a directory that is not there, not as a
+    // stale preparation — "prepare again" is no remedy for a project that is
+    // gone (agent review, PR #1557) — and the running worker is left alone.
+    let moved = project.with_extension("old");
+    std::fs::rename(&project, &moved).expect("move the verified directory away");
     let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    let error = response.error.clone().unwrap_or_default();
     assert!(
-        response.restarted,
-        "force-restarting a healthy pane with an intact registry record must succeed; \
+        !response.restarted && error.contains("is not a directory"),
+        "a restart whose verified directory was deleted must be refused as not a directory; \
          response = {response:?}"
     );
     assert!(
-        response.error.is_none(),
-        "a successful restart must carry no error; response = {response:?}"
+        !error.contains("Prepared project directory changed"),
+        "a deleted directory is not a stale preparation; response = {response:?}"
+    );
+    assert_eq!(
+        fx.daemon.registry.pane_current_agent_id(WORKER_PANE),
+        Some(fx.worker_agent_id.clone()),
+        "a refused restart must leave the running worker in place"
     );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while recorded_env_blocks(&log_path).len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "force-restarting a pane with an intact registry record never produced an ordinary \
-             respawn; blocks = {:?}",
-            recorded_env_blocks(&log_path)
-        );
+    // Rename-and-replace: the verified object sits at `<project>.old`, and a
+    // directory with its own config (the same role, so the restart resolves a
+    // command) takes the pathname.
+    std::fs::create_dir(&project).expect("put a replacement at the verified path");
+    std::fs::copy(
+        moved.join(".dot-agent-deck.toml"),
+        project.join(".dot-agent-deck.toml"),
+    )
+    .expect("give the replacement a config");
+
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    // A restart that was (wrongly) served starts its command asynchronously;
+    // give it the time a `touch` needs before looking for the marker.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !project.join(MARKER).exists(),
+        "the prepared role was restarted in the REPLACEMENT directory; response = {response:?}"
+    );
+    assert!(
+        !response.restarted && response.error.is_some(),
+        "a restart whose verified directory was replaced must be refused; response = {response:?}"
+    );
+    assert_eq!(
+        fx.daemon.registry.pane_current_agent_id(WORKER_PANE),
+        Some(fx.worker_agent_id.clone()),
+        "a refused restart must leave the running worker in place"
+    );
+
+    // Control: put the verified directory back. The pathname names the object
+    // the start verified again, so the same restart is served and runs there.
+    std::fs::remove_dir_all(&project).expect("remove the replacement");
+    std::fs::rename(&moved, &project).expect("restore the verified directory");
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    assert!(
+        response.restarted && response.error.is_none(),
+        "control: a restart in the verified directory must succeed; response = {response:?}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !project.join(MARKER).exists() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-
-    let blocks = recorded_env_blocks(&log_path);
-    let respawned_block = blocks.last().expect("a second launch block exists");
-    let field = |name: &str| -> String {
-        respawned_block
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name}=")))
-            .unwrap_or_default()
-            .to_string()
-    };
-    let injected_gen = field("gen");
-
-    // The handler now confirms/restores the generation synchronously on both
-    // legs (this one is `recreated == false`, so it restores rather than
-    // confirms) — so there is no detached task to wait for either way; the
-    // map is already whatever it is going to be by the time `restart_role`
-    // above returns.
-    let state = fx.daemon.state.read().await;
-    let map_generation = state.pane_registration_generation.get(WORKER_PANE).copied();
-    drop(state);
-
-    assert_eq!(
-        map_generation,
-        injected_gen.parse::<u64>().ok(),
-        "on the ORDINARY (non-recreate) respawn leg, `pane_registration_generation` must still \
-         equal whatever generation the respawned child's actual (verbatim-replayed) env carries \
-         — the eager, unconditional reservation this handler performs before EVERY respawn \
-         attempt bumps the map regardless of which leg runs, but only the recreate leg's \
-         `confirm_orchestration_role` call keeps it in sync (issue #706 fix-round review B1 / \
-         audit A1); block = {respawned_block:?}, map = {map_generation:?}"
+    assert!(
+        project.join(MARKER).exists(),
+        "control: the restarted worker must have run in the verified directory"
     );
 }

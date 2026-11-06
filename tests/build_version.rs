@@ -30,6 +30,10 @@ const UPSTREAM_RELEASE_REPO: &str = "vfarcic/dot-agent-deck";
 /// the expectations stay readable.
 const PLACEHOLDER: &str = "0.1.0";
 
+/// What a build reports when it falls through to [`PLACEHOLDER`]: the
+/// placeholder marked as a build whose version is unknown (issue #326).
+const PLACEHOLDER_REPORTED: &str = "0.1.0+unknown";
+
 #[test]
 fn version_resolution_prefers_injection_then_git_then_cargo_pkg_version() {
     // 1. A valid injected DAD_VERSION wins even when git has a usable tag.
@@ -61,7 +65,7 @@ fn version_resolution_prefers_injection_then_git_then_cargo_pkg_version() {
 
     // 3. Neither -> the CARGO_PKG_VERSION placeholder (build.rs warns here).
     let r = resolve_version(None, None, PLACEHOLDER);
-    assert_eq!(r.value, PLACEHOLDER);
+    assert_eq!(r.value, PLACEHOLDER_REPORTED);
     assert_eq!(r.source, VersionSource::Placeholder);
 }
 
@@ -135,7 +139,7 @@ fn invalid_injected_version_falls_through_instead_of_being_emitted() {
         let r = resolve_version(Some(bad), None, PLACEHOLDER);
         assert_eq!(
             (r.value.as_str(), r.source),
-            (PLACEHOLDER, VersionSource::Placeholder),
+            (PLACEHOLDER_REPORTED, VersionSource::Placeholder),
             "invalid injected DAD_VERSION {bad:?} with no git tag must fall through to the \
              CARGO_PKG_VERSION placeholder"
         );
@@ -146,7 +150,7 @@ fn invalid_injected_version_falls_through_instead_of_being_emitted() {
     let r = resolve_version(None, Some("nightly"), PLACEHOLDER);
     assert_eq!(
         (r.value.as_str(), r.source),
-        (PLACEHOLDER, VersionSource::Placeholder)
+        (PLACEHOLDER_REPORTED, VersionSource::Placeholder)
     );
 
     // Everything the resolver *does* accept must parse under the same

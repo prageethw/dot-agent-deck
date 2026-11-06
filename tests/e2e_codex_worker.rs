@@ -2,12 +2,10 @@
 
 //! L2 real-Codex orchestration-worker proof for PRD #20.
 
-use std::path::Path;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-use dot_agent_deck::event::DelegateSignal;
-use dot_agent_deck::state::work_done_file_name;
+use dot_agent_deck::event::{AgentType, DelegateSignal};
 use spec::spec;
 
 mod common;
@@ -17,16 +15,6 @@ const WORKER_PANE: &str = "codex-worker-pane";
 const WORKER_ROLE: &str = "coder";
 const SENTINEL_NAME: &str = "codex_worker_sentinel_c81f2a.txt";
 const SENTINEL_CONTENT: &str = "CODEX_WORKER_SENTINEL_OK";
-
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
-}
 
 /// Scenario: Start a real cheap-model Codex as the `coder` role through the
 /// normal wrapper spawn seam, then have a synthetic orchestrator delegate a
@@ -42,10 +30,39 @@ fn codex_worker_001_real_worker_receives_delegate_and_signals_work_done() {
         .enable_all()
         .build()
         .expect("build multi-thread runtime");
-    runtime.block_on(codex_worker_001_inner());
+    runtime.block_on(codex_worker_inner(WorkerLaunch::Settled));
 }
 
-async fn codex_worker_001_inner() {
+/// Scenario: Start a real cheap-model Codex as a `clear = false` `coder` role
+/// behind a launcher script that takes a few seconds before it runs Codex, as
+/// `devbox run codex-big` does, and delegate to it at once, while it is still
+/// starting, with the deck's re-send turned off. The single write of the task
+/// pointer must reach Codex whole: Codex does the task (the sentinel with exact
+/// contents) and signals work-done.
+#[spec("codex/worker/002")]
+#[test]
+fn codex_worker_002_clear_false_delegate_to_a_starting_worker_arrives_whole() {
+    skip_unless!(common::check_codex_available());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    runtime.block_on(codex_worker_inner(WorkerLaunch::StillStarting));
+}
+
+/// When the delegate goes out relative to the worker's start.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerLaunch {
+    /// Bare `codex`, delegated once its output has settled.
+    Settled,
+    /// Through a launcher that waits before it runs Codex, delegated as soon as
+    /// the worker is spawned (issue #1650).
+    StillStarting,
+}
+
+async fn codex_worker_inner(launch: WorkerLaunch) {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd
@@ -53,10 +70,25 @@ async fn codex_worker_001_inner() {
         .to_str()
         .expect("worker cwd is UTF-8")
         .to_string();
-    let command = format!(
-        "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
+    let codex_args = format!(
+        "--model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
         common::codex_test_model(),
     );
+    let command = match launch {
+        WorkerLaunch::Settled => format!("codex {codex_args}"),
+        WorkerLaunch::StillStarting => {
+            // A launcher whose name hides the agent, like `devbox run …`; the
+            // role declares `agent = "codex"` as this repository's own config
+            // does, so the deck still wraps it.
+            let launcher = cwd.path().join("start-codex.sh");
+            tokio::fs::write(&launcher, "sleep 4\nexec codex \"$@\"\n")
+                .await
+                .expect("write the Codex launcher");
+            // Through `sh`, so the script needs no executable bit — and this
+            // file no Unix-only permissions API (Qodo, PR #1659).
+            format!("sh {} {codex_args}", launcher.display())
+        }
+    };
 
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
@@ -70,6 +102,7 @@ async fn codex_worker_001_inner() {
              [[orchestrations.roles]]\n\
              name = \"{WORKER_ROLE}\"\n\
              command = {command:?}\n\
+             agent = \"codex\"\n\
              clear = false\n"
         ),
     )
@@ -81,7 +114,6 @@ async fn codex_worker_001_inner() {
     // `TuiDeck` to hold a recording set — which it has none of, and never will.
     let _codex_redactions = common::import_codex_credentials(&codex_home)
         .expect("copy Codex credentials and trust worker cwd");
-    let boot_id_tuple = common::daemon_boot_id_env_tuple(&daemon.state).await;
     let worker_agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
@@ -95,7 +127,10 @@ async fn codex_worker_001_inner() {
                     "DOT_AGENT_DECK_SOCKET".to_string(),
                     daemon.hook_path.display().to_string(),
                 ),
-                ("PATH".to_string(), path_with_binary_dir()),
+                ("PATH".to_string(), common::path_with_binary_dir()),
+                // This fixture owns a PTY even when the test runner's parent
+                // uses pipes and advertises TERM=dumb.
+                ("TERM".to_string(), "xterm-256color".to_string()),
                 (
                     "HOME".to_string(),
                     codex_home
@@ -103,9 +138,21 @@ async fn codex_worker_001_inner() {
                         .expect("Codex test HOME is UTF-8")
                         .to_string(),
                 ),
-                common::registration_generation_env_tuple(),
-                boot_id_tuple,
+                // This in-process spawn inherits the test's environment, so an
+                // ambient `CODEX_HOME` would otherwise outrank the HOME above:
+                // the worker would run on credentials the preflight never
+                // probed, and its wrapper would install the deck's hooks into
+                // that real home instead of this one (review of #1653).
+                (
+                    "CODEX_HOME".to_string(),
+                    codex_home
+                        .join(".codex")
+                        .to_str()
+                        .expect("Codex test CODEX_HOME is UTF-8")
+                        .to_string(),
+                ),
             ],
+            agent_type: Some(AgentType::Codex),
             ..SpawnOptions::default()
         })
         .expect("spawn wrapped real Codex worker");
@@ -119,9 +166,9 @@ async fn codex_worker_001_inner() {
             .pane_role_map
             .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
         state.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        let orchestration = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
+        let orchestration = dot_agent_deck::state::OrchestrationIdentity {
+            id: "orch-test-0".to_string(),
             name: "codex-worker-orchestration".to_string(),
-            cwd: cwd_str.clone(),
         };
         state
             .pane_orchestration_map
@@ -135,31 +182,30 @@ async fn codex_worker_001_inner() {
         state
             .pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
-        common::insert_pane_registration_generation(&mut state, WORKER_PANE);
-        // Issue #567: `handle_delegate_with_state` now guards on the
-        // SENDING pane's (ORCH_PANE) generation too — reserve one, or the
-        // delegate below is refused as "no registration on file".
-        common::insert_pane_registration_generation(&mut state, ORCH_PANE);
     }
 
-    common::wait_until_agent_output_settled(
-        &daemon.registry,
-        &worker_agent_id,
-        Duration::from_secs(2),
-        Duration::from_secs(45),
-    )
-    .await;
+    if launch == WorkerLaunch::Settled {
+        common::wait_until_agent_output_settled(
+            &daemon.registry,
+            &worker_agent_id,
+            Duration::from_secs(2),
+            Duration::from_secs(45),
+        )
+        .await;
+    }
 
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: format!(
-            "First create {SENTINEL_NAME} in the current working directory with the exact contents {SENTINEL_CONTENT} and no trailing newline. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete."
+            "First create the file {} containing exactly {SENTINEL_CONTENT}. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete.",
+            // PRD #1666: the absolute path, so the model need not infer its
+            // working directory (one inferred it from the deck binary's path).
+            cwd.path().join(SENTINEL_NAME).display()
         ),
         to: vec![WORKER_ROLE.to_string()],
+        supersede: false,
         timestamp: chrono::Utc::now(),
-        generation: 1,
-        daemon_boot_id: daemon.state.read().await.daemon_boot_id().to_string(),
-        subject: None,
+        token: None,
     };
     daemon
         .state
@@ -169,7 +215,19 @@ async fn codex_worker_001_inner() {
         .await;
 
     let sentinel = cwd.path().join(SENTINEL_NAME);
-    let sentinel_ok = common::wait_for_path_async(&sentinel, Duration::from_secs(240)).await;
+    // Poll the CONTENT, not existence: a shell redirect creates the file before
+    // the write lands, so an existence wait can read it empty (issue #244).
+    // Compared trimmed, which is why the task does not ask for "no trailing
+    // newline": asked that, the cheap model reached for `truncate` and twice
+    // wrote a padded or cut sentinel, or stopped before work-done (2026-10-14).
+    // `codex/worker/002` runs inside nextest's 180 s terminate-after, so its
+    // wait ends early enough for the panic below to show the pane.
+    let sentinel_wait = match launch {
+        WorkerLaunch::Settled => Duration::from_secs(240),
+        WorkerLaunch::StillStarting => Duration::from_secs(120),
+    };
+    let sentinel_result =
+        common::wait_for_file_trimmed_eq_async(&sentinel, SENTINEL_CONTENT, sentinel_wait).await;
     let worker_pane = || {
         daemon
             .registry
@@ -177,22 +235,19 @@ async fn codex_worker_001_inner() {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default()
     };
-    let pane = worker_pane();
-    assert!(
-        sentinel_ok,
-        "wrapped Codex never created {SENTINEL_NAME:?}. pointer_reached_pane={}\n=== Codex worker pane ===\n{pane}\n=== end ===",
-        pane.contains("worker-task-coder.md")
-    );
-    if let Err(observed) =
-        common::wait_for_file_trimmed_eq(&sentinel, SENTINEL_CONTENT, Duration::from_secs(10))
-    {
-        panic!("Codex worker created the sentinel with unexpected contents; observed: {observed}");
+    if let Err(observed) = sentinel_result {
+        let pane = worker_pane();
+        panic!(
+            "wrapped Codex never wrote {SENTINEL_CONTENT:?} into {SENTINEL_NAME:?} within {sentinel_wait:?}; \
+             observed: {observed}. pointer_reached_pane={}\n=== Codex worker pane ===\n{pane}\n=== end ===",
+            pane.contains("worker-task-coder.md")
+        );
     }
 
     let work_done = cwd
         .path()
         .join(".dot-agent-deck")
-        .join(work_done_file_name(WORKER_ROLE, WORKER_PANE));
+        .join("work-done-coder.md");
     assert!(
         common::wait_for_path_async(&work_done, Duration::from_secs(120)).await,
         "wrapped Codex created the sentinel but never signalled work-done through the hook socket (missing {work_done:?})\n=== Codex worker pane ===\n{}\n=== end ===",

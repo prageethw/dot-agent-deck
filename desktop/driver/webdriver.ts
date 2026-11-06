@@ -1,0 +1,301 @@
+// Issue #953 — the driver tier's WebDriver client.
+//
+// A W3C WebDriver session is plain JSON over HTTP, and this suite needs
+// fourteen of its endpoints, so it speaks the protocol directly with Node's own `fetch`
+// rather than pulling in WebdriverIO: no new dependency to pin, audit or bump,
+// and nothing between a failing assertion and the wire it came from.
+//
+// `tauri-driver` is the server. It accepts the session request, launches the
+// app binary named in `tauri:options`, and proxies every later call to the
+// platform's native driver — `WebKitWebDriver` on Linux — which drives the
+// app's real WebKitGTK webview.
+
+/** WebDriver's name for the element reference key in a JSON response. */
+const ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
+
+function elementOf(value: Record<string, string>): Element {
+  const id = value[ELEMENT_KEY];
+  if (typeof id !== "string") throw new WebDriverError("invalid element reference", JSON.stringify(value));
+  return { id };
+}
+
+/** The Enter key, as WebDriver's key table spells it. */
+export const ENTER = "";
+/** The modifier keys, by the same table, for `Session.chord`. */
+export const SHIFT = "\uE008";
+export const CONTROL = "\uE009";
+export const META = "\uE03D";
+
+export class WebDriverError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(`${code}: ${message}`);
+    this.code = code;
+  }
+}
+
+/**
+ * `DAD_DRIVER_WAIT_MS`, validated once for both this client and the harness.
+ * `Number("abc")` is `NaN`, and a `NaN` deadline never compares as expired —
+ * every wait would then spin forever, which is the one outcome a bound exists
+ * to rule out — so anything but a positive whole number is refused at load.
+ * The ceiling is Node's timer limit: a longer delay is clamped to an
+ * immediate one, which would expire every request and the harness's
+ * `execFile` bound the moment it started.
+ */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+function parseWaitMs(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return 120_000;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0 || value > MAX_TIMER_MS) {
+    throw new Error(
+      `DAD_DRIVER_WAIT_MS must be a whole number of milliseconds from 1 to ${MAX_TIMER_MS}, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return value;
+}
+
+export const WAIT_MS = parseWaitMs(process.env.DAD_DRIVER_WAIT_MS);
+
+/**
+ * The deadline on any one request. A native driver that stops answering would
+ * otherwise hold a `fetch` open forever — and with it the harness's state
+ * waits, which only check their own deadline between requests, and its
+ * teardown, which closes the session before it stops the child processes.
+ * Same default and variable as the harness's wait bound (`DAD_DRIVER_WAIT_MS`),
+ * because a session request includes launching the app, the slowest single
+ * thing this client asks for.
+ */
+const REQUEST_MS = WAIT_MS;
+
+async function call(base: string, method: string, path: string, body?: unknown): Promise<unknown> {
+  const response = await fetch(`${base}${path}`, {
+    method,
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(REQUEST_MS),
+  });
+  const parsed = (await response.json()) as { value?: unknown };
+  const value = parsed.value;
+  if (!response.ok) {
+    const failure = (value ?? {}) as { error?: string; message?: string };
+    throw new WebDriverError(failure.error ?? `http ${response.status}`, failure.message ?? "");
+  }
+  return value;
+}
+
+/** True once the server answers `/status` as ready. */
+export async function serverReady(base: string): Promise<boolean> {
+  try {
+    const value = (await call(base, "GET", "/status")) as { ready?: boolean } | undefined;
+    return value?.ready !== false;
+  } catch {
+    return false;
+  }
+}
+
+export type Element = { readonly id: string };
+
+export type WindowRect = { x: number; y: number; width: number; height: number };
+
+export class Session {
+  readonly base: string;
+  readonly id: string;
+
+  private constructor(base: string, id: string) {
+    this.base = base;
+    this.id = id;
+  }
+
+  /** Launches `application` through tauri-driver and returns the session on its window. */
+  static async open(base: string, application: string): Promise<Session> {
+    const value = (await call(base, "POST", "/session", {
+      capabilities: { alwaysMatch: { "tauri:options": { application } } },
+    })) as { sessionId: string };
+    return new Session(base, value.sessionId);
+  }
+
+  private request(method: string, path: string, body?: unknown): Promise<unknown> {
+    return call(this.base, method, `/session/${this.id}${path}`, body);
+  }
+
+  async close(): Promise<void> {
+    await this.request("DELETE", "");
+  }
+
+  /** The first element matching `css`, or `null` — never throws for "not there yet". */
+  async find(css: string): Promise<Element | null> {
+    try {
+      const value = (await this.request("POST", "/element", { using: "css selector", value: css })) as Record<
+        string,
+        string
+      >;
+      return elementOf(value);
+    } catch (error) {
+      if (error instanceof WebDriverError && error.code === "no such element") return null;
+      throw error;
+    }
+  }
+
+  async click(element: Element): Promise<void> {
+    await this.request("POST", `/element/${element.id}/click`, {});
+  }
+
+  /** Real key events into `element`, which is what a React-controlled input and xterm's textarea both need. */
+  async type(element: Element, text: string): Promise<void> {
+    await this.request("POST", `/element/${element.id}/value`, { text });
+  }
+
+  /**
+   * Issue #1403 — press `keys` together and release them in reverse, as W3C
+   * key actions: modifiers first, then the key. Element Send Keys cannot hold a
+   * modifier across a keystroke in a way every native driver agrees on, and a
+   * chord is exactly that. The events go to whatever has focus, so focus the
+   * target first (`type` into it, or click it).
+   */
+  async chord(keys: string[]): Promise<void> {
+    const down = keys.map((value) => ({ type: "keyDown", value }));
+    const up = [...keys].reverse().map((value) => ({ type: "keyUp", value }));
+    await this.perform([{ type: "key", id: "keyboard", actions: [...down, ...up] }]);
+  }
+
+  /** Issue #1403 — a real left-button click at a viewport point, as W3C pointer actions. */
+  async clickAt(point: { x: number; y: number }): Promise<void> {
+    await this.perform([
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", duration: 0, origin: "viewport", x: Math.round(point.x), y: Math.round(point.y) },
+          { type: "pointerDown", button: 0 },
+          { type: "pointerUp", button: 0 },
+        ],
+      },
+    ]);
+  }
+
+  /**
+   * Issue #1403 — a real left-button drag between two viewport points, which is
+   * how a person selects text in xterm: the selection service listens for the
+   * press on the terminal's screen and follows the pointer until release.
+   *
+   * The pointer passes through the midpoint and rests at the end before the
+   * button comes up, as a hand does. On a slow runner a single move straight
+   * into the release could reach the page after the button was already up,
+   * and xterm then records a click, not a selection.
+   */
+  async drag(from: { x: number; y: number }, to: { x: number; y: number }): Promise<void> {
+    const at = (point: { x: number; y: number }, duration: number) => ({
+      type: "pointerMove",
+      duration,
+      origin: "viewport",
+      x: Math.round(point.x),
+      y: Math.round(point.y),
+    });
+    await this.perform([
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          at(from, 0),
+          { type: "pointerDown", button: 0 },
+          at({ x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 }, 100),
+          at(to, 100),
+          { type: "pause", duration: 150 },
+          { type: "pointerUp", button: 0 },
+        ],
+      },
+    ]);
+  }
+
+  /**
+   * Issue #1457 — the first half of a drag: move to a viewport point and press
+   * the left button there, and KEEP it held, so a scenario can make something
+   * happen mid-gesture before `releaseAt` finishes it. Separate Perform
+   * Actions requests share the session's input state, which is what keeps the
+   * button down between the two. This is the one action here that skips
+   * `perform`'s Release Actions, and only when it succeeds.
+   */
+  async pressAt(point: { x: number; y: number }): Promise<void> {
+    const actions = [
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", duration: 0, origin: "viewport", x: Math.round(point.x), y: Math.round(point.y) },
+          { type: "pointerDown", button: 0 },
+        ],
+      },
+    ];
+    try {
+      await this.request("POST", "/actions", { actions });
+    } catch (error) {
+      await this.request("DELETE", "/actions").catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Issue #1457 — the second half of `pressAt`'s drag: move to `point` the way `drag` does, rest, and release. */
+  async releaseAt(point: { x: number; y: number }): Promise<void> {
+    await this.perform([
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", duration: 100, origin: "viewport", x: Math.round(point.x), y: Math.round(point.y) },
+          { type: "pause", duration: 150 },
+          { type: "pointerUp", button: 0 },
+        ],
+      },
+    ]);
+  }
+
+  private async perform(actions: unknown[]): Promise<void> {
+    try {
+      await this.request("POST", "/actions", { actions });
+    } finally {
+      // Release Actions, so a chord or a drag that failed half way cannot leave
+      // a modifier or the button held down under every later step.
+      await this.request("DELETE", "/actions");
+    }
+  }
+
+  /** The element's DOM property (`value` for an input), not its attribute. */
+  async property(element: Element, name: string): Promise<unknown> {
+    return this.request("GET", `/element/${element.id}/property/${encodeURIComponent(name)}`);
+  }
+
+  async attribute(element: Element, name: string): Promise<string | null> {
+    return (await this.request("GET", `/element/${element.id}/attribute/${encodeURIComponent(name)}`)) as
+      | string
+      | null;
+  }
+
+  async execute<T>(script: string, args: unknown[] = []): Promise<T> {
+    return (await this.request("POST", "/execute/sync", { script, args })) as T;
+  }
+
+  /** Issue #1355 — the app window's position and outer size, in CSS pixels. */
+  async windowRect(): Promise<WindowRect> {
+    return (await this.request("GET", "/window/rect")) as WindowRect;
+  }
+
+  /**
+   * Issue #1355 — resize the app window as a window manager would, with
+   * WebDriver's Set Window Rect, and return the rect the driver reports after
+   * it. Only the size is sent: xvfb runs no window manager to place a window.
+   */
+  async setWindowRect(size: { width: number; height: number }): Promise<WindowRect> {
+    return (await this.request("POST", "/window/rect", size)) as WindowRect;
+  }
+
+  /** Base64 PNG of the window, for the failure record. */
+  async screenshot(): Promise<string> {
+    return (await this.request("GET", "/screenshot")) as string;
+  }
+}

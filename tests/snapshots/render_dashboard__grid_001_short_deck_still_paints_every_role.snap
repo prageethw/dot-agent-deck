@@ -2,7 +2,7 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
- worker-deck — 7 session(s)                                                               
+ worker-deck — 7 agent(s)                                                                 
 ┏ ▸ 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Idle ┓┌ 2 ──────────────────────────────── ● Idle ┐
 ┃orchestrator                               ┃│developer                                  │
 ┃Dir:  dot-agent-deck                       ┃│Dir:  dot-agent-deck                       │

@@ -63,7 +63,7 @@ Publishing reads three values **from the environment** — that is the only cont
 
 Populate them however your environment manages secrets — a direct `export`, a `.env` file, your CI's secret store, or any secret manager. The engine just reads the three variables.
 
-> **Maintainer's setup (one example, not required).** In this repo they are sourced via [`vals`](../../.env.vals.yaml) from GCP Secret Manager: `.env.vals.yaml` maps each var to a `ref+gcpsecrets://vfarcic/youtube-dot-releases-*` reference that `vals env -export -f .env.vals.yaml` resolves into the environment (which `devbox shell` does automatically when `USE_VALS` is set). Substitute your own mechanism freely.
+> **Maintainer's setup (one example, not required).** In this repo they are sourced via [`vals`](../../.env.vals.yaml) from GCP Secret Manager: `.env.vals.yaml` maps each var to a `ref+gcpsecrets://vfarcic/youtube-dot-releases-*` reference that `vals env -export -f .env.vals.yaml` resolves into the environment (which `devbox shell` does automatically when `USE_VALS` is set). The same setup also supplies the maintainer's telemetry endpoint and Honeycomb ingest key (`OTEL_EXPORTER_OTLP_ENDPOINT`, and `OTEL_EXPORTER_OTLP_HEADERS`, which the `devbox.json` init hook composes from `HONEYCOMB_INGEST_KEY`). Substitute your own mechanism freely.
 
 > **One-time human provisioning.** The refresh token requires Google OAuth user consent, which a service account cannot grant cleanly for a personal channel, so the agent cannot self-provision it. Mint it once with the recipe below, then make the three values available as the env vars above. After that, every reel run reuses the stored refresh token.
 
@@ -160,7 +160,7 @@ The YouTube link goes in the PR body **and** the changelog fragment, so once the
 
 1. **The cast header matches the size actually used.** `head -1 <cast>` and compare `width`/`height` against what the test set. Then check nothing addresses a column past it — the engine warns automatically, because a v2 cast has one fixed size and no resize event, so a mid-recording resize silently hard-wraps every earlier frame into garbage.
 2. **The re-timing ratio is sane.** The engine prints `clip N: re-timed <a>s -> <b>s (<r>x)` per clip; `retime.sh` bounds `r` by `MAX_STRETCH`, so a ratio far above it means a tunable (or `CLIP_SPEED`) was overridden.
-3. **The reel duration is about (card holds) + (clip durations).** `ffprobe -v error -show_entries format=duration -of csv=p=0 reel.mp4` against `CARD_HOLD` (4s) per entry plus each clip's re-timed length. A 15s clip inside a 161s video is the shape of the PRD #339 bug.
+3. **The reel duration is about (card holds) + (clip durations) + (final-frame holds).** `ffprobe -v error -show_entries format=duration -of csv=p=0 reel.mp4` against `CARD_HOLD` (4s) per entry plus each clip's re-timed length plus the final-frame hold beyond each clip's tail, which is 1–2s at the default `CLIP_LAST_FRAME` and `CLIP_FINAL_DWELL` (the engine logs the full hold per clip as `final state held …s`). A 15s clip inside a 161s video is the shape of the PRD #339 bug.
 4. **Extract a frame and look at it.** No check substitutes for seeing it:
 
    ```sh

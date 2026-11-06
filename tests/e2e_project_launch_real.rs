@@ -13,7 +13,7 @@
 //! on a machine the client cannot see still gets a context to read. Nothing in
 //! lane 1 proves an agent ever reads it, and CLAUDE.md rule 4 asks for exactly
 //! one test per major feature that validates it as a user actually uses and sees
-//! it. This is that test, and rule 5 records that it runs on a developer's
+//! it. This is that test, and CLAUDE.md rule 5 records that it runs on a developer's
 //! machine and **nowhere in CI** — so a break here surfaces when someone next
 //! runs `cargo test-e2e-live`, not on any schedule.
 //!
@@ -30,21 +30,21 @@
 //!      derives a path from its own environment.
 //!   2. `PrepareWorkflow` — the **daemon** loads one validated config snapshot,
 //!      composes the coordinator context through the shared composer and
-//!      publishes it at `<project>/.dot-agent-deck/orchestrator-context.md`.
+//!      publishes it at a unique file under `<project>/.dot-agent-deck`.
 //!      This is the path under test; the test never writes that file.
 //!   3. `StartAgent` — one role, spawned into the canonical path the daemon
 //!      returned. `crate::event::ProjectRole` deliberately carries only `name`
 //!      and `start`, so command strings never cross the wire and the client
 //!      supplies the command; [`COORDINATOR_COMMAND`] is kept in lockstep with
 //!      the fixture's own `command` key.
-//!   4. `WriteAndSubmit` — the production guarded prompt-delivery RPC types the
-//!      one-line pointer into the coordinator's PTY. That line is all the agent
-//!      is ever told: it names the file and nothing else, so a coordinator that
+//!   4. `PostMessage` — the one-line pointer goes to the coordinator's inbox,
+//!      the way a launch hands it the coordinator prompt. That line is all the
+//!      agent is ever told: it names the file and nothing else, so a coordinator that
 //!      does not read the daemon's file has no task at all.
 //!
 //! ## What makes the assertion robust rather than lucky
 //! The task the daemon writes into the context is a directive list-files
-//! command (rule 4's shape, copied from `scheduler/dispatch/013`), and the
+//! command (CLAUDE.md rule 4's shape, copied from `scheduler/dispatch/013`), and the
 //! fixture ships a uniquely named [`SENTINEL`]. So the hard assertion is on one
 //! literal filename appearing in the coordinator's pane — never on prose the
 //! model composes. The sentinel is deliberately absent from the context file
@@ -60,7 +60,7 @@
 //!
 //! Cost (Decision 23): one short interactive Haiku turn (read a file, run
 //! `ls -a`, print the listing) — well under the <$0.05/run bound. Flaky-tolerant
-//! (real LLM) per rule 4: run once, not looped.
+//! (real LLM) per CLAUDE.md rule 4: run once, not looped.
 
 mod common;
 
@@ -70,7 +70,7 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::daemon_protocol::AttachRequest;
-use dot_agent_deck::event::{AgentType, SendResult};
+use dot_agent_deck::event::AgentType;
 use spec::spec;
 
 /// The fixture's `[[orchestrations]] name`. Named explicitly so nothing about
@@ -87,18 +87,18 @@ const COORDINATOR_ROLE: &str = "coordinator";
 /// `name` and `start`, so a role's command never crosses the wire and the
 /// spawning client is the party that holds it. `Read` lets the coordinator open
 /// the daemon-published context without stopping at a permission prompt;
-/// `Bash` lets it genuinely run `ls -a`. Interactive — no `-p`, per rule 4.
+/// `Bash` lets it genuinely run `ls -a`. Interactive — no `-p`, per CLAUDE.md rule 4.
 const COORDINATOR_COMMAND: &str =
     "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read";
 
 /// The committed fixture file the coordinator must report back. Uniquely named
-/// (rule 4) so the assertion survives LLM phrasing and tool variance: only this
+/// (CLAUDE.md rule 4) so the assertion survives LLM phrasing and tool variance: only this
 /// literal has to come through, and `common::wait_for_pane_text_on` matches it
 /// wrap-insensitively.
 const SENTINEL: &str = "context_proof_9d4f2a.txt";
 
 /// `DOT_AGENT_DECK_PANE_ID` for the coordinator pane. The test mints it (as
-/// every spawning client does) because it is the handle both `WriteAndSubmit`
+/// every spawning client does) because it is the handle both `PostMessage`
 /// and the daemon's pane maps are keyed on.
 const PANE_ID: &str = "project-launch-coordinator";
 
@@ -117,26 +117,15 @@ const LAUNCH_TASK: &str = "Do this yourself and do not delegate - no other agent
      numbered choices, or wait for further instructions - this IS the task and you already \
      have everything you need.";
 
-/// The single line delivered into the coordinator's PTY, reproduced verbatim
-/// from `orchestrator_context::orchestrator_prompt_line(true)` — the private
-/// helper every production launch path injects.
-///
-/// It is load-bearing that this line names the file and nothing else: it
-/// carries no task, no sentinel and no `ls`, so everything the coordinator does
-/// next it learned from the daemon's write.
-const COORDINATOR_PROMPT: &str = "Read .dot-agent-deck/orchestrator-context.md for your role, the available agents, the \
-     delegation protocol, and your task under `## Your task`. Then carry out that task, \
-     delegating to the agents listed there.";
-
 /// Scenario: Launch the real deck in a project whose single `context-handoff`
 /// orchestration declares one interactive Haiku Claude `coordinator` role, then
 /// drive the desktop's own sequence over the attach socket — `ResolveProject`
 /// for the daemon's canonical path and config revision, then `PrepareWorkflow`,
 /// so the DAEMON composes and publishes the coordinator context carrying a
 /// directive list-files task, then `StartAgent` to bring a real coordinator up
-/// in that canonical directory, then the production `WriteAndSubmit` RPC to type
-/// the one-line "read `.dot-agent-deck/orchestrator-context.md` and carry out
-/// your task" pointer into its pane. Its pane is opened in the attached TUI so
+/// in that canonical directory, then `PostMessage` to post the returned one-line
+/// "read `.dot-agent-deck/orchestrator-context-*.md` and carry out your task"
+/// pointer to its inbox. Its pane is opened in the attached TUI so
 /// the live agent is visible while it works. HARD-ASSERT that the uniquely named
 /// fixture sentinel `context_proof_9d4f2a.txt` — which appears nowhere in the
 /// published context, only on disk — shows up in the coordinator's pane, which
@@ -169,8 +158,14 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         // builder flag trusts BOTH the raw and the canonicalised form of the work
         // dir, which is the only spelling pair the daemon can produce here.
         .with_claude_trust_workdir()
+        // The daemon's own lifetime cap has to outlast the waits below, which
+        // `.config/nextest.toml` allows 660 s for; the harness default of 300 s
+        // would shut the deck down mid-wait on a slow agent and fail with a
+        // socket error instead of the phase that was slow. Below linkage-check
+        // rule 11's 900 s ceiling.
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "720")
         .launch_with_fixture("project-launch-real");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let events = deck.subscribe_events();
@@ -231,7 +226,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     );
     let prepared = resp
         .workflow_prepared
-        .expect("a successful PrepareWorkflow must carry a PreparedWorkflow");
+        .expect("a successful PrepareWorkflow must carry a PreparedOrchestration");
 
     // Preconditions, not the claim — `project/launch/001` owns the publish
     // contract. They are here so a red run says WHICH half broke: the daemon
@@ -276,8 +271,10 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
             // Pi's native seed pull only; a claude coordinator is driven by the
             // guarded PTY delivery below.
             seed: None,
-
             isolated_clone_origin: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         },
     )
     .expect("StartAgent over the attach socket");
@@ -291,15 +288,13 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         .expect("a successful StartAgent must report the registry id it created");
 
     // ---- 4. The real agent boots. A genuine (non-wrapper) `SessionStart` from
-    // the pane is both the proof that claude actually came up and the generation
-    // the guarded delivery below binds to.
-    let session_id =
-        events.wait_for_session_start_on_pane(PANE_ID, &agent_id, Duration::from_secs(180));
+    // the pane is the proof that claude actually came up.
+    events.wait_for_session_start_on_pane(PANE_ID, &agent_id, Duration::from_secs(180));
 
     // Open the coordinator's pane in the already-attached TUI, so the live agent
     // is on screen (and on the cast) for the whole turn — the surface a user
     // actually watches.
-    deck.wait_for_absence("No active sessions");
+    deck.wait_for_absence("No active agents");
     deck.send_keys(b"1");
 
     // Nothing may be injected into a claude that is still painting its UI: bytes
@@ -316,30 +311,29 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         eprintln!("warning: the coordinator pane never settled within 180s; delivering anyway");
     }
 
-    // ---- 5. Deliver the one-line pointer through the production guarded RPC —
-    // the same write-and-submit a real launch uses for the coordinator prompt.
-    let resp = common::write_and_submit_with_identity_on(
-        &socket,
-        PANE_ID,
-        COORDINATOR_PROMPT,
-        &agent_id,
-        Some(&session_id),
-    )
-    .expect("WriteAndSubmit to the coordinator pane over the attach socket");
-    assert_eq!(
-        resp.send_result,
-        Some(SendResult::Applied),
-        "the daemon refused to deliver the coordinator prompt to pane {PANE_ID}: error={:?}, \
-         send_result={:?}",
-        resp.error,
-        resp.send_result
-    );
+    // ---- 5. Post the one-line pointer to the coordinator's inbox, the way a
+    // real launch hands it the coordinator prompt.
+    common::post_message_on(&socket, PANE_ID, &agent_id, &prepared.prompt)
+        .expect("post the coordinator prompt to its inbox");
 
     // ---- 6. THE claim. The coordinator was told only to read a file. If the
     // daemon's write is the one an agent actually reads, the fixture sentinel —
     // which is on disk and nowhere in the context — comes back in its pane.
+    //
+    // Matched on the coordinator's pane AS THE DECK RENDERS IT, with the raw
+    // scrollback as a second route. The raw route alone produced false reds
+    // (issue #1396, two of five runs on 2026-10-04): Claude Code redraws
+    // differentially, moving the cursor over characters already on screen
+    // instead of rewriting them, so stripping the escapes out of its scrollback
+    // drops those characters — the normalized dump read `conext_proof_9d4f2a.txt`
+    // while the deck's grid showed the agent's `ls -a` listing the sentinel
+    // intact. The grid is the deck's own vt100 render of the pane opened above,
+    // so it is the screen a user is looking at. The raw route stays for an agent
+    // whose listing has already scrolled off that screen
+    // (`TuiDeck::wait_for_grid_or_pane_text_within` owns both polls).
     const REPORT_WAIT: Duration = Duration::from_secs(240);
-    let reported = common::wait_for_pane_text_on(&socket, &agent_id, SENTINEL, REPORT_WAIT);
+    let reported =
+        deck.wait_for_grid_or_pane_text_within(&socket, &agent_id, SENTINEL, REPORT_WAIT);
     assert!(
         reported,
         "the coordinator never reported the fixture sentinel {SENTINEL:?} within {}s. It was \

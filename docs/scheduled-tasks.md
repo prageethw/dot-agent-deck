@@ -1,278 +1,356 @@
----
-sidebar_position: 5.7
-title: Scheduled Tasks
----
+# Schedules
 
-# Scheduled Tasks
+A schedule runs a prompt on a cron timetable: when it comes due, the deck opens a tab in the schedule's working directory, starts an agent there (or an orchestration, if that directory defines one) and sends it the prompt. An issue-dispatch schedule instead starts one agent per open GitHub issue of a repository. This page shows how to create, check, change and troubleshoot schedules, and ends with a complete [reference](#reference) for the schedules file, the cron syntax and the `dot-agent-deck schedule` command.
 
-Scheduled tasks let you say *"every weekday at 09:00, run this prompt in this directory"* and have the result land in the deck where you can read it after a notification — no opening a terminal at the right time, `cd`-ing to the right place, and pasting the prompt by hand.
+Schedules run inside the deck's daemon, not inside the TUI or the desktop app. Each daemon runs the schedules in the schedules file on its own machine (`~/.config/dot-agent-deck/schedules.toml` by default; see [The schedules file](#the-schedules-file)), and only while it is running; see [Keep schedules running](#keep-schedules-running).
 
-Each task pairs a **schedule** (when it runs) with a **working directory and a prompt** (what runs). When the schedule comes due, the deck opens a tab in that directory and hands the prompt to a fresh agent — or to an orchestration, if that directory defines one — exactly as if you had started it yourself from the new-deck dialog.
+Which client can do what:
 
-> **The scheduler lives in the daemon**
->
-> Scheduling runs inside the long-lived **daemon**, not the TUI, so fires keep happening after you close the deck window. While the daemon is stopped nothing fires — and a fire that comes due during the downtime is **not** run later (there is no catch-up) — but your schedules **resume on the next daemon start**, because their definitions live on disk. See [Daemon must be running](#daemon-must-be-running).
+| What | TUI | Desktop app | CLI |
+|---|---|---|---|
+| Create a schedule with a guided authoring agent | yes: the Schedules manager, or the **schedule** mode in the New Agent form | yes: the **schedule** chip in **New agent** | — |
+| Create or change a schedule directly | — | — | `dot-agent-deck schedule add` / `update` |
+| List, pause, resume, run now, delete | yes: the Schedules manager | no schedule manager | `dot-agent-deck schedule …` |
+| See the agents a run starts | yes, as cards and tabs | yes, on the Dashboard | `dot-agent-deck daemon status` |
 
-## Creating and managing schedules
+The Schedules manager exists only in the TUI. In the desktop app, a schedule's runs appear on the Dashboard like agents you started yourself, but the schedules themselves are not listed there.
 
-**Do this in the deck.** Open the **Scheduled Tasks** dialog, and an authoring agent writes the entry for you — you describe the job in plain English instead of getting cron syntax, TOML quoting and flag names right by hand.
+## Before you start
 
-The [reference section](#reference) below documents the on-disk file the agent writes. You do not need it to use this feature — it is there so you can read back what was written, and know the vocabulary (`cron`, `working_dir`, `shape`, …) to ask for what you want.
+- **A running daemon.** Starting the TUI (`dot-agent-deck`) starts one if none is running. The `schedule` subcommands do not start one. Check with `dot-agent-deck daemon status`, which reports a missing daemon rather than starting it.
+- **An agent command.** A plain schedule needs the command that launches your agent, for example `claude`, `opencode`, `pi`, `codex` or `devin`, or a wrapper that ends up running one of them (`devbox run agent`). Any other command runs, but the deck cannot show its status.
+- **For issue dispatch only:** the GitHub CLI `gh`, installed and signed in (`gh auth status` succeeds), and `git`, both on the daemon's `PATH`. Read access to the repository is enough to dispatch. To [claim](#claims-on-github) the issues it dispatches, the account `gh` is signed in with also needs to add labels and comments to the repository's issues: write access to the repository covers the whole claim, including creating its label, and an account that can apply labels and comment but not create labels can claim once the `agent-deck/claimed` label exists.
 
-### The Scheduled Tasks dialog
+## Schedule a prompt with the CLI
 
-Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Scheduled Tasks** manager — your one place to see and manage every schedule. Its **`[Scheduled Tasks s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. You never type field values into the dialog itself — **`[Add]`** and **`[Edit]`** hand you to the authoring agent described below, which does the writing for you.
+This creates a schedule that runs every weekday at 09:00 in `~/scheduled/morning-digest`:
 
-Rows are **click-selectable**. Each row shows the task **name**, a **status** indicator, and its **next-fire** time:
+```bash
+dot-agent-deck schedule add \
+  --name morning-digest \
+  --cron "0 9 * * MON-FRI" \
+  --working-dir ~/scheduled/morning-digest \
+  --command claude \
+  --prompt "Summarize the GitHub issues opened in the last 24 hours in vfarcic/dot-agent-deck."
+```
+
+On success the command prints nothing and exits 0. It validates the cron expression, expands `~` and `$VAR` in the working directory, writes the schedules file, and asks the running daemon to reload it. If no daemon is running, it still writes the file and prints ``note: wrote <path> but could not reload the daemon (…); it will load on next `daemon serve` ``; the schedule loads the next time a daemon starts.
+
+Check each step:
+
+1. **The file has it.** `dot-agent-deck schedule list` prints one line per schedule, for example `enabled   morning-digest  cron="0 9 * * MON-FRI"  next=2026-09-30 09:00:00 CEST  shape=config-derived  dir=/home/you/scheduled/morning-digest`. `next=` is the next time the cron matches, whether or not the schedule is enabled.
+2. **The daemon has it.** `dot-agent-deck schedule reload` prints `reloaded; registered: <names>`, the enabled schedules the daemon is now running. If your schedule is missing from that list, it is disabled or the daemon rejected it; see [When a schedule does not run](#when-a-schedule-does-not-run).
+3. **It works.** `dot-agent-deck schedule run-now --name morning-digest` runs it immediately and prints `ran morning-digest`. A new card (or tab) opens in the TUI and a new row on the desktop Dashboard, and the prompt is sent once the agent is ready.
+
+The working directory is created (including missing parents) when the schedule runs, if it does not exist yet.
+
+## Schedule a prompt with an authoring agent
+
+Instead of writing the command yourself, you can describe the job to an agent that writes it for you. The authoring agent asks for each field, offers to try the prompt in its own session first, confirms the whole schedule with you, and then runs `dot-agent-deck schedule add` (or `schedule update` when editing). When it is done it tells you its pane can be closed.
+
+The authoring agent runs the command in the form's **Command** field, which is pre-filled from [`default_command`](configuration.md#set-the-command-new-agents-start-with); if that is empty, `claude` is used.
+
+It saves the schedule by running `schedule add` (or `schedule update` when editing) by the deck's full path, such as `/home/you/.local/bin/dot-agent-deck schedule add …`, so the schedule reaches this deck whatever the agent's own `PATH` holds. If you let the agent run commands through a permission rule, write the rule against the path shown in its pane: a Claude Code allow rule such as `Bash(dot-agent-deck schedule:*)` does not match it.
+
+**TUI, from the Schedules manager.** Press `s` on the dashboard (`S` also works, and the key can be remapped as `open_scheduled_tasks`; see [Keyboard Shortcuts](keyboard-shortcuts.md)), or click **[Schedules s]**. Press `a` (**[Add a]**), pick a directory (it becomes the schedule's default working directory), confirm the **New Schedule** form's **Dir** and **Command** fields, and the authoring agent starts in that directory. `Esc` or **[Cancel]** returns to the manager.
+
+**TUI, from the New Agent form.** Press `Ctrl+n`, choose a directory, and cycle the **Mode** field past your project's orchestrations to **schedule** (shown with the hint `authoring (one-off)`).
+
+**Desktop app.** Open **New agent**, choose the daemon and a directory, and pick the **schedule** chip under **Mode**. The schedule is written on the machine of the daemon you chose. See [New Agent](desktop/new-agent.md).
+
+Check the result the same way as for the CLI: `dot-agent-deck schedule list` on that machine, or the TUI's Schedules manager.
+
+## Manage schedules
+
+In the CLI, every command selects the schedule by `--name`:
+
+| Task | Command |
+|---|---|
+| List schedules | `dot-agent-deck schedule list` |
+| Change fields | `dot-agent-deck schedule update --name <name> [--cron …] [--working-dir …] [--command …] [--prompt …] [--new-tab-per-fire true\|false] [--enabled true\|false] [--shape …]` |
+| Pause | `dot-agent-deck schedule disable --name <name>` |
+| Resume | `dot-agent-deck schedule enable --name <name>` |
+| Run now | `dot-agent-deck schedule run-now --name <name>` |
+| Delete | `dot-agent-deck schedule remove --name <name>` |
+| Re-read a hand-edited file | `dot-agent-deck schedule reload` |
+
+Things to know when changing schedules:
+
+- **A schedule cannot be renamed.** `update` has no rename flag. Remove it and add it again under the new name.
+- **Pause rather than delete** when you only want it to stop for a while: `disable` keeps every field.
+- **Run now needs an enabled schedule.** The daemon only holds enabled schedules, so `run-now` on a disabled one fails with `run-now failed: no schedule named "<name>"`.
+- **Deleting does not close tabs.** A tab a schedule already opened stays open.
+- **Prompt, cron and `new_tab_per_fire` changes apply from the next run.** A change of `working_dir` or `command` also applies to the next run that opens a new tab. While the schedule reuses a tab whose agent is still running (the default), the next prompt goes into that existing tab, in its old directory with its old command. Close that tab to make the change take effect.
+- **`update` cannot change issue-dispatch settings** (`repo`, `max_per_run`, `label`, `query`). Remove the schedule and add it again, or edit the file and run `schedule reload`.
+
+### The TUI's Schedules manager
+
+![The TUI's Schedules manager with one schedule: its row shows the name, the status disabled and a next fire of —, above the Add, Edit, Delete, Run now and Toggle buttons](/img/schedules-tui.png)
+
+Each row shows the schedule's name, a status and its next run time. The statuses are taken when the dialog opens and refreshed after a run-now:
 
 | Status | Meaning |
 |---|---|
-| `live` | The task currently has a live reused tab/agent. |
-| `idle` | Enabled, but no live tab right now. |
-| `disabled` | `enabled = false`. Its next-fire cell shows `—`. |
+| `live` | Enabled, and a tab or agent this schedule started is still running. |
+| `idle` | Enabled, with nothing it started running now. |
+| `disabled` | Paused (`enabled = false`). Its next-fire cell shows `—`. |
 
-Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[Delete d]` `[Run now r]`:
-
-| Key / Button | Action |
+| Key / button | Action |
 |---|---|
-| `a` / `[Add a]` | **Add** — opens a **directory picker → New Schedule form** (Dir + free-text Command), then spawns the seeded authoring agent in that directory. |
-| `Enter` / `e` / `[Edit e]` | **Edit** the selected row — opens the same **directory picker → Edit Schedule form** (picker starts at the row's directory), then spawns the seeded authoring agent **pre-filled** with the row's current values (it calls `schedule update`). |
-| `d` then `y` / `[Delete d]` | **Delete** the selected row's **definition only** (a confirmation appears first). It does **not** close an open/running tab for that schedule — deleting a schedule must not nuke a conversation you're reading. |
-| `r` / `[Run now r]` | **Run now** — fire the selected task immediately. |
-| `t` / `[Toggle t]` | **Pause / resume** the selected task — flips its `enabled` flag. No confirmation: press `t` again to reverse it. |
-| `j` / `k` | Move the selection. |
-| `Esc` / `q` / `s` | Close the dialog. |
+| `a` / **[Add a]** | Add a schedule through the authoring agent (see above). |
+| `Enter` / `e` / **[Edit e]** | Edit the selected schedule: the directory picker opens at its working directory, and the authoring agent starts with its current values and saves with `schedule update`. |
+| `d`, then `y` / **[Delete d]** | Delete the selected schedule after confirmation (`n` or `Esc` cancels). |
+| `r` / **[Run now r]** | Run the selected schedule now. The status line says `Ran schedule '<name>'`, `'<name>' already running — skipped`, or `Run-now failed: …`. |
+| `t` / **[Toggle t]** | Pause or resume the selected schedule, without confirmation. |
+| `j` / `k` (or `↓` / `↑`) | Move the selection. Rows can also be clicked. |
+| `Esc` / `q` / `s` / `S` | Close the manager. |
 
-**Edits take effect on the next fire.** Change a schedule's prompt — or any field that affects a fire (cron, working dir, command, `new_tab_per_fire`) — and the next fire uses the new values, not the ones from when you first created the task.
+The manager reads and writes the schedules file on the machine the TUI runs on.
 
-**What the dialog deliberately does not do.** There is **no in-place field editing** — you change a task's fields by handing it to the authoring agent with `[Edit e]`, which keeps the terminal dialog simple. **Rename is forbidden** on the edit path because `name` is the reuse-tab key; to rename, delete and add.
+## Choose what a run opens
 
-**Pausing is not the same as deleting.** `[Delete d]` discards the definition — prompt, cron, directory and all — while **`[Toggle t]`** just flips the task's `enabled` flag, so it stops firing and everything about it survives. That is what you want for a schedule you are going away from, or one firing noisily while you debug the thing it drives. Press `t` again to resume it; there is no confirmation step because it is reversible from the same key.
+Without a `shape`, a run looks at the `.dot-agent-deck.toml` in the schedule's `working_dir` itself (parent directories are not searched):
 
-### What the authoring agent does
+- If it defines an `[[orchestrations]]` block with at least one role, the run opens that directory's default orchestration (the one with `default = true`, otherwise the first one with roles; see [Which orchestration a schedule opens](orchestration.md#which-orchestration-a-schedule-opens)) and sends the prompt to its orchestrator. The schedule's `command` is not used.
+- Otherwise the run opens one agent running `command` and sends the prompt to it.
 
-Both doors below open the same guided session:
+Set `shape` to decide it yourself:
 
-- **From the Scheduled Tasks dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). First a **directory picker** (the dir you choose becomes the authoring session's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring session in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
-- **From the new-deck / new-pane dialog** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked as an *authoring session*).
-
-Either way a throwaway authoring session opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:
-
-- asks you for the fields (name, cron, working dir, command, prompt, …);
-- asks for the **command that launches your agent** — it must result in a `claude`, `opencode`, `pi`, `codex`, or `devin` process, either directly (`claude`, `claude --model opus`, `opencode --model gpt-4o`, `pi`, `codex`, `devin`) or via a project wrapper that ends up launching one (`devbox run agent-new`, `npm run agent`). Those are the CLIs the deck integrates with for **live status tracking**; a command that doesn't result in one still runs but gets no status tracking, so the agent won't suggest unrelated CLIs (e.g. `gemini`). The command is **required** (there is no `$SHELL` fallback);
-- lets you **test the prompt in the same session** ("run it now, show me") before committing;
-- **confirms the full entry** with you, then calls `schedule add` (or `schedule update` on the edit path).
-
-The agent writes the entry for you, so you don't have to get the cron syntax or prompt formatting right by hand. When it's done it tells you that **this authoring pane existed only to create the schedule and can be closed** — when the schedule later fires, a single-agent run **appears live in its own pane** on the deck, while an orchestration-targeted run opens in its tab when the deck is (re)opened.
-
-## What happens when a task fires
-
-When a task fires, the scheduler decides its **shape**. If the task sets `shape`, that choice wins outright. Otherwise the shape is derived from the **target `working_dir`'s** `.dot-agent-deck.toml`:
-
-- If it defines an **`[[orchestrations]]`** block → an **orchestration tab** is opened rooted at that directory and the prompt is delivered to the `orchestrator` role (the task's `command` is ignored here).
-- Otherwise → a **single agent card** is opened, running `command`, and the prompt is delivered to it.
-
-**This is why `shape` exists.** Without it the shape came from the directory alone, so a schedule pointed at a repo that defines `[[orchestrations]]` fired the whole team and quietly ignored its own `command` — and nothing in the config, `schedule list` or the CLI said so. That is the common case for a schedule that *wants* the repo as its `working_dir` (so the repo's `.claude/skills/` load and `git` commands run in the right place) but wants **one** agent to do the job. `shape = "single"` is that combination.
-
-A `shape` naming an orchestration the target directory does not define **abandons the fire**: the failure is surfaced through the daemon's notification seam with a message listing what *is* available, and **nothing is spawned**. It never falls back to another shape — silently spawning something other than what you asked for is the surprise this field removes.
-
-`schedule list` prints the resolved shape for every task, showing `shape=config-derived` when the field is unset, so the behaviour above is visible without reading source.
-
-**The first prompt waits for the agent to be ready.** When a fire spawns a new agent, the deck waits for it to finish starting up before delivering the prompt, so nothing is lost while the agent is still coming up.
-
-A single malformed `[[scheduled_tasks]]` entry never crashes the daemon or blocks the other (valid) entries — the bad entry is reported and skipped. A **command-less entry is one such rejected entry** (see the `command` field above).
-
-## Tab reuse
-
-Most scheduled tasks should **reuse** one tab, because you primarily learn about fires through notifications and open the deck to dig into a result only when you choose to.
-
-- **Default (`new_tab_per_fire = false`)** — a task reuses the same tab/card each fire. Yesterday's weather output is replaced by today's. One weather tab, ever.
-- **Opt-in (`new_tab_per_fire = true`)** — each fire opens a fresh tab, for audit-style tasks where you want per-fire history.
-
-Tab reuse is tracked only while the daemon keeps running, so a daemon restart clears it — the first fire after a restart starts a fresh tab even when reuse is on.
-
-### If a fire lands while you're typing
-
-If a reuse fire lands while you are actively typing in that tab, the new prompt **waits** and is delivered once you pause (a short debounce, ~5s by default). If you are not typing, it is delivered immediately. The debounce window is tunable via the `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` environment variable (milliseconds).
-
-## Daemon must be running
-
-Scheduling depends on the daemon being up. The behavior on daemon stop / upgrade / restart / reboot is honest and documented:
-
-- Stopping the daemon (`daemon stop`, `daemon restart`, an upgrade, or a crash) **terminates every running agent** and **wipes the in-memory reuse registry**.
-- **There is no catch-up.** Fires that come due while the daemon is down are **not replayed** — an "every 09:00" task that was offline at 09:00 simply misses that day. There is no persistent queue and no last-fire timestamp.
-- Schedule **definitions survive** because they are reloaded from the global `schedules.toml` the next time the daemon starts.
-- The daemon is **lazy-spawned** by the next `dot-agent-deck` invocation and is **not** auto-respawned after it exits.
-
-The daemon also auto-exits after a short idle window when there are no clients and no live agents — but a **registered enabled schedule keeps it alive**, so a daily task survives the gaps between fires (and the gap before its first fire) as long as the daemon isn't explicitly stopped.
-
-## Dispatching agents onto open GitHub issues (`issue_dispatch`)
-
-> **The task type itself is always available; only the guided creation UI is experimental.**
->
-> A configured `issue_dispatch` task **always runs** — once the `[scheduled_tasks.issue_dispatch]` sub-table below is present (whether you hand-write it or author it with the CLI), the daemon fires it on schedule with no flag required. What *is* gated behind the `experimental` feature flag is the in-deck **guided `schedule: issues` authoring option** in the new-pane dialog (a convenience for building one of these tasks conversationally). To enable that option, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file). Everything below describes the task type, which works regardless of the flag.
-
-The examples so far run **one** prompt in **one** directory per fire. An **`issue_dispatch`** task is a specialized variant that, on each fire, looks at the **open GitHub issues of one repo** and spins up an agent **per issue** — so *"every weekday at 09:00, pull up to five open issues from `vfarcic/dot-ai` and start an agent on each"* becomes a single schedule instead of a morning of manual cloning, worktree-making, and prompt-pasting.
-
-You turn an ordinary scheduled task into an issue-dispatch task by adding a `[scheduled_tasks.issue_dispatch]` sub-table to it. The shared fields (`name`, `cron`, `working_dir`, `prompt`, `enabled`) keep their meaning; the sub-table adds the GitHub-specific knobs:
-
-```toml
-[[scheduled_tasks]]
-name = "Issues vfarcic/dot-ai"        # default-seeded to "Issues <repo>"
-cron = "0 9 * * MON-FRI"              # 09:00 on weekdays, local time
-working_dir = "~/dispatch"            # the workspace root — see "Where things land" below
-prompt = "Work on issue {{issue_number}}"   # per-issue template; {{issue_number}} is substituted per issue
-enabled = true
-
-[scheduled_tasks.issue_dispatch]
-repo = "vfarcic/dot-ai"               # ONE repo, "owner/name"
-max_per_run = 5                       # hard cap on how many issues a single fire dispatches
-# label = "agent-eligible"            # optional: only issues carrying this label
-# query = "is:open no:assignee"       # optional: advanced gh search override
-# triage = true                       # optional: opt in to per-issue triage — see "Opt-in triage" below
-# repo_allowlist = ["vfarcic/dot-ai"] # optional: see "Repo allowlist" below — must include `repo` when set
-# dry_run = true                      # optional: see "Dry run" below — try a new schedule with no writes
-```
-
-> **`command` is optional to load, and only matters for orchestration-less clones**
->
-> Unlike a plain scheduled task, an `issue_dispatch` task does **not** need a `command` to load — the loader returns before reaching the command check for any task carrying an `issue_dispatch` sub-table, unlike the required-field #127 single-spawn path. If you set one anyway it is not inert: it becomes the resolved `default_command` and wins over the global [`default_command`](configuration.md#default-command) for any dispatched clone whose `.dot-agent-deck.toml` defines no `[[orchestrations]]` block. A clone that does define one ignores it entirely — the orchestration's role commands win regardless.
->
-> **`new_tab_per_fire` has no effect here either, for an unrelated reason.** The `issue_dispatch` callback returns before reaching the `new_tab_per_fire`/tab-reuse branch further down the same function — each dispatched issue already gets its own worktree and card keyed by issue number, so the field is never read for this task type. Setting it is a no-op dressed up as a decision.
-
-**This is the one place on this page where you may have to run a command yourself.** The guided authoring option for issue-dispatch tasks (the `schedule: issues` entry in the new-pane cycler) sits behind the `experimental` flag, so with the flag off there is no agent-driven door for this task type — only the sub-table above, hand-written, or the CLI below. It takes `--repo` plus the optional `--max-per-run` / `--label` / `--query` / `--triage`, and needs no `--command`:
+| `shape` | What a run opens |
+|---|---|
+| *(unset)* | Decided from the directory, as above. `schedule list` shows `shape=config-derived`. |
+| `single` | One agent running `command`, even where the directory defines orchestrations. Use it when the job needs the repository (its skills, its git remote) but not the team. |
+| `orchestration` | The directory's default orchestration. |
+| `orchestration:<name>` | The orchestration with that name. |
 
 ```bash
-# --label and --triage are both optional — see "Opt-in triage" below for --triage.
+dot-agent-deck schedule update --name morning-digest --shape single
+dot-agent-deck schedule update --name morning-digest --shape ""   # back to config-derived
+```
+
+If a `shape` cannot be satisfied when the run comes due (the named orchestration no longer exists, more than one orchestration with roles uses that name, none has roles, or the directory's `.dot-agent-deck.toml` cannot be parsed), the run is skipped and nothing opens in its place. The reason, including the orchestrations that do exist, goes to the [daemon's output](#where-schedule-errors-are-reported).
+
+## Reuse one tab or open a new one per run
+
+- **`new_tab_per_fire = false` (default):** a run sends its prompt into the tab the previous run opened, if that tab's agent is still the one the schedule started. The agent receives the prompt in the same session, so it still has the previous run's conversation. If that tab was closed, its agent exited, or the daemon restarted since, the run opens a new tab.
+- **`new_tab_per_fire = true`:** every run opens a new tab, so you keep one tab per run.
+
+An orchestration a run starts is named after the orchestration and its working directory, for example `team · my-repo`. The TUI shows that name on the run's tab, and the desktop app as the title of the run's group on the Dashboard. If another run of the same orchestration is still running in that directory, started by this schedule or another one, the new run gets the next free number instead (`team · my-repo · 2`, then `· 3`), so you can tell the runs apart in both clients. The run is never skipped because of its name.
+
+A run's prompt waits in the agent's inbox, including when the schedule reuses a tab. The TUI card and desktop tile show `✉N queued`, then `✉ delivered` after receipt, or `not delivered: …` with **Error** (desktop **error**) if delivery fails. Native delivery leaves your input box alone. When the doorbell is needed, it waits for an idle agent and a clear input box; it does not force submission after a timeout. See [Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app).
+
+
+## Dispatch agents onto open GitHub issues
+
+An issue-dispatch schedule takes the open issues of one GitHub repository on each run and starts one agent per issue, each in its own git worktree on the branch `agent/issue-<n>`. For several repositories, create one schedule per repository.
+
+### Create one
+
+With the CLI (the `--repo` flag makes it an issue-dispatch schedule):
+
+```bash
 dot-agent-deck schedule add \
   --repo vfarcic/dot-ai \
-  --max-per-run 5 \
   --name "Issues vfarcic/dot-ai" \
   --cron "0 9 * * MON-FRI" \
   --working-dir ~/dispatch \
-  --prompt "Work on issue {{issue_number}}" \
+  --max-per-run 3 \
   --label agent-eligible \
-  --triage
+  --prompt "Work on issue {{issue_number}}"
 ```
 
-A malformed `--repo` (not an `owner/name` slug) is rejected before anything is written. The CLI validates, writes the global config atomically, and triggers a live daemon reload — exactly as for a plain task.
+- `--repo` must be `owner/name`; anything else is rejected before the file is written.
+- `--max-per-run` defaults to `3`; `--label`, `--query` and `--triage` are optional. `--triage` is a bare flag (present means on) that sets the `triage` key described under [Opt-in triage](#opt-in-triage).
+- `--command` is optional, and a schedule with an `issue_dispatch` table loads without one. It is used only for issues whose clone has no orchestration (see below): if it is set, it is the command for a dispatched clone whose `.dot-agent-deck.toml` defines no `[[orchestrations]]` block and wins over the global [`default_command`](configuration.md#set-the-command-new-agents-start-with); a clone that does define one ignores it, because the orchestration's role commands win.
+- `new_tab_per_fire` has no effect on an issue-dispatch schedule: each dispatched issue already gets its own worktree and card keyed by the issue number, so the field is never read for this schedule type.
+- `repo_allowlist` and `dry_run` (both described below) have no `schedule add` flag. Set either one by editing the `[scheduled_tasks.issue_dispatch]` table by hand.
+- `--shape` cannot be combined with `--repo`.
+- `{{issue_number}}` in the prompt is replaced with each issue's number. The agent works inside that issue's worktree, so the number is usually enough context; `--prompt "/prd-full {{issue_number}}"` runs one of your own skills instead.
 
-`--triage` is a bare flag (present = on) and, like `--max-per-run` / `--label` / `--query`, is only meaningful alongside `--repo`; it maps onto the `triage` field described below.
+The same schedule as TOML is in [Worked examples](#an-issue-dispatch-schedule). A schedule with an `[scheduled_tasks.issue_dispatch]` table runs whether or not the `experimental` flag is on.
 
-`repo_allowlist` and `dry_run` (both described below) have no `schedule add` flag yet — hand-edit the sub-table to set either one, matching this fork's existing pattern for advanced knobs added without a matching CLI flag.
+**With an authoring agent:** the **schedule: issues** mode in the TUI's New Agent form, or the **schedule: issues** chip in the desktop app's **New agent**, starts an agent that builds one with you. Both appear only when the `experimental` flag is on: for the TUI, set `experimental = true` under `[features]` in `.dot-agent-deck.toml` or launch it with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the variable wins); for the desktop app, the flag of the daemon you create the agent on decides. See [Configuration](configuration.md).
 
-### What a fire does, issue by issue
+Check it: `dot-agent-deck schedule list` shows the schedule, and `dot-agent-deck schedule run-now --name "Issues vfarcic/dot-ai"` runs it once. Once the run has cloned the repository, a tab opens per dispatched issue, and `git -C ~/dispatch/"Issues vfarcic-dot-ai" worktree list` lists one worktree per issue.
 
-When an `issue_dispatch` task fires it:
+### What a run does
 
-1. **Provisions the repo** under the workspace root — clones it on the first run, `git fetch` + fast-forward `pull` on later runs.
-2. **Enumerates open issues** via `gh` (honoring the optional `label` and `query`), then takes the first `max_per_run` in the order GitHub returns them. Nothing past the cap is touched.
-3. For each candidate issue, **creates a per-issue worktree** on a branch named `agent/issue-<n>`.
-4. **Spawns an agent** rooted in that worktree and delivers your `prompt` with `{{issue_number}}` substituted. Because the agent runs *inside* the issue's worktree, it can deduce the repo and issue from its surroundings — the issue number alone is enough context. Set `prompt = "/prd-full {{issue_number}}"` to drive your own skill instead.
+1. **Gets the repository.** The clone lives at `<working_dir>/<schedule name>`, with `/` and `\` in the name replaced by `-` (for the example above, `~/dispatch/Issues vfarcic-dot-ai`). The first run clones it with `gh repo clone`; later runs check that the clone's `origin` is that repository and then run `git fetch` and `git pull --ff-only`. A failed refresh is logged and the run continues with what is on disk; an `origin` that points at another repository stops the run.
+2. **Lists issues.** It runs `gh issue list --repo <repo> --state open --limit <max_per_run>`, adding `--label <label>` and `--search <query>` when set, and takes at most `max_per_run` issues in the order `gh` returns them.
+3. **Skips claimed issues.** An issue is skipped when its worktree `<clone>/.worktrees/issue-<n>` already exists, when it carries the `in-progress` label, or when an open pull request has the head branch `agent/issue-<n>`; the signals are checked in that order, so the one that needs its own GitHub call is read last. With `claim_gating = true`, it is also skipped while another schedule or machine holds a live claim on it (see [Claims on GitHub](#claims-on-github)). Each skip is logged with its reason, listed under [Skip causes](#skip-causes). Skipped issues still count toward `max_per_run`: if every listed issue is claimed, the run starts nothing, even when later issues are free.
+4. **Creates the worktree** at `<clone>/.worktrees/issue-<n>` on the branch `agent/issue-<n>`. If that branch already exists in the clone (from an earlier run whose tab you closed without opening a pull request), the worktree checks it out, so its commits carry over.
+5. **Starts the agent** in the worktree and sends it the prompt. If the worktree's `.dot-agent-deck.toml` defines an orchestration with roles, the issue gets an orchestration tab, using the roles' own commands. Otherwise it gets one agent running the schedule's `command`, else your [`default_command`](configuration.md#set-the-command-new-agents-start-with); if neither is set, the agent pane starts the daemon's shell (`$SHELL`), which cannot act on the prompt, so set one of them.
+6. **Claims the issue on GitHub** once the agent has started, as described in [Claims on GitHub](#claims-on-github): the `in-progress` label with a `Claimed by` comment, and the `agent-deck/claimed` label with its claim record. An issue whose agent did not start gets no claim of either kind.
 
-Each issue is handled in its **own error boundary**: if one issue fails (a `gh` rate-limit, a clone error), it is reported in the daemon log and the run **continues** with the remaining issues — one bad issue never aborts the rest.
+A failure on one issue (a `gh` error, a worktree error) is reported and the run carries on with the other issues. A failure to get the repository or list issues stops that run.
 
-### Where things land
+### Claims on GitHub
 
-Everything for a task lives under the task's own `working_dir` (the **workspace root**), so nothing is written to the daemon's launch directory:
+A dispatched issue gets two claims. They are separate and written side by side: the [`in-progress` claim](#the-in-progress-claim), which dispatch always honours, and the `agent-deck/claimed` claim described first below, which is visible to everyone reading the issue and only gates dispatch when `claim_gating` is on.
 
-| Path | What |
-|---|---|
-| `<working_dir>/<name>` | The **clone** of the repo (created once, reused and pulled thereafter). |
-| `<working_dir>/<name>/.worktrees/issue-<n>` | The **per-issue worktree** for issue `<n>`. |
-| `agent/issue-<n>` | The **branch** each worktree checks out. |
+The deck tries to mark each dispatched issue on GitHub with the `agent-deck/claimed` claim, so anyone reading the repository's issue list can see an agent is working on it before a pull request exists:
 
-### Idempotency: three signals, one explicit claim
+- **The `agent-deck/claimed` label** is added to the issue. If the repository does not have that label yet, the run creates it first; if it already exists, its colour and description are reset to the deck's. When the account cannot create or edit labels, the run logs that in the [daemon log](#where-schedule-errors-are-reported) and still adds the label if the repository already has it.
+- **One claim comment** on the issue, posted by the account `gh` is signed in with, names the schedule, a machine id for the machine that dispatched it, and when it last claimed the issue. When the same schedule on the same machine, signed in as the same account, dispatches that issue again later, it updates its comment, including that time, instead of posting another one. A copy of that comment posted by anyone else is left alone.
 
-There is no separate state file. Before dispatching an issue, the task checks three signals, in order, and **skips** the issue if any one of them is true:
+The claim comment is as visible as the issue: on a public repository, anyone can read it. It shows the schedule's `name`, so give an issue-dispatch schedule a name you are happy to publish. The machine id (`h1-` followed by 16 hex digits) is computed from the machine's host name, so the comment does not show the host name itself, but anyone who guesses the host name can compute the same id and confirm the guess. If the machine's host name changes, its next claim posts a new comment.
 
-1. its `.worktrees/issue-<n>` worktree **already exists on disk** (the primary signal — the filesystem itself records which issues are in flight, so re-running a dispatch, whether the cron fires again or you press **Run now**, does not double-dispatch work already underway);
-2. the issue carries the **`in-progress` label** (the secondary signal, PRD #421);
-3. an **open PR** already has head branch `agent/issue-<n>` (the tertiary signal — a deterministic check, not fuzzy `Closes #n` body parsing).
+With write access to the repository, the account `gh` is signed in with can do all of this. An account that can apply labels and comment on issues but not create labels, such as one with GitHub's triage role, claims issues too once the `agent-deck/claimed` label exists in the repository: if it is missing, ask someone with write access to create it once, for example with `gh label create agent-deck/claimed --repo <owner/name>`. If the label or the comment cannot be written, the run reports it with one `claim failed for issue #<n>` line in the [daemon log](#where-schedule-errors-are-reported) saying what happened to the label and to the claim record (the comment), and why. The agent keeps working either way: a failed claim never stops a dispatch. The claims of one run share a two-minute time limit on GitHub calls, so claims can delay later dispatches by up to two minutes in total per run. Once that limit is used up, the run's remaining issues are dispatched without a claim attempt, and each gets a `claim failed` line saying its claim was skipped because the run's claim time budget was used up.
 
-The worktree and label checks are both read for free — the filesystem check costs no I/O, and the label rides along on the issue list already fetched to find candidates — so both are checked before the PR probe, the one signal that needs its own GitHub call; a transient failure there can then never mask an already-decided worktree/label skip as a failure. The worktree and PR signals are **inferred** — they are side-effects of a dispatch having happened, read back off the filesystem or GitHub's PR state. The label is different: it is an **explicit claim**, and it is honoured no matter who applied it — this deck's own prior dispatch, a human working the issue by hand, or an external tool. Nothing compares "is this my own claim?"; the label alone is enough to skip. Because the label is checked ahead of the PR probe, an issue that is both labelled and has an open PR reports the label cause.
+The deck never removes the label or the comment, not even when you close the issue's tab. Remove them yourself when you no longer want them, for example with `gh issue edit <n> --repo <owner/name> --remove-label agent-deck/claimed`.
 
-**On a successful dispatch** — after the worktree is created and the agent is spawned — the task writes the `in-progress` label onto the issue and appends a comment naming the **claimant**: the scheduled task's name, the host it ran on, and a timestamp. The label is the machine-readable signal dispatch actually gates on; the comment is the human-readable record of *who* made the claim. Provenance never changes the skip decision — it only makes an already-decided skip legible when you go looking at the issue. If the label write or comment post itself fails — most commonly a `gh` token with no write access to issues/labels — the dispatch is still reported as a success (the worktree was created and the agent spawned), but a separate notification reports that the claim could not be written; see "Requirements & caveats" below for what that means in practice.
+#### The `in-progress` claim
 
-**A failed dispatch leaves the issue completely unmarked**, deliberately. Labelling before the outcome is known would let a failed dispatch produce a false claim — permanently un-dispatchable, since nothing would ever clear a label nobody is coming back to fix. The worktree/PR signals don't have this problem: a fire that fails after creating the worktree still leaves the worktree in place, so the *next* fire's worktree-exists check reclaims the same issue rather than skipping it forever.
+Every successful dispatch also writes the `in-progress` label onto the issue and appends a comment that starts `Claimed by` and names the **claimant**: the schedule's name, the host it ran on, and a timestamp. This is the claim dispatch always gates on, with no setting to turn it on. The label is the machine-readable signal; the comment is the human-readable record of who made the claim, and never changes the skip decision. The deck creates the label, with a fixed colour and description, on a repository that lacks it, so the claim does not silently fail on a repository that has never carried it.
 
-Skipping is always **reported** in the daemon log — never silent: a stray `in-progress` label left by a human silently starves the backlog, and from the outside that looks like nothing happening rather than like an issue being deliberately excluded. Each skip names its cause. There are four causes; the label cause renders two ways depending on whether a claimant could be found:
+The label is an explicit claim and is honoured no matter who applied it: this deck's own earlier dispatch, a human working the issue by hand, or an external tool. Nothing compares whether it is your own claim, so the label alone is enough to skip. Because the label is checked before the open-pull-request probe, an issue that is both labelled and has an open pull request reports the label as the cause.
+
+If the label write or the comment fails, most commonly because the `gh` token has no write access to issues and labels, the dispatch is still reported as a success, since the worktree was created and the agent spawned, and the daemon log has a separate line saying the claim could not be written. The token needs `repo` scope, or the finer-grained `issues: write` permission, not just read access. Without a write-capable token, two decks pointed at the same repository can dispatch the same issue repeatedly, because neither the worktree signal (local to one machine) nor the label signal (never written) stops the second one.
+
+**A failed dispatch leaves the issue completely unmarked**, deliberately. Labelling before the outcome is known would let a failed dispatch produce a false claim, permanently undispatchable because nothing clears a label nobody is coming back to fix. A fire that fails after creating the worktree still leaves the worktree in place, so the next fire's worktree check reclaims the same issue instead of skipping it forever. Remove the `in-progress` label yourself to release an issue: `gh issue edit <n> --repo <owner/name> --remove-label in-progress`.
+
+#### Skip issues that others have claimed
+
+By default the claim is for people reading the issue: another machine, or another schedule dispatching the same repository, still dispatches an issue that is already claimed. To make a schedule skip issues that others are working on, set `claim_gating = true` in its `[scheduled_tasks.issue_dispatch]` table:
+
+```toml
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"
+claim_gating = true
+claim_ttl_hours = 168   # the default: a week
+```
+
+With it on, a run skips an issue when the issue carries the `agent-deck/claimed` label and a claim comment from another schedule, another machine or another GitHub account was posted or updated within the last `claim_ttl_hours`. The log line names the schedule and machine id holding the claim, the GitHub account that wrote it, and how long ago it was last active, for example `skipping already-claimed issue #42 of vfarcic/dot-ai (agent/issue-42): claimed by schedule "Issues vfarcic/dot-ai" on machine h1-… (GitHub account teammate), last active 3h 2m ago`.
+
+- **Only claims by people with standing on the repository block a dispatch.** A claim comment counts only when GitHub reports its author as the repository's owner, a member of the organization that owns it, or a collaborator. On a public repository anyone can comment, so a claim comment written by anyone else is ignored: it never stops a schedule from dispatching the issue. Sign every deck's `gh` in with an account that has that standing, or their claims will not block each other.
+
+- **A schedule's own claim does not block it.** A claim comment this schedule wrote on this machine, signed in as the same account, is checked against the issue's worktree and pull request instead: if both are gone, for example after the machine's disk was wiped, the next run that considers the issue dispatches it again, even though its own claim comment is still there.
+- **Runs refresh their own claims on issues still in progress.** When a run considers an issue whose worktree still exists, it updates that schedule's claim comment once at least half of `claim_ttl_hours` has passed since its last update, whether or not `claim_gating` is on. A claim can still expire while its agent works: an issue the run does not consider, because it is not among the first `max_per_run` issues listed, is not refreshed, and neither is one whose update fails, for example because the account's GitHub API rate limit is used up. A claim whose schedule stopped running (the machine is gone, or the schedule was removed) expires `claim_ttl_hours` after its last update, and then other schedules can dispatch the issue.
+- **Remove the label to release a claim by hand.** Without the `agent-deck/claimed` label, no claim on the issue blocks anyone, whatever its comments say: `gh issue edit <n> --repo <owner/name> --remove-label agent-deck/claimed`. The next run that dispatches the issue adds the label again.
+- **`claim_ttl_hours` must be at least twice the longest gap between the schedule's runs, plus one hour**, which leaves headroom between the owner's scheduled refreshes before a claim expires. The extra hour allows for the time between a run starting and its claim being written or updated. For `0 9 * * MON-FRI`, the longest gap is the 72 hours over the weekend, so the TTL must be at least 145; the default of 168 is enough. When it is shorter, the schedule still loads, runs and writes claims, but does not skip anything for them: the daemon log has a `[scheduler] warning: schedule "<name>": claim_gating is OFF …` line naming the schedule and the TTL it needs, on every start and `schedule reload`.
+- **Claim ages are judged by GitHub's clock when GitHub reports it**, so a machine whose clock is fast or slow judges claims the same way as the others. When GitHub does not report its time, the run uses the machine's own clock instead and the daemon log has a warning saying so; a machine whose clock is wrong can then treat a live claim as expired, or the other way round. A claim comment dated more than a few minutes in the future does not block a dispatch.
+- **When an issue's claims cannot be read, the issue is dispatched.** If the run cannot read an issue's claims from GitHub, the `dispatched issue #<n>` line says it dispatched without checking its claims, and why. Reading claims shares the run's two-minute GitHub time limit with writing them.
+
+Claims cost GitHub API requests, whether or not `claim_gating` is on. A run that reads claims looks up the signed-in account and reuses a successful lookup for the rest of the run; after a failed lookup it may try again within the run's two-minute GitHub time limit. For each issue it considers whose worktree exists, it reads the issue's comments, plus the issue's events when its claim is due for an update. With `claim_gating = true`, each considered issue that has no worktree and no open pull request also costs a read of its events, and of its comments when it carries the label. Each read takes one request per 100 comments or events. These requests count against the GitHub API rate limit of the account `gh` is signed in with (GitHub's usual limit for a signed-in user is 5,000 requests an hour), shared with everything else that uses that account: a schedule that runs every minute with `max_per_run = 50` can spend over 3,000 requests an hour on claims alone. When the limit is used up, claims cannot be read, so issues are dispatched without checking them. Run issue-dispatch schedules every 15 minutes or less often, and lower `max_per_run` if a frequent schedule has many issues in flight.
+
+Each claim comment states the `claim_ttl_hours` of the schedule that wrote it, and a schedule with `claim_gating = true` judges the claim by that value rather than its own, so schedules with different `claim_ttl_hours` on one repository honour each other's claims for as long as their writers keep them; no claim counts as live more than 90 days after its last update. Machines running an earlier version of dot-agent-deck write claims without a lifetime, which each schedule judges by its own `claim_ttl_hours`. They also do not skip issues for claims, and do not update their claims while their agents work. A schedule with `claim_gating = true` honours their claims too, until `claim_ttl_hours` after their last update; after that it can dispatch an issue an older machine is still working on.
+
+#### Skip causes
+
+Skipping is always reported in the [daemon log](#where-schedule-errors-are-reported), never silent: a stray `in-progress` label left by a human would otherwise starve the backlog, and from the outside that looks like nothing happening instead of an issue being deliberately left out. Each skip names its cause:
 
 | Cause | Rendered reason |
 |---|---|
-| the worktree already exists | `the worktree already exists` |
-| an open PR already targets the branch | `an open PR already targets this branch` |
-| labelled `in-progress`, claimant known | ``labelled `in-progress` ({comment})`` |
-| labelled `in-progress`, no claimant recorded | ``labelled `in-progress`, no claimant recorded`` |
-| a concurrent dispatch won the race | `a concurrent dispatch claimed the worktree first` |
+| the worktree already exists | `its worktree exists` |
+| an open pull request already targets the branch | `an open pull request targets its branch` |
+| labelled `in-progress`, claimant known | ``it carries the `in-progress` label (<the `Claimed by` comment>)`` |
+| labelled `in-progress`, no claimant recorded | ``it carries the `in-progress` label, no claimant recorded`` |
+| a live `agent-deck/claimed` claim by someone else (only with `claim_gating = true`) | `claimed by <schedule, machine, account and age>` |
+| a concurrent run created the worktree first | `another run created its worktree first` |
 
-The last row is a benign race, not a failure: two fires can both pass the idempotency check before either has created its worktree, and only one wins — the loser skips rather than erroring. "No claimant recorded" covers a best-effort claimant lookup (reading the issue's comments back to find the claim) that itself failed to find one — the label is still honoured as a claim; the skip is simply reported without saying who made it.
-
-A skipped issue is left alone. Concurrency falls out of the same mechanism: a fire only fills the slots that earlier dispatches vacated by being closed, up to `max_per_run`.
+The last row is a benign race, not a failure: two fires can both pass the idempotency check before either has created its worktree, and only one wins, so the loser skips instead of erroring. "No claimant recorded" means the best-effort lookup of the claimant, which reads the issue's comments, found none; the label is still honoured as a claim and the skip is simply reported without saying who made it. A skipped issue is left alone. Concurrency falls out of the same mechanism: a fire only fills the slots that earlier dispatches vacated by being closed, up to `max_per_run`.
 
 ### Opt-in triage
 
-Set `triage = true` in the `[scheduled_tasks.issue_dispatch]` sub-table (or pass `--triage` to `schedule add`) to have each dispatched issue triaged by the agent working it, instead of landing with no priority/size signal at all. It is **off by default**.
+Set `triage = true` in the `[scheduled_tasks.issue_dispatch]` table, or pass `--triage` to `schedule add`, to have each dispatched issue triaged by the agent working it instead of landing with no priority or size signal at all. It is **off by default**.
 
-When triage is on, a fire first ensures a seven-label vocabulary exists on the repo (`gh label create --force`, with a fixed colour and description per label, so re-running converges on the same colour/description each label already has rather than randomizing them — a bare `--force` with no `--color` would pick a fresh random colour on every fire): `priority-high`, `priority-medium`, `priority-low`, `size-high`, `size-medium`, `size-low`, and `needs-triage`. The `in-progress` claim label (above) gets the same treatment, unconditionally, so the claim never silently fails on a repo that has never carried it. It then appends a triage instruction to the prompt of **every issue it actually dispatches** — a skipped issue never sees it.
+When triage is on, a fire first ensures the triage labels exist on the repository (`gh label create --force`, with a fixed colour and description for each, so running again converges on what each label already has instead of picking a fresh random colour): `priority-high`, `priority-medium`, `priority-low`, `size-high`, `size-medium`, `size-low` and `needs-triage`, plus the `chore` type label. The `in-progress` label gets the same treatment whether or not triage is on. The fire then appends a triage instruction to the prompt of **every issue it actually dispatches**; a skipped issue never sees it.
 
-**The deck itself never classifies anything.** The instruction asks the spawned agent to apply one size label and, when it can tell, one priority label, using its own `gh` calls — the same way it would apply any other label while working the issue. Under uncertainty the agent is instructed to apply `needs-triage` and leave priority unset rather than guess, because a **wrong** priority is worse than an **absent** one: an absent priority is visibly unclassified, while a wrong one is indistinguishable from a considered judgment until someone checks.
+**The deck itself never classifies anything.** The instruction asks the spawned agent to apply one size label and, when it can tell, one priority label, with its own `gh` calls, the same way it would apply any other label while working the issue. When unsure, the agent is told to apply `needs-triage` and leave the priority unset instead of guessing, because a wrong priority is worse than an absent one: an absent priority is visibly unclassified, while a wrong one is indistinguishable from a considered judgement until someone checks.
 
-Two things this deliberately does **not** do, so nobody infers a behavior that isn't there:
+Two things this deliberately does not do, so nobody infers a behaviour that is not there:
 
-- It does not triage your whole backlog — only the issues a fire actually dispatches ever get labeled or see the instruction.
-- Recording a priority does not currently affect dispatch order. `max_per_run` still takes issues in the order `gh` returns them; nothing sorts by `priority-*` yet.
+- It does not triage your whole backlog. Only the issues a fire actually dispatches get labelled or see the instruction.
+- Recording a priority does not affect dispatch order. `max_per_run` still takes issues in the order `gh` returns them; nothing sorts by `priority-*`.
 
 ### Repo allowlist
 
-Set `repo_allowlist = ["owner/name", ...]` in the `[scheduled_tasks.issue_dispatch]` sub-table to restrict which repo this task is permitted to write to. It is **unset by default** (`None`), which is unchanged behaviour — a hand-written config that never names this key dispatches exactly as before.
+Set `repo_allowlist = ["owner/name", ...]` in the `[scheduled_tasks.issue_dispatch]` table to restrict which repository this schedule may write to. It is **unset by default**, which changes nothing: a hand-written config that never names the key dispatches exactly as before.
 
-When set, `repo` must be a member of the list. If it isn't, the fire refuses to do **any** work for this config entry at all — no `gh` or `git` invocation of any kind, not merely the writes — and logs why. This is a fail-closed guard against a copy-pasted or hand-edited `repo` value quietly pointing a task at a repo it was never meant to touch.
+When it is set, `repo` must be a member of the list. If it is not, the fire refuses to do any work for that entry at all, with no `gh` or `git` invocation of any kind, not merely no writes, and logs why. This is a fail-closed guard against a copy-pasted or hand-edited `repo` value quietly pointing a schedule at a repository it was never meant to touch.
 
 ### Dry run
 
-Set `dry_run = true` in the `[scheduled_tasks.issue_dispatch]` sub-table to try a new schedule with no side effects. It is **off by default**.
+Set `dry_run = true` in the `[scheduled_tasks.issue_dispatch]` table to try a new schedule with no side effects. It is **off by default**.
 
-On a dry-run fire, each candidate issue still goes through the same reads and the same idempotency decision (worktree/label/open-PR checks) a real run would, and the outcome — dispatch or skip, and why — is still reported. Once an issue's decision resolves to "dispatch," the fire stops right there: no worktree is created, no branch, no agent is spawned, and no `gh` WRITE (claim comment, `in-progress`/triage label, assignee best-effort) happens. This is deliberately earlier than skipping only the writes — creating the worktree is itself a write a later *real* fire's idempotency check would see, so a dry run that got that far would poison the next real dispatch of the same issue by making it look already claimed. A dry run can therefore never leave anything behind for a real run to trip over.
+On a dry-run fire each candidate issue still goes through the same reads and the same idempotency decision a real run would, and the outcome, dispatch or skip and why, is still reported. Once an issue's decision resolves to dispatch, the fire stops right there: no worktree, no branch, no agent, and no `gh` write of any kind (claim comment, `in-progress` or triage label, assignee). That is deliberately earlier than skipping only the writes. Creating the worktree is itself a write that a later real fire's idempotency check would see, so a dry run that got that far would make the next real dispatch of the same issue look already claimed. A dry run therefore never leaves anything behind for a real run to trip over.
 
-### Cleanup: closing a tab tries to remove its worktree
+### Clean up
 
-Dispatched tabs/cards persist until **you** close them — you stay in control of review, further iteration, or discarding the work. **Closing a dispatched tab/card attempts to remove its worktree** (`git worktree remove`); the **clone is preserved** (only the per-issue worktree ever goes away). A **clean** worktree — no uncommitted or untracked changes — is removed and its slot is freed immediately. A **dirty** worktree, or one whose status couldn't be checked, is left in place instead of discarding the work, and you're notified where it's sitting; the slot stays claimed (subsequent fires still skip that issue) until you resolve the worktree's contents and run `worktree reclaim` yourself. Until the worktree is actually removed — by the close, or by a later reclaim — it keeps "claiming" its issue.
+Dispatched tabs stay open until you close them, so you stay in control of review, further iteration, or discarding the work. **Closing an issue's tab tries to remove its worktree** with `git worktree remove`. The branch and the clone stay: only the per-issue worktree ever goes away.
 
-> **Requirements & caveats**
->
-> - The **GitHub CLI (`gh`) must be installed and authenticated** — all GitHub access (issue enumeration, the PR idempotency check, and the initial clone) goes through it.
-> - **The `gh` token needs write access to issues and labels** (`repo` scope, or the finer-grained `issues:write` equivalent), not just read — PRD #421's claim label/comment and, when `triage` is on, the label vocabulary are both writes. A read-only token still dispatches issues correctly, but every claim attempt fails: the dispatch is reported as a success (the worktree was created and the agent spawned), and a separate notification reports that the label/comment could not be written. Without a write-capable token, two decks pointed at the same repo can dispatch the same issue repeatedly, since neither the worktree signal (machine-local) nor the label signal (never written) stops the second one.
-> - **GitHub only, for now.** Issue dispatch is built on the GitHub CLI, so other forges (GitLab, Gitea, Bitbucket, …) aren't supported yet. If you'd like dispatch for another provider, please [open an issue](https://github.com/vfarcic/dot-agent-deck/issues) — it helps us gauge demand.
-> - Like every scheduled task, this runs in the **daemon**: fires that come due while the daemon is down are **not** replayed (see [Daemon must be running](#daemon-must-be-running)).
-> - **Detaching vs. stopping.** *Detaching* (closing the deck/TUI window) leaves the dispatched agents and their tabs **running in the daemon** — reconnect and they're still there. Only **stopping the daemon** (`daemon stop`, a restart, an upgrade, or a crash) terminates them. After a stop, the per-issue worktrees **remain on disk** (so they keep claiming their issues and the scheduler won't re-dispatch them), but the tabs themselves are **not** auto-restored on the next launch. Run `git worktree remove` (or reopen and close the tab) to release a slot manually.
+A **clean** worktree, with no uncommitted or untracked changes, is removed and its slot is freed at once, so the issue becomes eligible again on the next run unless it has an open pull request. A **dirty** worktree, or one whose status could not be checked, is left in place instead of discarding the work, and the status line tells you where it is sitting. Its issue stays skipped, because the worktree still claims it, until you deal with its contents and remove it yourself, for example with `git -C <clone> worktree remove .worktrees/issue-<n>` or `worktree reclaim`. Nothing forces a removal: a close never discards uncommitted changes.
+
+After the daemon restarts, closing such a tab no longer removes the worktree. Remove it yourself the same way, or that issue stays skipped.
+
+An issue that is still open after its pull request merged or closed has no open pull request any more, so once its worktree is gone a later run dispatches it again on the existing branch. Close the issue (or remove the label your schedule's `label` filter selects) to stop that.
+
+## Keep schedules running
+
+- **Closing the TUI or the desktop app does not stop schedules**, and the daemon keeps running while at least one enabled schedule exists.
+- **Nothing runs while the daemon is stopped.** A run whose time passed while the daemon was stopped, or while the machine was asleep for more than a minute, is not made up later.
+- **A reboot or a crash stops schedules until something starts the daemon again.** For schedules that must run without you opening the deck, run the daemon as a service with `dot-agent-deck daemon install`; it then starts at boot or login and after a crash. See [Run the Daemon as a Service](daemon-service.md).
+- **Stopping the daemon stops the agents it runs**, including those schedules started. `dot-agent-deck daemon stop` may refuse while agents are running unless you pass `--force`. After a restart, the next run of each schedule opens a new tab.
+- **A run that comes due while the daemon is restarting** (for example during an upgrade) is not reported as failed. If the restart is called off, the run goes ahead; if it happens, the run is skipped and the schedule's next run happens on the new daemon. An issue-dispatch run leaves the issues it had not reached for that next run.
+- **Your schedules are kept.** A daemon loads the schedules file when it starts. The `schedule` subcommands do not start a daemon; start the TUI (`dot-agent-deck`), or run `dot-agent-deck daemon serve` to run one in the foreground.
+- **Time zone.** Cron times use the daemon's local time zone; there is no per-schedule time zone. On a daylight-saving change, a run inside the skipped hour does not happen and a run inside the repeated hour happens twice.
+- **One run at a time per schedule.** If a schedule comes due while its previous run is still starting its agent or waiting to deliver the prompt, the new run is skipped, and `run-now` prints `skipped <name>: previous run still active`.
+
+## When a schedule does not run
+
+### Where schedule errors are reported
+
+Schedule problems are not shown in the TUI or the desktop app. The daemon writes one line per problem, each starting with `[scheduler]`, to its output. For a daemon the deck started in the background, that output is appended to `daemon.log` in the state directory: `$XDG_STATE_HOME/dot-agent-deck/daemon.log`, or `~/.local/state/dot-agent-deck/daemon.log` when `XDG_STATE_HOME` is unset (on Windows, `%LOCALAPPDATA%\dot-agent-deck\daemon.log`). `DOT_AGENT_DECK_STATE_DIR` moves it. For a daemon started with `dot-agent-deck daemon serve`, the lines go to that terminal.
+
+```bash
+grep '\[scheduler\]' ~/.local/state/dot-agent-deck/daemon.log | tail -20
+```
+
+For more detail, see [Troubleshooting](troubleshooting.md#enabling-debug-logs).
+
+### Symptoms
+
+| Symptom | Cause | What to do |
+|---|---|---|
+| `schedule add` fails with `invalid cron expression: …` | The cron expression does not parse. | Fix it using [Cron syntax](#cron-syntax). |
+| `schedule add` fails with `--command is required: …` | A plain schedule has no `--command`. | Pass `--command`. |
+| `schedule add` fails with `a schedule named "<name>" already exists; …` | Names are unique. | Use `schedule update`, or another name. |
+| `schedule reload` does not list the schedule | It is disabled, or the daemon rejected the entry (missing `command`, bad `shape`, bad `repo`, `shape` together with `issue_dispatch`, invalid cron). | Run `schedule enable`, or read the `[scheduler] config error …` line in the [daemon log](#where-schedule-errors-are-reported) and fix the entry. |
+| `schedule` commands print `warning: skipped malformed entry…` | An entry in the file does not parse or is invalid. | Fix it by hand. **A command that changes the file (`add`, `update`, `remove`, `enable`, `disable`) rewrites it without the malformed entry**, so fix the entry first. |
+| `schedule run-now` or `reload` fails with a connection error | No daemon is running (or the CLI and the daemon use different sockets). | Start the TUI or `dot-agent-deck daemon serve`; check with `dot-agent-deck daemon status`. |
+| A schedule runs on the wrong days | Numeric days of the week count from `1` = Sunday, not `0` = Sunday. | Use day names (`MON-FRI`); see [Cron syntax](#cron-syntax). |
+| A run opened the whole team instead of one agent | The working directory defines `[[orchestrations]]` and the schedule has no `shape`. | `schedule update --name <name> --shape single`. |
+| A run opened one agent instead of the team | The directory's `.dot-agent-deck.toml` is missing, has no role-bearing orchestration, or does not parse (without a `shape`, a file that does not parse counts as no file). | Run `dot-agent-deck validate` in that directory, or set `--shape orchestration` to get an error instead of a single agent. |
+| Nothing opened, and the log has `[scheduler] task "<name>": spawn failed: shape …` | The `shape` could not be resolved in that directory. | The line names the orchestrations that exist; fix the `shape` or the directory's config. |
+| The log has `could not create working_dir` | The working directory cannot be created. | Fix the path or its permissions. |
+| A changed `working_dir` or `command` is ignored | The run reused the tab the previous run opened. | Close that tab; see [Manage schedules](#manage-schedules). |
+| The log has `claim failed for issue #<n>` | One step of the claim did not work. The agent was still dispatched. Possible causes: the account `gh` is signed in with cannot write to the repository's issues or labels, a GitHub call timed out (each claim call is given 30 seconds, and all the claims of one run two minutes together), or a network or GitHub server error. | Read what the line says after `label agent-deck/claimed:` and after `claim record:` before changing anything: an `HTTP 403` or `not accessible` points at permissions. The account (`gh auth status` shows which) needs to be able to add labels and comments to the repository's issues; if the line also says creating the label failed, have someone with write access create `agent-deck/claimed` once, or sign `gh` in with an account that has write access. `timed out`, `claim time budget` or a server error is usually temporary, but the deck does not come back to claim the issue later, so add the label yourself if you want it. Or leave it: the dispatch works without the claim. See [Claims on GitHub](#claims-on-github). |
+| An issue-dispatch run started nothing | The listed issues were all claimed, `gh` failed, or the clone's `origin` does not match `repo`. | Read the `[scheduler] task "<name>": …` lines: `skipping already-claimed issue` (the end of the line says why: its worktree exists, an open pull request targets its branch, or another schedule's claim), `repo … dispatch error`, `issue #<n> … failed`. |
+| An issue is skipped with `claimed by schedule "<other>" on machine h1-… (GitHub account <login>)` | `claim_gating` is on and another schedule, or the same schedule on another machine, claimed the issue within `claim_ttl_hours`, signed in as an account that is the repository's owner, a member or a collaborator. | Leave it to that schedule, or, if nobody is working on it, remove the `agent-deck/claimed` label from the issue; the next run that considers it dispatches it. See [Skip issues that others have claimed](#skip-issues-that-others-have-claimed). |
+| The log has `warning: schedule "<name>": claim_gating is OFF` | `claim_ttl_hours` is shorter than twice the longest gap between the schedule's runs plus one hour. The schedule loads, runs and writes claims, but skips nothing for other schedules' claims. | Raise `claim_ttl_hours` to the value the line names, or run the schedule more often, then `dot-agent-deck schedule reload`. |
+| The log has `dispatched issue #<n> … without checking its claims` | `claim_gating` is on, but the issue's claims could not be read from GitHub (for example a timeout, the run's two-minute GitHub time limit being used up, or the account's GitHub API rate limit being used up). The issue was dispatched, possibly while someone else holds it. | Read the reason at the end of the line. If another schedule had claimed the issue, close one of the two tabs. |
 
 ## Worked examples
 
 ### A daily single-agent digest
 
 ```toml
-# ~/.config/dot-agent-deck/schedules.toml
-
 [[scheduled_tasks]]
 name = "morning-digest"
-cron = "0 9 * * MON-FRI"          # 09:00 on weekdays, local time
+cron = "0 9 * * MON-FRI"          # 09:00 Monday to Friday, daemon local time
 working_dir = "~/scheduled/morning-digest"
-command = "claude"                 # required — the single-agent card's command (claude, opencode, pi, codex, or devin)
+command = "claude"
 prompt = """
-Generate a brief: Barcelona weather forecast for today, plus GitHub issues
-opened in the last 24h across vfarcic/dot-ai and vfarcic/dot-agent-deck.
-Notify when done.
+Summarize the GitHub issues opened in the last 24 hours
+in vfarcic/dot-ai and vfarcic/dot-agent-deck.
 """
-new_tab_per_fire = false           # reuse one tab (default)
+new_tab_per_fire = false
 enabled = true
 ```
 
-`~/scheduled/morning-digest` has no `.dot-agent-deck.toml`, so the fire opens a single `claude` card there and delivers the prompt.
+`~/scheduled/morning-digest` has no `.dot-agent-deck.toml`, so each run uses one `claude` agent, reusing its tab.
 
-### A scheduled task that targets an orchestration
-
-If the target directory defines an orchestration, the fire opens an orchestration tab and delivers the prompt to the `orchestrator` role. The schedule's `command` is **still required** (every schedule needs one to load) but is **ignored at fire** — the orchestration's role commands win.
+### A schedule that opens an orchestration
 
 `~/work/release-audit/.dot-agent-deck.toml`:
 
@@ -290,80 +368,143 @@ name = "reviewer"
 command = "claude"
 ```
 
-`~/.config/dot-agent-deck/schedules.toml`:
+The schedule:
 
 ```toml
 [[scheduled_tasks]]
 name = "weekly-release-audit"
 cron = "0 8 * * MON"               # 08:00 every Monday
 working_dir = "~/work/release-audit"
-command = "claude"                 # required to load; ignored at fire (the orchestration's role commands win)
-prompt = """
-Audit everything merged into main since last Monday: changelog accuracy,
-breaking changes, and follow-up issues to open. Delegate the per-area review.
-"""
+command = "claude"                 # required, but not used: the roles' commands are
+prompt = "Audit everything merged into main since last Monday and delegate the per-area review."
+shape = "orchestration:release-audit"
+```
+
+The `shape` is optional here; setting it makes a missing orchestration an error instead of a single agent.
+
+### An issue-dispatch schedule
+
+```toml
+[[scheduled_tasks]]
+name = "Issues vfarcic/dot-ai"
+cron = "0 9 * * MON-FRI"
+working_dir = "~/dispatch"
+prompt = "Work on issue {{issue_number}}"
 enabled = true
+
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"
+max_per_run = 3
+label = "agent-eligible"
 ```
 
 ## Reference
 
-You do not need this section to create or manage a schedule — the deck and its authoring agent cover that, and the agent writes this file for you. It is here so you can **read back** what it wrote, **know the field names** well enough to ask for what you want, and **hand-edit** when you would rather.
+### The schedules file
 
-### The global config file
+One file per user holds every schedule on a machine:
 
-You rarely need to touch this directly — the doors above write it for you — but here is the on-disk format and every field, for hand-editing and debugging.
+| Platform | Path |
+|---|---|
+| Linux, macOS | `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml`, or `~/.config/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is unset, empty or not an absolute path |
+| Windows | `%APPDATA%\dot-agent-deck\schedules.toml` |
 
-Schedule **definitions** live in a single global, per-user file:
+`DOT_AGENT_DECK_SCHEDULES` replaces the whole path. The CLI and the daemon each read it from their own environment, so set it for both or for neither. A missing file means no schedules. The deck writes the file with owner-only permissions (`0600` on Unix), because prompts may contain secrets.
 
-```
-~/.config/dot-agent-deck/schedules.toml
-```
+You can edit the file by hand. A running daemon does not notice the edit until you run `dot-agent-deck schedule reload` or it restarts. When a `schedule` command or the TUI's Schedules manager later changes the file, it rewrites the whole file: comments and formatting are not kept, and every `working_dir` is stored with `~` and `$VAR` already expanded.
 
-(honoring `$XDG_CONFIG_HOME` when set; override the path with the `DOT_AGENT_DECK_SCHEDULES` environment variable). It is **global** — not the per-project `.dot-agent-deck.toml` — because the daemon is global; which schedules are active must not depend on which directory you last launched the deck from.
+The file contains an array of `[[scheduled_tasks]]` tables. An entry that does not parse or is invalid is skipped and reported; the other entries still load. If two entries share a name, only one of them runs.
 
-Each task is a `[[scheduled_tasks]]` block:
+### `[[scheduled_tasks]]` keys
 
-```toml
-[[scheduled_tasks]]
-name = "morning-digest"
-cron = "0 9 * * MON-FRI"
-working_dir = "~/scheduled/morning-digest"
-command = "claude"
-prompt = """
-Generate a brief: Barcelona weather forecast for today, plus the list of
-GitHub issues opened in the last 24h across vfarcic/dot-ai and
-vfarcic/dot-agent-deck. Notify when done.
-"""
-# shape = "single"        # optional: force ONE agent even where this dir
-                          # defines [[orchestrations]]. Omit to derive the
-                          # shape from that dir's config (the default).
-new_tab_per_fire = false
-enabled = true
-```
+| Key | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `name` | string | yes | — | Unique name. `schedule` commands select by it, and it identifies the tab a run reuses. Cannot be renamed. |
+| `cron` | string | yes | — | When to run; see [Cron syntax](#cron-syntax). |
+| `working_dir` | string | yes | — | Where the run opens. `~`, `$VAR` and `${VAR}` are expanded (an undefined variable becomes empty), and a relative path is taken relative to your home directory. Created when a run needs it. For issue dispatch, the directory the repository is cloned into. |
+| `command` | string | yes, except for issue dispatch | — | The command a single-agent run starts, for example `claude --model opus`. Must be non-blank. Not used when the run opens an orchestration. For issue dispatch, optional: used for an issue whose clone has no orchestration, instead of `default_command`. |
+| `prompt` | string | yes | — | Sent to the agent, or to the orchestrator. For issue dispatch, `{{issue_number}}` is replaced with each issue's number. |
+| `shape` | string | no | unset | `single`, `orchestration` or `orchestration:<name>`; see [Choose what a run opens](#choose-what-a-run-opens). Any other value, or `orchestration:` with an empty name, makes the entry invalid. Not allowed together with `issue_dispatch`. |
+| `new_tab_per_fire` | boolean | no | `false` | `false` reuses the previous run's tab; `true` opens a new one each run. |
+| `enabled` | boolean | no | `true` | `false` keeps the entry but does not run it. |
 
-### Field reference
+### `[scheduled_tasks.issue_dispatch]` keys
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `name` | string | yes | Unique id. Also the key that ties a task to its reused tab — see [Tab reuse](#tab-reuse). Renaming is forbidden (it would orphan an open reused tab); treat a rename as remove + add. |
-| `cron` | string | yes | A **5-field POSIX** cron expression (`min hour day-of-month month day-of-week`), e.g. `0 9 * * MON-FRI`. Evaluated in **local time**. 6/7-field forms (with a seconds field) are also accepted. |
-| `working_dir` | string | yes | Directory the fire spawns into. `~` and `$VAR` / `${VAR}` are expanded at load time; a relative path resolves against `$HOME` (never the authoring agent's cwd). Created with `mkdir -p` if missing. |
-| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude`, `opencode`, `pi`, `codex`, or `devin`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** whenever the fire resolves to an orchestration — which is the case when the target dir defines an `[[orchestrations]]` block and the task does not set `shape` (the orchestration's role commands win). Set `shape = "single"` to make `command` take effect in such a directory. |
-| `prompt` | string | yes | The prompt delivered into the spawned agent (or the orchestrator role). |
-| `shape` | string | no (default: derived) | Forces the fire's **spawn shape** instead of deriving it from `working_dir`'s config. `"single"` opens **one** agent card running `command`, *even where that directory defines `[[orchestrations]]`*; `"orchestration"` opens that directory's default orchestration; `"orchestration:<name>"` opens the one with that name. **Omit it** and the shape is derived exactly as before. Any other value is a **load error** naming the task (not a surprise on the next fire). Cannot be combined with `issue_dispatch` — that task type resolves a shape per cloned repo — and the combination is rejected rather than ignored. |
-| `new_tab_per_fire` | bool | no (default `false`) | `false` reuses one tab per task; `true` opens a fresh tab every fire. See [Tab reuse](#tab-reuse). |
-| `enabled` | bool | no (default `true`) | `false` keeps the definition but stops it firing. |
+The table's presence makes the entry an issue-dispatch schedule. It must follow the entry's other keys.
 
-> **Local time & daylight saving**
->
-> Cron is evaluated in the host's **local time** — there is no timezone field. At a daylight-saving transition this means a fire may be **skipped** (the spring-forward hour never occurs) or **run twice** (the fall-back hour repeats). This is an accepted tradeoff of local-time scheduling; if you need exactness across a DST boundary, avoid scheduling inside the transition hour.
+| Key | Type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `repo` | string | yes | — | `owner/name`. Each part is non-empty and contains only letters, digits, `.`, `_` and `-`; it must not start with `-`. |
+| `max_per_run` | integer | no | `3` | How many open issues a run lists and considers. At least `1`. |
+| `label` | string | no | unset | Only issues with this label (`gh issue list --label`). Must not be empty or start with `-`. |
+| `query` | string | no | unset | A GitHub search query passed to `gh issue list --search`, for example `no:assignee`. Must not be empty or start with `-`. |
+| `claim_gating` | boolean | no | `false` | `true` skips issues that another schedule or machine has a live claim on; see [Skip issues that others have claimed](#skip-issues-that-others-have-claimed). Claims are written either way. Set in the file only: `schedule add` has no flag for it. |
+| `claim_ttl_hours` | integer | no | `168` | How long after its last update a claim stays live. From `1` to `2160` (90 days), and at least twice the longest gap between the schedule's runs plus one hour for `claim_gating` to take effect. Set in the file only. |
+| `triage` | boolean | no | `false` | `true` appends a triage instruction to each dispatched issue's prompt and ensures the triage labels exist; see [Opt-in triage](#opt-in-triage). `schedule add --triage` sets it. |
+| `repo_allowlist` | array of strings | no | unset | When set, `repo` must be in the list or the fire does no work at all; see [Repo allowlist](#repo-allowlist). Set in the file only. |
+| `dry_run` | boolean | no | `false` | `true` makes a fire stop before creating any worktree or writing anything to GitHub; see [Dry run](#dry-run). Set in the file only. |
 
-### Hand-editing the file
+### Cron syntax
 
-The TOML is human-readable; edit `~/.config/dot-agent-deck/schedules.toml` directly (see [the global config file](#the-global-config-file) above for the format). A running daemon will not notice on its own — **the deck has no "re-read the file" action** — so a hand-edit takes effect either on the next daemon start, or immediately if you run:
+A `cron` value has 5, 6 or 7 space-separated fields. The 5-field form is the usual one; the deck adds a seconds field of `0` in front of it.
 
-```bash
-dot-agent-deck schedule reload
-```
+| Form | Fields |
+|---|---|
+| 5 fields | `minute hour day-of-month month day-of-week` |
+| 6 fields | `second minute hour day-of-month month day-of-week` |
+| 7 fields | `second minute hour day-of-month month day-of-week year` |
 
-That is the only reason a command appears in this section. Editing through the deck needs none, because the agent's write triggers the reload for you.
+| Field | Values |
+|---|---|
+| second, minute | `0`–`59` |
+| hour | `0`–`23` |
+| day-of-month | `1`–`31` |
+| month | `1`–`12` or `JAN`–`DEC` |
+| day-of-week | `1`–`7` where **`1` is Sunday** and `7` is Saturday, or `SUN`–`SAT` |
+| year | a year, for example `2027` |
+
+Each field accepts `*` (any), a value, a range `a-b`, a list `a,b,c`, and a step `*/n` or `a-b/n` or `a/n`. Day-of-month and day-of-week also accept `?`, meaning any. Names are case-insensitive, and ranges of names work (`MON-FRI`, `JAN-MAR`).
+
+Differences from classic Unix cron that matter when you write an expression:
+
+- **Day-of-week numbers start at 1 for Sunday.** `0` is rejected, and `1-5` means Sunday to Thursday. Prefer names: `MON-FRI`.
+- **Day-of-month and day-of-week must both match** when both are restricted. `0 9 1 * MON` runs at 09:00 on the 1st of the month only when that day is a Monday, not on every Monday and every 1st.
+- `L`, `W` and `#` are not supported.
+
+The shorthands `@yearly`, `@monthly`, `@weekly`, `@daily` and `@hourly` are accepted. `@weekly` runs at 00:00 on Sunday.
+
+| Expression | Runs |
+|---|---|
+| `0 9 * * MON-FRI` | 09:00, Monday to Friday |
+| `30 7 * * *` | 07:30 every day |
+| `0 */2 * * *` | every two hours, on the hour |
+| `0 8 * * MON` | 08:00 every Monday |
+| `0 0 1 * *` | midnight on the 1st of each month |
+| `0 18 * * SAT,SUN` | 18:00 on Saturday and Sunday |
+
+`dot-agent-deck schedule list` prints each schedule's next run time, which is the quickest way to check an expression after adding it.
+
+### `dot-agent-deck schedule` subcommands
+
+Every subcommand that changes the file (`add`, `update`, `remove`, `enable`, `disable`) validates its input, writes the file atomically, and then asks the running daemon to reload. Errors are printed to stderr with a non-zero exit status.
+
+| Subcommand | Flags | Notes |
+|---|---|---|
+| `add` | `--name <NAME>` `--cron <CRON>` `--working-dir <DIR>` `--prompt <TEXT>` (all required); `--command <CMD>` (required unless `--repo`); `--new-tab-per-fire <true\|false>` (default `false`); `--enabled <true\|false>` (default `true`); `--shape <SHAPE>`; `--repo <OWNER/NAME>`; `--max-per-run <N>` (default `3`, with `--repo`); `--label <LABEL>`; `--query <QUERY>`; `--triage` | `--repo` makes an issue-dispatch schedule. `--max-per-run`, `--label`, `--query` and `--triage` only take effect with `--repo`; `--triage` is a bare flag. `--shape` and `--repo` cannot be combined. |
+| `update` | `--name <NAME>` (required); `--cron`, `--working-dir`, `--command`, `--prompt`, `--new-tab-per-fire <true\|false>`, `--enabled <true\|false>`, `--shape <SHAPE>` | Omitted flags leave the value unchanged. `--shape ""` clears the shape. No flag renames a schedule or changes issue-dispatch settings. Fails with `no schedule named "<name>"` for an unknown name. |
+| `remove` | `--name <NAME>` | Does not close tabs the schedule opened. |
+| `enable` | `--name <NAME>` | |
+| `disable` | `--name <NAME>` | |
+| `list` | — | Reads the file only; prints `No schedules.` when empty. |
+| `run-now` | `--name <NAME>` | Needs a running daemon and an enabled schedule. Prints `ran <name>`, or `skipped <name>: previous run still active` (exit 0 for both). |
+| `reload` | — | Needs a running daemon. Prints `reloaded; registered: <names>`. |
+
+`--new-tab-per-fire` and `--enabled` take a value (`--enabled false`), not a bare flag.
+
+### Environment variables
+
+| Variable | Read by | Effect |
+|---|---|---|
+| `DOT_AGENT_DECK_SCHEDULES` | CLI, TUI, daemon | Path of the schedules file. |
+| `XDG_CONFIG_HOME` | CLI, TUI, daemon (Linux, macOS) | Base directory of the default schedules file path. An empty or relative value is ignored. |
+| `DOT_AGENT_DECK_STATE_DIR` | daemon | Where `daemon.log` goes. |

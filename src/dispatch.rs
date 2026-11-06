@@ -5,9 +5,9 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
     IsolatedCloneOutcome, LegacyFallbackEligibility, RemovalPolicy, RemoveOutcome,
-    WorktreeCreation, WorktreeRegistry, attempt_isolated_clone_cleanup, create_worktree,
-    provision_isolated_clone_sync_resolved, record_worktree, remove_worktree, run_capture_args,
-    run_status, worktree_still_in_use,
+    WorktreeCreation, WorktreeRegistry, attempt_isolated_clone_cleanup, create_worktree_from,
+    provision_isolated_clone_sync_resolved, record_worktree, remove_worktree, run_git_capture,
+    run_git_status, worktree_still_in_use,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -161,7 +161,7 @@ pub fn list_targets_response(cwd: Option<&Path>) -> crate::event::ListTargetsRes
 ///
 /// `SpawnRequest.command: None` means `$SHELL` in the spawn path, so passing None
 /// here starts a **shell**, not an agent: the worktree appears, a pane appears,
-/// and the `--task` prompt is typed into a bash prompt. Before the shape selector
+/// and the `--task` prompt is posted to the inbox of a shell that never reads it. Before the shape selector
 /// this repo never took the single-agent branch (role commands win for an
 /// orchestration), which is why it went unnoticed — but any repo with no
 /// `[[orchestrations]]` already hit it.
@@ -182,7 +182,189 @@ pub fn resolve_single_agent_command(configured: Option<&str>) -> String {
     }
 }
 
-fn sanitize_name(name: &str) -> String {
+/// Issue #1602: how the pane that asked for a dispatch was configured to run,
+/// read from the daemon's own record of that pane
+/// ([`AgentPtyRegistry::configured_launch_of`]).
+pub type DispatcherLaunch = crate::agent_pty::ConfiguredLaunch;
+
+/// What a single-agent unit is started with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleUnitLaunch {
+    pub command: String,
+    /// `Some` when `command` is the dispatcher's own, carrying how the
+    /// dispatcher ran it; `None` for the fallbacks, which the spawn starts the
+    /// way it always has.
+    pub inherited: Option<crate::spawn::InheritedLaunch>,
+}
+
+/// Issue #1602: the command a single-agent unit runs, and as which agent.
+///
+/// Precedence, first match wins:
+///
+/// 1. an explicit per-project single-unit command — not offered today; when it
+///    is, it goes ABOVE the dispatcher's command, so a project can override
+///    what every dispatcher in it would otherwise pass on;
+/// 2. the dispatching pane's configured command, with its agent type and its
+///    shell, so a dispatcher started as `devbox run agent` gets units started
+///    the same way (inside devbox, as Claude Code) rather than as bare
+///    `claude` under the daemon's environment;
+/// 3. the deck's `default_command`;
+/// 4. `claude`.
+///
+/// `dispatcher` is `None` for a dispatch no pane asked for (the scheduler,
+/// unit tests) and for a pane started with no command, which skips step 2. So
+/// does a dispatcher whose command only opens an interactive shell
+/// ([`opens_an_interactive_shell`]): its agent was started by hand inside that
+/// shell, so the command would give the unit a bare shell, into which the
+/// task would then be typed and run as shell input. Steps 3 and 4 carry
+/// nothing: the spawn derives the type from the command, as it always did.
+pub fn resolve_single_unit_launch(
+    dispatcher: Option<&DispatcherLaunch>,
+    default_command: Option<&str>,
+) -> SingleUnitLaunch {
+    if let Some(d) = dispatcher {
+        let command = d.command.trim();
+        if !command.is_empty() && !opens_an_interactive_shell(command) {
+            return SingleUnitLaunch {
+                command: command.to_string(),
+                inherited: Some(crate::spawn::InheritedLaunch {
+                    agent_type: d.agent_type.clone(),
+                    shell: d.shell.clone(),
+                }),
+            };
+        }
+    }
+    SingleUnitLaunch {
+        command: resolve_single_agent_command(default_command),
+        inherited: None,
+    }
+}
+
+/// The command's program and its arguments, past any leading `env` and
+/// `NAME=value` assignments. Whitespace-split: enough to name the program and
+/// spot a flag, which is all [`opens_an_interactive_shell`] asks.
+fn program_and_args(command: &str) -> (Option<&str>, Vec<&str>) {
+    let mut tokens = command.split_whitespace().peekable();
+    while let Some(token) = tokens.peek() {
+        let assignment = token
+            .split_once('=')
+            .is_some_and(|(name, _)| !name.is_empty() && !name.contains('/'));
+        if *token == "env" || assignment {
+            tokens.next();
+        } else {
+            break;
+        }
+    }
+    let program = tokens.next();
+    (program, tokens.collect())
+}
+
+fn basename(program: &str) -> &str {
+    program.rsplit(['/', '\\']).next().unwrap_or(program)
+}
+
+/// Issue #1602 (PR #1603 review): whether `command` only opens an interactive
+/// shell — a shell with no script or `-c` to run (`bash`, `zsh -l`), or a
+/// project-environment shell (`devbox shell`, `nix develop`, `nix-shell`)
+/// without a command to run in it. Such a dispatcher's agent was started by
+/// hand inside the shell, so its command must not be handed to a unit.
+///
+/// A list, so it recognises the shells named in it and nothing else: a
+/// launcher it does not know (`tmux`, `ssh host`) is passed on as given.
+pub fn opens_an_interactive_shell(command: &str) -> bool {
+    const SHELLS: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "dash",
+        "ksh",
+        "mksh",
+        "tcsh",
+        "csh",
+        "nu",
+        "elvish",
+        "xonsh",
+        "pwsh",
+        "pwsh.exe",
+        "powershell",
+        "powershell.exe",
+        "cmd",
+        "cmd.exe",
+    ];
+    let (Some(program), args) = program_and_args(command) else {
+        return false;
+    };
+    let name = basename(program);
+    if SHELLS.contains(&name) {
+        // `bash script.sh` runs a script and `bash -lc '…'` a command; only a
+        // shell given nothing but options is interactive. `cmd` takes `/c`.
+        let runs_something = if name.starts_with("cmd") {
+            args.iter()
+                .any(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+        } else {
+            // Options that take a value (`--rcfile <file>`, `-o vi`) consume
+            // the next word, which is therefore not a script (Qodo, PR #1603).
+            const TAKES_A_VALUE: &[&str] = &["-o", "+o", "-O", "+O", "--rcfile", "--init-file"];
+            let mut runs = false;
+            let mut skip_value = false;
+            for arg in &args {
+                if skip_value {
+                    skip_value = false;
+                    continue;
+                }
+                let is_option = arg.starts_with('-') || arg.starts_with('+');
+                if !is_option
+                    || arg.eq_ignore_ascii_case("-command")
+                    || arg.eq_ignore_ascii_case("-file")
+                    || arg.strip_prefix('-').is_some_and(|rest| {
+                        rest.chars().all(|c| c.is_ascii_lowercase()) && rest.contains('c')
+                    })
+                {
+                    runs = true;
+                    break;
+                }
+                skip_value = TAKES_A_VALUE.contains(arg);
+            }
+            runs
+        };
+        return !runs_something;
+    }
+    let runs_flag = |flags: &[&str]| args.iter().any(|arg| flags.contains(arg));
+    match (name, args.first().copied()) {
+        ("devbox", Some("shell")) => true,
+        ("nix", Some("develop")) | ("nix", Some("shell")) => !runs_flag(&["-c", "--command"]),
+        ("nix-shell", _) => !runs_flag(&["--run", "--command"]),
+        _ => false,
+    }
+}
+
+/// Issue #1602 (PR #1603 review): whether `command` names anything by a path
+/// relative to the directory it starts in — its program (`./agent.sh`), a
+/// script it hands a shell or launcher (`sh ./agent.sh`, `devbox run ./agent`),
+/// or an option or variable value (`--settings=./x.json`, `CONF=../x`). Such a
+/// command only resolves in a unit's worktree when the dispatcher was started
+/// at the repository root, which is where the unit starts.
+///
+/// Deliberately broad: a word that merely looks like a relative path
+/// (`--model provider/name`) only makes a dispatcher started below its
+/// repository root hand its unit the fallback command instead of its own.
+fn names_a_relative_path(command: &str) -> bool {
+    command.split_whitespace().any(|word| {
+        let value = word.split_once('=').map_or(word, |(_, value)| value);
+        let path = value.trim_matches(['\'', '"']);
+        (path.contains('/') || path.contains('\\'))
+            && !path.contains("://")
+            && !std::path::Path::new(path).is_absolute()
+            // Rooted without a drive (`/opt/agent` on Windows) is not relative to
+            // the directory it starts in either.
+            && !path.starts_with(['/', '\\'])
+            && !path.starts_with('~')
+            && !path.starts_with('$')
+    })
+}
+
+pub(crate) fn sanitize_name(name: &str) -> String {
     let slug_chars: String = name
         .replace("..", "_")
         .replace('\0', "")
@@ -235,47 +417,108 @@ fn derive_dispatch_paths(working_dir: &Path, name: &str) -> DispatchPaths {
     }
 }
 
-/// Human-readable description of the commit a dispatch is about to cut its
-/// worktree from — `"main at c701932"`, or `"detached HEAD at c701932"`.
+/// The commit a dispatch cuts its worktree from, read once from the caller's
+/// checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchBase {
+    /// The full sha `HEAD` resolved to. [`create_dispatch_worktree`] passes it
+    /// to `git worktree add` as the start-point, so this IS the unit's base.
+    sha: String,
+    /// What the success line reports — `"main at c701932"`, or
+    /// `"detached HEAD at c701932"` — naming the same commit as [`Self::sha`].
+    description: String,
+}
+
+/// Read the commit a dispatch is about to cut its worktree from.
 ///
-/// Issue #674: `dispatch` takes no base or branch option. [`create_worktree`]
-/// runs `git worktree add <dir> -b <branch>` with no start-point, which git
-/// resolves to the CALLER's `HEAD`, so the freshness of the caller's checkout is
-/// the only thing deciding where a unit starts — and nothing in the dispatch
-/// output named it. A stale or simply unexpected base (a feature branch the user
+/// Issue #674: `dispatch` takes no base or branch option and cuts every unit
+/// from the CALLER's `HEAD`, so the freshness of the caller's checkout is the
+/// only thing deciding where a unit starts — and nothing in the dispatch output
+/// named it. A stale or simply unexpected base (a feature branch the user
 /// happened to be standing on) was therefore invisible at the one moment the
 /// user is looking: three units cut from a `main` six commits behind
 /// `origin/main` reported exactly the same success line as three cut from a
 /// current one.
 ///
-/// Deliberately best-effort and `Option`: this is a reporting nicety on a path
-/// that has already done the real work, so a probe that fails must drop the
-/// clause rather than fail the dispatch. Read BEFORE the worktree is created,
-/// which is the state `git worktree add` will actually resolve.
-async fn describe_dispatch_base(clone_dir: &Path) -> Option<String> {
+/// Issue #1643: `HEAD` is resolved to a full sha HERE, once, and that sha is
+/// both what the clause reports and what the worktree is cut from (see
+/// [`create_dispatch_worktree`]). Before, git resolved `HEAD` a second time
+/// inside `git worktree add`, so a `HEAD` that moved in between left the reply
+/// naming one commit and the unit starting from another. The branch NAME in the
+/// description is read separately and is a label; the sha is the base.
+///
+/// Deliberately best-effort and `Option`: this is a reporting nicety, so a
+/// probe that fails drops the clause rather than failing the dispatch, and the
+/// worktree is then cut without a start-point, as it always was.
+async fn resolve_dispatch_base(clone_dir: &Path) -> Option<DispatchBase> {
     let clone = clone_dir.to_string_lossy();
-    let head = run_capture_args("git", &["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
+    let sha = run_git_capture(&["-C", &clone, "rev-parse", "--verify", "HEAD^{commit}"])
         .await
         .ok()?;
-    let sha = run_capture_args("git", &["-C", &clone, "rev-parse", "--short", "HEAD"])
+    let sha = sha.trim();
+    // Abbreviated from the sha just read, never from a fresh `HEAD`, so the
+    // short form cannot name a different commit than the full one.
+    let short = run_git_capture(&["-C", &clone, "rev-parse", "--short", sha])
         .await
         .ok()?;
-    let (head, sha) = (head.trim(), sha.trim());
-    if head.is_empty() || sha.is_empty() {
+    let head = run_git_capture(&["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .ok()?;
+    let (head, short) = (head.trim(), short.trim());
+    if sha.is_empty() || short.is_empty() || head.is_empty() {
         return None;
     }
     // `rev-parse --abbrev-ref HEAD` answers the literal string `HEAD` when the
     // checkout is detached, which as a branch name would read as a lie.
-    if head == "HEAD" {
-        return Some(format!("detached HEAD at {sha}"));
-    }
-    Some(format!("{head} at {sha}"))
+    let description = if head == "HEAD" {
+        format!("detached HEAD at {short}")
+    } else {
+        format!("{head} at {short}")
+    };
+    Some(DispatchBase {
+        sha: sha.to_string(),
+        description,
+    })
+}
+
+/// Create a dispatch's worktree from `base` — the commit the success line will
+/// report — rather than from whatever `HEAD` is by the time `git worktree add`
+/// runs (issue #1643). With no base (the probe failed) git resolves `HEAD`
+/// itself, which is what every dispatch did before.
+async fn create_dispatch_worktree(
+    clone_dir: &Path,
+    paths: &DispatchPaths,
+    name: &str,
+    base: Option<&DispatchBase>,
+) -> Result<WorktreeCreation, String> {
+    create_worktree_from(
+        clone_dir,
+        &paths.worktree_dir,
+        &paths.branch,
+        false,
+        Creator::dispatch(name),
+        base.map(|b| b.sha.as_str()),
+    )
+    .await
+}
+
+/// Whether `dir` is the top of its git working tree — where a unit cut from it
+/// starts. A probe that fails answers `false`, which only withholds the
+/// dispatcher's relative command from the unit.
+async fn starts_at_repository_root(dir: &Path) -> bool {
+    let dir = dir.to_string_lossy();
+    run_git_capture(&["-C", &dir, "rev-parse", "--show-prefix"])
+        .await
+        .is_ok_and(|prefix| prefix.trim().is_empty())
 }
 
 pub struct DispatchResult {
     pub worktree_dir: PathBuf,
     pub success: bool,
     pub message: String,
+    /// PRD #1666 part 3, round 5: the unit the dispatch started, when it
+    /// started one and a caller was recorded.
+    pub unit_id: Option<String>,
 }
 
 pub struct DispatchContext {
@@ -402,18 +645,25 @@ fn next_report_nonce() -> String {
 /// interpolated as a literal, so the unit has no filename to invent — see that
 /// function for the class of defect that removes.
 ///
-/// **This whole prompt can be dropped, silently and in full** (PRD #220 Phase 2
-/// review, finding A6). It is multi-line, so
-/// [`crate::pane_input::encode_pane_payload`] wraps it in bracketed paste — and
-/// that encoder REFUSES a multi-line payload containing a literal
-/// `ESC[200~`/`ESC[201~`, because an embedded marker would close the outer paste
-/// early and let the remainder run as live keystrokes. The refusal drops the
-/// entire write with only a log line: not the completion instruction alone, but
-/// the CALLER'S OWN TASK with it, leaving a unit sitting at an empty prompt in a
-/// worktree nobody is watching. The probability of LLM-authored task text carrying
-/// those bytes is near zero and the behaviour is deliberately unchanged; what was
-/// missing was any note that the failure is total rather than partial.
-fn dispatch_prompt(task: &str, target: &crate::spawn::SpawnTarget, report_path: &str) -> String {
+/// The prompt reaches the unit as its first inbox message
+/// ([`crate::spawn::post_seed`], PRD #1666), not as pane input, so the
+/// bracketed-paste refusal that could once drop it whole (PRD #220 Phase 2
+/// review, finding A6) no longer applies to it.
+///
+/// `main_worktree` is `Some` only when the unit's own directory is a LINKED
+/// worktree (issue #550) — which for a dispatch it always is, since `dispatch`
+/// cuts one per unit. It is interpolated as a literal for exactly the reason
+/// `report_path` is: an agent's file-writing tool does not go through a shell,
+/// so naming an environment variable here would have the unit create a
+/// directory called `$THE_VARIABLE`. `None` (an unresolvable repository) omits
+/// the paragraph rather than guessing a path — a unit told the wrong durable
+/// location writes there and nobody notices.
+fn dispatch_prompt(
+    task: &str,
+    target: &crate::spawn::SpawnTarget,
+    report_path: &str,
+    main_worktree: Option<&std::path::Path>,
+) -> String {
     if matches!(target, crate::spawn::SpawnTarget::Orchestration { .. }) {
         return task.to_string();
     }
@@ -445,6 +695,21 @@ fn dispatch_prompt(task: &str, target: &crate::spawn::SpawnTarget, report_path: 
          write it for someone who cannot see this pane: what you did, what the outcome was, \
          and anything they have to act on. Run it exactly once, when you are done."
     ));
+    // Issue #550: the report above travels back over the wire and is deleted, so
+    // it needs nowhere durable. Anything BIGGER than that does — the return edge
+    // carries bounded text, not an artifact — and this directory is a worktree
+    // that goes away. Stated only when we actually resolved the main checkout.
+    if let Some(main_worktree) = main_worktree {
+        prompt.push_str(&format!(
+            "\n\nYou are working in a linked git worktree, which is removed once this work \
+             lands — anything you leave in it goes with it, including the report file above \
+             (that one is fine: its contents travel back to the caller, which is why you \
+             delete it). If you need to leave behind something the report itself cannot \
+             carry — a large artifact, a generated file someone will open later — write it \
+             under the main checkout instead: {}",
+            main_worktree.display()
+        ));
+    }
     prompt
 }
 
@@ -488,8 +753,25 @@ fn isolated_clone_failure_result(
         worktree_dir: worktree_dir.to_path_buf(),
         success: false,
         message,
+        unit_id: None,
     }
 }
+
+/// How the daemon's reply to a dispatch that STARTED something opens — the
+/// message posted to the caller's inbox once the spawn returns. Every refusal
+/// or failure [`handle_dispatch`] reports opens `dispatch:` with anything else.
+///
+/// Issue #530: a constant because callers are taught to branch on it. The CLI's
+/// exit status is the provenance gate's acknowledgement, written before this
+/// handler runs, so this message is the first thing that says whether a unit
+/// exists at all — and `dispatch --help` and the dispatcher seed both quote it.
+/// Tests pin both quotes against this value, so rewording the reply cannot leave
+/// them teaching an opening nothing sends.
+///
+/// It says a unit was spawned, not that its task was taken: the task is posted
+/// to the unit's inbox before this message (a refused post is only logged, see
+/// [`crate::spawn::post_seed`]), and nothing confirms the agent read it.
+pub const SPAWNED_OPENING: &str = "dispatch: spawned isolated";
 
 pub async fn handle_dispatch(
     ctx: &DispatchContext,
@@ -545,6 +827,7 @@ pub async fn handle_dispatch(
                     "dispatch: git-toplevel resolution task panicked: {}",
                     crate::terminal_sanitize::sanitize_for_terminal_display(&join_err.to_string())
                 ),
+                unit_id: None,
             };
         }
     };
@@ -612,7 +895,31 @@ pub async fn handle_dispatch(
     // inside `spawn` meant a typo'd `--orchestration` created a worktree and branch,
     // rolled them back, and reported "failed to spawn agent" for what is a plain
     // validation error.
-    let single_command = resolve_single_agent_command(ctx.default_command.as_deref());
+    // Issue #1602: a single unit runs the way the pane that dispatched it runs.
+    // Read by the agent id the daemon captured for this caller, so a pane that
+    // changed hands since then contributes nothing rather than its successor's
+    // command.
+    let mut dispatcher_launch = ctx
+        .caller
+        .as_ref()
+        .and_then(|caller| ctx.registry.configured_launch_of(&caller.agent_id));
+    // A unit starts at its worktree's root. A dispatcher started below its
+    // repository's root with `./agent.sh` would hand its unit a path that names
+    // nothing there, so such a command is not passed on.
+    if dispatcher_launch
+        .as_ref()
+        .is_some_and(|d| names_a_relative_path(&d.command))
+        && !starts_at_repository_root(&clone_dir).await
+    {
+        tracing::debug!(
+            "dispatch: the caller's command names a relative path and the caller is below the \
+             repository root, so the single unit falls back to the default command"
+        );
+        dispatcher_launch = None;
+    }
+    let single_launch =
+        resolve_single_unit_launch(dispatcher_launch.as_ref(), ctx.default_command.as_deref());
+    let single_command = single_launch.command.clone();
     let caller_config = crate::spawn::load_config_for_dir(&clone_dir);
     // Issue #704: when the caller named no orchestration and the config left the
     // choice to file order, the reply says which one was opened and what else was
@@ -634,20 +941,28 @@ pub async fn handle_dispatch(
         Some(single_command.as_str()),
         shape_override_of(shape).as_ref(),
     ) {
+        // The resolver above already settled the agent a single unit runs; an
+        // orchestration's roles carry their own.
+        Ok(crate::spawn::SpawnTarget::SingleAgent { command, .. }) => {
+            crate::spawn::SpawnTarget::SingleAgent {
+                command,
+                inherited: single_launch.inherited.clone(),
+            }
+        }
         Ok(t) => t,
         Err(e) => {
             return DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: false,
                 message: format!("dispatch: {e}"),
+                unit_id: None,
             };
         }
     };
 
-    // Captured before the worktree exists, so it names the state `git worktree
-    // add` resolves its (absent) start-point against. See
-    // [`describe_dispatch_base`] for why this is reported at all.
-    let base = describe_dispatch_base(&clone_dir).await;
+    // Read once, and the worktree is cut from exactly this sha, so the base the
+    // reply names is the unit's base. See [`resolve_dispatch_base`].
+    let base = resolve_dispatch_base(&clone_dir).await;
 
     // Fork #166: stamp this worktree with the creator identity `dispatch`
     // used, mirroring `issue-dispatch:<task>#<issue>` and
@@ -695,6 +1010,7 @@ pub async fn handle_dispatch(
                      shares {} — {reason}",
                     crate::terminal_sanitize::sanitize_path_for_terminal_display(&clone_dir)
                 ),
+                unit_id: None,
             };
         }
         Err(join_err) => {
@@ -705,6 +1021,7 @@ pub async fn handle_dispatch(
                     "dispatch: live-sibling check task panicked: {}",
                     crate::terminal_sanitize::sanitize_for_terminal_display(&join_err.to_string())
                 ),
+                unit_id: None,
             };
         }
     };
@@ -818,6 +1135,7 @@ pub async fn handle_dispatch(
                             &paths.worktree_dir
                         )
                     ),
+                    unit_id: None,
                 };
             }
             // PRD fork#544 M3: resuming an existing, eligible isolated clone
@@ -835,6 +1153,7 @@ pub async fn handle_dispatch(
                         paths.worktree_dir.display(),
                         reason.describe(),
                     ),
+                    unit_id: None,
                 };
             }
             Ok(Ok(IsolatedCloneOutcome::TimedOut { cleaned_up_by })) => {
@@ -868,6 +1187,7 @@ pub async fn handle_dispatch(
                         "dispatch: failed to provision isolated clone: {}",
                         crate::terminal_sanitize::sanitize_for_terminal_display(&e)
                     ),
+                    unit_id: None,
                 };
             }
             Err(join_err) => {
@@ -880,19 +1200,15 @@ pub async fn handle_dispatch(
                             &join_err.to_string()
                         )
                     ),
+                    unit_id: None,
                 };
             }
         }
     } else {
-        match create_worktree(
-            &clone_dir,
-            &paths.worktree_dir,
-            &paths.branch,
-            false,
-            creator_ident,
-        )
-        .await
-        {
+        // Upstream #1643: the worktree is cut from the sha `base` named, via
+        // `create_worktree_from`; `create_dispatch_worktree` stamps the same fork
+        // #166 creator (`Creator::dispatch(name)`) the isolated-clone arm above uses.
+        match create_dispatch_worktree(&clone_dir, &paths, name, base.as_ref()).await {
             // Issue #164: a marker-write warning is not surfaced on this
             // ad hoc `dispatch` CLI path -- out of scope here, which covers
             // only the TUI's `SpawnPane` creation and the scheduled
@@ -908,6 +1224,7 @@ pub async fn handle_dispatch(
                          Wait for it to finish, or dispatch under a different name.",
                         paths.worktree_dir.display()
                     ),
+                    unit_id: None,
                 };
             }
             // The worktree dir is GONE but its branch survived — `git worktree
@@ -928,6 +1245,7 @@ pub async fn handle_dispatch(
                         name = name,
                         clone = clone_dir.display(),
                     ),
+                    unit_id: None,
                 };
             }
             // Fork #282: the async `create_worktree` now bounds its `git worktree
@@ -947,6 +1265,7 @@ pub async fn handle_dispatch(
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
                     message: format!("dispatch: worktree add timed out — {detail}"),
+                    unit_id: None,
                 };
             }
             Err(e) => {
@@ -957,6 +1276,7 @@ pub async fn handle_dispatch(
                         "dispatch: failed to create worktree: {}",
                         crate::terminal_sanitize::sanitize_for_terminal_display(&e)
                     ),
+                    unit_id: None,
                 };
             }
         }
@@ -1020,6 +1340,7 @@ pub async fn handle_dispatch(
                             &paths.worktree_dir
                         ),
                     ),
+                    unit_id: None,
                 };
             }
             // Fork issue #595 fix round 4 (reviewer N9): a distinct
@@ -1040,6 +1361,7 @@ pub async fn handle_dispatch(
                             &paths.worktree_dir
                         ),
                     ),
+                    unit_id: None,
                 };
             }
             joined
@@ -1051,12 +1373,13 @@ pub async fn handle_dispatch(
         task,
         &resolved_target,
         &dispatch_report_path(name, &next_report_nonce()),
+        crate::worktree_owner::main_worktree_if_linked(&paths.worktree_dir).as_deref(),
     );
 
     let req = SpawnRequest {
         task_name: format!("dispatch-{name}"),
         working_dir: dispatch_working_dir.to_string_lossy().into_owned(),
-        // A real agent command, never `None` — see `resolve_single_agent_command`.
+        // A real agent command, never `None` — see `resolve_single_unit_launch`.
         // Ignored when the dispatch starts an orchestration (role commands win).
         command: Some(single_command),
         prompt,
@@ -1077,111 +1400,134 @@ pub async fn handle_dispatch(
         // spawn-rollback arm below also needs `creator`, as the `remover`
         // identity for its own `remove_worktree` call.
         owner: Some(creator.clone()),
+        seed_reason: Some(crate::dispatch_return::dispatch_reason(name)),
     };
 
     let notifier = StderrNotifier;
 
-    match spawn(
-        req,
-        &ctx.registry,
-        &notifier,
-        Some(&ctx.event_tx),
-        false,
-        ctx.state.as_ref(),
-    )
-    .await
-    {
+    // PRD #1589 D5: a dispatch with a caller is a unit the `close` verb can
+    // later be authorized against, so it is recorded — inside the spawn, before
+    // its task is delivered (see `spawn_dispatched_unit`). A dispatch with no
+    // caller (an internal caller with nobody to report to) records nothing.
+    let spawned = match ctx.caller.as_ref() {
+        Some(caller) => {
+            // Issue #1981: the runs the unit's agents open are named after it
+            // from their start, so one that ends at once still carries it.
+            let naming = crate::telemetry::begin_dispatch(&ctx.registry, name, &paths.worktree_dir);
+            let spawned = crate::spawn::spawn_dispatched_unit(
+                req,
+                &ctx.registry,
+                &notifier,
+                Some(&ctx.event_tx),
+                false,
+                ctx.state.as_ref(),
+                crate::dispatched_units::UnitOrigin {
+                    name: name.to_string(),
+                    worktree: paths.worktree_dir.clone(),
+                    branch: paths.branch.clone(),
+                    clone_dir: clone_dir.clone(),
+                    dispatcher: crate::dispatched_units::Dispatcher {
+                        pane_id: caller.pane_id.clone(),
+                        agent_id: caller.agent_id.clone(),
+                    },
+                },
+                caller.clone(),
+            )
+            .await;
+            if let Ok(handle) = &spawned {
+                crate::telemetry::dispatch_spawned(naming, handle);
+            }
+            spawned
+        }
+        None => {
+            spawn(
+                req,
+                &ctx.registry,
+                &notifier,
+                Some(&ctx.event_tx),
+                false,
+                ctx.state.as_ref(),
+            )
+            .await
+        }
+    };
+    match spawned {
         Ok(handle) => {
-            // PRD #220 M2.0: retain the caller against the unit's TERMINAL pane —
-            // the single agent's pane, or the orchestration's start role — which is
-            // the pane a `work-done --done` will arrive under. Registered here, at
-            // the first moment that pane id exists, rather than by the daemon after
-            // this call returns: every instant between the spawn and the
-            // registration is an instant in which a completion resolves to nothing.
-            if let Some(caller) = ctx.caller.clone() {
-                tracing::debug!(
-                    unit_pane_id = %handle.delivery_pane_id,
-                    unit_agent_id = %handle.delivery_agent_id,
-                    caller_pane_id = %caller.pane_id,
-                    // PRD #220 Phase 2 review (finding A4), missed here and caught
-                    // by PR #1081's review (Greptile finding 3): the unit name is
-                    // producer-supplied and rode into this field raw, where a bare
-                    // LF forges a log line, a CR overwrites the one being written
-                    // and a bidi override reorders whatever renders it.
-                    unit = %crate::config_validation::escape_field_for_log(
-                        &caller.unit_name,
-                        crate::config_validation::MAX_QUOTED_VALUE_CHARS,
-                    ),
-                    "dispatch: retained the caller for this unit's completion report"
-                );
-                // Bound to the unit's AGENT as well as its pane: a pane id is a
-                // recycled handle, and a predecessor's late EOF would otherwise
-                // evict this route out from under the agent that now holds the
-                // pane (PR #1081 review, Greptile finding 1).
-                ctx.registry.register_dispatch_return(
-                    &handle.delivery_pane_id,
-                    &handle.delivery_agent_id,
-                    caller,
-                );
-            }
-            // Report what was ACTUALLY opened, from the spawn's own verdict.
-            // `spawn` → `decide_target` branches on the dispatched worktree's
-            // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
-            // full multi-role orchestration, anything else a single agent (PRD
-            // #220 M1.1). Hardcoding either word makes this message a lie in the
-            // other case — and it is written straight into the caller's pane, so
-            // the dispatching agent repeats it to the user verbatim.
-            //
-            // The base clause is appended rather than interpolated into both arms
-            // so a failed probe degrades to the pre-#674 sentence exactly, instead
-            // of leaving a dangling "cut from ".
-            let opened = match &handle.kind {
-                SpawnKind::Orchestration { name: orch } => format!(
-                    "dispatch: spawned isolated orchestration '{}' for '{}' in {}",
-                    crate::terminal_sanitize::sanitize_for_terminal_display(orch),
-                    crate::terminal_sanitize::sanitize_for_terminal_display(name),
-                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
-                        &paths.worktree_dir
-                    )
-                ),
-                SpawnKind::SingleAgent => format!(
-                    "dispatch: spawned isolated agent for '{}' in {}",
-                    crate::terminal_sanitize::sanitize_for_terminal_display(name),
-                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
-                        &paths.worktree_dir
-                    )
-                ),
-            };
-            let mut message = match &base {
-                Some(base) => format!("{opened}, cut from {base}"),
-                None => opened,
-            };
-            // Only for an orchestration: a `--single` dispatch consulted no
-            // default, so a note about which one it would have picked is
-            // noise the caller then relays to the user as if it mattered.
-            if let (SpawnKind::Orchestration { .. }, Some(note)) = (&handle.kind, &default_note) {
-                message.push_str(&format!("\ndispatch: {note}"));
-            }
-            // PRD fork#325 fix round (reviewer B3 / auditor B1): surface the
-            // origin-fixup warning captured above. This message reaches the
-            // dispatching agent verbatim (`DispatchResult.message` is written
-            // straight into the caller's pane), and that agent is precisely
-            // the one CLAUDE.md rule 1 tells to run `git push origin
-            // HEAD:refs/heads/<branch>` -- so it must not silently push into
-            // the user's own root checkout. Matches `src/ui.rs`'s handling of
-            // the same field.
-            if let Some(error) = &clone_origin_warning {
-                message.push_str(&format!(
-                    " (warning: this clone's `origin` could not be pointed at the real remote \
-                     ({}) — manually run `git remote set-url origin <url>` (or `git remote \
-                     remove origin` if none exists) before pushing from inside it)",
-                    crate::terminal_sanitize::sanitize_for_terminal_display(error)
-                ));
-            }
+            // PRD #220 M2.0 / PRD #1589 D5: the caller was retained for the
+            // unit's completion report inside the spawn, before the task was
+            // delivered — see `crate::spawn::spawn_dispatched_unit`.
             DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: true,
-                message,
+                unit_id: handle.unit_id.clone(),
+                // Report what was ACTUALLY opened, from the spawn's own verdict.
+                // `spawn` → `decide_target` branches on the dispatched worktree's
+                // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
+                // full multi-role orchestration, anything else a single agent (PRD
+                // #220 M1.1). Hardcoding either word makes this message a lie in the
+                // other case — and it is written straight into the caller's pane, so
+                // the dispatching agent repeats it to the user verbatim.
+                //
+                // The base clause is appended rather than interpolated into both
+                // arms so a failed probe degrades to the pre-#674 sentence exactly,
+                // instead of leaving a dangling "cut from ".
+                //
+                // PRD #1589: the branch is named too, so a runner can record the
+                // branch each unit works on as dispatch created it — what
+                // `/issue-queue` intersects with the merged branches before a
+                // `close --all` — instead of reconstructing it from the name.
+                message: {
+                    let opened = match &handle.kind {
+                        // The orchestration name and `name` are producer-supplied and
+                        // this reply is written into the caller's pane, so they go
+                        // through the terminal sanitizer (fork #325 auditor C1).
+                        SpawnKind::Orchestration { name: orch } => format!(
+                            "{SPAWNED_OPENING} orchestration '{}' for '{}' in {} on branch {}",
+                            crate::terminal_sanitize::sanitize_for_terminal_display(orch),
+                            crate::terminal_sanitize::sanitize_for_terminal_display(name),
+                            crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                                &paths.worktree_dir
+                            ),
+                            crate::terminal_sanitize::sanitize_for_terminal_display(&paths.branch)
+                        ),
+                        SpawnKind::SingleAgent => format!(
+                            "{SPAWNED_OPENING} agent for '{}' in {} on branch {}",
+                            crate::terminal_sanitize::sanitize_for_terminal_display(name),
+                            crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                                &paths.worktree_dir
+                            ),
+                            crate::terminal_sanitize::sanitize_for_terminal_display(&paths.branch)
+                        ),
+                    };
+                    let mut msg = match &base {
+                        Some(base) => format!("{opened}, cut from {}", base.description),
+                        None => opened,
+                    };
+                    // Only for an orchestration: a `--single` dispatch consulted no
+                    // default, so a note about which one it would have picked is
+                    // noise the caller then relays to the user as if it mattered.
+                    if let (SpawnKind::Orchestration { .. }, Some(note)) =
+                        (&handle.kind, &default_note)
+                    {
+                        msg.push_str(&format!("\ndispatch: {note}"));
+                    }
+                    // PRD fork#325 fix round (reviewer B3 / auditor B1): surface the
+                    // origin-fixup warning captured when the isolated clone was
+                    // provisioned. This message reaches the dispatching agent
+                    // verbatim, and that agent is the one CLAUDE.md rule 1 tells to
+                    // `git push origin HEAD:refs/heads/<branch>` -- it must not
+                    // silently push into the user's own root checkout.
+                    if let Some(error) = &clone_origin_warning {
+                        msg.push_str(&format!(
+                            " (warning: this clone's `origin` could not be pointed at the \
+                             real remote ({}) — manually run `git remote set-url origin \
+                             <url>` (or `git remote remove origin` if none exists) before \
+                             pushing from inside it)",
+                            crate::terminal_sanitize::sanitize_for_terminal_display(error)
+                        ));
+                    }
+                    msg
+                },
             }
         }
         Err(e) => {
@@ -1229,6 +1575,7 @@ pub async fn handle_dispatch(
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
                     message,
+                    unit_id: None,
                 };
             }
 
@@ -1321,16 +1668,13 @@ pub async fn handle_dispatch(
                 // deletes it. Same multi-role caveat as above — a still-live
                 // sibling role may hold committed work whose only record is
                 // this branch.
-                let branch_delete_failed = run_status(
-                    "git",
-                    &[
-                        "-C",
-                        &clone_dir.to_string_lossy(),
-                        "branch",
-                        "-D",
-                        &paths.branch,
-                    ],
-                )
+                let branch_delete_failed = run_git_status(&[
+                    "-C",
+                    &clone_dir.to_string_lossy(),
+                    "branch",
+                    "-D",
+                    &paths.branch,
+                ])
                 .await
                 .is_err();
                 remove_failed || branch_delete_failed
@@ -1383,6 +1727,7 @@ pub async fn handle_dispatch(
                 worktree_dir: paths.worktree_dir,
                 success: false,
                 message: format!("dispatch: spawn failed: {e}{cleanup_note}"),
+                unit_id: None,
             }
         }
     }
@@ -1397,37 +1742,45 @@ pub async fn handle_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::issue_dispatch_run::{new_worktree_registry, take_worktree};
+    use crate::issue_dispatch_run::{create_worktree, new_worktree_registry, take_worktree};
 
     /// Build a real git repo with one commit, so the `git worktree` primitives
     /// under test operate on a genuine repo rather than a stubbed one.
-    fn init_repo(dir: &Path) {
+    /// A real repo with one commit.
+    ///
+    /// Every `git` goes through [`crate::git_env::fixture_git`] — see
+    /// the twin fixture in `issue_dispatch_run` for what that switches off and
+    /// why a fixture that runs `git` with only `.current_dir` can write to the
+    /// checkout the suite is running in. `sandbox_root` bounds the upward walk
+    /// and holds the neutralized config; it is the tempdir `dir` lives under,
+    /// not `dir` itself, so `git` cannot discover its way out of it.
+    fn init_repo_in(sandbox_root: &Path, dir: &Path) {
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::git_env::fixture_git(dir, sandbox_root)
                 .args(args)
-                .current_dir(dir)
                 .output()
                 .expect("git available");
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
         };
         std::fs::create_dir_all(dir).unwrap();
         run(&["init", "-q", "."]);
-        run(&["config", "user.email", "t@t.t"]);
-        run(&["config", "user.name", "T"]);
+        // Immune today only because `a.txt` holds no newline; pinned anyway so
+        // that adding one stays a content change rather than a Windows-only
+        // failure three modules away (`pin_fixture_eol`).
+        crate::worktree_owner::pin_fixture_eol(dir, sandbox_root);
         std::fs::write(dir.join("a.txt"), "hi").unwrap();
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
     }
 
-    fn branch_exists(repo: &Path, branch: &str) -> bool {
-        std::process::Command::new("git")
+    fn branch_exists(sandbox_root: &Path, repo: &Path, branch: &str) -> bool {
+        crate::git_env::fixture_git(repo, sandbox_root)
             .args([
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("refs/heads/{branch}"),
             ])
-            .current_dir(repo)
             .output()
             .expect("git available")
             .status
@@ -1435,10 +1788,22 @@ mod tests {
     }
 
     /// Run a git command in `repo`, asserting it succeeded.
-    fn git_in(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+    ///
+    /// Through [`crate::git_env::fixture_git`] for the same reason
+    /// [`init_repo_in`] is, and it is the same `sandbox_root`. Two halves
+    /// matter here and only one of them is visible from the call sites.
+    /// *Location* is the issue #834 one: a bare `git` with only
+    /// `.current_dir` obeys an ambient `GIT_DIR`, so a fixture `commit` run
+    /// under one writes into whatever repository that names rather than into
+    /// `repo`. *Configuration* is why this signature changed at all: the
+    /// identity a commit needs comes from `fixture_git`'s `GIT_AUTHOR_*` /
+    /// `GIT_COMMITTER_*` environment, and `init_repo_in` deliberately no
+    /// longer writes it into the fixture repo with `git config`, so a bare
+    /// `git commit` here fails outright on a machine with no global identity
+    /// — which is a CI runner, and is not this box.
+    fn git_in(sandbox_root: &Path, repo: &Path, args: &[&str]) {
+        let out = crate::git_env::fixture_git(repo, sandbox_root)
             .args(args)
-            .current_dir(repo)
             .output()
             .expect("git available");
         assert!(out.status.success(), "git {args:?} failed: {out:?}");
@@ -1459,23 +1824,104 @@ mod tests {
     async fn dispatch_base_names_the_branch_and_commit_it_was_cut_from() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
-        git_in(&repo, &["checkout", "-q", "-b", "feature-x"]);
+        init_repo_in(tmp.path(), &repo);
+        git_in(tmp.path(), &repo, &["checkout", "-q", "-b", "feature-x"]);
 
-        let base = describe_dispatch_base(&repo)
+        let base = resolve_dispatch_base(&repo)
             .await
             .expect("a healthy repo must yield a base");
 
-        let sha = String::from_utf8(
-            std::process::Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
-                .current_dir(&repo)
-                .output()
-                .expect("git available")
-                .stdout,
-        )
-        .unwrap();
-        assert_eq!(base, format!("feature-x at {}", sha.trim()));
+        assert_eq!(
+            base.description,
+            format!(
+                "feature-x at {}",
+                git_out(tmp.path(), &repo, &["rev-parse", "--short", "HEAD"])
+            )
+        );
+        assert_eq!(base.sha, git_out(tmp.path(), &repo, &["rev-parse", "HEAD"]));
+    }
+
+    /// `git` in `repo`, trimmed stdout.
+    fn git_out(sandbox_root: &Path, repo: &Path, args: &[&str]) -> String {
+        let out = crate::git_env::fixture_git(repo, sandbox_root)
+            .args(args)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Issue #1643: the base the reply names must be the base the unit is cut
+    /// from, even when the caller's `HEAD` moves after it was read. Before the
+    /// fix, `git worktree add -b` got no start-point and read `HEAD` a second
+    /// time, so a commit landing in between put the unit on the NEW commit
+    /// while the reply named the old one.
+    #[tokio::test]
+    async fn dispatch_worktree_is_cut_from_the_reported_base_when_head_moves() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let paths = derive_dispatch_paths(&repo, "race");
+
+        let base = resolve_dispatch_base(&repo)
+            .await
+            .expect("a healthy repo must yield a base");
+        // `HEAD` moves between the probe and the worktree creation.
+        git_in(
+            tmp.path(),
+            &repo,
+            &["commit", "-q", "--allow-empty", "-m", "moved"],
+        );
+        let moved = git_out(tmp.path(), &repo, &["rev-parse", "HEAD"]);
+        assert_ne!(moved, base.sha, "the premise: HEAD really moved");
+
+        assert!(matches!(
+            create_dispatch_worktree(&repo, &paths, "race", Some(&base)).await,
+            Ok(WorktreeCreation::Created { .. })
+        ));
+        assert_eq!(
+            git_out(tmp.path(), &paths.worktree_dir, &["rev-parse", "HEAD"]),
+            base.sha,
+            "the unit must start at the reported base ({}), not at the moved HEAD",
+            base.description
+        );
+    }
+
+    /// With no base (the probe failed), the worktree is still cut, from the
+    /// caller's `HEAD`, exactly as before issue #1643.
+    #[tokio::test]
+    async fn dispatch_worktree_without_a_base_is_cut_from_head() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let paths = derive_dispatch_paths(&repo, "no-base");
+
+        assert!(matches!(
+            create_dispatch_worktree(&repo, &paths, "no-base", None).await,
+            Ok(WorktreeCreation::Created { .. })
+        ));
+        assert_eq!(
+            git_out(tmp.path(), &paths.worktree_dir, &["rev-parse", "HEAD"]),
+            git_out(tmp.path(), &repo, &["rev-parse", "HEAD"])
+        );
+    }
+
+    /// Issue #1602 (PR #1603 review): the root of a repository is where a
+    /// unit cut from it starts; a subdirectory is not, so a dispatcher there
+    /// does not hand its unit a command naming a relative path.
+    #[tokio::test]
+    async fn starts_at_repository_root_only_at_the_top_of_the_working_tree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let sub = repo.join("tools");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(starts_at_repository_root(&repo).await);
+        assert!(!starts_at_repository_root(&sub).await);
+        assert!(
+            !starts_at_repository_root(&tmp.path().join("missing")).await,
+            "a probe that fails withholds the relative command"
+        );
     }
 
     /// A detached checkout answers the literal string `HEAD` to `rev-parse
@@ -1485,12 +1931,13 @@ mod tests {
     async fn dispatch_base_says_detached_rather_than_naming_a_branch_head() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
-        git_in(&repo, &["checkout", "-q", "--detach", "HEAD"]);
+        init_repo_in(tmp.path(), &repo);
+        git_in(tmp.path(), &repo, &["checkout", "-q", "--detach", "HEAD"]);
 
-        let base = describe_dispatch_base(&repo)
+        let base = resolve_dispatch_base(&repo)
             .await
-            .expect("a detached checkout is still a healthy repo");
+            .expect("a detached checkout is still a healthy repo")
+            .description;
 
         assert!(
             base.starts_with("detached HEAD at "),
@@ -1508,7 +1955,7 @@ mod tests {
         let not_a_repo = tmp.path().join("plain-dir");
         std::fs::create_dir_all(&not_a_repo).unwrap();
 
-        assert_eq!(describe_dispatch_base(&not_a_repo).await, None);
+        assert_eq!(resolve_dispatch_base(&not_a_repo).await, None);
     }
 
     // --- slug + path derivation ---
@@ -1556,7 +2003,7 @@ mod tests {
     async fn second_dispatch_of_a_name_reports_branch_exists_after_cleanup() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "fix-auth");
 
         // First dispatch claims the name.
@@ -1584,7 +2031,7 @@ mod tests {
         .await;
         assert!(!paths.worktree_dir.exists(), "worktree dir should be gone");
         assert!(
-            branch_exists(&repo, &paths.branch),
+            branch_exists(tmp.path(), &repo, &paths.branch),
             "git worktree remove must not delete the branch — the premise of this test"
         );
 
@@ -1609,7 +2056,7 @@ mod tests {
     async fn deleting_the_leftover_branch_frees_the_name() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "fix-auth");
 
         create_worktree(
@@ -1628,11 +2075,7 @@ mod tests {
             "dispatch:test",
         )
         .await;
-        std::process::Command::new("git")
-            .args(["branch", "-D", &paths.branch])
-            .current_dir(&repo)
-            .output()
-            .expect("git available");
+        git_in(tmp.path(), &repo, &["branch", "-D", &paths.branch]);
 
         assert_eq!(
             create_worktree(
@@ -1658,7 +2101,7 @@ mod tests {
     async fn keep_if_dirty_preserves_a_worktree_with_uncommitted_work() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "unit");
         create_worktree(
             &repo,
@@ -1696,7 +2139,7 @@ mod tests {
     async fn force_removes_a_dirty_worktree_regardless_of_uncommitted_work() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let worktree_dir = repo.join(".worktrees").join("issue-7");
         create_worktree(
             &repo,
@@ -1908,6 +2351,189 @@ mod tests {
         );
     }
 
+    fn dispatcher(command: &str, agent_type: Option<crate::event::AgentType>) -> DispatcherLaunch {
+        DispatcherLaunch {
+            command: command.to_string(),
+            agent_type,
+            shell: None,
+        }
+    }
+
+    fn inherited(
+        agent_type: Option<crate::event::AgentType>,
+        shell: Option<&str>,
+    ) -> Option<crate::spawn::InheritedLaunch> {
+        Some(crate::spawn::InheritedLaunch {
+            agent_type,
+            shell: shell.map(str::to_string),
+        })
+    }
+
+    /// Issue #1602: a single unit runs its dispatcher's configured command, as
+    /// the dispatcher's agent and under the dispatcher's shell, ahead of
+    /// `default_command` and `claude`.
+    ///
+    /// Reported from real use: a dispatcher started as `devbox run agent` got
+    /// every `--single` unit as bare `claude` under the daemon's environment,
+    /// outside devbox, so the unit's builds failed on a missing `pkg-config`.
+    #[test]
+    fn a_single_unit_runs_its_dispatchers_command_as_its_dispatchers_agent() {
+        use crate::event::AgentType;
+        assert_eq!(
+            resolve_single_unit_launch(
+                Some(&dispatcher("devbox run agent", Some(AgentType::ClaudeCode))),
+                Some("opencode")
+            ),
+            SingleUnitLaunch {
+                command: "devbox run agent".to_string(),
+                inherited: inherited(Some(AgentType::ClaudeCode), None),
+            },
+            "the dispatcher's own command wins over default_command, and its type rides along"
+        );
+        // A non-Claude dispatcher gets units of its own agent type.
+        assert_eq!(
+            resolve_single_unit_launch(
+                Some(&dispatcher("devbox run codex-big", Some(AgentType::Codex))),
+                None
+            )
+            .inherited,
+            inherited(Some(AgentType::Codex), None)
+        );
+        // The dispatcher's shell choice rides along too (Greptile, PR #1603):
+        // `source` that works under its bash must not meet `/bin/sh` in the unit.
+        let mut sourced = dispatcher("source ./env.sh && claude", None);
+        sourced.shell = Some("/bin/bash".to_string());
+        assert_eq!(
+            resolve_single_unit_launch(Some(&sourced), None).inherited,
+            inherited(None, Some("/bin/bash"))
+        );
+        // A dispatcher whose type nobody knows still passes its command on; the
+        // spawn then derives the type from it, as it always did.
+        assert_eq!(
+            resolve_single_unit_launch(Some(&dispatcher("  ./my-agent  ", None)), Some("opencode")),
+            SingleUnitLaunch {
+                command: "./my-agent".to_string(),
+                inherited: inherited(None, None),
+            }
+        );
+    }
+
+    /// Issue #1602's controls: with no dispatching pane (the scheduler), a
+    /// dispatcher whose command is blank, or one whose command only opens an
+    /// interactive shell, the unit falls back exactly as before —
+    /// `default_command`, then `claude` — and inherits nothing.
+    #[test]
+    fn a_single_unit_without_a_dispatcher_command_falls_back_to_default_then_claude() {
+        use crate::event::AgentType;
+        let claude = crate::agent_registry::CLAUDE_CODE
+            .default_command
+            .unwrap_or("claude")
+            .to_string();
+        let fallback = |command: &str| SingleUnitLaunch {
+            command: command.to_string(),
+            inherited: None,
+        };
+        assert_eq!(
+            resolve_single_unit_launch(None, Some("opencode")),
+            fallback("opencode")
+        );
+        assert_eq!(resolve_single_unit_launch(None, None), fallback(&claude));
+        assert_eq!(
+            resolve_single_unit_launch(Some(&dispatcher("   ", Some(AgentType::Codex))), None),
+            fallback(&claude),
+            "a blank dispatcher command must not carry its type onto the fallback"
+        );
+        // Qodo, PR #1603: a dispatcher that is a shell the user started Claude
+        // in by hand. Its hooks say Claude Code, but its command is the shell —
+        // inheriting it would type the task into a bare shell and run it.
+        for shell in [
+            "bash",
+            "/bin/zsh -l",
+            "devbox shell",
+            "nix develop",
+            "nix-shell",
+        ] {
+            assert_eq!(
+                resolve_single_unit_launch(
+                    Some(&dispatcher(shell, Some(AgentType::ClaudeCode))),
+                    Some("opencode")
+                ),
+                fallback("opencode"),
+                "{shell:?} only opens a shell, so the unit must fall back"
+            );
+        }
+    }
+
+    /// The interactive-shell test recognises a shell given nothing to run, and
+    /// lets through a shell that runs a script or a command, and launchers.
+    #[test]
+    fn opens_an_interactive_shell_only_for_a_shell_with_nothing_to_run() {
+        for interactive in [
+            "bash",
+            "zsh -l",
+            "/usr/bin/fish",
+            "env FOO=1 bash -i",
+            "pwsh -NoLogo",
+            "cmd.exe",
+            "devbox shell",
+            "nix develop .#dev",
+            "nix shell nixpkgs#hello",
+            "nix-shell -p hello",
+            "bash --rcfile /tmp/rc",
+            "bash -o vi",
+            "zsh +o nomatch -i",
+        ] {
+            assert!(opens_an_interactive_shell(interactive), "{interactive:?}");
+        }
+        for runs in [
+            "devbox run agent",
+            "claude",
+            "sh /tmp/launcher.sh",
+            "bash -lc 'devbox run agent'",
+            "zsh ./agent.zsh",
+            "pwsh -Command claude",
+            "cmd /c claude",
+            "nix develop -c claude",
+            "nix-shell --run claude",
+            "FOO=1 claude --model opus",
+            "bash --rcfile /tmp/rc ./agent.sh",
+            "bash /opt/launch-agent.sh",
+        ] {
+            assert!(!opens_an_interactive_shell(runs), "{runs:?}");
+        }
+    }
+
+    /// Greptile and Qodo, PR #1603: a command naming anything by a relative
+    /// path is recognised, so it is not handed on from a dispatcher started
+    /// below the repository root.
+    #[test]
+    fn names_a_relative_path_wherever_the_command_names_one() {
+        for relative in [
+            "./agent.sh",
+            "../bin/agent",
+            "tools/agent --x",
+            "FOO=1 ./agent",
+            "sh ./agent.sh",
+            "bash tools/agent.sh",
+            "devbox run ./agent",
+            "claude --settings=./settings.json",
+            "CONF=../agent.toml claude",
+        ] {
+            assert!(names_a_relative_path(relative), "{relative:?}");
+        }
+        for not in [
+            "claude",
+            "devbox run agent",
+            "/opt/agent",
+            "~/bin/agent",
+            "$HOME/agent",
+            "sh /opt/launch.sh",
+            "agent --endpoint https://example.com/v1",
+        ] {
+            assert!(!names_a_relative_path(not), "{not:?}");
+        }
+    }
+
     /// A single-agent dispatch must run an AGENT, never `$SHELL`.
     ///
     /// `SpawnRequest.command: None` means `$SHELL` in the spawn path, so the
@@ -2010,15 +2636,19 @@ mod tests {
     /// A pure composer test rather than a spawned one: the single-agent prompt is
     /// delivered into a PTY and never written to disk, so there is no artefact to
     /// assert on the way the orchestration test asserts on
-    /// `orchestrator-context.md`. `dispatch/return/003` covers the same
+    /// `orchestrator-context-<id>.md`. `dispatch/return/003` covers the same
     /// instruction arriving at a real dispatched unit end to end.
     #[test]
     fn a_single_dispatch_prompt_tells_the_unit_to_report_when_it_finishes() {
         let bin = crate::platform::paths::binary_name();
         let prompt = dispatch_prompt(
             "Verify PR #232 and report back.",
-            &crate::spawn::SpawnTarget::SingleAgent { command: None },
+            &crate::spawn::SpawnTarget::SingleAgent {
+                command: None,
+                inherited: None,
+            },
             ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
+            None,
         );
 
         assert!(
@@ -2050,6 +2680,62 @@ mod tests {
             !prompt.contains("<slug>"),
             "no filename placeholder may survive — a slug the model invents is a slug \
              nothing validates:\n{prompt}"
+        );
+    }
+
+    /// Issue #550: a dispatched unit works in a worktree `dispatch` cut for it,
+    /// so anything it leaves there goes when the worktree does. The report
+    /// above does not care — its contents travel back over the wire and the
+    /// file is deleted — but a LARGER artifact does, and the return edge carries
+    /// bounded text rather than files.
+    ///
+    /// Asserted as a literal path, never a variable name: an agent's
+    /// file-writing tool does not go through a shell, so `$SOME_VAR/out.txt`
+    /// makes a directory called `$SOME_VAR`. That is the whole reason this is
+    /// interpolated instead of exported.
+    #[test]
+    fn a_single_dispatch_prompt_names_the_main_checkout_as_a_literal_path() {
+        let prompt = dispatch_prompt(
+            "Verify PR #232 and report back.",
+            &crate::spawn::SpawnTarget::SingleAgent {
+                command: None,
+                inherited: None,
+            },
+            ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
+            Some(std::path::Path::new("/home/dev/myproject")),
+        );
+
+        assert!(
+            prompt.contains("/home/dev/myproject"),
+            "the unit must be handed the path itself:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("linked git worktree"),
+            "and told why it matters, or it has no reason to use it:\n{prompt}"
+        );
+    }
+
+    /// Fail-closed, and the reason it matters more here than most places: a
+    /// unit told the WRONG durable location writes there and nobody notices.
+    /// `None` — an unresolvable repository — omits the paragraph rather than
+    /// guessing, exactly as `worktree_owner::main_worktree_if_linked` fails
+    /// closed upstream of it.
+    #[test]
+    fn a_single_dispatch_prompt_says_nothing_when_the_checkout_is_unresolvable() {
+        let prompt = dispatch_prompt(
+            "Verify PR #232 and report back.",
+            &crate::spawn::SpawnTarget::SingleAgent {
+                command: None,
+                inherited: None,
+            },
+            ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
+            None,
+        );
+
+        assert!(!prompt.contains("linked git worktree"));
+        assert!(
+            prompt.contains("work-done --done"),
+            "the rest of the prompt is unaffected:\n{prompt}"
         );
     }
 
@@ -2145,6 +2831,7 @@ mod tests {
                 "Verify PR #232 and report back.",
                 &target,
                 ".dot-agent-deck/dispatch-report-demo-orch-99990001.md",
+                None,
             ),
             "Verify PR #232 and report back.",
             "an orchestration's task rides into the composed context verbatim"
@@ -2162,15 +2849,14 @@ mod tests {
     ///
     /// Roles run `cat` (alive on stdin, no LLM tokens), mirroring the `orch-deck`
     /// fixture.
-    // Gated to the e2e tier: this spawns REAL PTYs and awaits the prompt-delivery
-    // readiness gate, so it costs ~30s — too slow for the per-task fast gate, and
-    // not a unit test by any honest reading.
+    // Gated to the e2e tier: this spawns REAL PTYs, which puts it outside the
+    // per-task fast gate and outside what a unit test is by any honest reading.
     #[cfg(feature = "e2e")]
     #[tokio::test]
     async fn an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         std::fs::write(
             repo.join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"demo-orch\"\n\n\
@@ -2180,15 +2866,8 @@ mod tests {
         .unwrap();
         // The config must be COMMITTED: the shape is resolved from the caller's repo,
         // but the worktree the roles run in is a HEAD checkout.
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .expect("git available");
-        };
-        run(&["add", "-A"]);
-        run(&["commit", "-qm", "add orchestration"]);
+        git_in(tmp.path(), &repo, &["add", "-A"]);
+        git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
 
         // issue #490's clone gate now runs unconditionally near the top of
         // `handle_dispatch`, before any worktree provisioning -- without a
@@ -2245,11 +2924,35 @@ mod tests {
             "the reported shape must say orchestration, got: {}",
             result.message
         );
+        // PRD #1589: the reply names the branch the unit works on, which is what
+        // `/issue-queue` records per unit for its `close --all` ledger.
+        assert!(
+            result.message.contains(&format!(
+                "in {} on branch agent/dispatch-team-unit",
+                worktree.display()
+            )),
+            "the success reply must name the worktree and its branch, got: {}",
+            result.message
+        );
 
-        let context = worktree.join(".dot-agent-deck/orchestrator-context.md");
+        // Issue #1233: the orchestration's own per-publish file, not the
+        // compatibility mirror beside it.
+        let context = std::fs::read_dir(worktree.join(".dot-agent-deck"))
+            .expect("list the dispatched worktree's .dot-agent-deck")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(crate::orchestrator_context::CONTEXT_FILE_PREFIX)
+                            && name.ends_with(".md")
+                    })
+            })
+            .expect("the dispatched orchestration must publish its own context file");
         let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
             panic!(
-                "the dispatched orchestration must get an orchestrator-context.md at {} \
+                "the dispatched orchestration must get a context file at {} \
                  (its absence is exactly why workers sat idle): {e}",
                 context.display()
             )
@@ -2321,7 +3024,7 @@ mod tests {
     async fn a_dispatch_whose_coordinator_context_cannot_be_published_is_refused_not_degraded() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         std::fs::write(
             repo.join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"refused-orch\"\n\n\
@@ -2338,8 +3041,9 @@ mod tests {
             .expect("plant the symlinked context dir");
         // The shape is resolved from the CALLER's repo, but the roles run in a
         // HEAD checkout, so both the config and the symlink have to be committed.
-        git_in(&repo, &["add", "-A"]);
+        git_in(tmp.path(), &repo, &["add", "-A"]);
         git_in(
+            tmp.path(),
             &repo,
             &[
                 "commit",
@@ -2443,7 +3147,7 @@ mod tests {
             "with nothing live in it, the worktree must be reclaimed"
         );
         assert!(
-            !branch_exists(&repo, "agent/dispatch-refused-unit"),
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-refused-unit"),
             "…and its branch deleted, so the name is not wedged"
         );
     }
@@ -2472,14 +3176,13 @@ mod tests {
     async fn dispatch_from_a_nested_working_dir_places_the_worktree_outside_the_source_repo() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let nested = repo.join("baseline").join("intent");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("marker.txt"), "hi\n").unwrap();
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
+            crate::git_env::fixture_git(&repo, tmp.path())
                 .args(args)
-                .current_dir(&repo)
                 .output()
                 .expect("git available");
         };
@@ -2571,7 +3274,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let real_root = tmp.path().join("real");
         let repo = real_root.join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let sub = repo.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let rootlink = sub.join("rootlink");
@@ -2659,7 +3362,7 @@ mod tests {
     async fn a_partial_orchestration_dispatch_leaves_no_orphans_and_no_deleted_cwd() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         std::fs::write(
             repo.join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"partial-orch\"\n\n\
@@ -2671,15 +3374,8 @@ mod tests {
         .unwrap();
         // The shape is resolved from the CALLER's repo, but the roles run in a HEAD
         // checkout, so the config has to be committed.
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .expect("git available");
-        };
-        run(&["add", "-A"]);
-        run(&["commit", "-qm", "add orchestration"]);
+        git_in(tmp.path(), &repo, &["add", "-A"]);
+        git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let state: crate::state::SharedState =
@@ -2761,9 +3457,209 @@ mod tests {
             "with nothing live in it, the worktree must still be reclaimed"
         );
         assert!(
-            !branch_exists(&repo, "agent/dispatch-partial-unit"),
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-partial-unit"),
             "…and its branch deleted, so the name is not wedged"
         );
+    }
+
+    /// Scenario: reviewer nit-R1 (PRD #1589) — a dispatched orchestration is
+    /// closed while it is starting, and its dispatch resumes while the close
+    /// still holds the instance: one role stopped, the other still running in
+    /// the worktree. The dispatch answers that it was closed, and its rollback
+    /// finds a live role and retains the worktree; the close then stops that
+    /// role and removes the worktree itself, reporting it. The worktree is
+    /// never left behind with nothing to reclaim it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatch_closed_mid_construction_leaves_no_orphaned_worktree() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use crate::spawn::{RoleSpawn, SpawnTarget};
+        struct SilentNotifier;
+        impl crate::scheduler::Notifier for SilentNotifier {
+            fn notify(&self, _event: crate::scheduler::NotifyEvent) {}
+        }
+
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let worktree_dir = repo.parent().unwrap().join("repo-dispatch-nit-r1");
+        let branch = "agent/dispatch-nit-r1";
+        create_worktree(
+            &repo,
+            &worktree_dir,
+            branch,
+            false,
+            Creator::dispatch("nit-r1"),
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _keep) = tokio::sync::broadcast::channel(1024);
+        let worktrees = new_worktree_registry();
+        record_worktree(&worktrees, &worktree_dir, &repo, RemovalPolicy::KeepIfDirty);
+        struct Guard(Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.shutdown_all();
+            }
+        }
+        let _guard = Guard(registry.clone());
+
+        let (dispatch_reached, dispatch_release) =
+            registry.pause_at_for_test("dispatch-publication");
+        let spawned = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let role = |idx: usize, name: &str| RoleSpawn {
+                agent_type: None,
+                role_index: idx,
+                role_name: name.to_string(),
+                command: "sleep 30".to_string(),
+                is_start_role: idx == 0,
+            };
+            let req = SpawnRequest {
+                task_name: "dispatch-nit-r1".to_string(),
+                working_dir: worktree_dir.to_string_lossy().into_owned(),
+                command: None,
+                prompt: "unused".to_string(),
+                resolved_target: Some(SpawnTarget::Orchestration {
+                    name: "nit-r1".to_string(),
+                    roles: vec![role(0, "orchestrator"), role(1, "worker")],
+                    config: Box::new(OrchestrationConfig {
+                        default: false,
+                        name: "nit-r1".to_string(),
+                        roles: vec![OrchestrationRoleConfig {
+                            agent: None,
+                            name: "orchestrator".to_string(),
+                            command: "sleep 30".to_string(),
+                            start: true,
+                            description: None,
+                            prompt_template: None,
+                            clear: false,
+                        }],
+                    }),
+                }),
+                compose_orchestrator_context: None,
+                owner: None,
+                seed_reason: None,
+            };
+            let origin = crate::dispatched_units::UnitOrigin {
+                name: "nit-r1".to_string(),
+                worktree: worktree_dir.clone(),
+                branch: branch.to_string(),
+                clone_dir: repo.clone(),
+                dispatcher: crate::dispatched_units::Dispatcher {
+                    pane_id: "disp".to_string(),
+                    agent_id: "nobody".to_string(),
+                },
+            };
+            let caller = crate::dispatch_return::DispatchCaller {
+                pane_id: "disp".to_string(),
+                agent_id: "nobody".to_string(),
+                unit_name: "nit-r1".to_string(),
+            };
+            tokio::spawn(async move {
+                crate::spawn::spawn_dispatched_unit(
+                    req,
+                    &registry,
+                    &SilentNotifier,
+                    Some(&event_tx),
+                    true,
+                    Some(&state),
+                    origin,
+                    caller,
+                )
+                .await
+                .map(|handle| handle.unit_id)
+            })
+        };
+        dispatch_reached
+            .await
+            .expect("the dispatch reaches its publication");
+        let orchestrator = registry
+            .agent_records()
+            .into_iter()
+            .find(|r| {
+                matches!(
+                    &r.tab_membership,
+                    Some(crate::agent_pty::TabMembership::Orchestration {
+                        is_start_role: true,
+                        ..
+                    })
+                )
+            })
+            .and_then(|r| r.pane_id_env)
+            .expect("the orchestrator was published");
+
+        let (close_reached, close_release) = registry.pause_at_for_test("close-after-first-stop");
+        let close = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let worktrees = worktrees.clone();
+            tokio::spawn(async move {
+                crate::close_agents::handle_close_agents(
+                    crate::daemon_protocol::CloseSelector::OrchestrationOf {
+                        pane_id: orchestrator,
+                    },
+                    None,
+                    false,
+                    false,
+                    &registry,
+                    &state,
+                    &event_tx,
+                    &worktrees,
+                )
+                .await
+            })
+        };
+        close_reached
+            .await
+            .expect("the close stops the orchestrator and pauses");
+
+        let _ = dispatch_release.send(());
+        let result = spawned.await.unwrap();
+        assert!(
+            matches!(&result, Err(crate::spawn::SpawnError::Agent(m))
+                if m == crate::spawn::CLOSED_WHILE_STARTING),
+            "{result:?}"
+        );
+        // The dispatch's rollback leaves a tree that agents are still rooted in
+        // (fork #469 / upstream #575): the guard it asks is this count, so one
+        // live role means a rollback right now would retain the tree.
+        assert_eq!(
+            crate::issue_dispatch_run::agents_rooted_in_worktree(
+                &registry.agent_records(),
+                &worktree_dir
+            ),
+            1,
+            "the close is still stopping the worker, so a rollback would leave the tree"
+        );
+        assert!(
+            worktrees.lock().unwrap().contains_key(&worktree_dir),
+            "a retained tree keeps the entry a later cleanup finds it by"
+        );
+
+        let _ = close_release.send(());
+        let report = close.await.unwrap();
+        let target = &report.targets[0];
+        assert_eq!(
+            target.outcome,
+            crate::daemon_protocol::CloseOutcome::Closed,
+            "{target:?}"
+        );
+        assert_eq!(
+            target.worktree_verdict.as_ref().map(|v| v.verdict),
+            Some(crate::daemon_protocol::WorktreeVerdictKind::Removed),
+            "the close that owns the teardown reclaims the tree: {target:?}"
+        );
+        assert!(!worktree_dir.exists(), "the worktree is not orphaned");
+        assert!(!worktrees.lock().unwrap().contains_key(&worktree_dir));
+        assert!(registry.agent_records().is_empty());
+        assert_eq!(registry.dispatched_units().live().count(), 0);
     }
 
     /// A shape the repo cannot satisfy must be refused BEFORE any git work, so a
@@ -2773,7 +3669,7 @@ mod tests {
     async fn an_unknown_orchestration_name_is_refused_without_creating_a_worktree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
@@ -2816,7 +3712,71 @@ mod tests {
             "no worktree may be created for a shape that was refused"
         );
         assert!(
-            !branch_exists(&repo, "agent/dispatch-typo-unit"),
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-typo-unit"),
+            "no branch may be left behind either"
+        );
+    }
+
+    /// Issue #1396 item 4: `dispatch --orchestration <name>` naming an
+    /// orchestration the repo declares twice, with roles both times, is refused
+    /// as ambiguous — the rule `PrepareOrchestration` follows since #1233 —
+    /// instead of starting the first declaration's roles for a caller that may
+    /// have meant the second. Refused before any git work, like a typo.
+    #[tokio::test]
+    async fn an_ambiguous_orchestration_name_is_refused_without_creating_a_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        std::fs::write(
+            repo.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n",
+        )
+        .unwrap();
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: registry.clone(),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: None,
+            caller: None,
+        };
+        let result = handle_dispatch(
+            &ctx,
+            "ambiguous-unit",
+            "task",
+            Some(&crate::event::DispatchShape::Orchestration {
+                name: Some("dup".into()),
+            }),
+        )
+        .await;
+        registry.shutdown_all();
+
+        assert!(
+            !result.success,
+            "an orchestration name declared twice with roles must be refused, not resolved to \
+             the first declaration: {}",
+            result.message
+        );
+        assert!(
+            result
+                .message
+                .contains(crate::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION),
+            "the refusal must carry the code PrepareOrchestration uses for the same case: {}",
+            result.message
+        );
+        assert!(
+            !result.worktree_dir.exists(),
+            "no worktree may be created for a shape that was refused"
+        );
+        assert!(
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-ambiguous-unit"),
             "no branch may be left behind either"
         );
     }
@@ -2838,7 +3798,7 @@ mod tests {
     async fn spawn_rollback_skips_cleanup_when_a_live_sibling_still_roots_the_worktree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "guard-trip-unit");
 
         // issue #490's clone gate now runs unconditionally near the top of
@@ -2909,7 +3869,7 @@ mod tests {
             result.message
         );
         assert!(
-            branch_exists(&repo, &paths.branch),
+            branch_exists(tmp.path(), &repo, &paths.branch),
             "the branch must survive too -- a still-live sibling may hold committed work \
              whose only record is this branch"
         );
@@ -2942,7 +3902,7 @@ mod tests {
     async fn spawn_rollback_force_removes_when_nothing_else_roots_the_worktree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "guard-notrip-unit");
 
         // See the sibling `..._skips_cleanup...` test above: without a
@@ -2985,7 +3945,7 @@ mod tests {
             result.message
         );
         assert!(
-            !branch_exists(&repo, &paths.branch),
+            !branch_exists(tmp.path(), &repo, &paths.branch),
             "the branch must still be deleted too"
         );
         assert!(
@@ -3013,7 +3973,7 @@ mod tests {
     async fn spawn_rollback_retains_registry_entry_when_force_removal_fails() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "lockfail-unit");
 
         // Same daemon-gate bypass as the sibling test above -- without it,
@@ -3089,7 +4049,7 @@ mod tests {
         // Best-effort cleanup: `tmp`'s own Drop removes everything under it
         // regardless, but unlock first so a leftover admin lock file cannot
         // confuse anything that inspects `repo/.git/worktrees/` before then.
-        let _ = std::process::Command::new("git")
+        let _ = crate::git_env::fixture_git(&repo, tmp.path())
             .args([
                 "-C",
                 &repo.to_string_lossy(),
@@ -3140,6 +4100,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Reads the request a stub attach daemon's connection carries, answering
+    /// the protocol gate in front of it. A copy of `src/ui.rs`'s test helper of
+    /// the same name (copied rather than shared: that one is private to
+    /// `ui.rs`'s own test module, as is the stub below it mirrors).
+    ///
+    /// PRD #1666 part 2 (`lifecycle/handshake/011`): `crate::ui`'s
+    /// `send_daemon_request_blocking_at` — under `root_checkout_has_live_sibling`,
+    /// which the dispatch gate calls — sends `Hello { follow_on: true }` first
+    /// and writes the real request only if the reply is `ok`, names this
+    /// build's `PROTOCOL_VERSION` and advertises `CAP_HELLO_FOLLOW_ON`. A stub
+    /// that takes the connection's first frame for the request fails that
+    /// gate and never sees the `ListAgents` under test.
+    ///
+    /// A first frame that is not a `Hello` is returned as it is. A `Hello` is
+    /// answered `ok` with this build's version and `CAP_HELLO_FOLLOW_ON` and,
+    /// when it asked for a follow-on, the real request is read off the same
+    /// stream and returned; the `Hello` itself is never returned. `None` means
+    /// there is no request to serve (EOF before a frame, a transport error, or
+    /// a `Hello` that asked for no follow-on).
+    async fn read_request_after_hello<S>(stream: &mut S) -> Option<Vec<u8>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (_, first) = crate::daemon_protocol::read_frame(stream)
+            .await
+            .ok()
+            .flatten()?;
+        let hello = serde_json::from_slice::<serde_json::Value>(&first)
+            .ok()
+            .filter(|v| v.get("op").and_then(|o| o.as_str()) == Some("hello"));
+        let Some(hello) = hello else {
+            return Some(first);
+        };
+        let reply = crate::daemon_protocol::AttachResponse {
+            ok: true,
+            server_version: Some(crate::daemon_protocol::PROTOCOL_VERSION),
+            capabilities: Some(vec![
+                crate::daemon_protocol::CAP_HELLO_FOLLOW_ON.to_string(),
+            ]),
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&reply).expect("serialize the stub's Hello reply");
+        crate::daemon_protocol::write_frame(stream, crate::daemon_protocol::KIND_RESP, &payload)
+            .await
+            .ok()?;
+        // `follow_on` is skipped on the wire when false, so absent means false.
+        if !hello
+            .get("follow_on")
+            .and_then(|f| f.as_bool())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let (_, request) = crate::daemon_protocol::read_frame(stream)
+            .await
+            .ok()
+            .flatten()?;
+        Some(request)
     }
 
     /// Stand up a stub attach daemon that answers every `ListAgents` request
@@ -3206,7 +4226,11 @@ mod tests {
                     let Ok(mut stream) = listener.accept().await else {
                         return;
                     };
-                    let _ = crate::daemon_protocol::read_frame(&mut stream).await;
+                    // The crafted response answers the REAL request; the gate's
+                    // `Hello` in front of it gets a capability-advertising reply.
+                    if read_request_after_hello(&mut stream).await.is_none() {
+                        continue;
+                    }
                     let _ = crate::daemon_protocol::write_frame(
                         &mut stream,
                         crate::daemon_protocol::KIND_RESP,
@@ -3258,12 +4282,13 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
-            daemon_boot_id: None,
-            registration_generation: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            inbox: None,
             outstanding_delegation: None,
-            silence_watch: None,
             delegation_commission: None,
         }
     }
@@ -3607,7 +4632,7 @@ mod tests {
     async fn spawn_rollback_drops_registry_entry_when_only_branch_delete_fails() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "branchfail-unit");
 
         // Same daemon-gate bypass every sibling rollback test in this file
@@ -3645,7 +4670,7 @@ mod tests {
             result.message
         );
         assert!(
-            branch_exists(&repo, &paths.branch),
+            branch_exists(tmp.path(), &repo, &paths.branch),
             "the branch delete must have genuinely failed, or this test proves nothing \
              about the sibling gap it targets"
         );
@@ -3680,7 +4705,7 @@ mod tests {
     async fn dispatch_shares_the_checkout_when_no_live_sibling_exists() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         let _daemon = with_crafted_attach_daemon(
             tmp.path(),
@@ -3737,7 +4762,7 @@ mod tests {
     async fn dispatch_isolates_into_a_fresh_clone_when_a_live_sibling_shares_the_checkout() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         // The already-live sibling: a distinct `git worktree add` off `repo`,
         // exactly the shape an earlier orchestration's own dispatch/SpawnPane
@@ -3833,7 +4858,7 @@ mod tests {
     async fn dispatch_fails_closed_on_daemon_error_response() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         let _daemon = with_crafted_attach_daemon(
             tmp.path(),
@@ -3866,7 +4891,7 @@ mod tests {
             result.message
         );
         assert!(
-            !branch_exists(&repo, &paths.branch),
+            !branch_exists(tmp.path(), &repo, &paths.branch),
             "a fail-closed refusal must not leave a branch behind either: {}",
             result.message
         );
@@ -3886,7 +4911,7 @@ mod tests {
     async fn dispatch_fails_closed_on_legacy_agents_only_response() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         let _daemon = with_crafted_attach_daemon(
             tmp.path(),
@@ -3919,7 +4944,7 @@ mod tests {
             result.message
         );
         assert!(
-            !branch_exists(&repo, &paths.branch),
+            !branch_exists(tmp.path(), &repo, &paths.branch),
             "a fail-closed refusal must not leave a branch behind either: {}",
             result.message
         );
@@ -3959,7 +4984,7 @@ mod tests {
     async fn spawn_rollback_force_removes_the_isolated_clone_when_nothing_else_roots_it() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         // Trips the has_live_sibling GATE: an already-live orchestration
         // sharing `repo`'s git-common-dir via its own sibling worktree.
@@ -3984,13 +5009,12 @@ mod tests {
         // Auditor F2: unrelated pre-existing committed work in the ROOT
         // checkout, under the exact branch name this dispatch will pick.
         let paths = derive_dispatch_paths(&repo, "isolated-notrip-unit");
-        std::process::Command::new("git")
+        crate::git_env::fixture_git(&repo, tmp.path())
             .args(["branch", &paths.branch])
-            .current_dir(&repo)
             .output()
             .expect("git available");
         assert!(
-            branch_exists(&repo, &paths.branch),
+            branch_exists(tmp.path(), &repo, &paths.branch),
             "sanity: the unrelated root-checkout branch must actually have been created"
         );
 
@@ -4033,7 +5057,7 @@ mod tests {
             "the registry entry must still be dropped"
         );
         assert!(
-            branch_exists(&repo, &paths.branch),
+            branch_exists(tmp.path(), &repo, &paths.branch),
             "auditor F2 (round-1 BLOCKER A1): the isolated-clone rollback path must NEVER run \
              `branch -D` against the root checkout -- this branch is unrelated pre-existing \
              work that merely shares a name with the dispatch, and must survive untouched: {}",
@@ -4070,19 +5094,18 @@ mod tests {
     async fn spawn_rollback_skips_cleanup_when_a_live_sibling_still_roots_the_isolated_clone() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         // Gives the source an `origin` so `provision_isolated_clone_sync`
         // takes the "point at source's own origin" branch rather than the
         // "no origin" removal branch -- see
         // `dispatch_surfaces_the_origin_warning_in_the_success_message`.
-        let out = std::process::Command::new("git")
+        let out = crate::git_env::fixture_git(&repo, tmp.path())
             .args([
                 "remote",
                 "add",
                 "origin",
                 "https://example.invalid/repo.git",
             ])
-            .current_dir(&repo)
             .output()
             .expect("git available");
         assert!(out.status.success(), "git remote add failed: {out:?}");
@@ -4159,7 +5182,7 @@ mod tests {
             result.message
         );
         assert!(
-            branch_exists(&repo, &paths.branch)
+            branch_exists(tmp.path(), &repo, &paths.branch)
                 || crate::issue_dispatch_run::git_common_dir(&paths.worktree_dir).is_ok(),
             "the clone itself (which carries its own local branch) must survive too"
         );
@@ -4224,7 +5247,7 @@ mod tests {
 
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         // Trips the has_live_sibling GATE, same as
         // `spawn_rollback_force_removes_the_isolated_clone_when_nothing_else_roots_it`.
@@ -4316,14 +5339,14 @@ mod tests {
     async fn isolated_clone_is_always_kept_on_tab_close_even_when_clean() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let clone_dir = tmp.path().join("isolated-clone");
 
         // A real, genuinely-clean `git clone` -- not provisioned via
         // `provision_isolated_clone_sync`, since `remove_worktree`'s policy
         // branch doesn't care how the clone came to exist, only what policy
         // it's called with.
-        let out = std::process::Command::new("git")
+        let out = crate::git_env::fixture_git(tmp.path(), tmp.path())
             .args([
                 "clone",
                 "-q",
@@ -4370,7 +5393,7 @@ mod tests {
     async fn dispatch_surfaces_the_origin_warning_in_the_success_message() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         // The origin fixup takes the "point at the source's own origin"
         // branch -- whose `origin_warning` is never overwritten again below
         // it in `provision_isolated_clone_sync` -- only when the SOURCE
@@ -4378,14 +5401,13 @@ mod tests {
         // `remove_isolated_clone_origin_default` call (unaffected by this
         // test's stub, which only fails `remote set-url`) would otherwise
         // silently overwrite the warning this test injects.
-        let out = std::process::Command::new("git")
+        let out = crate::git_env::fixture_git(&repo, tmp.path())
             .args([
                 "remote",
                 "add",
                 "origin",
                 "https://example.invalid/repo.git",
             ])
-            .current_dir(&repo)
             .output()
             .expect("git available");
         assert!(out.status.success(), "git remote add failed: {out:?}");
@@ -4465,7 +5487,7 @@ mod tests {
     async fn dispatch_sanitizes_git_stderr_in_the_isolated_clone_failed_message() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         let live_sibling_dir = tmp.path().join("repo-existing-live-orchestration");
         create_worktree(
@@ -4492,7 +5514,7 @@ mod tests {
         // stderr genuinely contains the ESC byte, before any sanitizer has
         // had a chance to touch it.
         let probe_dest = tmp.path().join("git-stub-probe-dest");
-        let probe = std::process::Command::new("git")
+        let probe = crate::git_env::fixture_git(tmp.path(), tmp.path())
             .args([
                 "clone",
                 "--",

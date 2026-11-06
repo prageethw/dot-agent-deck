@@ -7,7 +7,7 @@
 //! `dot-agent-deck hook --agent devin` — into Devin's user config, so a live
 //! session's prompt / tool / turn events ride the deck's existing
 //! raw-`AgentEvent` hook socket (no new wire, no `PROTOCOL_VERSION` bump —
-//! rule 12).
+//! CLAUDE.md rule 12).
 //!
 //! It is the [`IntegrationStrategy::NativeHooks`] analog of
 //! [`crate::hooks_manage`] (Claude), but it borrows its SAFETY discipline from
@@ -63,6 +63,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde_json::{Value, json};
+
+use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
 
 /// The fixed command signature that identifies a deck-authored Devin hook. Every
 /// deck hook command is `<binary_path> hook --agent devin`, so a command ending
@@ -163,11 +165,8 @@ fn config_dir_from(
     xdg_config_home: Option<&std::ffi::OsStr>,
     home: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_config_home {
-        let xdg = Path::new(xdg);
-        if xdg.is_absolute() {
-            return Some(xdg.join("devin"));
-        }
+    if let Some(xdg) = crate::platform::paths::absolute_dir_from_env(xdg_config_home) {
+        return Some(xdg.join("devin"));
     }
     let home = home.filter(|h| !h.is_empty())?;
     Some(Path::new(home).join(".config").join("devin"))
@@ -193,6 +192,8 @@ fn devin_present_on_path() -> bool {
     };
     std::env::split_paths(&path).any(|dir| {
         let candidate = dir.join("devin");
+        // Any error is absence here, not a failed inspection: a `devin` that
+        // cannot be inspected cannot be run from this `PATH` entry either.
         let Ok(meta) = std::fs::metadata(&candidate) else {
             return false;
         };
@@ -271,8 +272,9 @@ fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
 /// Whether a re-install by `binary_path` may REPLACE `command`: it is either
 /// this binary's own prior deck command, or a deck command naming a pin the deck
 /// cannot use — missing, bare or relative, non-executable, or a build-artifact
-/// path — under this binary's basename. The union of
-/// [`command_is_this_binary`] and [`command_is_dead_deck`], named once because
+/// path — under this binary's basename — or naming an install this copy
+/// supersedes. The union of [`command_is_this_binary`],
+/// [`command_is_dead_deck`] and [`command_is_superseded_deck`], named once because
 /// [`install_impl`] applies it in two places — the installed events and the
 /// retired-event sweep — and the two must not drift apart (issue #730).
 ///
@@ -285,7 +287,26 @@ fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
 /// this as pruning only what is positively gone; it prunes what the deck would
 /// refuse to write.
 fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
-    command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
+    command_is_this_binary(command, binary_path)
+        || command_is_dead_deck(command, binary_path)
+        || command_is_superseded_deck(command, binary_path)
+}
+
+/// Whether `command` is a deck command naming an install this copy supersedes
+/// ([`crate::agent_hook_config::pin_is_superseded_sibling`]), whose rule under a
+/// retired event the takeover would otherwise leave behind.
+fn command_is_superseded_deck(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::pin_is_superseded_sibling(&exe, binary_path))
+}
+
+/// Whether an install by `binary_path` owns `command` under an event it
+/// INSTALLS: any deck install sharing its basename, live or not — one deck
+/// entry per event (PRD #1487). [`command_is_replaceable`] still governs the
+/// retired-event sweep, where the deck has nothing to put in its place.
+fn command_is_deck_install(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::is_replaceable_deck_install(&exe, binary_path))
 }
 
 /// Merge the deck's command hooks for `command` — the command built for
@@ -296,7 +317,12 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
 /// `binary_path` is passed alongside the already-built `command` because the two
 /// answer different questions: `command` is what gets WRITTEN, `binary_path` is
 /// what decides which existing deck commands may be overwritten.
-fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
+///
+/// Under [`InstallMode::Automatic`] a deck entry naming another live, durable
+/// install is kept rather than replaced, and an event with none gets that
+/// install's command — the policy the Codex writer documents (PRD #1487).
+/// Returns the binary the installed events now name.
+fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: InstallMode) -> String {
     use crate::agent_hook_config::strip_deck_commands;
 
     if !root.is_object() {
@@ -325,10 +351,18 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
     // delete a live hook belonging to a user or to a newer sibling install.
     // That is issue #730's own defect one door along.
     //
-    // The consequence, stated rather than left to be discovered: nothing cleans
-    // a FOREIGN install's retired-event rule during install. That is the same
-    // tradeoff already accepted for the installed events, and `uninstall_impl`
-    // still clears every deck-signature command wide.
+    // The consequence, stated rather than left to be discovered: a FOREIGN
+    // install's retired-event hook is left in place by install — unless this
+    // copy supersedes that install (issue #1637's takeover), which repointed its
+    // installed events here and leaves nothing else to remove its retired ones
+    // (`command_is_superseded_deck`) — with the two
+    // exceptions the Codex writer applies (PRD #1497 audit F4,
+    // `remediate_retired_deck_handlers`), and like it only to a command naming
+    // a deck install (this binary, or an executable sharing its basename;
+    // audit A1): one whose executable has no safe spelling is removed, and one in the legacy `DOT_AGENT_DECK_BIN` wrapper,
+    // or one whose executable needs quoting and is not spelled as the current
+    // command for it, is rebuilt into the current form in place. `uninstall_impl` still clears
+    // every deck-signature command wide.
     //
     // An event key left empty IS dropped by this INSTALL sweep, while Codex's
     // install sweep leaves it. (Both adapters' `uninstall` drop emptied keys;
@@ -343,31 +377,69 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         }
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
             strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
+            crate::agent_hook_config::remediate_retired_deck_handlers(
+                arr,
+                command_is_deck_owned,
+                deck_command_executable,
+                binary_path,
+                HOOK_COMMAND_SUFFIX,
+                HOOK_SHELL,
+                crate::agent_hook_config::EmptiedRule::Drop,
+            );
             if arr.is_empty() {
                 hooks.remove(&key);
             }
         }
     }
 
-    let entry = json!({
-        "hooks": [ { "type": "command", "command": command } ]
-    });
+    let kept = |rules: &[Value]| {
+        crate::agent_hook_config::auto_install_kept_entry(
+            rules,
+            binary_path,
+            |cmd| command_is_deck_install(cmd, binary_path),
+            deck_command_executable,
+            |exe| crate::agent_hook_config::build_command(exe, HOOK_COMMAND_SUFFIX, HOOK_SHELL),
+        )
+    };
+    let keeper = match mode {
+        InstallMode::Explicit => None,
+        InstallMode::Automatic => DEVIN_HOOK_EVENTS.iter().find_map(|event| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .and_then(|rules| kept(rules))
+        }),
+    };
     for &event in DEVIN_HOOK_EVENTS {
         let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
         if !arr.is_array() {
             *arr = json!([]);
         }
         let arr = arr.as_array_mut().expect("hook event value is an array");
-        // Normalize down to a single fresh rule, but only for THIS binary —
-        // plus any deck pin sharing its basename that the deck would not
-        // itself write (missing, bare or relative, non-executable, or a
-        // build-artifact path), the shape N worktree builds actually take. A
-        // deck rule belonging to a genuinely different, still-valid install is
-        // left in place and the new rule is added ALONGSIDE it (issue #730),
-        // which is what Claude's `install_impl` has always done.
-        strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
-        arr.push(entry.clone());
+        let kept_here = match mode {
+            InstallMode::Explicit => None,
+            InstallMode::Automatic => kept(arr),
+        };
+        let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), command);
+        let entry = json!({
+            "hooks": [ { "type": "command", "command": command } ]
+        });
+        // ONE deck rule per event (PRD #1487), the policy the Codex and Claude
+        // writers share: the first deck command — this binary's or any other
+        // install of the deck under its basename, live or dead — is refreshed
+        // where it sits and every other copy is consolidated away, leaving the
+        // user's handlers where they were. Only when there is nothing to claim
+        // does it fall back to strip-then-append.
+        if crate::agent_hook_config::consolidate_deck_handlers_in_place(arr, command, |cmd| {
+            command_is_deck_install(cmd, binary_path)
+        })
+        .is_none()
+        {
+            strip_deck_commands(arr, |cmd| command_is_deck_install(cmd, binary_path));
+            arr.push(entry);
+        }
     }
+    KeptDeckEntry::named_binary(keeper.as_ref(), binary_path)
 }
 
 /// Remove the deck's hooks from an existing config value, leaving user hooks and
@@ -445,8 +517,9 @@ fn validate_structure(root: &Value) -> io::Result<()> {
 ///
 /// The copy aside goes through
 /// [`agent_hook_config::backup_malformed`](crate::agent_hook_config::backup_malformed),
-/// which publishes it rather than `std::fs::write`ing it — that followed a
-/// symlink planted at the predictable `.bak` name (#731).
+/// which creates it exclusively rather than `std::fs::write`ing it — that
+/// followed a symlink planted at the predictable `.bak` name (#731) — and never
+/// replaces a `config.json.bak` that is already there (#537).
 fn read_config(path: &Path) -> io::Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -458,7 +531,7 @@ fn read_config(path: &Path) -> io::Result<Value> {
                     format!(
                         "existing Devin config.json is not valid JSON — Devin allows \
                          comments, which cannot be edited in place ({}): {parse_err}",
-                        crate::agent_hook_config::preserved_phrase(backup.as_deref())
+                        crate::agent_hook_config::preserved_phrase(&backup)
                     ),
                 ))
             }
@@ -472,19 +545,47 @@ fn read_config(path: &Path) -> io::Result<Value> {
 /// writing the file atomically (creating the dir if needed). `binary_path` is
 /// the absolute `dot-agent-deck` path the hook command should invoke.
 pub fn install_to(config_dir: &Path, binary_path: &str) -> io::Result<()> {
-    std::fs::create_dir_all(config_dir)?;
+    install_to_reporting(config_dir, binary_path, InstallMode::Explicit).map(|_| ())
+}
+
+/// The automatic install's seam: [`install_to`] under
+/// [`InstallMode::Automatic`], which keeps another live durable install's entry
+/// (PRD #1487). Returns whether the config changed and the binary it names.
+pub(crate) fn auto_install_to(config_dir: &Path, binary_path: &str) -> io::Result<(bool, String)> {
+    install_to_reporting(config_dir, binary_path, InstallMode::Automatic)
+}
+
+/// [`install_to`], reporting whether it changed the config and the binary the
+/// deck's entries name. Equal merged definitions are not written (PRD #1487).
+fn install_to_reporting(
+    config_dir: &Path,
+    binary_path: &str,
+    mode: InstallMode,
+) -> io::Result<(bool, String)> {
     let path = config_path(config_dir);
+    // Before the config is read, so a refusal leaves it as it was (PRD #1497).
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
+    // Before the directory, the backup and the temp file (PRD #1487).
+    crate::config_write_guard::ensure_config_write_allowed(&path)?;
+    std::fs::create_dir_all(config_dir)?;
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Across deck processes too (issue #1493's follow-up), not only threads.
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
 
     let mut root = read_config(&path)?;
     validate_structure(&root)?;
 
     let command =
         crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
-    install_impl(&mut root, &command, binary_path);
+    let before = root.clone();
+    let named = install_impl(&mut root, &command, binary_path, mode);
+    if root == before {
+        return Ok((false, named));
+    }
     let contents = serde_json::to_string_pretty(&root)?;
-    crate::agent_hook_config::write_atomic(config_dir, &path, contents.as_bytes())
+    crate::agent_hook_config::write_atomic(config_dir, &path, contents.as_bytes())?;
+    Ok((true, named))
 }
 
 /// Testable core: remove the deck's hooks from `<config_dir>/config.json`.
@@ -498,6 +599,8 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
     }
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Across deck processes too (issue #1493's follow-up), not only threads.
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
 
     let mut root = read_config(&path)?;
     validate_structure(&root)?;
@@ -511,20 +614,6 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
     Ok(removed)
 }
 
-/// The DURABLE absolute path to pin into Devin's hook commands, or the
-/// resolver's refusal (PRD #381).
-///
-/// PRD #381's M2 list names six call sites and omits this one, but it is the
-/// same shape as the other six and writes a path Devin later executes — so
-/// "no remaining `current_exe()` feeding an external config write" is not
-/// satisfiable without it. It used to be `current_exe()` with a
-/// [`crate::platform::paths::DEFAULT_BINARY_NAME`] fallback, which is issue
-/// #536's bug in miniature: a bare command name in a file another program
-/// hands to a shell.
-fn durable_binary_path() -> Result<String, String> {
-    crate::platform::paths::durable_binary_path()
-}
-
 /// Startup entry: install the deck's Devin hooks into the user's Devin config,
 /// ONCE, command-agnostically. Wired as `DEVIN.startup_auto_install`, so the TUI
 /// runs it at launch like Claude's hooks and OpenCode's plugin — meaning Devin
@@ -535,33 +624,95 @@ fn durable_binary_path() -> Result<String, String> {
 /// Guarded, idempotent, and best-effort: SKIPs unless `devin` is on `PATH` and a
 /// real config dir resolves, and any failure is logged, never fatal. Never prints
 /// to stdout (it runs on the dashboard startup path).
-pub fn auto_install() {
+pub fn auto_install() -> Vec<crate::hook_binary::HookPin> {
+    match startup_install() {
+        Some(Ok(pin)) => vec![pin],
+        Some(Err(e)) => {
+            tracing::warn!("auto-install: {e}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// [`auto_install`] for `hooks refresh` (PRD #1666 part 3, R-3): whether
+/// Devin is installed here, and what the install could not write, which
+/// [`auto_install`] only logs.
+pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
+    let attempt = startup_install();
+    if let Some(Err(e)) = &attempt {
+        tracing::warn!("auto-install: {e}");
+    }
+    crate::hooks_refresh::InstallAttempt::of(attempt)
+}
+
+/// [`auto_install`]'s work: `None` when Devin is not installed here, else
+/// the pin or why the install wrote nothing.
+fn startup_install() -> Option<Result<crate::hook_binary::HookPin, String>> {
     if !devin_present_on_path() {
         tracing::debug!("devin startup install: skipped (devin not on PATH)");
-        return;
+        return None;
     }
     let Some(config_dir) = devin_config_dir() else {
         tracing::debug!("devin startup install: skipped (no config dir resolves)");
-        return;
+        return None;
     };
+    Some(install_into(&config_dir))
+}
 
-    let binary_path = match durable_binary_path() {
-        Ok(binary_path) => binary_path,
-        Err(e) => {
-            tracing::warn!("auto-install: {e}");
-            return;
-        }
-    };
-
-    match install_to(&config_dir, &binary_path) {
-        Ok(()) => {
-            tracing::info!(
-                "auto-installed Devin hooks: {}",
-                DEVIN_HOOK_EVENTS.join(", ")
-            );
-        }
-        Err(e) => tracing::warn!("auto-install: failed to write Devin hooks: {e}"),
+/// The automatic install into `config_dir`, from this copy's durable path.
+fn install_into(config_dir: &Path) -> Result<crate::hook_binary::HookPin, String> {
+    // PRD #381: the shared resolver, never `current_exe()` with a bare-name
+    // fallback (issue #536's bug in miniature), and under the same trust
+    // policy as every other agent's pin (issue #732).
+    let binary_path = crate::platform::paths::durable_binary_path()?;
+    let (changed, named) = auto_install_to(config_dir, &binary_path)
+        .map_err(|e| format!("failed to write Devin hooks: {e}"))?;
+    if changed {
+        crate::agent_hook_config::log_auto_install_change(
+            "devin",
+            &config_path(config_dir),
+            &named,
+            "devin startup auto-install",
+        );
     }
+    Ok(crate::hook_binary::HookPin {
+        agent: crate::event::AgentType::Devin,
+        config: config_path(config_dir),
+        binary: named,
+    })
+}
+
+/// What Devin's hooks are pinned to now, read back from its config without
+/// installing anything (issue #1637's pin refresh, `DEVIN.configured_pins`).
+/// An empty list when the config file is missing; `None` under the same
+/// guards as [`auto_install`] or when the config cannot be read, which leaves
+/// the pins the daemon knows.
+pub fn configured_pins() -> Option<Vec<crate::hook_binary::HookPin>> {
+    if !devin_present_on_path() {
+        return None;
+    }
+    configured_pins_in(&devin_config_dir()?)
+}
+
+/// [`configured_pins`] for an explicit config dir.
+fn configured_pins_in(config_dir: &Path) -> Option<Vec<crate::hook_binary::HookPin>> {
+    let path = config_path(config_dir);
+    let Some(root) = crate::agent_hook_config::read_json_config(&path)? else {
+        // Confirmed missing: it names nothing, which clears a notice about
+        // the binary it used to name (Qodo on #1656).
+        return Some(Vec::new());
+    };
+    Some(
+        crate::agent_hook_config::configured_deck_executables(&root, deck_command_executable)
+            .into_iter()
+            .map(|binary| crate::hook_binary::HookPin {
+                agent: crate::event::AgentType::Devin,
+                config: path.clone(),
+                binary,
+            })
+            .collect(),
+    )
 }
 
 /// `dot-agent-deck hooks install --agent devin` — the explicit, chatty install.
@@ -571,7 +722,8 @@ pub fn auto_install() {
 pub fn install() -> Result<(), String> {
     let config_dir = devin_config_dir()
         .ok_or_else(|| "no Devin config dir resolves (HOME is unset)".to_string())?;
-    install_to(&config_dir, &durable_binary_path()?).map_err(|e| e.to_string())?;
+    install_to(&config_dir, &crate::platform::paths::durable_binary_path()?)
+        .map_err(|e| e.to_string())?;
 
     println!("Installed hooks: {}", DEVIN_HOOK_EVENTS.join(", "));
     println!("Settings file: {}", config_path(&config_dir).display());
@@ -598,6 +750,32 @@ pub fn uninstall() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Scenario (issue #1637): the daemon's pin refresh reads back what Devin's
+    /// config pins, writing nothing — not even the backup an install makes of
+    /// an unparseable file, which is no evidence. A missing config names
+    /// nothing.
+    #[test]
+    fn configured_pins_reads_the_config_back_without_writing() {
+        let dir = crate::test_temp::tempdir().expect("config tempdir");
+        let config = config_path(dir.path());
+        assert_eq!(configured_pins_in(dir.path()), Some(Vec::new()));
+        assert!(!config.exists(), "a read-back creates nothing");
+        std::fs::write(&config, b"{ // a comment\n}").unwrap();
+        assert_eq!(configured_pins_in(dir.path()), None);
+        assert!(!dir.path().join("config.json.bak").exists());
+        let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
+        let old = old.as_str();
+        let command = crate::agent_hook_config::build_command(old, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
+        let root = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command}]}]}
+        });
+        std::fs::write(&config, root.to_string()).unwrap();
+        let pins = configured_pins_in(dir.path()).expect("readable config");
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].binary, old);
+        assert_eq!(pins[0].agent, crate::event::AgentType::Devin);
+    }
+
     fn read_back(dir: &Path) -> Value {
         let contents = std::fs::read_to_string(config_path(dir)).expect("read config.json");
         serde_json::from_str(&contents).expect("parse config.json")
@@ -607,7 +785,8 @@ mod tests {
     /// return its path as a string — a pin `pin_is_repairable` will call alive.
     fn seed_executable(path: &Path) -> String {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
-        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write seeded binary");
+        crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n")
+            .expect("write seeded binary");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -664,7 +843,13 @@ mod tests {
             assert_eq!(rules.len(), 1, "one deck rule per event ({event})");
             assert_eq!(
                 rules[0]["hooks"][0]["command"].as_str(),
-                Some("/abs/dot-agent-deck hook --agent devin"),
+                Some(
+                    format!(
+                        "{}/abs/dot-agent-deck hook --agent devin",
+                        crate::agent_hook_config::BIN_OVERRIDE_PREFIX
+                    )
+                    .as_str()
+                ),
                 "event {event}"
             );
             assert_eq!(rules[0]["hooks"][0]["type"].as_str(), Some("command"));
@@ -753,7 +938,8 @@ mod tests {
     /// object is doing a normal thing — the `hooks` array is a list of commands
     /// sharing a matcher. Removal used to be a `retain` over whole rules keyed
     /// on an `any()` across that list, so the automatic startup re-install
-    /// deleted the user's handler along with the deck's.
+    /// deleted the user's handler along with the deck's. Since PRD #1487 the
+    /// deck's command is refreshed where it sits, so neither handler moves.
     #[test]
     fn install_keeps_a_users_sibling_handler_in_a_shared_rule() {
         let dir = tempfile::tempdir().expect("config tempdir");
@@ -788,13 +974,18 @@ mod tests {
             .unwrap_or_else(|| panic!("the shared rule object was deleted: {pre:?}"));
         assert_eq!(
             shared["hooks"].as_array().map(Vec::len),
-            Some(1),
-            "only the deck's own command may leave a shared rule: {shared:?}"
+            Some(2),
+            "the deck's command is refreshed in place, beside the user's: {shared:?}"
         );
         assert_eq!(
             shared["hooks"][0]["command"],
+            json!(deck_command),
+            "the deck's command keeps its position: {shared:?}"
+        );
+        assert_eq!(
+            shared["hooks"][1]["command"],
             json!("/usr/local/bin/my-critical-audit.sh"),
-            "the user's sibling handler must survive: {shared:?}"
+            "the user's sibling handler must survive at its index: {shared:?}"
         );
         assert_eq!(
             deck_commands_for(&root, "PreToolUse").len(),
@@ -845,17 +1036,9 @@ mod tests {
         );
     }
 
-    /// PRD #381 Open Question 3, for Devin (issue #730): repair only when the
-    /// target is POSITIVELY missing, never merely because it differs from what
-    /// this install would have written.
-    ///
-    /// Both arms or the test proves nothing — a predicate that never prunes
-    /// anything passes the first on its own. The valid foreign install
-    /// deliberately shares the installing binary's basename, so
-    /// `pin_is_repairable` saying "the target is still there" is the only thing
-    /// standing between it and deletion.
+    /// Scenario: Replace a second valid deck installation and a missing one with the installing deck. Both leave exactly one deck command per event.
     #[test]
-    fn install_leaves_a_valid_foreign_pin_alone_and_repairs_a_dead_one() {
+    fn install_replaces_valid_and_dead_deck_pins_in_place() {
         let fixture = crate::test_temp::tempdir().expect("devin fixture tempdir");
         let installing =
             seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
@@ -881,9 +1064,8 @@ mod tests {
 
         assert_eq!(
             deck_commands_for(&read_back(&valid), "SessionStart"),
-            vec![command_for(&other), command_for(&installing)],
-            "a deck pin that still works is left alone and the fresh rule is added \
-             ALONGSIDE it, never repointed"
+            vec![command_for(&installing)],
+            "a different valid deck install must be replaced in place, never appended alongside"
         );
 
         // Arm 2 — the same shape, but the binary is positively gone.
@@ -1094,16 +1276,15 @@ mod tests {
             "the backup was written through the planted symlink and overwrote the victim"
         );
         assert!(
-            !std::fs::symlink_metadata(&backup)
+            std::fs::symlink_metadata(&backup)
                 .expect("stat backup")
                 .file_type()
                 .is_symlink(),
-            "the backup must be a real file, not the planted symlink"
+            "something already at the backup name is left as it was (#537)"
         );
-        assert_eq!(
-            std::fs::read_to_string(&backup).expect("read backup"),
-            jsonc,
-            "the user's bytes must still be preserved beside the original"
+        assert!(
+            !err.to_string().contains("preserved at"),
+            "the planted link must not be claimed as the backup: {err}"
         );
     }
 
@@ -1135,9 +1316,79 @@ mod tests {
             .unwrap();
         assert_eq!(
             command,
-            "'/Applications/My Deck/dot-agent-deck' hook --agent devin"
+            format!(
+                "{}'/Applications/My Deck/dot-agent-deck' hook --agent devin",
+                crate::agent_hook_config::BIN_OVERRIDE_PREFIX
+            )
         );
         assert!(command_is_deck_owned(command));
+        assert_eq!(
+            deck_command_executable(command).as_deref(),
+            Some("/Applications/My Deck/dot-agent-deck"),
+            "the installed path behind the DOT_AGENT_DECK_BIN wrapper is recovered"
+        );
+    }
+
+    /// PRD #1497: a Devin config holding the plain `<path> hook --agent devin`
+    /// command an older release wrote is migrated in place to the
+    /// `DOT_AGENT_DECK_BIN` form, one deck entry per event and the user's hook
+    /// kept; an uninstall over a config holding both forms removes both.
+    #[test]
+    fn install_migrates_the_plain_form_and_uninstall_removes_both_forms() {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        let binary = "/abs/dot-agent-deck";
+        let plain = format!("{binary} {HOOK_COMMAND_SUFFIX}");
+        let overridden = format!(
+            "{}{binary} {HOOK_COMMAND_SUFFIX}",
+            crate::agent_hook_config::BIN_OVERRIDE_PREFIX
+        );
+        let user = "./scripts/audit.sh";
+        let seed = |hooks: Value| {
+            std::fs::write(
+                config_path(dir.path()),
+                serde_json::to_string_pretty(&json!({ "theme_mode": "dark", "hooks": hooks }))
+                    .unwrap(),
+            )
+            .unwrap();
+        };
+        let commands = |root: &Value, event: &str| -> Vec<String> {
+            root["hooks"][event]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .flat_map(crate::agent_hook_config::rule_commands)
+                .map(str::to_string)
+                .collect()
+        };
+
+        seed(json!({ "Stop": [
+            { "hooks": [{ "type": "command", "command": plain }] },
+            { "hooks": [{ "type": "command", "command": user }] }
+        ] }));
+        install_to(dir.path(), binary).expect("install");
+        let root = read_back(dir.path());
+        for &event in DEVIN_HOOK_EVENTS {
+            let all = commands(&root, event);
+            let deck: Vec<_> = all
+                .iter()
+                .filter(|c| c.ends_with(HOOK_COMMAND_SUFFIX))
+                .collect();
+            assert_eq!(deck, vec![&overridden], "{event}: {all:?}");
+        }
+        assert!(commands(&root, "Stop").contains(&user.to_string()));
+        assert_eq!(root["theme_mode"], json!("dark"));
+
+        seed(json!({
+            "Stop": [{ "hooks": [
+                { "type": "command", "command": overridden },
+                { "type": "command", "command": user }
+            ] }],
+            "SessionStart": [{ "hooks": [{ "type": "command", "command": plain }] }]
+        }));
+        uninstall_from(dir.path()).expect("uninstall");
+        let root = read_back(dir.path());
+        assert_eq!(commands(&root, "Stop"), vec![user.to_string()]);
+        assert!(commands(&root, "SessionStart").is_empty());
     }
 
     /// Uninstall removes only the deck's rules, drops the keys they emptied, and
@@ -1318,7 +1569,8 @@ mod tests {
             .join(&name);
         for candidate in [&durable, &artifact] {
             std::fs::create_dir_all(candidate.parent().expect("parent")).expect("create dir");
-            std::fs::write(candidate, b"#!/bin/sh\nexit 0\n").expect("write candidate");
+            crate::test_isolation::write_script(candidate, b"#!/bin/sh\nexit 0\n")
+                .expect("write candidate");
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1374,8 +1626,8 @@ mod tests {
     }
 
     /// The refusal reaches the caller rather than degrading to a bare name.
-    /// `durable_binary_path` is a thin wrapper, so this pins the one property
-    /// that matters at this site: its error type is propagated by `install`,
+    /// This site calls the shared resolver directly, so this pins the one
+    /// property that matters here: its error type is propagated by `install`,
     /// which returns `Result<(), String>`.
     #[test]
     fn a_refused_resolution_is_an_error_not_a_bare_command_name() {

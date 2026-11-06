@@ -1,5 +1,4 @@
 use crate::project_config::ProjectConfig;
-use regex::Regex;
 use std::collections::HashSet;
 
 /// Sanitize a role name for safe use in filenames.
@@ -26,11 +25,11 @@ pub struct ValidationIssue {
 /// Issue #308 audit (MEDIUM): how much of a project-controlled VALUE a
 /// diagnostic quotes back before it stops and reports a count instead.
 ///
-/// A value is not prose — it is a mode name, a role name, a regex, an agent
+/// A value is not prose — it is an orchestration name, a role name, a regex, an agent
 /// name — so 120 characters is far past the longest plausible real one while
 /// leaving an absurd one unable to fill a screen. The count that replaces the
 /// tail is what keeps the diagnostic honest: "this is longer than it looks" is
-/// itself the finding when a config carries a 100 KB mode name.
+/// itself the finding when a config carries a 100 KB role name.
 pub(crate) const MAX_QUOTED_VALUE_CHARS: usize = 120;
 
 /// Issue #308 audit (MEDIUM): the per-line ceiling on a whole rendered
@@ -100,7 +99,7 @@ pub(crate) fn escape_multiline_for_terminal(s: &str) -> String {
 /// `dot-agent-deck validate` writes each issue straight to stderr with
 /// `eprintln!("{issue}")`, and `.dot-agent-deck.toml` travels with a repository
 /// — a clone, a contributor branch, a PR checkout. Both fields interpolate raw
-/// strings from that file: `scope` is a mode or orchestration name verbatim, and
+/// strings from that file: `scope` is an orchestration name verbatim, and
 /// several messages quote a role name, a regex pattern or (issue #308) a
 /// declared `agent = "…"`. Without this, a repo shipping
 /// `agent = "x\n[error] 'trusted': validation passed"` makes `validate` print a
@@ -147,7 +146,7 @@ impl std::fmt::Display for ValidationIssue {
 ///
 /// Characters, not bytes, so the cut can never land inside a UTF-8 sequence and
 /// the reported number matches what a reader would count.
-fn bound_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+pub(crate) fn bound_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
     let total = s.chars().count();
     if total <= max {
         return std::borrow::Cow::Borrowed(s);
@@ -180,7 +179,7 @@ fn bound_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
 /// deliberately not escaped: nothing parses this output back, and doubling it
 /// would cost real legibility on the messages that quote a Windows path or a
 /// regex.
-fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.chars().any(needs_escape) {
         return std::borrow::Cow::Borrowed(s);
     }
@@ -212,80 +211,112 @@ pub(crate) fn escape_field_for_log(value: &str, max_chars: usize) -> String {
     escape_for_terminal(&bound_chars(value, max_chars)).into_owned()
 }
 
+/// Issue #1082: [`escape_field_for_log`] at [`MAX_QUOTED_VALUE_CHARS`] — the
+/// spelling for the daemon's socket surface, where every field being escaped is
+/// an IDENTIFIER a producer supplied (a pane id, a session id, a role name)
+/// rather than prose.
+///
+/// A shorthand, not a second helper: it is that call with the default bound and
+/// nothing else. It earns a name because that surface has ~20 of them — spelled
+/// out, each costs four wrapped lines inside a `tracing` macro and the bound
+/// stops being the interesting part of the line, while `grep escape_id_for_log`
+/// enumerates the swept class in one command. A site that needs a DIFFERENT
+/// bound calls [`escape_field_for_log`] directly and says why there;
+/// `crate::daemon`'s raw hook line is the one that does.
+pub(crate) fn escape_id_for_log(value: &str) -> String {
+    escape_field_for_log(value, MAX_QUOTED_VALUE_CHARS)
+}
+
 /// The predicate behind [`escape_for_terminal`] — see its doc for why the set is
 /// the union of two Unicode categories rather than just `Cc`.
 fn needs_escape(c: char) -> bool {
     c.is_control() || crate::untrusted_text::is_bidi_format_char(c)
 }
 
+/// Issue #1199: what `dot-agent-deck validate` says about a leftover
+/// `[[modes]]` block.
+pub const LEGACY_MODES_VALIDATE_MESSAGE: &str =
+    "workspace modes were removed (#1199); this block is ignored and can be deleted";
+
 /// Validate a project config and return a list of issues.
-/// Errors should prevent mode activation; warnings are informational.
-pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
-    let mut issues = Vec::new();
-
-    // Check for duplicate mode names.
-    let mut seen_names = HashSet::new();
-    for mode in &config.modes {
-        if !seen_names.insert(&mode.name) {
-            issues.push(ValidationIssue {
-                severity: Severity::Warning,
-                scope: mode.name.clone(),
-                message: "duplicate mode name".to_string(),
-            });
-        }
-    }
-
-    for mode in &config.modes {
-        // Reject modes with rules but zero reactive panes.
-        if !mode.rules.is_empty() && mode.reactive_panes == 0 {
+/// Errors should block the config from being used; warnings are informational.
+/// PRD #1666: every `subscribe` and `take_offers` entry is a topic or pool
+/// name the inbox accepts. A name it would refuse is an error rather than a
+/// warning: the subscription would never match anything, and nothing else
+/// would ever say why.
+fn validate_subscriptions(config: &ProjectConfig, issues: &mut Vec<ValidationIssue>) {
+    let mut check = |scope: &str, owner: &str, key: &str, names: &[String]| {
+        if names.len() > crate::inbox::MAX_SUBSCRIPTIONS {
             issues.push(ValidationIssue {
                 severity: Severity::Error,
-                scope: mode.name.clone(),
-                message: "modes with reactive rules must configure at least one reactive pane"
-                    .to_string(),
+                scope: scope.to_string(),
+                message: format!(
+                    "{owner}`{key}` names {} entries; at most {} are allowed",
+                    names.len(),
+                    crate::inbox::MAX_SUBSCRIPTIONS
+                ),
             });
         }
-
-        // Validate regex patterns.
-        for rule in &mode.rules {
-            if let Err(e) = Regex::new(&rule.pattern) {
+        for name in names {
+            if !crate::inbox::is_valid_label(name) {
                 issues.push(ValidationIssue {
                     severity: Severity::Error,
-                    scope: mode.name.clone(),
-                    message: format!("invalid regex '{}': {}", rule.pattern, e),
-                });
-            }
-        }
-
-        // Warn if interval is set but watch is false.
-        for rule in &mode.rules {
-            if rule.interval.is_some() && !rule.watch {
-                issues.push(ValidationIssue {
-                    severity: Severity::Warning,
-                    scope: mode.name.clone(),
+                    scope: scope.to_string(),
                     message: format!(
-                        "rule '{}' has interval but watch is false — interval will be ignored",
-                        rule.pattern
+                        "{owner}`{key}` entry \"{}\" is not a valid name: use 1 to {} lowercase \
+                         letters, digits and hyphens, starting with a letter or digit",
+                        bound_chars(name, MAX_QUOTED_VALUE_CHARS),
+                        crate::inbox::MAX_LABEL_LEN
                     ),
                 });
             }
         }
-    }
-
-    // Issue #308: a declared `agent = "…"` that no shipped agent claims is a
-    // WARNING, not an error — the config still loads and the mode still opens,
-    // it just gets no agent. Worth saying out loud because the failure is
-    // otherwise silent and looks exactly like the bug the key exists to fix: the
-    // pane reads "No agent", which is precisely what a user reaches for this key
-    // to stop seeing. `AgentType::None` is what an unrecognized name resolves
-    // to, deliberately — the declaration is honored rather than quietly
-    // replaced by a guess from the command — so the only place to surface a typo
-    // is here.
-    for mode in &config.modes {
-        if let Some(issue) = unknown_agent_issue(&mode.name, mode.agent.as_deref()) {
-            issues.push(issue);
+    };
+    check("[dispatch]", "", "subscribe", &config.inbox.dispatch);
+    for (orchestration, subs) in config
+        .orchestrations
+        .iter()
+        .zip(&config.inbox.orchestrations)
+    {
+        check(&orchestration.name, "", "subscribe", &subs.subscribe);
+        let mut roles: Vec<_> = subs.roles.iter().collect();
+        roles.sort_by(|a, b| a.0.cmp(b.0));
+        for (role, role_subs) in roles {
+            let owner = format!("role '{}': ", bound_chars(role, MAX_QUOTED_VALUE_CHARS));
+            check(
+                &orchestration.name,
+                &owner,
+                "subscribe",
+                &role_subs.subscribe,
+            );
+            check(
+                &orchestration.name,
+                &owner,
+                "take_offers",
+                &role_subs.take_offers,
+            );
         }
     }
+}
+
+pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+
+    // Issue #1199: workspace modes were removed. A leftover `[[modes]]` block
+    // still parses (the parse layer accepts any shape of it), so the config keeps
+    // loading; this is where the user is told the block does nothing now. A
+    // WARNING rather than an error: every config written before the removal
+    // carries one, and a config that validated yesterday must not start failing
+    // CI today over a block that is merely dead.
+    if config.legacy_modes_declared {
+        issues.push(ValidationIssue {
+            severity: Severity::Warning,
+            scope: "[[modes]]".to_string(),
+            message: LEGACY_MODES_VALIDATE_MESSAGE.to_string(),
+        });
+    }
+
+    validate_subscriptions(config, &mut issues);
 
     // Check for duplicate orchestration names.
     let mut seen_orch_names = HashSet::new();
@@ -345,7 +376,7 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             scope: spawnable[0].name.clone(),
             message: format!(
                 "{} orchestrations are defined and none declares `default = true`, so a dispatch \
-                 or scheduled task that names none opens this one purely because it comes first \
+                 or schedule that names none opens this one purely because it comes first \
                  in the file — reordering the file would silently change that. Add \
                  `default = true` to the one you want.",
                 spawnable.len()
@@ -426,9 +457,18 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             }
         }
 
-        // Warn about worker roles without descriptions (helps orchestrator know capabilities).
+        // Issue #1243: a role whose agent the deck cannot identify at all.
         for role in &orch.roles {
-            if !role.start && role.description.is_none() {
+            if let Some(issue) = unidentified_role_agent_issue(&orch.name, role) {
+                issues.push(issue);
+            }
+        }
+
+        // Warn about worker roles without descriptions (helps orchestrator know capabilities).
+        // Issue #523: one seat, whichever path opens the tab.
+        let orch_idx = orch.orchestrator_role_index();
+        for (idx, role) in orch.roles.iter().enumerate() {
+            if idx != orch_idx && role.description.is_none() {
                 issues.push(ValidationIssue {
                     severity: Severity::Warning,
                     scope: orch.name.clone(),
@@ -476,6 +516,47 @@ fn unknown_agent_issue(scope: &str, declared: Option<&str>) -> Option<Validation
     })
 }
 
+/// Issue #1243: the warning for a role whose `command` resolves to no agent and
+/// which declares none, or `None` when the deck can identify it (or when the
+/// command is empty, which is an error of its own).
+///
+/// This is `devbox run codex-big`, `mise exec -- opencode`, `./run-pi.sh`: a
+/// launcher [`crate::event::AgentType::from_command`] cannot see through. The
+/// role still opens and still receives work, which is why this is a warning:
+/// a task reaches it through its inbox whatever its type, since the inbox
+/// component that wakes it is named by the agent's own hook, plugin or
+/// extension, not by the role. What the role loses is what the deck keys on
+/// its RESOLVED type at spawn: the card gets no agent from the config, and a
+/// Codex agent behind the launcher runs without the deck's wrapper (`spawn`
+/// resolves the wrapper from the same type).
+///
+/// Resolved through [`crate::project_config::OrchestrationRoleConfig::resolved_agent_type`],
+/// the accessor both spawn paths and the delegate's respawn read, so this
+/// warns for exactly the roles that spawn untyped. A declared-but-unknown name
+/// resolves to `Some(AgentType::None)` and is [`unknown_agent_issue`]'s to
+/// report, not this function's.
+fn unidentified_role_agent_issue(
+    scope: &str,
+    role: &crate::project_config::OrchestrationRoleConfig,
+) -> Option<ValidationIssue> {
+    if role.command.trim().is_empty() || role.resolved_agent_type().is_some() {
+        return None;
+    }
+    let command = bound_chars(role.command.trim(), MAX_QUOTED_VALUE_CHARS);
+    Some(ValidationIssue {
+        severity: Severity::Warning,
+        scope: scope.to_string(),
+        message: format!(
+            "role '{}': the deck cannot tell which agent `{command}` launches and the role \
+             declares no `agent` — the card gets no agent from the config, and if the agent \
+             behind it is Codex it runs without the deck's wrapper. Declare the agent, e.g. \
+             `agent = \"codex\"`; known agents: {}",
+            bound_chars(&role.name, MAX_QUOTED_VALUE_CHARS),
+            crate::agent_registry::declarable_agent_names().join(", ")
+        ),
+    })
+}
+
 /// Returns true if any issue is an error.
 pub fn has_errors(issues: &[ValidationIssue]) -> bool {
     issues.iter().any(|i| i.severity == Severity::Error)
@@ -484,18 +565,7 @@ pub fn has_errors(issues: &[ValidationIssue]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_config::{
-        ModeConfig, ModeRule, OrchestrationConfig, OrchestrationRoleConfig, ProjectConfig,
-    };
-
-    fn make_config(modes: Vec<ModeConfig>) -> ProjectConfig {
-        ProjectConfig {
-            modes,
-            orchestrations: vec![],
-            worker_response_timeout_minutes:
-                crate::project_config::DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES,
-        }
-    }
+    use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig, ProjectConfig};
 
     fn make_role(name: &str, start: bool) -> OrchestrationRoleConfig {
         OrchestrationRoleConfig {
@@ -523,98 +593,13 @@ mod tests {
 
     fn make_orch_config(orchestrations: Vec<OrchestrationConfig>) -> ProjectConfig {
         ProjectConfig {
-            modes: vec![],
+            legacy_modes_declared: false,
             orchestrations,
             worker_response_timeout_minutes:
                 crate::project_config::DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES,
+
+            inbox: Default::default(),
         }
-    }
-
-    fn make_mode(name: &str, rules: Vec<ModeRule>) -> ModeConfig {
-        ModeConfig {
-            agent: None,
-            name: name.to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: vec![],
-            rules,
-            reactive_panes: 2,
-        }
-    }
-
-    fn make_rule(pattern: &str, watch: bool, interval: Option<u64>) -> ModeRule {
-        ModeRule {
-            pattern: pattern.to_string(),
-            watch,
-            interval,
-        }
-    }
-
-    #[test]
-    fn valid_config_has_no_issues() {
-        let config = make_config(vec![make_mode(
-            "dev",
-            vec![make_rule("cargo\\s+build", false, None)],
-        )]);
-        let issues = validate_config(&config);
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn invalid_regex_produces_error() {
-        let config = make_config(vec![make_mode(
-            "dev",
-            vec![make_rule("[invalid", false, None)],
-        )]);
-        let issues = validate_config(&config);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].severity, Severity::Error);
-        assert!(issues[0].message.contains("invalid regex"));
-        assert!(has_errors(&issues));
-    }
-
-    #[test]
-    fn duplicate_mode_names_produce_warning() {
-        let config = make_config(vec![make_mode("dev", vec![]), make_mode("dev", vec![])]);
-        let issues = validate_config(&config);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].severity, Severity::Warning);
-        assert!(issues[0].message.contains("duplicate"));
-        assert!(!has_errors(&issues));
-    }
-
-    #[test]
-    fn interval_without_watch_produces_warning() {
-        let config = make_config(vec![make_mode(
-            "dev",
-            vec![make_rule("cargo\\s+test", false, Some(5))],
-        )]);
-        let issues = validate_config(&config);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].severity, Severity::Warning);
-        assert!(issues[0].message.contains("interval will be ignored"));
-    }
-
-    #[test]
-    fn watch_with_interval_is_valid() {
-        let config = make_config(vec![make_mode(
-            "dev",
-            vec![make_rule("kubectl\\s+get", true, Some(2))],
-        )]);
-        let issues = validate_config(&config);
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn multiple_issues_across_modes() {
-        let config = make_config(vec![
-            make_mode("a", vec![make_rule("[bad", false, None)]),
-            make_mode("a", vec![make_rule("good", false, Some(3))]),
-        ]);
-        let issues = validate_config(&config);
-        // 1 duplicate name + 1 invalid regex + 1 interval without watch
-        assert_eq!(issues.len(), 3);
-        assert!(has_errors(&issues));
     }
 
     #[test]
@@ -629,43 +614,62 @@ mod tests {
     }
 
     #[test]
-    fn rules_with_zero_reactive_panes_produces_error() {
-        let config = make_config(vec![ModeConfig {
-            agent: None,
-            name: "dev".to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: vec![],
-            rules: vec![make_rule("cargo\\s+test", false, None)],
-            reactive_panes: 0,
-        }]);
-        let issues = validate_config(&config);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].severity, Severity::Error);
-        assert!(issues[0].message.contains("reactive pane"));
-        assert!(has_errors(&issues));
-    }
-
-    #[test]
     fn empty_config_is_valid() {
-        let config = make_config(vec![]);
+        let config = make_orch_config(vec![]);
         let issues = validate_config(&config);
         assert!(issues.is_empty());
     }
 
+    /// Issue #1199: a leftover `[[modes]]` block is one WARNING scoped
+    /// `[[modes]]` — never an error, so `validate` still exits 0 — and the
+    /// orchestrations beside it are validated exactly as before.
     #[test]
-    fn empty_mode_is_valid() {
-        let config = make_config(vec![ModeConfig {
-            agent: None,
-            name: "empty".to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: vec![],
-            rules: vec![],
-            reactive_panes: 2,
-        }]);
+    fn legacy_modes_block_warns_once_and_is_not_an_error() {
+        let config: ProjectConfig = toml::from_str(
+            r#"
+[[modes]]
+name = "a"
+reactive_panes = 0
+
+[[modes.rules]]
+pattern = "[unclosed"
+
+[[modes]]
+name = "a"
+
+[[orchestrations]]
+name = "orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "claude"
+description = "Does worker tasks"
+"#,
+        )
+        .expect("a legacy [[modes]] block parses");
+
         let issues = validate_config(&config);
-        assert!(issues.is_empty());
+        let legacy: Vec<&ValidationIssue> =
+            issues.iter().filter(|i| i.scope == "[[modes]]").collect();
+        assert_eq!(
+            legacy.len(),
+            1,
+            "one warning for the whole block, however many modes it declares; got {issues:?}"
+        );
+        assert_eq!(legacy[0].severity, Severity::Warning);
+        assert!(legacy[0].message.contains("workspace modes were removed"));
+        assert!(legacy[0].message.contains("#1199"));
+        assert!(legacy[0].message.contains("ignored"));
+        assert!(legacy[0].message.contains("deleted"));
+        assert!(
+            !has_errors(&issues),
+            "the old mode checks (duplicate names, bad regexes, zero reactive panes) are gone; got {issues:?}"
+        );
     }
 
     // --- Orchestration validation tests ---
@@ -865,29 +869,22 @@ mod tests {
     }
 
     /// Issue #308: a declared agent name no shipped agent claims is warned
-    /// about — on a role and on a mode — while a recognized name, a blank value
-    /// (which reads as unset) and an absent key are all silent.
+    /// about on a role, while a recognized name, a blank value (which reads as
+    /// unset) and an absent key are all silent.
     #[test]
-    fn unknown_declared_agent_warns_on_roles_and_modes() {
+    fn unknown_declared_agent_warns_on_roles() {
         let mut role = make_role("worker", false);
         role.agent = Some("codx".to_string());
         let mut start = make_role("orchestrator", true);
         start.agent = Some("codex".to_string());
-        let mut mode = make_mode("declared", vec![]);
-        mode.agent = Some("nonsense".to_string());
-        let mut blank = make_mode("blank", vec![]);
+        let mut blank = make_role("blank", false);
         blank.agent = Some("  ".to_string());
+        let plain = make_role("plain", false);
 
-        let config = ProjectConfig {
-            modes: vec![mode, blank, make_mode("plain", vec![])],
-            orchestrations: vec![OrchestrationConfig {
-                default: false,
-                name: "orch".to_string(),
-                roles: vec![start, role],
-            }],
-            worker_response_timeout_minutes:
-                crate::project_config::DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES,
-        };
+        let config = make_orch_config(vec![make_orchestration(
+            "orch",
+            vec![start, role, blank, plain],
+        )]);
 
         let warned: Vec<String> = validate_config(&config)
             .into_iter()
@@ -897,14 +894,8 @@ mod tests {
 
         assert_eq!(
             warned.len(),
-            2,
-            "exactly the two unrecognized declarations warn; got {warned:?}"
-        );
-        assert!(
-            warned
-                .iter()
-                .any(|w| w.starts_with("declared|unknown agent 'nonsense'")),
-            "the mode declaration warns under the mode's name; got {warned:?}"
+            1,
+            "exactly the one unrecognized declaration warns; got {warned:?}"
         );
         assert!(
             warned
@@ -919,6 +910,130 @@ mod tests {
         assert!(
             !has_errors(&validate_config(&config)),
             "an unknown agent name is advisory — the config still loads"
+        );
+    }
+
+    /// Issue #1243: a role whose command names no agent the deck recognizes,
+    /// and which declares none, is warned about — its card gets no agent from
+    /// the config and a Codex agent behind it runs without the deck's wrapper,
+    /// and nothing else would say so. A declared role, an inferable command and
+    /// an empty command (already an error of its own) are all silent here.
+    #[test]
+    fn role_whose_agent_cannot_be_identified_warns() {
+        let mut launcher = make_role("tester", false);
+        launcher.command = "devbox run codex-big".to_string();
+        let mut declared = make_role("reviewer", false);
+        declared.command = "devbox run pi-big".to_string();
+        declared.agent = Some("pi".to_string());
+        let inferable = make_role("orchestrator", true);
+        let mut empty = make_role("auditor", false);
+        empty.command = "  ".to_string();
+
+        let undeclared = launcher.clone();
+        let config = make_orch_config(vec![make_orchestration(
+            "orch",
+            vec![inferable, launcher, declared, empty],
+        )]);
+        let warned: Vec<String> = validate_config(&config)
+            .into_iter()
+            .filter(|i| {
+                i.severity == Severity::Warning && i.message.contains("declares no `agent`")
+            })
+            .map(|i| format!("{}|{}", i.scope, i.message))
+            .collect();
+
+        assert_eq!(
+            warned.len(),
+            1,
+            "exactly the undeclared launcher role warns; got {warned:?}"
+        );
+        let warning = &warned[0];
+        assert!(
+            warning.starts_with("orch|role 'tester':"),
+            "the warning is scoped to the orchestration and names the role; got {warning}"
+        );
+        assert!(
+            warning.contains("devbox run codex-big"),
+            "the warning quotes the command it could not see through; got {warning}"
+        );
+        assert!(
+            warning.contains("card gets no agent") && warning.contains("agent = "),
+            "the warning names the cost and the remedy; got {warning}"
+        );
+        assert!(
+            warning.contains("codex, "),
+            "the warning lists the names the user could declare; got {warning}"
+        );
+        let advisory = make_orch_config(vec![make_orchestration(
+            "orch",
+            vec![make_role("orchestrator", true), undeclared],
+        )]);
+        assert!(
+            !has_errors(&validate_config(&advisory)),
+            "an undeclared launcher is advisory — the role still opens and still receives work"
+        );
+    }
+
+    /// PRD #1666: the inbox replaced the readiness gate, so no role waits for
+    /// readiness before a task reaches it. A `clear = true` worker the delegate
+    /// respawns, a `clear = false` worker that keeps its process and the
+    /// orchestrator all get the same warning, and none of them is told about a
+    /// wait.
+    #[test]
+    fn unidentified_role_warning_claims_no_readiness_wait_for_any_role() {
+        let warning_for = |role: OrchestrationRoleConfig| -> String {
+            // A companion whose agent the deck CAN identify, so it warns about
+            // nothing itself: the flagged orchestrator beside a worker under
+            // test, or a worker beside a flagged one.
+            let companion = if role.start {
+                make_role("coder", false)
+            } else {
+                make_role("lead", true)
+            };
+            let config = make_orch_config(vec![make_orchestration("orch", vec![companion, role])]);
+            let warned: Vec<String> = validate_config(&config)
+                .into_iter()
+                .filter(|i| {
+                    i.severity == Severity::Warning && i.message.contains("declares no `agent`")
+                })
+                .map(|i| i.message)
+                .collect();
+            assert_eq!(
+                warned.len(),
+                1,
+                "exactly one unidentified-agent warning; got {warned:?}"
+            );
+            warned.into_iter().next().unwrap()
+        };
+
+        let mut respawned = make_role("tester", false);
+        respawned.command = "devbox run codex-big".to_string();
+        let mut persistent = respawned.clone();
+        persistent.clear = false;
+        let mut start = make_role("tester", true);
+        start.command = "devbox run codex-big".to_string();
+
+        let warnings = [
+            ("`clear = true` worker", warning_for(respawned)),
+            ("`clear = false` worker", warning_for(persistent)),
+            ("orchestrator", warning_for(start)),
+        ];
+        for (label, warning) in &warnings {
+            assert!(
+                !warning.contains("readiness") && !warning.contains("30 s"),
+                "no {label} waits for readiness, so it must not be told it does; got {warning}"
+            );
+            assert!(
+                warning.contains("card gets no agent")
+                    && warning.contains("wrapper")
+                    && warning.contains("agent = "),
+                "a {label} is still told what it loses and how to fix it; got {warning}"
+            );
+        }
+        assert!(
+            warnings.iter().all(|(_, w)| w == &warnings[0].1),
+            "what an unidentified role loses does not depend on its seat or `clear`; \
+             got {warnings:?}"
         );
     }
 
@@ -1012,9 +1127,12 @@ mod tests {
     #[test]
     fn overlong_declared_agent_name_is_bounded_in_the_warning() {
         let long = "z".repeat(50_000);
-        let mut mode = make_mode("declared", vec![]);
-        mode.agent = Some(long.clone());
-        let config = make_config(vec![mode]);
+        let mut role = make_role("declared", false);
+        role.agent = Some(long.clone());
+        let config = make_orch_config(vec![make_orchestration(
+            "orch",
+            vec![make_role("orchestrator", true), role],
+        )]);
 
         let issues = validate_config(&config);
         let warning = issues
@@ -1085,15 +1203,38 @@ mod tests {
         );
     }
 
+    /// Issue #1082: the shorthand the daemon's socket sweep spells at ~20 call
+    /// sites must stay exactly [`escape_field_for_log`] at
+    /// [`MAX_QUOTED_VALUE_CHARS`]. A wrapper that quietly drifted would move all
+    /// of them at once and no per-site test would notice, because each of those
+    /// asserts the PROPERTY (nothing a terminal acts on survives) rather than
+    /// the bound.
+    #[test]
+    fn escape_id_for_log_is_the_default_bound_of_escape_field_for_log() {
+        let long = "z".repeat(5_000);
+        for value in [
+            "ordinary-pane-id",
+            "unit\nINFO forged\rovershoot\u{1b}[2Jcleared\u{202e}reversed",
+            "",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                escape_id_for_log(value),
+                escape_field_for_log(value, MAX_QUOTED_VALUE_CHARS),
+                "the shorthand must be the two-argument call and nothing else"
+            );
+        }
+    }
+
     /// Issue #308 audit (MEDIUM): the flood backstop covers fields no producer
-    /// thought to bound — here the `scope`, which is a mode name copied verbatim
+    /// thought to bound — here the `scope`, which is an orchestration name copied verbatim
     /// out of the config with no prose around it.
     #[test]
     fn overlong_scope_is_bounded_at_the_output_seam() {
         let issue = ValidationIssue {
             severity: Severity::Error,
             scope: "s".repeat(10_000),
-            message: "duplicate mode name".to_string(),
+            message: "duplicate orchestration name".to_string(),
         };
         let rendered = format!("{issue}");
 
@@ -1103,7 +1244,7 @@ mod tests {
             rendered.len()
         );
         assert!(
-            rendered.ends_with("duplicate mode name"),
+            rendered.ends_with("duplicate orchestration name"),
             "the message still follows the bounded scope; got {rendered:?}"
         );
     }
@@ -1114,17 +1255,20 @@ mod tests {
     /// the raw value, exact and fail-closed.
     #[test]
     fn sanitising_does_not_change_which_names_are_recognized() {
-        let mut sneaky = make_mode("sneaky", vec![]);
+        let mut sneaky = make_role("sneaky", false);
         // A real agent name wrapped in characters the escaper would rewrite.
         sneaky.agent = Some("\u{202e}claude\u{1b}".to_string());
-        let mut plain = make_mode("plain", vec![]);
+        let mut plain = make_role("plain", false);
         plain.agent = Some("claude".to_string());
 
-        let issues = validate_config(&make_config(vec![sneaky, plain]));
+        let issues = validate_config(&make_orch_config(vec![make_orchestration(
+            "orch",
+            vec![make_role("orchestrator", true), sneaky, plain],
+        )]));
         let warned: Vec<&str> = issues
             .iter()
             .filter(|i| i.message.contains("unknown agent"))
-            .map(|i| i.scope.as_str())
+            .filter_map(|i| i.message.split('\'').nth(1))
             .collect();
 
         assert_eq!(

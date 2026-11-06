@@ -1,39 +1,78 @@
----
-sidebar_position: 7.5
-title: Remote Environment Requirements
----
-
 # Remote Environment Requirements
 
-What a host must provide for a `dot-agent-deck` **remote environment** — a per-project, long-running Linux host that runs the deck daemon and owns the project's agents. This is not a provisioning guide and not a daily-use guide; it lists the prerequisites a Linux VM must satisfy before the deck can register it as a remote.
+What a host must provide before `dot-agent-deck remote add` can register it, and what to set up so the deck keeps running there. The **host** is the machine that runs the daemon and the agents; **your laptop** is the machine you connect from. For registering and connecting see [Remote Environments](remote-environments.md); for bootstrap commands see [Remote Recipes](remote-recipes.md).
 
-For lifecycle, failure modes, and how the TUI attaches see [Remote Environments](remote-environments.md). For provisioning recipes see [Remote Recipes](remote-recipes.md).
+## Checklist
 
-> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS UpCloud VM, which has been the reference target throughout; the Recommended section reflects best-practice hardening that has not yet been re-validated end to end on a clean provision.
+Everything under [Required](#required) must hold before `remote add` succeeds and an agent can run. [Recommended for persistent and safe use](#recommended-for-persistent-and-safe-use) is what keeps the daemon running across disconnects and reboots and limits what agents can reach.
 
-## How this page is organized
-
-Requirements are split into two sections. **Required** is the strict minimum for the daemon to launch and an agent to run on a remote at all — confirmed empirically on a fresh Ubuntu 24.04 LTS VM. **Recommended for persistent and safe use** is what hardens the install and delivers the deck's reason for existing as a remote: persistence across laptop sleep, network drops, and reboots. Without the recommended setup, the daemon will still start, but agents will not survive your laptop disconnecting — which defeats the whole point of running the deck remotely.
-
-> **Warning — do not stop at Required.** A host that satisfies only the Required section will function, but it runs the daemon as root, accepts default SSH configuration, and places the daemon socket in `/tmp` — none of which are safe defaults on a multi-user host or anything resembling production. Anyone running beyond a personal sandbox should follow the Recommended section.
+| Requirement | How to check it from your laptop |
+|---|---|
+| Linux or macOS, amd64 or arm64 | `ssh <target> uname -s -m` prints `Linux x86_64`, `Linux aarch64`, `Linux arm64`, `Darwin x86_64` or `Darwin arm64`. |
+| Non-interactive ssh with a key | `ssh -o BatchMode=yes <target> true` exits 0 and prints nothing. |
+| `curl` and outbound HTTPS to GitHub (unless Homebrew installed the deck) | `ssh <target> 'curl -fsSI https://github.com'` exits 0. |
+| A writable `~/.local/bin` | `ssh <target> 'mkdir -p ~/.local/bin && test -w ~/.local/bin'` exits 0. |
+| The agent CLI on the login `PATH`, with its credentials | `ssh <target> '$SHELL -ilc "command -v claude"'` prints a path (substitute your agent's command). |
 
 ## Required
 
-The strict minimum for the daemon to launch and an agent to run.
+### Operating system and architecture
 
-### Operating system
+| Host | Supported | Build `remote add` installs |
+|---|---|---|
+| Linux on x86_64 | Yes | `linux-amd64` |
+| Linux on aarch64 / arm64 | Yes | `linux-arm64` |
+| macOS on Apple Silicon | Yes; see [macOS as a remote host](#macos-as-a-remote-host) | `darwin-arm64` |
+| macOS on Intel | Installs, but has not been exercised end to end | `darwin-amd64` |
+| Windows | No. `remote add` refuses it (`Remote arch is …`), and there is no Windows daemon build. Windows works as the laptop. | none |
 
-Linux is the only supported host for a remote environment. macOS and Windows are not supported as remote hosts (you can still use them as the local client).
+#### Which Linux distribution
 
-| Distribution | Status |
-|---|---|
-| Ubuntu 24.04 LTS | Tested |
+To identify the host, `remote add` reads only `uname -s -m`; it does not check the distribution. Two things do vary:
 
-Other modern systemd-based Linux distributions are likely to work but have not been exercised. If you'd like a specific distribution validated, [open an issue](https://github.com/vfarcic/dot-agent-deck/issues) and we'll add it to the test matrix.
+- **glibc.** The Linux release binaries are glibc builds; there is no musl build. On a musl distribution such as Alpine, install the deck on the host from source or with [Nix](installation.md#nix), put the binary (or a symlink to it) at `~/.local/bin/dot-agent-deck`, and register with `--no-install --version <the version it reports>`. Build it with `DAD_VERSION=<x.y.z>` set, or from a checkout with tags: a build that cannot tell which release it is reports a version ending in `+unknown`, and `remote add` refuses it.
+- **systemd.** Only needed to [run the daemon as a service](daemon-service.md). Without systemd, and without `XDG_RUNTIME_DIR` set, the daemon's sockets go in the temp directory ([Where the deck puts its files](#where-the-deck-puts-its-files)).
+
+### ssh access
+
+- An OpenSSH server reachable from your laptop (port 22 unless you pass `--port`). The daemon opens no network port of its own.
+- **Key-based login that needs no prompt.** `remote add`, `remote upgrade`, `remote doctor` and the checks `connect` makes before a session all run ssh with `BatchMode=yes`. A key with a passphrase must be loaded into `ssh-agent` on your laptop.
+- **The host key already in your `~/.ssh/known_hosts`.** Run `ssh <target> true` once and accept the key before `remote add`.
+- **A login shell that prints nothing** on a non-interactive ssh command. `remote add` parses the output of commands it runs over ssh; a shell startup file that echoes text can make it fail with `Could not tell how dot-agent-deck is installed on the remote`.
+
+### Software on the host
+
+- A POSIX shell and the standard tools `uname`, `mkdir`, `chmod` and `mv`.
+- **`curl`**, used by `remote add` and `remote upgrade` to download the release binary. Not needed when Homebrew installed the deck, or with `--no-install`.
+- **`git`**, for the project you clone there. The deck itself does not need it to start.
+- **The agent CLI** for each agent you will run, the runtime it needs, and its credentials, all available to the account the daemon runs as. The deck starts agents but does not install them. Claude Code, OpenCode, Pi, Codex and Devin have status reporting in the deck; other interactive terminal programs can run in a pane without it.
+
+  | Agent | Install (one option) |
+  |---|---|
+  | Claude Code | `npm install -g @anthropic-ai/claude-code` (needs Node.js) |
+  | OpenCode | `npm install -g opencode-ai` for OpenCode 1.x, or `npm install -g @opencode/cli` for OpenCode 2 (needs Node.js) |
+  | Pi | `npm install -g @earendil-works/pi-coding-agent` (needs Node.js) |
+  | Codex | `npm install -g @openai/codex` (needs Node.js) |
+  | Devin | the vendor's install instructions; `devin` must end up on `PATH` |
+
+  The daemon reads `PATH` from your login shell when it starts (it runs `$SHELL` as an interactive login shell), so a directory added to `PATH` in `~/.bashrc` or `~/.zshrc` is found. If an agent still fails to start with a bare command, see [A bare command fails to spawn](troubleshooting.md#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn).
+
+- Optional: **`bash`, `timeout`, `head` and `od`**, used by `remote doctor`'s `ForwardBound` check for a reverse tunnel. Without them that check reports `UNKNOWN`. `remote doctor`'s `AllowTcpForwarding` and `ClientAliveInterval` checks run `sshd -T`, which usually needs root; without it they report `UNKNOWN`.
+- Optional: a container runtime, only if your agents run containers.
+
+### Network
+
+- **Inbound:** ssh only.
+- **Outbound HTTPS** to:
+  - GitHub release downloads (`github.com` and the storage host it redirects to), for `remote add` and `remote upgrade` to fetch the binary. Not needed with a Homebrew install or `--no-install`.
+  - Your agents' model provider (for example the Anthropic API).
+  - Package registries and git hosts your project uses.
+
+On a restricted network, allow those destinations specifically. If the host cannot be given access to something your laptop can reach (an internal git server behind your VPN, say), see [Reaching networks only your laptop can see](remote-recipes.md#reaching-networks-only-your-laptop-can-see).
 
 ### Hardware
 
-Provisional sizing. Actual usage depends on workspace size and the number of concurrent agents.
+A starting point; actual use depends on project size and how many agents run at once.
 
 | Resource | Minimum | Recommended |
 |---|---|---|
@@ -41,138 +80,103 @@ Provisional sizing. Actual usage depends on workspace size and the number of con
 | RAM | 2 GB | 8 GB |
 | Disk | 10 GB | 40 GB |
 
-The daemon and a single agent are lightweight. Disk is dominated by the project's git working tree plus build/test caches. RAM scales with the number of agents you run in parallel and what they invoke (compilers, language servers, container runtimes).
+Disk is mostly the project's working tree and build caches. RAM grows with the number of parallel agents and what they run (compilers, language servers, containers).
 
-### Network
+### Where the deck puts its files
 
-**Outbound (required):** HTTPS access to whatever the agents call. Typical destinations:
+| What | Where on the host |
+|---|---|
+| The binary | `~/.local/bin/dot-agent-deck`, or `<homebrew prefix>/bin/dot-agent-deck` on a Homebrew host (see [Hosts where Homebrew installed the deck](remote-environments.md#hosts-where-homebrew-installed-the-deck)) |
+| Configuration | `~/.config/dot-agent-deck/` |
+| Claude Code hooks | `~/.claude/settings.json` |
+| Hook socket | `$DOT_AGENT_DECK_SOCKET` if set; else `$XDG_RUNTIME_DIR/dot-agent-deck.sock` if `XDG_RUNTIME_DIR` is set; else `dot-agent-deck-<uid>/hook.sock` in the temp directory (`$TMPDIR`, or `/tmp` when it is unset or empty) |
+| Attach socket | `$DOT_AGENT_DECK_ATTACH_SOCKET` if set; else `$XDG_RUNTIME_DIR/dot-agent-deck-attach.sock`; else `dot-agent-deck-<uid>/attach.sock` in the temp directory |
 
-- Anthropic API (or whichever LLM provider the agents use)
-- Package registries the project depends on (npm, PyPI, crates.io, Go module proxy, etc.)
-- Git remotes (GitHub, GitLab, etc.) — git is the sync layer between your laptop's working copy and the remote
-
-If you run in a network-restricted environment, allowlist only the specific destinations your agents and toolchains use rather than allowing wide-open outbound; the destinations vary per project.
-
-If the remote *cannot* be given access to a destination your laptop can reach — an internal git host behind a corporate VPN, say — see [Reaching networks only your laptop can see](remote-recipes.md#reaching-networks-only-your-laptop-can-see) for how to lend the remote your laptop's access over a reverse tunnel.
-
-**Inbound (required):** SSH only (port 22 by default), reachable from the laptop running the deck client. The daemon itself does not listen on any TCP port — it serves a Unix domain socket on the remote, and hooks reach it over localhost.
-
-No other inbound ports are required.
-
-### Required software
-
-The host must have:
-
-- `bash`
-- An OpenSSH server (`sshd`)
-- `git` — typically pre-installed on cloud Linux images (Ubuntu 24.04 cloud images ship with it). Only needs an explicit install if it's missing.
-- A working PTY layer (standard on every Linux distribution)
-
-**AI agent runtime.** The deck launches AI agents but does not bundle them — the agent and its runtime must already be on the host, otherwise the deck has nothing to spawn. You need:
-
-- The agent CLI itself. Claude Code, OpenCode, Pi, Codex, and Devin have first-class event/status support in the deck today. Other agents may work if their CLI follows the same PTY pattern, but those five are the ones with first-class event support.
-- The runtime that agent depends on (e.g. Node.js for npm-distributed agents like Claude Code).
-- The agent's API credentials available in the user's environment (e.g. `ANTHROPIC_API_KEY` for Claude Code).
-
-Install hints (pick whichever agent you use; install only what you need):
-
-- Claude Code: `npm install -g @anthropic-ai/claude-code` (requires Node.js).
-- OpenCode: `npm install -g opencode-ai` (requires Node.js).
-- Pi: `npm install -g @earendil-works/pi-coding-agent` (requires Node.js).
-- Codex: `npm install -g @openai/codex` (requires Node.js).
-- Devin: follow the [Devin CLI install instructions](https://devin.ai/support) (the `devin` binary must be on `PATH`).
-- Other agents: follow the agent's own install instructions.
-
-The deck does not prescribe a specific agent or pin a specific install method — install whichever supported agent you plan to run, by whichever method that agent's documentation recommends.
-
-**Credentials and host scope.** A few rules of thumb for where agent credentials should live and what a host should hold:
-
-- Set credentials as environment variables in the daemon user's environment (e.g. `ANTHROPIC_API_KEY`). Do not commit them to disk in plaintext config, do not paste them into shell history, and do not place them in world-readable files.
-- A remote environment is per-project. Do not reuse a single host for unrelated projects with their own credentials — agent isolation in v1 is at the host level, so agents that share a host share its credentials and filesystem.
-- For `systemd --user` setups, put credentials in the unit's `Environment=` directive or in an `EnvironmentFile=` with mode `0600` — not in `~/.bashrc` or other shell rc files where they leak into every interactive shell and may be sourced by unrelated tooling.
-
-Optional:
-
-- A container runtime (Docker or Podman) — only required if your agents themselves run containers. The daemon does not need one.
-
-### Daemon binary
-
-The deck installs the `dot-agent-deck` binary to `~/.local/bin/dot-agent-deck` on the remote by default.
-
-### Daemon runtime files
-
-The daemon resolves its socket and config paths at startup from environment variables that follow the XDG Base Directory spec.
-
-**Socket path** — checked in this order:
-
-1. `$DOT_AGENT_DECK_SOCKET` if set (explicit override)
-2. `$XDG_RUNTIME_DIR/dot-agent-deck.sock` if `XDG_RUNTIME_DIR` is set (the case on systemd hosts with `logind`, which is the typical case)
-3. `/tmp/dot-agent-deck-{uid}.sock` as a last-resort fallback (where `{uid}` is the user's POSIX uid, included so two users on the same host get disjoint sockets — the XDG path at step 2 is already per-user)
-
-The `/tmp` fallback is **not safe on multi-user hosts** — see [Daemon socket security](#daemon-socket-security) under Recommended for the override and directory-permission guidance.
-
-Hooks running on the same host resolve the same path the same way and connect via Unix socket. Nothing crosses the network.
-
-**Config directory:** `~/.config/dot-agent-deck/` (standard XDG config home).
+To see which attach socket a running daemon is using, run `dot-agent-deck daemon endpoint` on the host; it prints the path only when a live daemon answers there. Processes that should talk to the same daemon (the TUI, hooks, the desktop app's tunnel) must see the same values of these variables; a process started with a different `XDG_RUNTIME_DIR`, or on a host without it a different `TMPDIR`, looks for a different socket. The temp-directory fallback is a directory the deck creates owner-only (mode `0700`). If another user already owns that name, the deck uses a sibling named `dot-agent-deck-<uid>.<16 hex digits>` instead and logs a warning naming both.
 
 ## Recommended for persistent and safe use
 
-Hardening, persistence, and best-practice setup. None of this is needed for the daemon to start, but skipping it means agents won't survive a laptop disconnect, the daemon won't restart on crash, and the host posture will be looser than it should be.
+### Keep the daemon running
+
+**Across disconnects.** The daemon that `connect` starts runs in its own session, detached from your ssh session, so it keeps running after you disconnect, as long as it has agents. That holds on a host with systemd-logind's default settings. If the host's `/etc/systemd/logind.conf` sets `KillUserProcesses=yes`, logind kills everything started from your ssh session when it ends, the daemon included; run the daemon as a systemd user service instead (below).
+
+**With no agents.** A daemon exits about 30 seconds after its last client disconnects when it has no agents and no enabled schedules. That is fine for `connect`, which starts one when needed. The desktop app does not start one, so for it, and for schedules you want to fire while nobody is connected, run a daemon with the idle shutdown off (`DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`). The service below runs it that way.
+
+**Across reboots.** Agents do not survive a host reboot, and nothing starts the daemon again until the next `connect`. To have the host start it at boot and after a crash, run it as a service, on the host:
+
+```bash
+~/.local/bin/dot-agent-deck daemon install
+sudo loginctl enable-linger "$USER"
+```
+
+The first line writes and starts a systemd user service, `dot-agent-deck.service`; the second lets it start at boot without a login. [Run the Daemon as a Service](daemon-service.md) has what the service changes, how to give it agent credentials, and how to remove it. For `connect` to find this daemon, your ssh session must see the same `XDG_RUNTIME_DIR` as the service, which is normally the case on a systemd host, where `pam_systemd` sets it for ssh logins; check with `ssh <target> 'echo $XDG_RUNTIME_DIR'`. After `remote upgrade`, or the desktop app's **Upgrade**, there is nothing to do: the restart ends the service's daemon and systemd starts it again on the new release. The journal records the old daemon's exit as `status=75/TEMPFAIL` followed by `Scheduled restart job`; that is the upgrade's restart, not an error.
+
+On macOS, see [macOS as a remote host](#macos-as-a-remote-host).
 
 ### Non-root user account
 
-A dedicated non-root Linux user account for the daemon. Running the daemon as root works, but anything an agent does then runs with full system privileges; a non-root account is the recommended posture. The daemon runs as that user; agents run as children of the daemon and inherit the account.
-
-`systemd --user` is the recommended persistence layer, so the daemon survives logout and restarts on crash. Enable lingering for the user so user-scoped units run without an active login session:
-
-```bash
-sudo loginctl enable-linger $USER
-```
+Run the daemon as a dedicated non-root user. The deck runs as root, but agents run as children of the daemon under the same account, so under root every command an agent runs has full control of the host. [Remote Recipes](remote-recipes.md#bootstrapping-a-linux-host) shows how to create the user.
 
 ### `~/.local/bin` on PATH
 
-When running the daemon as a non-root user, make sure `~/.local/bin` is on that user's `$PATH` so the installed binary is reachable from a fresh shell. If it isn't already, add it once:
+`connect` and `remote add` call the binary by its full path, so they work without it. Add it anyway so you can run `dot-agent-deck` in a shell on the host:
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 ```
 
-Root has its own PATH and typically doesn't need this step.
-
 ### SSH hardening
 
-- Use key-based authentication only; disable password auth in `sshd_config` (`PasswordAuthentication no`).
-- Disable root login (`PermitRootLogin no`); the daemon runs as a non-root user anyway.
-- SSH hardening on the host is the operator's responsibility — follow your distribution's own SSH hardening guide rather than treating these bullets as exhaustive.
+- Key-based authentication only: `PasswordAuthentication no` in `sshd_config`.
+- No root login: `PermitRootLogin no`.
+- Follow your distribution's ssh hardening guide beyond these two.
+
+### Credentials and one host per project
+
+- Give agents their credentials through the daemon user's environment (for example `ANTHROPIC_API_KEY`), or the agent's own login flow. Do not put them in world-readable files or in the project.
+- Agents on one host share that account's files and credentials; the deck adds no isolation between them. Use a separate host, or a separate account, for projects whose credentials should not mix.
+- Keep one directory per project, for example under `~/projects/`, and move changes with git. The deck does not sync files between your laptop and the host.
 
 ### Daemon socket security
 
-The `/tmp/dot-agent-deck-{uid}.sock` fallback is intended for hosts that do not set `XDG_RUNTIME_DIR`. The `{uid}` suffix means two users on the same host get disjoint paths so neither can pre-create the other's socket path; the underlying directory is still world-writable, so the fallback remains **not safe on multi-user hosts** in the broader sense — another local user can still observe socket-path activity in `/tmp` and could attempt to connect. v1 assumes a single-user host (the PRD's stated scope: "no multi-user access controls beyond Linux user separation"). If the host is shared, set `$DOT_AGENT_DECK_SOCKET` to a path inside the user's home, for example `~/.local/state/dot-agent-deck/daemon.sock`, and ensure the parent directory is mode `0700`. The socket file itself is created at mode `0600` directly by the daemon — `bind(2)` runs with a narrowed umask of `0o177` so the socket inode is never world-readable for any window, and a defense-in-depth `chmod 0600` follows. The user's process umask does not affect the socket mode, but it still affects other files the daemon and its agents create, so a restrictive umask (e.g. `umask 077`) in the unit file or login profile remains a sound default on a shared host.
-
-### Project filesystem layout
-
-**One environment per project.** A remote environment is bound to a single project; agents inside the environment all operate on the same project tree. The `~/projects/` convention below is for users who run multiple environments side-by-side on the same host (one directory per environment, one environment per project), not for packing several projects into a single environment.
-
-Project files live on the remote — agents read and write them in place. Recommended layout: one directory per project under `~/projects/`.
+The sockets are created owner-only (mode `0600`), and a client checks that the process listening on the socket runs as the same user before using it. Other unprivileged users on the host cannot use your sockets; root and any process running as you can, which is how hooks reach the daemon. On a host shared with other users, put the sockets in a directory you own by setting both variables for every process that runs the deck (the systemd unit, your shell profile):
 
 ```bash
-mkdir -p ~/projects
+export DOT_AGENT_DECK_SOCKET="$HOME/.local/state/dot-agent-deck/daemon.sock"
+export DOT_AGENT_DECK_ATTACH_SOCKET="$HOME/.local/state/dot-agent-deck/attach.sock"
+mkdir -p ~/.local/state/dot-agent-deck && chmod 700 ~/.local/state/dot-agent-deck
 ```
 
-Git is the sync layer. Clone the repository on the remote, run agents against it there, and push/pull through your usual git remote. There is no bidirectional file sync between your laptop and the remote — the deck does not bundle mutagen, syncthing, or sshfs.
+A restrictive `umask 077` in the unit or login profile is a sound default on a shared host: it does not change the sockets' mode, but it does apply to other files the daemon and agents write.
 
-## See also
+## macOS as a remote host
 
-- [Remote Environments](remote-environments.md) — lifecycle model, stop vs detach, failure modes, hooks behavior.
-- [Remote Recipes](remote-recipes.md) — provisioning snippets for multipass, Hetzner, UpCloud, bare metal.
+A Mac on Apple Silicon works as a host: `remote add`, `connect`, a Claude Code agent working in a pane, disconnecting and reconnecting have been run end to end. Four things differ from Linux.
+
+**Enable Remote Login.** In System Settings → General → Sharing, turn on **Remote Login** so the Mac accepts ssh.
+
+**Log Claude Code in once, inside the pane.** Claude Code on macOS stores its credentials in the login Keychain, which an ssh session cannot unlock. The first agent prints `Not logged in · Please run /login`. Run `/login` in that pane once; Claude Code then writes `~/.claude/.credentials.json`, which later sessions use. Codex and OpenCode keep their credentials in files and need no such step. Setting `ANTHROPIC_API_KEY` for the daemon's user also works, but bills as API usage rather than against a subscription.
+
+**Stop the Mac from sleeping.** System sleep suspends the agents; display sleep does not. On the Mac:
+
+```bash
+sudo pmset -a sleep 0          # no system sleep
+sudo pmset -a displaysleep 15  # screen off after 15 minutes
+sudo pmset -a disksleep 0
+```
+
+**Sockets are in the temp directory.** macOS does not set `XDG_RUNTIME_DIR`, so the sockets use the temp-directory fallback in [Where the deck puts its files](#where-the-deck-puts-its-files) unless you set `DOT_AGENT_DECK_SOCKET` and `DOT_AGENT_DECK_ATTACH_SOCKET`. Those overrides have not been exercised on macOS.
+
+**Restarting after a reboot** needs a LaunchAgent. `~/.local/bin/dot-agent-deck daemon install`, run on the Mac, writes and loads one; this has not been tested on a Mac yet. Two constraints apply to any LaunchAgent:
+
+- **It starts at GUI login, not at boot.** An unattended Mac needs automatic login to come back after a reboot, and FileVault asks for a password at startup before any automatic login. Decide that trade-off deliberately.
+- **It does not read your shell profile** except for the `PATH` the daemon captures itself. Anything else the agents need, such as an `ANTHROPIC_API_KEY`, goes in the LaunchAgent's `EnvironmentVariables`.
+
+[Run the Daemon as a Service](daemon-service.md#macos) has the details.
 
 ## What is not required
 
-To rule out common assumptions:
-
-- **No inbound network port for the daemon** beyond SSH (port 22 by default). The daemon never opens a TCP listener.
-- **No cloud-provider account.** Multipass, Hetzner, Fly, a bare-metal box on your desk — any of them works.
-- **No specific provisioner.** There is no opinion in the product about how the VM gets created.
-- **No Terraform, Pulumi, or other IaC** is shipped or required.
-- **No bidirectional file sync** between laptop and remote. Use git.
-- **No reverse tunnel** from the remote back to the laptop. The daemon is the long-lived process; the laptop is just a viewer.
+- No inbound port besides ssh.
+- No particular cloud provider, hypervisor or provisioning tool. A machine that meets the requirements above can be anywhere, including on your desk.
+- No file sync tool. Use git.
+- No reverse tunnel, unless the host needs to reach a network only your laptop can reach.

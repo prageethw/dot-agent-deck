@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { openOverview } from "./support/overview";
 
 /**
- * Fifteen agents, grouped the way the deck groups them — issue #836's fourth
+ * Fifteen agents, grouped the way the daemon groups them — issue #836's fourth
  * item, against `?fixture=1&state=crowded`.
  *
  * The fixture is built to make this hard on purpose (PRD #745): its agents are
@@ -106,12 +106,12 @@ const EXPECTED = [
     title: "Standalone agents",
     subtitle: null,
     names: ["Scratch shell", "Changelog sweep", "pi-extension spike"],
-    /** Which row carries the COORDINATOR badge, or `null` for a group that has no start role. */
+    /** Which row carries the ORCHESTRATOR badge, or `null` for a group that has no start role. */
     coordinatorRow: null as number | null,
   },
   {
     kind: "orchestration",
-    title: "PRD 745 · agent overview",
+    title: "PRD 745 · agent dashboard",
     subtitle: "dot-agent-deck",
     names: ["orchestrator", "coder", "tester", "reviewer", "docs", "release"],
     coordinatorRow: 0,
@@ -202,13 +202,14 @@ test.describe("the overview at fifteen agents", () => {
     }
   });
 
-  test("badges the coordinator, which is not simply each orchestration's first row", async ({ page }) => {
+  /** Scenario: Badges the orchestrator, which is not simply each orchestration's first row. */
+  test("badges the orchestrator, which is not simply each orchestration's first row", async ({ page }) => {
     await openOverview(page, "crowded");
     const groups = await readGroups(page);
 
     // DOM-shape: exactly one badge per orchestration, on the row the daemon
     // marked as the start role, and none at all outside an orchestration —
-    // there is no agent to message on a mode tab or a loose pane.
+    // there is no agent to message in a legacy mode group or a loose pane.
     const badgedRows = groups.map((group) => group.rows.findIndex((row) => row.coordinator !== null));
     expect(badgedRows).toEqual(EXPECTED.map((expected) => expected.coordinatorRow ?? -1));
     expect(groups.map((group) => group.rows.filter((row) => row.coordinator !== null).length)).toEqual([0, 1, 1, 0]);
@@ -224,11 +225,11 @@ test.describe("the overview at fifteen agents", () => {
     for (const group of groups) {
       for (const row of group.rows) {
         if (row.coordinator === null) continue;
-        expect(row.coordinator.text).toBe("COORDINATOR");
+        expect(row.coordinator.text).toBe("ORCHESTRATOR");
 
         /*
           Real geometry. The badge is styled only inside `.overview-row` —
-          `.coordinator-badge` is shared with the deck's agent tile and has no
+          `.coordinator-badge` is shared with the daemon's agent tile and has no
           rule of its own — so an unscoped or missing rule leaves it in the DOM
           and effectively invisible. Measured: it has a box, that box sits
           within its own row rather than spilling into the neighbours, and it
@@ -264,7 +265,7 @@ test.describe("the overview at fifteen agents", () => {
  */
 test.describe("the fleet view (PRD #742 M4)", () => {
   /** Each deck section's identity and box, read in one round trip. */
-  async function readDecks(page: Page) {
+  async function readDaemons(page: Page) {
     return page.evaluate(() =>
       Array.from(document.querySelectorAll("[data-testid='daemon-group']")).map((section) => {
         const box = section.getBoundingClientRect();
@@ -285,16 +286,17 @@ test.describe("the fleet view (PRD #742 M4)", () => {
     );
   }
 
+  /** Scenario: Renders one section per deck, in order, each holding only its own deck's rows. */
   test("renders one section per deck, in order, each holding only its own deck's rows", async ({ page }) => {
     await openOverview(page, "fleet");
-    const decks = await readDecks(page);
+    const decks = await readDaemons(page);
 
     // DOM shape: four decks, the local one first, and each named the way a
     // reader is meant to tell them apart — the last of them named from the
     // crate's `observed` list, because nothing has reported for it (M14).
     expect(decks.map((deck) => deck.deckId)).toEqual(["/tmp/dot-agent-deck.sock", "dev@build-box", "ci@runner-7", "ops@edge-3"]);
     expect(decks.map((deck) => deck.connected)).toEqual(["yes", "yes", "no", "no"]);
-    expect(decks.map((deck) => deck.name)).toEqual(["Local deck", "dev@build-box", "ci@runner-7", "ops@edge-3"]);
+    expect(decks.map((deck) => deck.name)).toEqual(["Local daemon", "dev@build-box", "ci@runner-7", "ops@edge-3"]);
 
     // No deck's rows appear under another deck's heading. The two connected
     // decks mint colliding agent ids, so this is about the section a row is
@@ -334,12 +336,42 @@ test.describe("the fleet view (PRD #742 M4)", () => {
     await expect(page.getByTestId("overview-count-agents").locator("strong")).toHaveText("7");
   });
 
+  /*
+    Issue #1676. Between 961px and 1260px the header has room for five
+    counters, and which five is named, not positional: NEEDS INPUT and FAILED
+    stay, because a person has to act on them, and IDLE and GROUPS give way.
+  */
+  test.describe("between 961px and 1260px", () => {
+    /// Scenario: open the fleet dashboard in a 1200px window, then narrow it to 961px, the narrowest width before the counters go. At both widths NEEDS INPUT and FAILED are among the counters shown, IDLE and GROUPS are not, the counters stop short of the header's buttons, and nothing runs off the right edge.
+    test("keeps the counters a person acts on and drops idle and groups", async ({ page }) => {
+      await page.setViewportSize({ width: 1200, height: 800 });
+      await openOverview(page, "fleet");
+      for (const width of [1200, 961]) {
+        await page.setViewportSize({ width, height: 800 });
+        for (const name of ["agents", "running", "needs-input", "failed", "decks"]) {
+          await expect(page.getByTestId(`overview-count-${name}`), `${name} is hidden at ${width}px`).toBeVisible();
+        }
+        for (const name of ["idle", "groups"]) {
+          await expect(page.getByTestId(`overview-count-${name}`), `${name} is shown at ${width}px`).toBeHidden();
+        }
+        const layout = await page.evaluate(() => {
+          const counters = document.querySelector(".overview-instruments")?.getBoundingClientRect();
+          const actions = Array.from(document.querySelectorAll(".topbar .top-actions")).at(-1)?.getBoundingClientRect();
+          return { countersRight: counters?.right, actionsLeft: actions?.left, actionsRight: actions?.right, scroll: document.documentElement.scrollWidth, viewport: window.innerWidth };
+        });
+        expect(layout.countersRight, `the counters run under the header's buttons at ${width}px`).toBeLessThanOrEqual((layout.actionsLeft ?? 0) + 0.5);
+        expect(layout.actionsRight, `the header's buttons run off the window at ${width}px`).toBeLessThanOrEqual(layout.viewport + 0.5);
+        expect(layout.scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(layout.viewport);
+      }
+    });
+  });
+
   test.describe("at 400x780 phone", () => {
     test.use({ viewport: { width: 400, height: 780 } });
 
     test("stacks four decks down a phone screen without sliding the page sideways", async ({ page }) => {
       await openOverview(page, "fleet");
-      const decks = await readDecks(page);
+      const decks = await readDaemons(page);
       expect(decks).toHaveLength(4);
 
       // Every section is inside the viewport horizontally, and still stacked.

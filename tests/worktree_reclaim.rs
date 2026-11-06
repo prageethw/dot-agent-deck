@@ -169,9 +169,64 @@ struct Fixture {
     state_dir: PathBuf,
 }
 
+/// Ambient git LOCATION variables, cleared so a fixture command's repository is
+/// the one at its cwd and nothing else. Mirrors `AMBIENT_LOCATION_VARS` in
+/// `src/worktree_owner.rs`, `tests/common/mod.rs` and
+/// `xtask/linkage-check/src/repo_state.rs`.
+const AMBIENT_LOCATION_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// `git` in `dir` with the ambient git environment switched off in both of the
+/// groups issue #834 names — *location*, which git resolves in preference to
+/// the process cwd, so a bare `git` here would `init`, `add` and `commit`
+/// against whatever an ambient `GIT_DIR` names (under `cargo test`, possibly
+/// the checkout the suite is running in); and *configuration*, which supplies
+/// the commit identity by environment rather than by writing `git config` into
+/// the fixture repo.
+///
+/// A file-local copy rather than a shared one, twice over: `src`'s
+/// `worktree_owner::fixture_git` is `#[cfg(test)] pub(crate)` and so does not
+/// exist in the library an integration test links, and `tests/common/mod.rs`
+/// is the PTY harness — this is a fast-tier test, and `mod common;` would drag
+/// that whole harness into it.
+///
+/// `dir` doubles as the ceiling: every call site below is a repository or
+/// linked-worktree ROOT, and a ceiling equal to the cwd still permits
+/// discovery at that directory (measured, including through a linked
+/// worktree's `.git` file) while blocking any ascent above it.
+fn fixture_git(dir: &Path) -> Command {
+    // Same standing as `common::fixture_git`: the single bare constructor
+    // this file's every other `git` goes through.
+    let mut cmd = Command::new("git"); // linkage-check:allow-bare-git
+    cmd.current_dir(dir);
+    for var in AMBIENT_LOCATION_VARS {
+        cmd.env_remove(var);
+    }
+    let absent = dir.join("no-such-gitconfig");
+    cmd.env("GIT_CONFIG_GLOBAL", &absent)
+        .env("GIT_CONFIG_SYSTEM", &absent)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@t.t")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@t.t")
+        .env("GIT_CEILING_DIRECTORIES", dir);
+    cmd
+}
+
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
+    let out = fixture_git(dir)
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -224,8 +279,17 @@ impl Fixture {
             ),
             None => git(&repo, &["init", "--initial-branch=main", "--quiet"]),
         }
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        // No `git config user.email`/`user.name` here: `fixture_git` supplies
+        // the identity by environment, so the fixture never writes to a
+        // repository just to configure one.
+        //
+        // The exception to that sentence, and the twin of
+        // `worktree_owner::pin_fixture_eol` — see its doc comment for the
+        // measurement. `010`/`011` create worktrees through PRODUCTION
+        // `create_worktree`, whose `git worktree add` reads the ambient config
+        // this fixture's own `git` cannot see, so `core.autocrlf` has to live
+        // where both of them look: in the repository.
+        git(&repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "--quiet", "-m", "seed"]);
@@ -310,27 +374,34 @@ impl Fixture {
         path
     }
 
-    /// Canned `gh pr list --head <branch>` reply. `headRepositoryOwner` is set
-    /// to `"test-org"`, matching `Fixture::new`'s own `origin` remote
+    /// Canned `gh pr list --head <branch>` reply: one pull request from a
+    /// branch of the repository itself. `headRepositoryOwner` is set to
+    /// `"test-org"`, matching `Fixture::new`'s own `origin` remote
     /// (`test-org/test-repo`) -- so every existing caller of this helper keeps
-    /// describing a legitimate same-repo merged PR once `resolve_pr_state`
-    /// starts requiring the head repository owner to match (issue #144
-    /// finding 2). Callers exercising a DIFFERENT owner (a genuinely
-    /// different fork, or a worktree-scoped remote pointing elsewhere) use
+    /// describing a legitimate same-repo merged PR now that `resolve_pr_state`
+    /// requires the head repository owner to match (issue #144 finding 2).
+    /// Callers exercising a DIFFERENT owner (a genuinely different fork, or a
+    /// worktree-scoped remote pointing elsewhere) use
     /// [`Fixture::set_pr_state_with_head_owner`] instead.
     fn set_pr_state(&self, branch: &str, state: &str) {
-        self.set_pr_state_with_head_owner(branch, state, "test-org");
+        self.set_pr_entries(
+            branch,
+            &format!(
+                r#"{{"state":"{state}","headRefName":"{branch}","isCrossRepository":false,"headRepositoryOwner":{{"login":"test-org"}}}}"#
+            ),
+        );
     }
 
     /// Same as [`Fixture::set_pr_state`], but with an explicit
     /// `headRepositoryOwner.login` value -- for a PR opened from a fork whose
     /// owner differs from this fixture's own `origin` remote.
     fn set_pr_state_with_head_owner(&self, branch: &str, state: &str, head_owner: &str) {
-        let key = branch.replace('/', "_");
-        let body = format!(
-            r#"[{{"state":"{state}","headRefName":"{branch}","headRepositoryOwner":{{"login":"{head_owner}"}}}}]"#
+        self.set_pr_entries(
+            branch,
+            &format!(
+                r#"{{"state":"{state}","headRefName":"{branch}","headRepositoryOwner":{{"login":"{head_owner}"}}}}"#
+            ),
         );
-        std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
     }
 
     /// Same as [`Fixture::set_pr_state`], but the canned reply carries NO
@@ -339,9 +410,21 @@ impl Fixture {
     /// deleted after its PR merged). Used to pin the fail-closed path: an
     /// unverifiable owner must never be treated as a match.
     fn set_pr_state_no_owner_field(&self, branch: &str, state: &str) {
+        self.set_pr_entries(
+            branch,
+            &format!(r#"{{"state":"{state}","headRefName":"{branch}"}}"#),
+        );
+    }
+
+    /// Canned `gh pr list --head <branch>` reply holding exactly `entries`, a
+    /// comma-separated list of JSON objects.
+    fn set_pr_entries(&self, branch: &str, entries: &str) {
         let key = branch.replace('/', "_");
-        let body = format!(r#"[{{"state":"{state}","headRefName":"{branch}"}}]"#);
-        std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
+        std::fs::write(
+            self.ghstub.join(format!("pr-{key}.json")),
+            format!("[{entries}]"),
+        )
+        .expect("write pr fixture");
     }
 
     /// Give a linked worktree its OWN `origin` remote via
@@ -387,8 +470,7 @@ impl Fixture {
     #[cfg(target_os = "linux")]
     fn add_worktree_with_commit_raw(&self, name: &std::ffi::OsStr, branch: &str) -> PathBuf {
         let path = self._scratch.path().join(name);
-        let add = Command::new("git")
-            .current_dir(&self.repo)
+        let add = fixture_git(&self.repo)
             .arg("worktree")
             .arg("add")
             .arg("-b")
@@ -422,8 +504,7 @@ impl Fixture {
     fn mark_owned_raw(&self, worktree: &Path) {
         use std::os::unix::ffi::OsStrExt;
 
-        let out = Command::new("git")
-            .current_dir(worktree)
+        let out = fixture_git(worktree)
             .args(["rev-parse", "--git-dir"])
             .output()
             .expect("git rev-parse --git-dir");
@@ -739,8 +820,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// [`Fixture::forge_ownership_via_git_dir_redirect`] (to locate the REAL admin
 /// dir before it gets copied and the worktree's `.git` file is overwritten).
 fn worktree_git_dir(worktree: &Path) -> PathBuf {
-    let out = Command::new("git")
-        .current_dir(worktree)
+    let out = fixture_git(worktree)
         .args(["rev-parse", "--git-dir"])
         .output()
         .expect("git rev-parse --git-dir");
@@ -874,8 +954,7 @@ fn worktree_reclaim_002_squash_merged_clean_owned_is_reclaimed_and_branch_surviv
 
     // Precondition: git ancestry does NOT consider this merged. If this ever
     // stops holding, the test is no longer exercising the squash-merge case.
-    let merged = Command::new("git")
-        .current_dir(&fx.repo)
+    let merged = fixture_git(&fx.repo)
         .args(["branch", "--merged", "main", "--list", "feat/squashed"])
         .output()
         .expect("git branch --merged");
@@ -900,8 +979,7 @@ fn worktree_reclaim_002_squash_merged_clean_owned_is_reclaimed_and_branch_surviv
         combined(&out)
     );
 
-    let branches = Command::new("git")
-        .current_dir(&fx.repo)
+    let branches = fixture_git(&fx.repo)
         .args(["branch", "--list", "feat/squashed"])
         .output()
         .expect("git branch --list");
@@ -979,8 +1057,7 @@ fn worktree_reclaim_004_ancestor_branch_without_a_pr_is_never_removed() {
     let wt = fx.add_worktree_at_main("wt-scratch", "chore/scratch");
     fx.mark_owned(&wt); // owned, clean, and an ancestor: only "no PR" protects it
 
-    let merged = Command::new("git")
-        .current_dir(&fx.repo)
+    let merged = fixture_git(&fx.repo)
         .args(["branch", "--merged", "main", "--list", "chore/scratch"])
         .output()
         .expect("git branch --merged");
@@ -1354,10 +1431,10 @@ fn worktree_reclaim_011_yes_removes_a_foreign_merged_clean_worktree_named_in_pen
 /// shown and no `--yes` required. Ignored content must instead demote the
 /// verdict from `Remove` to `Ask`, so the exact path is shown and removal
 /// requires `--yes` (auditor finding F1, P1).
-#[spec("worktree/reclaim/012")]
+#[spec("worktree/reclaim/024")]
 #[test]
 #[cfg(unix)]
-fn worktree_reclaim_012_gitignored_content_demotes_bare_reclaim_to_ask() {
+fn worktree_reclaim_024_gitignored_content_demotes_bare_reclaim_to_ask() {
     let fx = Fixture::new();
     fx.write_gitignore("ignored/\n");
     let wt = fx.add_worktree_with_commit("wt-ignored", "feat/ignored");
@@ -1370,8 +1447,7 @@ fn worktree_reclaim_012_gitignored_content_demotes_bare_reclaim_to_ask() {
     // Fixture precondition: the ignored content must be genuinely invisible
     // to `git status --porcelain`, or this test is not exercising the gate
     // gap F1 exists for.
-    let status = Command::new("git")
-        .current_dir(&wt)
+    let status = fixture_git(&wt)
         .args(["status", "--porcelain"])
         .output()
         .expect("git status --porcelain");
@@ -1404,17 +1480,17 @@ fn worktree_reclaim_012_gitignored_content_demotes_bare_reclaim_to_ask() {
     );
 }
 
-/// Scenario: Pairs with `012` to prove the ignored-content demotion actually
+/// Scenario: Pairs with `024` to prove the ignored-content demotion actually
 /// discriminates: the SAME deck-owned/merged/clean shape, but with no ignored
 /// content at all, must still be removed by a bare `reclaim`, unprompted.
-/// Without this, a coder could satisfy `012` by demoting every worktree to
-/// `Ask` regardless of content, which would make the ownership gate `012`
+/// Without this, a coder could satisfy `024` by demoting every worktree to
+/// `Ask` regardless of content, which would make the ownership gate `024`
 /// exists alongside pointless again. Expected GREEN from the start -- nothing
 /// about the current (pre-F1-fix) code path treats this shape differently.
-#[spec("worktree/reclaim/013")]
+#[spec("worktree/reclaim/025")]
 #[test]
 #[cfg(unix)]
-fn worktree_reclaim_013_no_ignored_content_still_removed_bare_regression_guard() {
+fn worktree_reclaim_025_no_ignored_content_still_removed_bare_regression_guard() {
     let fx = Fixture::new();
     fx.write_gitignore("ignored/\n");
     let wt = fx.add_worktree_with_commit("wt-clean-no-ignored", "feat/clean-no-ignored");
@@ -1462,8 +1538,7 @@ fn worktree_reclaim_014_forged_git_dir_redirect_is_not_treated_as_ours() {
     // Fixture precondition: the redirect must actually fool
     // `git status --porcelain` into reporting nothing, or this test is not
     // exercising the forgery F2 exists for.
-    let status = Command::new("git")
-        .current_dir(&wt)
+    let status = fixture_git(&wt)
         .args(["status", "--porcelain"])
         .output()
         .expect("git status --porcelain");
@@ -1985,9 +2060,243 @@ fn worktree_reclaim_027_a_zero_byte_marker_is_not_proof_of_ownership() {
     );
 }
 
+/// Scenario: A deck-owned, clean worktree's branch has no pull request of its
+/// own, but a contributor's fork has a MERGED pull request from a branch with
+/// the same name, which `gh pr list --head` lists too. `worktree list` must
+/// not read the fork's merge as this branch's (`unresolvable`, `keep`: a pull
+/// request with this head ref was found but nothing admits it, which this
+/// fork's fail-closed rule reports as unresolvable rather than as no pull
+/// request), and `worktree reclaim --yes` must leave the directory on disk.
+#[spec("worktree/reclaim/012")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_012_a_merged_fork_pr_with_the_same_branch_name_is_not_this_branchs() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-fork-namesake", "feat/namesake");
+    fx.mark_owned(&wt); // clean by construction, owned: only PR state decides the verdict
+    fx.set_pr_entries(
+        "feat/namesake",
+        r#"{"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":true,
+            "headRepositoryOwner":{"login":"contributor"}}"#,
+    );
+
+    let entry = verdict_entry(&fx, "wt-fork-namesake");
+    assert_eq!(
+        (
+            entry.get("owned").and_then(|o| o.as_bool()),
+            entry.get("clean").and_then(|c| c.as_bool()),
+        ),
+        (Some(true), Some(true)),
+        "fixture precondition: the worktree must be owned and clean, so that PR state is the \
+         only gate deciding its verdict; got entry:\n{entry}"
+    );
+    assert_eq!(
+        (
+            entry.get("pr_state").and_then(|p| p.as_str()),
+            entry.get("verdict").and_then(|v| v.as_str()),
+        ),
+        (Some("unresolvable"), Some("keep")),
+        "a fork's merged pull request from a same-named branch is someone else's, so nothing \
+         admits it as this branch's and its worktree is kept; got entry:\n{entry}"
+    );
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.is_dir(),
+        "a worktree whose only merged pull request is a fork's must survive `reclaim --yes` — \
+         {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+
+    // Control: the same worktree with its own merged pull request listed beside
+    // the fork's is reclaimable, so the `keep` above is the fork filter's doing
+    // and not some other gate's.
+    // The branch's own pull request carries the head repository owner this
+    // fixture's `origin` is under (`set_pr_state`'s shape): the owner
+    // allowlist admits it, the fork's does not.
+    fx.set_pr_entries(
+        "feat/namesake",
+        r#"{"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":true,
+            "headRepositoryOwner":{"login":"contributor"}},
+           {"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":false,
+            "headRepositoryOwner":{"login":"test-org"}}"#,
+    );
+    let control = verdict_entry(&fx, "wt-fork-namesake");
+    assert_eq!(
+        (
+            control.get("pr_state").and_then(|p| p.as_str()),
+            control.get("verdict").and_then(|v| v.as_str()),
+        ),
+        (Some("merged"), Some("remove")),
+        "control: with the branch's own merged pull request listed too, the worktree is \
+         reclaimable; got entry:\n{control}"
+    );
+}
+
+/// Scenario: A contributor's checkout has `origin` on the upstream repository
+/// and pushes a deck-owned, clean worktree's branch to their fork, where its
+/// pull request was opened and has MERGED at the worktree's own branch tip.
+/// `worktree list` reads that pull request as the branch's (`merged`,
+/// `remove`) and `worktree reclaim` removes the worktree; with no push remote,
+/// a stranger's fork as the pull request's head, or a head commit that is not
+/// the worktree's own tip (repository identity alone never removes), the same
+/// worktree is kept.
+#[spec("worktree/reclaim/013")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_013_a_merged_pr_from_the_fork_the_branch_is_pushed_to_is_this_branchs() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-own-fork", "feat/own-fork");
+    fx.mark_owned(&wt); // clean by construction, owned: only PR state decides the verdict
+    git(
+        &fx.repo,
+        &[
+            "remote",
+            "add",
+            "fork",
+            "git@github.com:contributor/test-repo.git",
+        ],
+    );
+    // The worktree's own branch tip: a verdict admitted only through the push
+    // repository is bound to it (PRD sync ruling 42), so the contributor's
+    // merged pull request must name this exact commit as its head.
+    let tip = {
+        let out = fixture_git(&wt)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        tip.len(),
+        40,
+        "fixture precondition: HEAD resolves to a sha"
+    );
+    let from = |owner: &str, head_oid: &str| {
+        format!(
+            r#"{{"state":"MERGED","headRefName":"feat/own-fork","isCrossRepository":true,
+                "headRefOid":"{head_oid}",
+                "headRepository":{{"id":"R_1","name":"test-repo"}},
+                "headRepositoryOwner":{{"id":"U_1","login":"{owner}"}}}}"#
+        )
+    };
+    let pr_and_verdict = |entry: &serde_json::Value| {
+        (
+            entry
+                .get("pr_state")
+                .and_then(|p| p.as_str())
+                .map(str::to_string),
+            entry
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        )
+    };
+    // A pull request with this head ref exists but nothing admits it: the
+    // fork's fail-closed `unresolvable`, which keeps (upstream reports `no_pr`).
+    let keep = (Some("unresolvable".to_string()), Some("keep".to_string()));
+    fx.set_pr_entries("feat/own-fork", &from("contributor", &tip));
+
+    // No push remote: the fork's pull request cannot be shown to be this
+    // branch's, so the worktree is kept, as before issue #1779.
+    let entry = verdict_entry(&fx, "wt-own-fork");
+    assert_eq!(
+        (
+            entry.get("owned").and_then(|o| o.as_bool()),
+            entry.get("clean").and_then(|c| c.as_bool()),
+        ),
+        (Some(true), Some(true)),
+        "fixture precondition: the worktree must be owned and clean, so that PR state is the \
+         only gate deciding its verdict; got entry:\n{entry}"
+    );
+    assert_eq!(
+        pr_and_verdict(&entry),
+        keep,
+        "with no push remote a fork's pull request is not this branch's; got entry:\n{entry}"
+    );
+
+    // Pushed to a fork whose owner did not open the pull request: kept.
+    git(
+        &fx.repo,
+        &["config", "branch.feat/own-fork.pushRemote", "fork"],
+    );
+    fx.set_pr_entries("feat/own-fork", &from("stranger", &tip));
+    let entry = verdict_entry(&fx, "wt-own-fork");
+    assert_eq!(
+        pr_and_verdict(&entry),
+        keep,
+        "a stranger's fork is not the one the branch is pushed to; got entry:\n{entry}"
+    );
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        wt.is_dir(),
+        "a worktree whose only merged pull request is a stranger's fork's must survive \
+         `reclaim --yes` — {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+
+    // The right fork, but the merged pull request's head is NOT this worktree's
+    // tip (a same-named branch that moved on, or a different branch of the same
+    // name in that fork): repository identity alone must never remove a
+    // worktree (PRD sync ruling 42), so it is kept.
+    fx.set_pr_entries(
+        "feat/own-fork",
+        &from("contributor", "0000000000000000000000000000000000000000"),
+    );
+    let entry = verdict_entry(&fx, "wt-own-fork");
+    assert_eq!(
+        pr_and_verdict(&entry),
+        keep,
+        "a push-repository pull request whose head commit is not this worktree's tip is not \
+         proof it merged this worktree's work; got entry:\n{entry}"
+    );
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        wt.is_dir(),
+        "a worktree whose push-repository pull request names a different head commit must \
+         survive `reclaim --yes` — {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+
+    // Pushed to the contributor's fork, which opened the merged pull request
+    // at exactly this worktree's tip.
+    fx.set_pr_entries("feat/own-fork", &from("contributor", &tip));
+    let entry = verdict_entry(&fx, "wt-own-fork");
+    assert_eq!(
+        pr_and_verdict(&entry),
+        (Some("merged".to_string()), Some("remove".to_string())),
+        "the merged pull request from the fork the branch is pushed to is this branch's; got \
+         entry:\n{entry}"
+    );
+    let out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !wt.exists(),
+        "a deck-owned, clean worktree whose own fork pull request merged must be reclaimed — \
+         {} survived\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
 /// The `worktree list --json` entry whose `path` contains `needle`, panicking
 /// with the whole document when it is absent — used by `011` to take the same
-/// measurement twice, before and after the marker is truncated.
+/// measurement twice, before and after the marker is truncated, and by `012`
+/// and `013`.
 #[cfg(unix)]
 fn verdict_entry(fx: &Fixture, needle: &str) -> serde_json::Value {
     let out = fx.run(&["worktree", "list", "--json"]);
@@ -2830,6 +3139,7 @@ async fn worktree_reclaim_045_issue_dispatch_producer_records_keep_if_dirty() {
         triage: false,
         repo_allowlist: None,
         dry_run: false,
+        claim: Default::default(),
     };
 
     dot_agent_deck::issue_dispatch_run::run_issue_dispatch(
@@ -2902,8 +3212,10 @@ fn worktree_reclaim_046_kept_120_tree_stays_claimed_but_is_reclaimable() {
     // regardless of which policy created or kept it. No fixture needed --
     // this is `dispatch_decision`'s own contract.
     assert_eq!(
-        dot_agent_deck::issue_dispatch::dispatch_decision(true, false, false),
-        dot_agent_deck::issue_dispatch::DispatchDecision::Skip,
+        dot_agent_deck::issue_dispatch::dispatch_decision(true, false, false, None),
+        dot_agent_deck::issue_dispatch::DispatchDecision::Skip(
+            dot_agent_deck::issue_dispatch::SkipCause::WorktreeExists
+        ),
         "a present #120 worktree must still read as already-claimed to dispatch_decision -- if \
          this ever flips to Dispatch, #120 would re-dispatch the SAME issue into the SAME \
          worktree path on every later fire, which is exactly the hazard the shipped code's \

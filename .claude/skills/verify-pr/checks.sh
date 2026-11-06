@@ -21,7 +21,7 @@
 #   --only    comma-separated subset of: fmt,clippy,build,test-fast,
 #             linkage-check,windows-cross,audit,e2e (naming `e2e` here implies
 #             --e2e)
-#   --filter  test-name filter passed to the test steps, for rule 6's
+#   --filter  test-name filter passed to the test steps, for CLAUDE.md rule 6's
 #             rerun-one-test loop (e.g. --filter lifecycle_001)
 #
 # RUN THIS IN THE BACKGROUND. The full suite takes far longer than a foreground
@@ -184,7 +184,7 @@ build_ok=true
 # CI: `cargo fmt --check` (CLAUDE.md rule 2).
 wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in --only"
 
-# CLAUDE.md rule 2, and the Linux `build` job in ci.yml matches this exactly.
+# CLAUDE.md rule 2, and the Linux `clippy` job in ci.yml matches this exactly.
 # All four flags matter. Both of #407's: without `--all-targets` no test
 # target is built at all, and without `--features e2e` every `tests/e2e_*.rs`
 # compiles to an empty crate — so the bare `cargo clippy` this used to run
@@ -194,7 +194,7 @@ wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in 
 # touching only `xtask/*` — linkage-check, the docs generator, the `spec`
 # macro — was reviewed against a lint that never read a line of it.
 #
-# `e2e-live` (issue #502) is the same hole reopened for the 24 real-agent
+# `e2e-live` (issue #502) is the same hole reopened for the real-agent
 # files, which open with
 # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and are empty crates
 # under `--features e2e` alone. This gate is where a reviewer catches a break in
@@ -231,19 +231,19 @@ if wanted test-fast; then
     # `--workspace` (issue #489) mirrors the `test-fast` alias and CI. Without
     # it cargo selects the root package alone and the `xtask/*` members' tests
     # never run, so a reviewer's gate would be narrower than the author's.
-    run_step test-fast "cargo nextest run --workspace${test_filter}" "rule 5 fast tier" || true
+    run_step test-fast "cargo nextest run --workspace${test_filter}" "CLAUDE.md rule 5 fast tier" || true
   fi
 else
   skip test-fast "not in --only"
 fi
 
-# Rule 7: catalog<->test linkage, function-name prefixes, no raw sleeps in
+# linkage-check (CLAUDE.md rule 7's gate): catalog<->test linkage, function-name prefixes, no raw sleeps in
 # e2e_*.rs, and the `/// Scenario:` doc comment on every #[spec] test.
 if wanted linkage-check; then
   if [ "$build_ok" != true ]; then
     record linkage-check BLOCKED 0 - "build failed; fix that first"
   else
-    run_step linkage-check "cargo xtask linkage-check" "rule 7" || true
+    run_step linkage-check "cargo xtask linkage-check" "CLAUDE.md rule 7" || true
   fi
 else
   skip linkage-check "not in --only"
@@ -277,7 +277,7 @@ fi
 
 # --- e2e lane 1: OPT-IN, because CI already runs it on this PR ------------
 #
-# OFF BY DEFAULT since issue #502 (CLAUDE.md rule 5). Lane 1 — the 47
+# OFF BY DEFAULT since issue #502 (CLAUDE.md rule 5). Lane 1 — the
 # `tests/e2e_*.rs` files that reach no real agent, `--features e2e` — runs in CI
 # on every PR as the `e2e-deterministic` job, so the reviewer's job is to READ
 # that run: `gh pr checks <n>` for its conclusion, `gh run view <id> --log-failed`
@@ -295,7 +295,7 @@ fi
 # docs/develop/e2e-lanes.md has the reasoning.
 
 if [ "$run_e2e" != true ]; then
-  skip e2e "not run locally — READ THE PR's e2e-deterministic CI run instead (gh pr checks <n>); pass --e2e to run it here"
+  skip e2e "not run locally — READ THE PR's e2e-deterministic CI run, or RWX: linux when .github/ci-backend says rwx, instead (gh pr checks <n>); pass --e2e to run it here"
 elif ! wanted e2e; then
   skip e2e "not in --only"
 elif [ "$build_ok" != true ]; then
@@ -315,7 +315,7 @@ else
   # this in lockstep with the `test-e2e` alias in .cargo/config.toml. Note that
   # alias is lane 1 exactly; `test-e2e-live` is the superset and is not run
   # here.
-  run_step e2e "cargo nextest run --workspace --features e2e --success-output=final${test_filter}" "rule 5 lane 1 (deterministic e2e)" || true
+  run_step e2e "cargo nextest run --workspace --features e2e --success-output=final${test_filter}" "CLAUDE.md rule 5 lane 1 (deterministic e2e)" || true
 
   e2e_log="${logs}/e2e.log"
   if [ -f "$e2e_log" ]; then

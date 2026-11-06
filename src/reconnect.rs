@@ -1,5 +1,14 @@
-//! TUI-side reconnect bootstrap: the daemon event subscription and the
-//! ordering contract it has with `ListAgents` hydration (fork issue #36).
+//! The hydration gate: the ordering contract between the TUI's daemon event
+//! subscription and its `ListAgents` hydration (fork issue #36).
+//!
+//! **This module holds ONLY the gate.** The subscriber itself is upstream's
+//! [`crate::event_subscriber`]; the fork's gate is carried on top of it through
+//! [`crate::event_subscriber::run_gated`]. Until the 2026-11-05 net merge this
+//! file also held the fork's own subscriber loop (`run_event_subscriber`,
+//! `resync_after_reconnect`, `apply_broadcast`); upstream's later loop (gap
+//! resync #1520, protocol refusal #405, hook-binary notices #1637, the inbox
+//! arms) superseded all of it, so it was deleted rather than re-ported. The name
+//! `reconnect` is kept only to avoid churning every import.
 //!
 //! # The window this module exists to close
 //!
@@ -10,14 +19,14 @@
 //!    [`crate::state::SessionSnapshot`] carries each session's status at the
 //!    instant the daemon serialized it; and
 //! 2. a **stream** — a long-lived `SubscribeEvents` connection carrying every
-//!    subsequent [`BroadcastMsg`].
+//!    subsequent [`crate::event::BroadcastMsg`].
 //!
-//! Before this module the two were unordered: `spawn_event_subscriber` was
-//! spawned as a detached task from `main`, and hydration ran concurrently on
-//! the blocking TUI thread. Whichever connection the daemon happened to accept
-//! first won. When the snapshot won, every event the daemon broadcast between
-//! the snapshot and the subscription was delivered to nobody — the client had
-//! no receiver registered yet, and nothing replays.
+//! Before the gate the two were unordered: the subscriber was spawned as a
+//! detached task from `main`, and hydration ran concurrently on the blocking
+//! TUI thread. Whichever connection the daemon happened to accept first won.
+//! When the snapshot won, every event the daemon broadcast between the snapshot
+//! and the subscription was delivered to nobody — the client had no receiver
+//! registered yet, and nothing replays.
 //!
 //! That is invisible for most events (the next one corrects the card), but it
 //! is permanent for an **edge**. The daemon's shell-activity monitor
@@ -33,6 +42,13 @@
 //! `shell_synthetic_working` provenance marker so `apply_event` declined to
 //! revert. Here the event is never delivered at all.
 //!
+//! Upstream's `event_subscriber` does NOT close this window (verified for the
+//! 2026-11-05 merge, `.dot-agent-deck/sync-merge-2026-11-05-subscriber-memo.md`
+//! Q1): bootstrap hydration still makes its own `ListAgents` call that is not
+//! ordered against the subscription, the first subscription reads only the
+//! inboxes from `SubscribeEventsWithSnapshot`, and the monitor's idle side is
+//! purely edge-triggered. That is why the gate is carried rather than dropped.
+//!
 //! # The fix: subscribe first, buffer across hydration
 //!
 //! The daemon registers the broadcast receiver **before** it writes the
@@ -46,10 +62,12 @@
 //! 2. Hydration waits for that signal ([`HydrationGate::wait_subscribed`])
 //!    before issuing `ListAgents`, so the snapshot is strictly newer than the
 //!    subscription.
-//! 3. Events that arrive while hydration is still seeding cards are **buffered
+//! 3. Messages that arrive while hydration is still seeding cards are **buffered
 //!    by the subscriber task**, not applied — `AppState::apply_event` drops any
 //!    non-`SessionStart` event whose pane is not yet registered, so merely
-//!    reordering the two connections would still lose the edge.
+//!    reordering the two connections would still lose the edge. Every
+//!    [`crate::event::BroadcastMsg`] kind is held, not only `Event`, so the
+//!    inbox and hook-binary-notice messages keep their arrival order.
 //! 4. Once hydration has registered and seeded every pane it calls
 //!    [`HydrationGate::mark_seeded`]; the subscriber drains its buffer in
 //!    arrival order and then applies live.
@@ -66,43 +84,27 @@
 //!
 //! Everything above is about *bootstrap*. The identical loss happens whenever
 //! the subscription dies mid-session — a daemon restart, a dead socket, or the
-//! `KIND_STREAM_END "lagged"` tear-down `handle_subscribe_events` performs for
-//! a receiver that falls behind. The reconnect loop below re-subscribed and
-//! resumed applying events, but nothing re-read the daemon's state, so every
-//! event broadcast during the outage was gone for good and the card sat on its
-//! pre-outage status indefinitely. `handle_subscribe_events`'s own doc comment
-//! already stated the intended contract — the client is expected to "drain a
-//! `list_agents` snapshot to recover" — and the client did not.
+//! `KIND_STREAM_END "lagged"` tear-down. Upstream's loop re-reads the daemon's
+//! agents on every resubscribe after the first (issue #1520, one atomic
+//! `SubscribeEventsWithSnapshot`), which supersedes the fork's own
+//! `resync_after_reconnect`. The gate only adds one rule on top: a resync whose
+//! stream opened BEFORE hydration finished seeding is **held** until
+//! [`HydrationGate::mark_seeded`], then applied snapshot-first with the buffered
+//! events on top, so it cannot mint cards that hydration is about to create for
+//! the same panes.
 //!
-//! [`run_event_subscriber`] now does exactly that: **every re-subscribe after
-//! the first** captures a fresh `ListAgents` snapshot and reconciles it onto
-//! the cards that already exist ([`crate::state::AppState::resync_hydrated_sessions`]).
-//! It is deliberately unconditional rather than triggered by the tear-down
-//! reason: a bare transport drop loses precisely as much as a `"lagged"` one,
-//! and reason-string matching would recover only the case that bothered to
-//! announce itself.
+//! # Every wait is bounded
 //!
-//! The ordering that makes bootstrap correct makes this correct too, for the
-//! same reason and in the same shape. The resync runs *after* the new
-//! subscription is confirmed and *before* the first event is read off it, so
-//! the snapshot is strictly newer than the stream and every event the stream
-//! carries is applied on top of it — never underneath.
-//!
-//! The first subscribe deliberately does NOT resync: bootstrap hydration is
-//! the pass that owns it, and it does more (it attaches a PTY and mints a card
-//! per agent). The resync is the narrow mid-session counterpart — it updates
-//! cards in place and creates nothing.
+//! Hydration waits at most [`SUBSCRIBE_READY_TIMEOUT`] for the subscription, the
+//! TUI calls [`HydrationGate::mark_seeded`] after its seeding loop even when
+//! nothing was hydrated, and `main`'s 30 s watchdog calls it if `run_tui` never
+//! does. A refused subscription (issue #405 protocol skew) releases the wait at
+//! once through [`HydrationGate::release_waiters`] instead of timing out.
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-
-use crate::daemon_client::DaemonClient;
-use crate::event::BroadcastMsg;
-use crate::state::SharedState;
 
 /// How long hydration will wait for the event subscription to be confirmed
 /// before giving up and issuing `ListAgents` anyway.
@@ -129,15 +131,6 @@ pub const SUBSCRIBE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// state, and the newest events are the ones that carry it.
 pub const HYDRATION_BUFFER_CAP: usize = 1024;
 
-/// Bound on the `ListAgents` round-trip the reconnect resync makes (issues
-/// #49 / #28). Matches `embedded_pane`'s `HYDRATE_LIST_TIMEOUT`, the bound on
-/// the equivalent call at bootstrap.
-///
-/// Expiry is a **degradation, never a hang**: the resync is abandoned for this
-/// reconnect and the subscriber goes straight to reading events, exactly as it
-/// behaved before the resync existed. The next reconnect tries again.
-pub const RESYNC_LIST_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Coordination handle between the event subscriber and reconnect hydration.
 ///
 /// Cheap to clone — every clone refers to the same pair of signals. See the
@@ -158,6 +151,11 @@ pub struct HydrationGate {
 struct GateInner {
     subscribed: watch::Sender<bool>,
     seeded: watch::Sender<bool>,
+    /// Raised by [`HydrationGate::release_waiters`]: the subscriber has given up
+    /// for now, so nobody should keep waiting on `subscribed`. Deliberately NOT
+    /// folded into `subscribed`, so [`HydrationGate::is_subscribed`] keeps
+    /// meaning "a stream is actually up".
+    released: watch::Sender<bool>,
 }
 
 impl HydrationGate {
@@ -169,6 +167,7 @@ impl HydrationGate {
             inner: Arc::new(GateInner {
                 subscribed: watch::Sender::new(false),
                 seeded: watch::Sender::new(false),
+                released: watch::Sender::new(false),
             }),
         }
     }
@@ -197,6 +196,19 @@ impl HydrationGate {
         self.inner.subscribed.send_replace(true);
     }
 
+    /// Subscriber side: the subscription was REFUSED (issue #405 protocol skew),
+    /// so no stream will come up until the daemon is replaced. Releases anyone
+    /// in [`Self::wait_subscribed`] at once instead of leaving hydration to wait
+    /// out [`SUBSCRIBE_READY_TIMEOUT`] before its own gated `ListAgents` is
+    /// refused the same way. [`Self::wait_subscribed`] then returns `false`, and
+    /// [`Self::is_subscribed`] stays `false`: this is "stop waiting", never
+    /// "the stream is up". Idempotent; `send_replace` for the same reason as
+    /// [`Self::mark_subscribed`]. A plain daemon-down failure does NOT call this,
+    /// it keeps the wait-then-time-out behaviour.
+    pub fn release_waiters(&self) {
+        self.inner.released.send_replace(true);
+    }
+
     /// Hydration side: every hydrated pane has been registered and seeded, so
     /// buffered events can now land on real cards. Idempotent. `send_replace`
     /// for the same reason as [`Self::mark_subscribed`].
@@ -217,31 +229,52 @@ impl HydrationGate {
     /// Hydration side: wait for the subscription to be confirmed, bounded by
     /// `timeout`. Returns `true` when the stream is up (the snapshot that
     /// follows is then strictly newer than the subscription) and `false` on
-    /// expiry — in which case the caller should proceed anyway rather than
-    /// stall TUI startup, accepting the pre-fix window for this attach.
+    /// expiry or on [`Self::release_waiters`] — in which case the caller should
+    /// proceed anyway rather than stall TUI startup, accepting the pre-fix
+    /// window for this attach.
     pub async fn wait_subscribed(&self, timeout: Duration) -> bool {
         // Subscribe BEFORE reading the value. `subscribe()` marks the current
         // value as already seen, so a receiver created after the flip would
         // never see a `changed()` for it — checking first and subscribing after
         // would lose a signal that landed between the two.
         let mut rx = self.inner.subscribed.subscribe();
+        let mut released = self.inner.released.subscribe();
         if *rx.borrow() {
             return true;
         }
+        if *released.borrow() {
+            return false;
+        }
         tokio::time::timeout(timeout, async move {
-            // `changed()` errs only when every Sender is dropped; we hold one
+            // `changed()` errs only when every Sender is dropped; we hold them
             // through `self`, so this loop cannot spin.
-            while rx.changed().await.is_ok() {
-                if *rx.borrow() {
-                    return;
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            return false;
+                        }
+                        if *rx.borrow() {
+                            return true;
+                        }
+                    }
+                    changed = released.changed() => {
+                        if changed.is_err() || *released.borrow() {
+                            // Re-read `subscribed` once: a stream that came up
+                            // in the same instant outranks the release.
+                            return *rx.borrow();
+                        }
+                    }
                 }
             }
         })
         .await
-        .is_ok()
+        .unwrap_or(false)
     }
 
-    fn seeded_receiver(&self) -> watch::Receiver<bool> {
+    /// The subscriber's view of the `seeded` signal: it holds messages back
+    /// until this reads `true`. `pub(crate)` for [`crate::event_subscriber`].
+    pub(crate) fn seeded_receiver(&self) -> watch::Receiver<bool> {
         self.inner.seeded.subscribe()
     }
 }
@@ -249,254 +282,6 @@ impl HydrationGate {
 impl Default for HydrationGate {
     fn default() -> Self {
         Self::open()
-    }
-}
-
-/// PRD #76 M2.17 (hook events) / M2.19 (delegate signals): open a long-lived
-/// `SubscribeEvents` connection against the daemon and route each
-/// [`BroadcastMsg::Event`] into the TUI's `AppState` via `apply_event`.
-///
-/// PRD #93 round-5: the delegate / work-done variants used to ride this channel
-/// too — the daemon couldn't dispatch them locally and the TUI re-ran the
-/// role-validation guards. The daemon now owns dispatch end to end (writes the
-/// prompt directly into the target pane's PTY), so only hook events flow
-/// through here.
-///
-/// Reconnects with a small backoff on transport errors so a daemon restart or a
-/// `KIND_STREAM_END "lagged"` tear-down recovers automatically.
-///
-/// Fork issues #49/#28: recovery is not just re-subscribing. Every re-subscribe
-/// after the first also drains a fresh `ListAgents` snapshot and reconciles it
-/// onto the existing cards, because nothing replays what the daemon broadcast
-/// while the stream was down. See the module docs for the ordering.
-///
-/// Fork issue #36: `gate` orders this subscription against reconnect
-/// hydration. Pass [`HydrationGate::armed`] when a `hydrate_from_daemon` pass
-/// will follow (the TUI bootstrap), or [`HydrationGate::open`] when it will
-/// not. See the module docs for why buffering — not merely reordering — is
-/// what closes the window.
-pub fn spawn_event_subscriber(attach_path: PathBuf, state: SharedState, gate: HydrationGate) {
-    tokio::spawn(async move {
-        run_event_subscriber(attach_path, state, gate).await;
-    });
-}
-
-/// The body of [`spawn_event_subscriber`], as an ordinary future so tests can
-/// drive it with their own task/abort handle. Never returns on its own.
-pub async fn run_event_subscriber(attach_path: PathBuf, state: SharedState, gate: HydrationGate) {
-    // Backoff parameters tuned for "daemon briefly unavailable" rather than
-    // long outages: a fresh-daemon ready window is sub-second, so a 500ms
-    // initial delay catches most transient cases, and we cap at 5s so a stuck
-    // daemon doesn't burn CPU on reconnect attempts.
-    let mut delay = Duration::from_millis(500);
-    let max_delay = Duration::from_secs(5);
-    let client = DaemonClient::new(attach_path);
-    // Fork issues #49/#28: the first subscribe is bootstrap's, and bootstrap
-    // hydration owns the snapshot for it. Every LATER one is a reconnect, and
-    // has an outage behind it whose events nothing else will ever deliver.
-    let mut subscribed_before = false;
-    loop {
-        match client.subscribe_events().await {
-            Ok(mut sub) => {
-                // Reset backoff on a successful subscribe.
-                delay = Duration::from_millis(500);
-                // Fork issue #36: the daemon registered our broadcast receiver
-                // BEFORE it wrote the OK RESP we just read, so from here on no
-                // event can be missed. Releasing hydration only now is what
-                // makes the `ListAgents` snapshot strictly newer than this
-                // subscription.
-                gate.mark_subscribed();
-
-                // Fork issues #49/#28. Placed HERE — after the subscription is
-                // confirmed, before a single event is read off `sub` — for the
-                // ordering, not for convenience: the snapshot is therefore
-                // newer than the stream, and the events that arrive during the
-                // round-trip wait in the socket and land on top of it rather
-                // than being overwritten by it.
-                if subscribed_before {
-                    resync_after_reconnect(&client, &state, &gate).await;
-                }
-                subscribed_before = true;
-
-                // Events received before hydration finished seeding its cards.
-                // Held here rather than applied because `apply_event` drops any
-                // non-`SessionStart` event whose pane is not yet registered —
-                // applying early would lose the edge just as surely as never
-                // receiving it.
-                let mut pending: VecDeque<BroadcastMsg> = VecDeque::new();
-                let mut seeded_rx = gate.seeded_receiver();
-                loop {
-                    tokio::select! {
-                        recv = sub.next_event() => {
-                            match recv {
-                                Ok(Some(msg)) => {
-                                    if *seeded_rx.borrow() {
-                                        // Drain first: `select!` may pick this
-                                        // branch on the same poll the gate
-                                        // opened, and buffered events must
-                                        // still land in arrival order.
-                                        drain_pending(&state, &mut pending).await;
-                                        apply_broadcast(&state, msg).await;
-                                    } else {
-                                        if pending.len() >= HYDRATION_BUFFER_CAP {
-                                            tracing::warn!(
-                                                cap = HYDRATION_BUFFER_CAP,
-                                                "subscribe_events: hydration buffer full, dropping oldest \
-                                                 held event"
-                                            );
-                                            pending.pop_front();
-                                        }
-                                        pending.push_back(msg);
-                                    }
-                                }
-                                Ok(None) => break,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "subscribe_events: stream error, reconnecting"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        // Hydration finished while the stream was quiet. Without
-                        // this branch the held events would sit until the next
-                        // event happened to arrive — which, for the edge this
-                        // whole module exists to preserve, may be never.
-                        changed = seeded_rx.changed() => {
-                            if changed.is_err() {
-                                // Every gate Sender dropped. Nothing will ever
-                                // open it, so stop holding events back.
-                                drain_pending(&state, &mut pending).await;
-                                break;
-                            }
-                            if *seeded_rx.borrow() {
-                                drain_pending(&state, &mut pending).await;
-                            }
-                        }
-                    }
-                }
-                // The stream is going away; don't strand anything we held.
-                // Applying now is a no-op for panes hydration never registered
-                // and correct for the ones it did.
-                drain_pending(&state, &mut pending).await;
-            }
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "subscribe_events: subscribe failed, retrying"
-                );
-            }
-        }
-        tokio::time::sleep(delay).await;
-        delay = std::cmp::min(delay * 2, max_delay);
-    }
-}
-
-/// Fork issues #49 / #28: re-read the daemon's state after a mid-session
-/// subscription loss and reconcile it onto the cards that already exist.
-///
-/// Narrow by construction — see
-/// [`crate::state::AppState::resync_hydrated_sessions`] for why it updates in
-/// place and mints nothing, and why reusing bootstrap's
-/// `EmbeddedPaneController::hydrate_from_daemon` would be wrong here (that one
-/// re-attaches a PTY and creates a pane per agent, which is right for a cold
-/// attach and duplicate work for panes that are already live).
-///
-/// Every failure mode is a no-op that leaves the subscriber to carry on with
-/// live events. Reconnect-storm safety comes from three properties together:
-/// the caller only reaches this after a *successful* subscribe, and every loop
-/// iteration ends in a `sleep` of at least 500 ms — so a flapping daemon costs
-/// at most one extra `ListAgents` per reconnect attempt, at the rate the
-/// reconnect loop was already running; the call is bounded by
-/// [`RESYNC_LIST_TIMEOUT`]; and it retries nothing internally, so a daemon
-/// that answers slowly or not at all cannot turn this into a spin.
-async fn resync_after_reconnect(client: &DaemonClient, state: &SharedState, gate: &HydrationGate) {
-    // Bootstrap hydration has not finished seeding its cards yet, so there is
-    // nothing to reconcile and it is still the pass that owns the snapshot.
-    // (Its own buffered-event path covers this window — see the module docs.)
-    if !gate.is_seeded() {
-        return;
-    }
-    // Nothing to reconcile: no card on screen to correct and no outstanding
-    // delegation to confirm. Skipping the round-trip entirely keeps a flapping
-    // daemon from being probed by a TUI that holds nothing. The delegations
-    // count on their own because they are kept per pane, not per card: one
-    // whose retirement was lost in the outage would otherwise be inherited by
-    // the next session to appear on its pane.
-    {
-        let state = state.read().await;
-        if state.sessions.is_empty() && !state.has_outstanding_delegations() {
-            return;
-        }
-    }
-
-    let records = match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents()).await {
-        Ok(Ok(records)) => records,
-        Ok(Err(e)) => {
-            tracing::debug!(
-                error = %e,
-                "reconnect resync: list_agents failed; leaving cards as they are"
-            );
-            return;
-        }
-        Err(_) => {
-            tracing::debug!(
-                timeout_ms = RESYNC_LIST_TIMEOUT.as_millis() as u64,
-                "reconnect resync: list_agents timed out; leaving cards as they are"
-            );
-            return;
-        }
-    };
-
-    let recovered = state.write().await.resync_hydrated_sessions(&records);
-    if recovered > 0 {
-        tracing::info!(
-            recovered,
-            agents = records.len(),
-            "reconnect resync: recovered session statuses missed while the event stream was down"
-        );
-    }
-}
-
-async fn drain_pending(state: &SharedState, pending: &mut VecDeque<BroadcastMsg>) {
-    while let Some(msg) = pending.pop_front() {
-        apply_broadcast(state, msg).await;
-    }
-}
-
-async fn apply_broadcast(state: &SharedState, msg: BroadcastMsg) {
-    match msg {
-        BroadcastMsg::Event(event) => state.write().await.apply_event(event),
-        // PRD #120: a daemon-spawned orchestration (issue dispatch). Queue it
-        // for the render loop, which owns the TabManager + pane controller and
-        // builds the live tab. The subscriber task can't touch those.
-        BroadcastMsg::OrchestrationSurface(surface) => {
-            state.write().await.queue_orchestration_surface(surface)
-        }
-        // Issue #717 / PRD 236: a dispatched worktree the daemon kept on tab
-        // close. Queue it for the render loop the same way as the surface
-        // above — the subscriber task can't touch `ui.session_warnings`
-        // either, that's render-loop-local state.
-        BroadcastMsg::WorktreeKept(notice) => state.write().await.queue_kept_worktree(notice),
-        // Issue #755: applied directly, unlike the two queued variants above
-        // — the outstanding delegations live on `AppState`, which this
-        // subscriber can already write through `state`, exactly like the
-        // `Event` arm at the top of this match. This is the live-push path
-        // that lets an already-attached, healthily-subscribed TUI see a
-        // delegation arm/retire with no reconnect.
-        BroadcastMsg::DelegationArmed(notice) => state.write().await.apply_delegation_armed(notice),
-        BroadcastMsg::DelegationRetired(notice) => {
-            state.write().await.apply_delegation_retired(notice)
-        }
-        // PRD #741 M8 (issue #801 item 3): a `kind` tag this build does not
-        // know, from a newer daemon. Ignored rather than escalated — there is
-        // no payload to act on, and the TUI's own state is rebuilt from
-        // `list_agents` at hydration and reconciled by the ordinary event
-        // flow, so a message it cannot read costs it nothing it can name.
-        BroadcastMsg::Unknown => {
-            tracing::debug!("subscribe_events: ignoring a broadcast kind this build does not know");
-        }
     }
 }
 
@@ -542,5 +327,27 @@ mod tests {
         });
         assert!(gate.wait_subscribed(Duration::from_secs(2)).await);
         assert!(gate.is_subscribed());
+    }
+
+    /// A refused subscription (issue #405) must stop hydration waiting out the
+    /// full timeout, WITHOUT claiming a stream is up: `is_subscribed` keeps
+    /// meaning "a stream is actually open".
+    #[tokio::test]
+    async fn release_waiters_ends_the_wait_without_claiming_a_stream() {
+        let gate = HydrationGate::armed();
+        let releaser = gate.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            releaser.release_waiters();
+        });
+        let started = std::time::Instant::now();
+        assert!(!gate.wait_subscribed(Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!gate.is_subscribed());
+        // Already released: a later wait returns at once.
+        assert!(!gate.wait_subscribed(Duration::from_secs(5)).await);
+        // A stream coming up afterwards still outranks the release.
+        gate.mark_subscribed();
+        assert!(gate.wait_subscribed(Duration::from_millis(20)).await);
     }
 }

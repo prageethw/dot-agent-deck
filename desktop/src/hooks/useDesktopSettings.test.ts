@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_DESKTOP_SETTINGS, type AppearanceMode, type DesktopSettingsDto } from "../lib/bridge";
+import { PartialSettingsSaveError } from "../lib/settingsError";
 import type { DeckRuntimeState } from "../types";
 import { useDesktopSettings } from "./useDesktopSettings";
 
@@ -25,12 +26,14 @@ function withMode(mode: AppearanceMode): DesktopSettingsDto {
 /** A `saveSettings` whose every call the test settles by hand. */
 function deferredSaves() {
   const sent: DesktopSettingsDto[] = [];
+  const bases: (DesktopSettingsDto | undefined)[] = [];
   const pending: { resolve: (written: DesktopSettingsDto) => void; reject: (cause: unknown) => void }[] = [];
-  const saveSettings = vi.fn((settings: DesktopSettingsDto) => {
+  const saveSettings = vi.fn((settings: DesktopSettingsDto, base?: DesktopSettingsDto) => {
     sent.push(settings);
+    bases.push(base);
     return new Promise<DesktopSettingsDto>((resolve, reject) => { pending.push({ resolve, reject }); });
   });
-  return { sent, pending, saveSettings };
+  return { sent, bases, pending, saveSettings };
 }
 
 /**
@@ -38,18 +41,27 @@ function deferredSaves() {
  * The cast is what keeps that honest: a third member would fail to compile here
  * rather than being quietly stubbed.
  */
-function runtime(saveSettings: DeckRuntimeState["saveSettings"]): DeckRuntimeState {
+function runtime(saveSettings: DeckRuntimeState["saveSettings"], problem?: string): DeckRuntimeState {
   return {
-    getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: "/tmp/desktop.toml" })),
+    getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: "/tmp/desktop.toml", problem })),
     saveSettings,
   } as unknown as DeckRuntimeState;
 }
 
-async function loadedHook(saveSettings: DeckRuntimeState["saveSettings"]) {
-  const hook = renderHook(() => useDesktopSettings(runtime(saveSettings)));
+async function loadedHook(saveSettings: DeckRuntimeState["saveSettings"], problem?: string) {
+  // Built ONCE, outside the render callback. `useDesktopSettings` keys its load
+  // effect on `getSettings`, and the real runtime memoises that with
+  // `useCallback` — building a fresh runtime per render instead would re-run the
+  // read on every state change and quietly re-seed whatever the read reports,
+  // which is a property of this helper and not of the hook.
+  const value = runtime(saveSettings, problem);
+  const hook = renderHook(() => useDesktopSettings(value));
   await waitFor(() => expect(hook.result.current.loaded).toBe(true));
   return hook;
 }
+
+/** The sentence the Rust side sends when the document on disk cannot be read. */
+const UNREADABLE = "The desktop settings file cannot be read: line 3, column 9 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.";
 
 describe("useDesktopSettings save ordering", () => {
   it("sends one save at a time and drops a superseded response", async () => {
@@ -100,7 +112,272 @@ describe("useDesktopSettings save ordering", () => {
     // The newest one's failure is the one the user needs, and the choice stays
     // applied: what failed is persisting it, not making it.
     await act(async () => { pending[1].reject(new Error("permission denied")); });
-    expect(result.current.saveError).toBe("permission denied");
+    expect(result.current.saveError).toContain("permission denied");
+    // The lead-in the panels used to compose themselves now lives here, because
+    // the same slot also carries an unreadable-document message (issue #1072).
+    expect(result.current.saveError).toContain("will not survive a restart");
     expect(result.current.settings.appearance.mode).toBe("light");
+  });
+});
+
+/**
+ * Two writers (issue #828).
+ *
+ * The Rust side writes only what differs between a save's `base` and its
+ * document, so the base must be exactly what the edit was made against: the
+ * document on screen at the click. Diffing against anything newer would read
+ * this window's stale copy of another window's field as an edit and write it
+ * back over the newer value — the lost edit #828 is about.
+ */
+describe("useDesktopSettings base", () => {
+  it("sends the document each edit was made against, and shows the file as written", async () => {
+    const { sent, bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    expect(bases[0]).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(sent[0].appearance.mode).toBe("dark");
+
+    // The reply is the file as written, and another window had changed the
+    // zoom meanwhile. The window must show that, not its own stale zoom.
+    const written = { ...withMode("dark"), zoom: { level: 1.5 } };
+    await act(async () => { pending[0].resolve(written); });
+    expect(result.current.settings.zoom.level).toBe(1.5);
+
+    // The next edit is made against what is now on screen.
+    await act(async () => { result.current.save({ ...result.current.settings, appearance: { mode: "light" } }); });
+    expect(bases[1]).toEqual(written);
+    expect(sent[1]).toEqual({ ...written, appearance: { mode: "light" } });
+  });
+
+  it("captures the base at the click, not when a queued save goes out", async () => {
+    const { bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    // A second choice while the first is still in flight: it was made against
+    // the dark document on screen, whatever the first reply later says.
+    act(() => { result.current.save(withMode("light")); });
+
+    // The first reply carries another window's zoom. Had the queued save taken
+    // its base from here, its own zoom — still the default — would read as an
+    // edit and be written back over the other window's.
+    await act(async () => { pending[0].resolve({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+    expect(saveSettings).toHaveBeenCalledTimes(2);
+    expect(bases[1]).toEqual(withMode("dark"));
+  });
+
+  it("measures a write-back against the snapshot it names, not the newer screen", async () => {
+    const { sent, bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    // A probe kept this snapshot across its `await`...
+    const snapshot = result.current.settings;
+    // ...and meanwhile a save's reply brought in another window's zoom.
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+    expect(result.current.settings.zoom.level).toBe(1.5);
+
+    // The write-back builds on its snapshot and says so. Measured against the
+    // screen instead, its old zoom would read as an edit and overwrite 1.5.
+    const next = { ...snapshot, appearance: { mode: "light" as const } };
+    await act(async () => { result.current.save(next, snapshot); });
+    expect(bases[1]).toEqual(snapshot);
+    expect(sent[1]).toEqual(next);
+  });
+
+  it("carries a failed save's edit into the next save instead of rolling it back", async () => {
+    const { sent, bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    // The theme, then the zoom while the theme save is still in flight.
+    await act(async () => { result.current.save(withMode("dark")); });
+    act(() => { result.current.save({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+
+    // The theme save fails. The zoom save was made against a document that
+    // already shows dark, so diffing against that would leave the file's old
+    // theme in place — and applying its reply would then flip the screen back.
+    await act(async () => { pending[0].reject(new Error("disk full")); });
+    expect(saveSettings).toHaveBeenCalledTimes(2);
+    expect(bases[1]).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(sent[1]).toEqual({ ...withMode("dark"), zoom: { level: 1.5 } });
+
+    // And once one save lands, the carry is spent: the next edit is measured
+    // from what is on screen again.
+    await act(async () => { pending[1].resolve({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+    await act(async () => { result.current.save({ ...withMode("light"), zoom: { level: 1.5 } }); });
+    expect(bases[2]).toEqual({ ...withMode("dark"), zoom: { level: 1.5 } });
+  });
+});
+
+/**
+ * An unreadable `desktop.toml` (issue #1072).
+ *
+ * The Rust side comes up on defaults and refuses every save, so the app looks
+ * exactly like a fresh install. Nothing but this message explains why — and
+ * before #1072 there was no message: the reason went to stderr and the next save
+ * overwrote the user's file with the defaults on screen.
+ */
+describe("useDesktopSettings unreadable document", () => {
+  it("surfaces the reason as soon as the load resolves, before any save", async () => {
+    const { saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings, UNREADABLE);
+
+    expect(result.current.saveError).toBe(UNREADABLE);
+    expect(saveSettings).not.toHaveBeenCalled();
+    // The document shown is this build's defaults, which is what the Rust side
+    // sent — the hook does not invent one.
+    expect(result.current.settings).toEqual(DEFAULT_DESKTOP_SETTINGS);
+  });
+
+  it("keeps the reason visible across the optimistic clear a save begins with", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings, UNREADABLE);
+
+    // The click clears the last SAVE failure, and must not clear this: the
+    // message would otherwise blink out at the one moment the user is reading
+    // it, and come back when the refusal lands a round trip later.
+    await act(async () => { result.current.save(withMode("dark")); });
+    expect(result.current.saveError).toBe(UNREADABLE);
+
+    // The refusal arrives and wins, because it is the newer and more specific
+    // answer — and it still says the change is applied but unsaved.
+    await act(async () => { pending[0].reject(new Error("refusing to overwrite the desktop settings file: line 3, column 9 is not valid settings")); });
+    expect(result.current.saveError).toContain("refusing to overwrite");
+    expect(result.current.settings.appearance.mode).toBe("dark");
+  });
+
+  it("stops reporting it once a save gets through", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings, UNREADABLE);
+
+    // A save that comes back at all means `save_to` got past its guard, so the
+    // document on disk is readable again — the user fixed or removed the file.
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+
+    expect(result.current.saveError).toBeUndefined();
+    expect(result.current.problem).toBeUndefined();
+  });
+
+  it("exposes the load problem on its own, unchanged by a save that fails", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings, UNREADABLE);
+    expect(result.current.problem).toBe(UNREADABLE);
+
+    // A failed save replaces `saveError`, but the footer's `problem` is about
+    // the file and must still say what is wrong with it (issue #829).
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].reject(new Error("Permission denied")); });
+    expect(result.current.saveError).toContain("Permission denied");
+    expect(result.current.problem).toBe(UNREADABLE);
+  });
+
+  it("does not let a load that resolves after an accepted save restore its stale problem", async () => {
+    // The read is still in flight when the user saves, and the backend accepts
+    // the save — the file was fixed in between. The read's problem describes the
+    // file as it was before that write, so it must not reach the footer.
+    const { pending, saveSettings } = deferredSaves();
+    let finishLoad: (snapshot: { settings: DesktopSettingsDto; path: string; problem?: string }) => void = () => undefined;
+    const value = {
+      getSettings: vi.fn(() => new Promise((resolve) => { finishLoad = resolve; })),
+      saveSettings,
+    } as unknown as DeckRuntimeState;
+    const { result } = renderHook(() => useDesktopSettings(value));
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+    await act(async () => { finishLoad({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: "/tmp/desktop.toml", problem: UNREADABLE }); });
+
+    expect(result.current.loaded).toBe(true);
+    expect(result.current.path).toBe("/tmp/desktop.toml");
+    expect(result.current.problem).toBeUndefined();
+    expect(result.current.saveError).toBeUndefined();
+  });
+
+  it("still reports the problem a load that starts after an accepted save finds", async () => {
+    // Only a read already in flight when the save landed is stale. A later read
+    // — `getSettings` changes identity when the bridge does — describes the file
+    // as it is now, and a document broken again since must reach the footer.
+    const { pending, saveSettings } = deferredSaves();
+    const first = runtime(saveSettings);
+    const { result, rerender } = renderHook(({ value }) => useDesktopSettings(value), { initialProps: { value: first } });
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+    expect(result.current.problem).toBeUndefined();
+
+    rerender({ value: runtime(saveSettings, UNREADABLE) });
+    await waitFor(() => expect(result.current.problem).toBe(UNREADABLE));
+  });
+});
+
+/**
+ * A save that half-happened (issue #1350's review).
+ *
+ * The deck edits went to the shared deck list and the rest of the document did
+ * not, so neither the edit nor the old document is what is on disk. The Rust
+ * side sends the re-read settings with the error; the window must show those,
+ * say which half was saved, and take them as the base of the next save.
+ */
+describe("useDesktopSettings partial save", () => {
+  it("shows the settings as they are on disk and diffs the next save against them", async () => {
+    const { bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    await act(async () => { result.current.save({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+    // On disk: the deck half (standing in here as the zoom another writer's
+    // field would show) landed, the theme did not.
+    const onDisk = { ...withMode("light"), zoom: { level: 1.5 } };
+    const message = "The deck list changes were saved, but the other settings were not, so they are shown as they are on disk: disk full";
+    await act(async () => { pending[0].reject(new PartialSettingsSaveError(message, onDisk)); });
+
+    expect(result.current.settings).toEqual(onDisk);
+    expect(result.current.saveError).toBe(message);
+
+    // Not carried: the screen is the disk now, so it is the next base.
+    await act(async () => { result.current.save({ ...result.current.settings, appearance: { mode: "dark" } }); });
+    expect(bases[1]).toEqual(onDisk);
+  });
+});
+
+describe("useDesktopSettings save outcomes and rename refusal", () => {
+  /// Scenario: A save reports whether it reached disk, including the disk document on a partial failure, without rejecting its caller.
+  it("resolves a save outcome for success and partial failure", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    let success!: ReturnType<typeof result.current.save>;
+    await act(async () => { success = result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+    expect(await success).toEqual({ saved: true });
+
+    let failure!: ReturnType<typeof result.current.save>;
+    await act(async () => { failure = result.current.save(withMode("light")); });
+    const onDisk = { ...withMode("dark"), zoom: { level: 1.5 } };
+    await act(async () => { pending[1].reject(new PartialSettingsSaveError("Deck list changed", onDisk)); });
+    expect(await failure).toEqual({ saved: false, disk: onDisk });
+    expect(result.current.settings).toEqual(onDisk);
+
+    let ordinaryFailure!: ReturnType<typeof result.current.save>;
+    await act(async () => { ordinaryFailure = result.current.save(withMode("light")); });
+    await act(async () => { pending[2].reject(new Error("disk full")); });
+    expect(await ordinaryFailure).toEqual({ saved: false });
+  });
+
+  /// Scenario: A stale rename fails while another window changes the deck list, so this window shows the disk list and the caller receives the refusal.
+  it("adopts a partial rename refusal's disk document and rethrows it", async () => {
+    const { result } = await loadedHook(vi.fn(async (settings: DesktopSettingsDto) => settings));
+    const disk = {
+      ...DEFAULT_DESKTOP_SETTINGS,
+      endpoints: { remote: [{ id: "deck0000000000aa", host: "other-host", port: 22, name: "other" }], selection: "local" },
+    };
+    const refusal = new PartialSettingsSaveError("That deck changed since this window loaded it.", disk);
+    let pending!: Promise<DesktopSettingsDto>;
+    act(() => { pending = result.current.apply!(() => Promise.reject(refusal)); });
+
+    await expect(pending).rejects.toBe(refusal);
+    await waitFor(() => expect(result.current.settings).toEqual(disk));
   });
 });

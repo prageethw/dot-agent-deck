@@ -8,11 +8,13 @@
 //! the sibling git worktree the feature promises.
 //!
 //! Marked [reel] — this is the genuine spawn → agent → work path (CLAUDE.md
-//! rule 4). The agent receives the dispatcher seed prompt via gated delivery,
+//! rule 4). The agent receives the dispatcher seed through its native inbox,
 //! acts on the goal, and invokes `dot-agent-deck dispatch` itself; the assertion
 //! is on the resulting worktree, so nothing here is a stand-in.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,13 +22,12 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
-use dot_agent_deck::event::SendResult;
-use dot_agent_deck::state::{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, SessionStatus};
+
+use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 
-/// The opening words of `ui::DISPATCHER_SEED_PROMPT` (private to `src/ui.rs`).
-/// Distinctive enough that an unseeded agent cannot produce it, and near enough
-/// the front of the seed to survive the hook's `USER_PROMPT_MAX_LEN` truncation.
+/// The opening words of `authoring_seeds::DISPATCHER_SEED_PROMPT`.
+/// Distinctive enough to identify the queued seed in inbox history.
 const DISPATCHER_SEED_OPENING: &str = "You are an ordinary assistant";
 
 /// Where `new_pane_016`'s launcher records what it found in the pane's input
@@ -37,11 +38,9 @@ const LAUNCHER_LOG: &str = "late-announce.log";
 ///
 /// Issue #1006: the field environment was `devbox run agent` → devbox init hooks
 /// → `claude`, announcing ~4.2 s after spawn, while the harness exec'd `claude`
-/// directly and announced fast enough to win the race. Three seconds is
-/// comfortably past the 500 ms `SPAWN_TIME_READINESS_BUFFER` the broken gate
-/// writes on, and leaves the real agent room to announce inside the 10 s
-/// `timeout_ready` slow path — which would deliver the seed for an unrelated
-/// reason and weaken what a green run proves.
+/// directly and announced fast enough to win the race. Three seconds is long
+/// enough that a seed written into the pane at spawn would be sitting in its
+/// input queue when the launcher hands over, which is what the launcher checks.
 const LAUNCHER_DELAY_SECS: u64 = 3;
 
 /// The absolute path of the REAL `claude`, resolved off the host PATH.
@@ -96,7 +95,7 @@ fn this_user_can_exec(candidate: &Path) -> bool {
 /// The dispatcher option hides the new-pane form's Command field, so the only
 /// way to put a launcher in front of its agent is the deck-wide default — which
 /// is also the shape the field report had. Mirrors
-/// `e2e_prompt_delivery_confirmation::write_default_command_config`.
+/// `e2e_inbox_seeds_live::configure`.
 fn write_default_command_config(command: &str) -> tempfile::TempDir {
     let dir = common::harness_tempdir().expect("config tempdir");
     let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
@@ -114,20 +113,18 @@ fn launcher_log(deck: &TuiDeck) -> String {
         .unwrap_or_else(|_| "<the launcher wrote no log>".to_string())
 }
 
-/// Whether any live card on this deck reports the dispatcher seed as its last
-/// submitted prompt — the "the agent ACTED on it" fact, read from the daemon's
-/// own registry rather than from the screen.
-///
-/// Issue #1006: the seed's text on the grid is an adjacent artefact. A premature
-/// write still reaches the PTY, which buffers it, so its bytes show up whether or
-/// not the delivery was sound; only a `UserPromptSubmit` reported back by the
-/// agent says the agent took it as a prompt.
-fn seed_is_in_a_card_prompt_history(deck: &TuiDeck) -> bool {
-    common::agent_records_on(deck.attach_socket_path())
+/// The native hook handed the seed to the live dispatcher exactly once.
+fn seed_is_acknowledged(deck: &TuiDeck) -> bool {
+    inbox_view::all_messages(deck.attach_socket_path())
         .into_iter()
-        .filter_map(|record| record.live)
-        .filter_map(|live| live.last_user_prompt)
-        .any(|prompt| prompt.contains(DISPATCHER_SEED_OPENING))
+        .any(|message| {
+            message.state == dot_agent_deck::inbox::StateName::Acknowledged
+                && message.deliveries == 1
+                && message
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains(DISPATCHER_SEED_OPENING))
+        })
 }
 
 /// Removes a dispatch worktree on drop, including on panic.
@@ -141,46 +138,6 @@ impl Drop for SiblingWorktreeGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-/// PATH for the spawned deck (→ daemon → agents) with the freshly-built
-/// `dot-agent-deck` binary's dir prepended to the host PATH.
-///
-/// Without this the seeded dispatcher agent runs whatever `dot-agent-deck`
-/// happens to be installed on the host, which predates the `dispatch` verb — the
-/// agent then reports "dispatch doesn't exist as a subcommand" and the test
-/// silently proves nothing about the feature. The rest of the host PATH is kept
-/// so `git` and `claude` still resolve. Mirrors
-/// `e2e_issue_dispatch_real.rs::path_with_binary_dir`.
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bindir = Path::new(bin).parent().expect("binary path has a parent");
-    format!(
-        "{}:{}",
-        bindir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
-/// Give the fixture repo an initial commit.
-///
-/// The harness `git init`s the copied fixture but never commits, leaving an
-/// unborn HEAD — and `git worktree add` cannot create a worktree from that. A
-/// dispatch in such a repo fails on worktree creation, so without this the
-/// dispatch path is unreachable no matter what the agent does.
-fn commit_fixture_repo(dir: &Path) {
-    let run = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git available");
-        assert!(out.status.success(), "git {args:?} failed: {out:?}");
-    };
-    run(&["config", "user.email", "deck-test@example.com"]);
-    run(&["config", "user.name", "Deck Test"]);
-    run(&["add", "-A"]);
-    run(&["commit", "-qm", "fixture baseline"]);
 }
 
 /// The sibling worktree a dispatch of `unit` must create — `../<repo>-dispatch-<unit>`.
@@ -212,14 +169,22 @@ fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
 /// Backspaces on an already-empty field are harmless, so this is unconditional
 /// rather than a flag the caller has to get right.
 fn open_cat_caller_pane(deck: &TuiDeck) -> String {
+    open_caller_pane(deck, b"cat")
+}
+
+/// [`open_cat_caller_pane`] with the caller's Command chosen by the test. An
+/// empty `command` starts the caller with no command at all (the user's shell),
+/// which is the dispatcher a `--single` unit does NOT copy its command from
+/// (issue #1602): such a unit starts the deck's `default_command` instead.
+fn open_caller_pane(deck: &TuiDeck, command: &[u8]) -> String {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(b"caller");
     deck.send_keys(b"\t");
     deck.send_keys(&[0x7f; 96]); // clear whatever the config seeded
-    deck.send_keys(b"cat");
+    deck.send_keys(command);
     let (col, row) = deck.wait_for_in_grid("[Submit]");
     deck.click(col, row);
     deck.wait_for_absence("[Submit]");
@@ -340,39 +305,6 @@ fn role_diagnostics(deck: &TuiDeck, orch: &str, expected: &[&str]) -> String {
     out
 }
 
-/// The single-line pointer `handle_delegate` writes into the TARGET worker's PTY
-/// (`state::resolve_delegate_task_body`). Role-qualified, and — the load-bearing
-/// property — DAEMON-authored: these bytes exist only if the daemon resolved the
-/// sender as an orchestrator AND the target as one of its workers, so their
-/// arrival in the worker's scrollback *is* the routing decision, observed at the
-/// only place the worker could ever act on it.
-///
-/// This is what makes a `cat` role enough here. `cat` cannot *initiate* a
-/// delegate — which is why `orchestration/dispatch/001` disclaimed the round
-/// trip — but the initiating half is a plain CLI invocation the test can make
-/// itself (see [`run_delegate`]), and `cat` echoes whatever is written to it. The
-/// receiving half is therefore fully observable without spending a token.
-///
-/// Issue #613 made the pointer absolute and pane-keyed
-/// (`dot_agent_deck::state::delegate_task_file_name`), so unlike before, this
-/// is no longer a pure function of `role` alone — it also needs the worker
-/// pane's cwd and pane id. This helper is display-only now (panic messages
-/// naming which role's pointer never arrived); [`wait_for_delegate_pointer`]
-/// computes the real, exact needle itself once it has resolved both.
-fn worker_pointer(role: &str) -> String {
-    format!("Read .dot-agent-deck/worker-task-{role}-<pane digest>.md for your task.")
-}
-
-/// `cwd` of the live pane carrying `pane_id`, straight from the daemon's own
-/// attach records — the same source [`role_panes_in`] reads, so the two never
-/// disagree about which pane they mean.
-fn cwd_for_pane(socket: &Path, pane_id: &str) -> Option<String> {
-    common::agent_records_on(socket)
-        .into_iter()
-        .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
-        .and_then(|r| r.cwd)
-}
-
 /// Every live role pane of orchestration `orch` whose cwd's basename satisfies
 /// `dir_is`, as `role name → DOT_AGENT_DECK_PANE_ID`.
 ///
@@ -461,30 +393,13 @@ fn run_delegate(deck: &TuiDeck, pane_id: &str, role: &str, task: &str) -> std::p
 /// [`run_delegate`] with the repeatable `--to` in its general form, for the
 /// fan-out cases — in particular the partially-resolvable one, where some roles
 /// have a worker pane and some do not.
-///
-/// Issue #567: this subprocess is launched from the test harness's own
-/// process, not `pane_id`'s real spawned child, so it never inherits the
-/// `DOT_AGENT_DECK_REGISTRATION_GENERATION` / `DOT_AGENT_DECK_DAEMON_BOOT_ID`
-/// env vars a real spawn injects — same fork-#358-style gap this repo's
-/// `work-done` CLI-subprocess helpers already close for the worker side.
-/// Query the daemon's own `ListAgents` for the values it assigned `pane_id`.
 fn run_delegate_to(
     deck: &TuiDeck,
     pane_id: &str,
     roles: &[&str],
     task: &str,
 ) -> std::process::Output {
-    let caller_record = common::agent_records_on(deck.attach_socket_path())
-        .into_iter()
-        .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
-        .expect("the caller pane must still be present in ListAgents");
-    let caller_generation = caller_record
-        .registration_generation
-        .expect("the caller pane must carry a registration_generation once registered");
-    let caller_boot_id = caller_record
-        .daemon_boot_id
-        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    let mut cmd = std::process::Command::new(common::contained_deck_binary());
     cmd.arg("delegate");
     for role in roles {
         cmd.args(["--to", role]);
@@ -492,38 +407,18 @@ fn run_delegate_to(
     cmd.args(["--task", task])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", pane_id)
-        .env(
-            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
-            caller_generation.to_string(),
-        )
-        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", caller_boot_id)
         .output()
         .expect("the delegate CLI should run")
 }
 
-/// Wait for the daemon's delegate pointer for `role` to appear in that role's
-/// pane, re-resolving the pane's registry agent id(s) on every poll.
-///
-/// Two properties here are load-bearing rather than defensive, and both were
-/// found by running this helper against the WORKING control path, where it
-/// failed once and then passed:
-///
-///  1. **Re-resolve, don't cache.** `clear` defaults to `true`, so a delegate
-///     RESPAWNS the worker: the agent id that existed when the delegate was sent
-///     is dead by the time the pointer is written ~31s later (the 30s
-///     `SessionStart` wait a `cat` role can never satisfy, plus the readiness
-///     buffer). A cached id reads an empty snapshot forever.
-///  2. **Check EVERY record carrying the pane id, not the first.** Across a
-///     respawn the registry briefly holds both the old and the new agent for one
-///     pane, and `ListAgents` order is not specified — so `.find()` can hand back
-///     the dead one, whose scrollback will never contain the pointer. That is a
-///     coin flip between a pass and a spurious failure, which is exactly what it
-///     did on the control.
-fn wait_for_delegate_pointer(
+/// Re-resolve the role after clear=true and observe its generation-bound task.
+/// A stand-in leaves the task queued; task content must never be typed into it.
+fn wait_for_delegate_inbox(
     deck: &TuiDeck,
     orch: &str,
     dir_is: impl Fn(&str) -> bool + Copy,
     role: &str,
+    task: &str,
     timeout: Duration,
 ) -> bool {
     let socket = deck.attach_socket_path();
@@ -531,19 +426,25 @@ fn wait_for_delegate_pointer(
         let Some(pane_id) = role_panes_in(socket, orch, dir_is).get(role).cloned() else {
             return false;
         };
-        // Issue #613: the pointer is absolute and pane-keyed, so it depends
-        // on the worker's cwd as well as its role — re-resolved on every
-        // poll alongside `pane_id` for the same reason `pane_id` itself is
-        // (a respawn can change either).
-        let Some(cwd) = cwd_for_pane(socket, &pane_id) else {
-            return false;
-        };
-        let pointer = common::expected_delegate_pointer(Path::new(&cwd), role, &pane_id);
-        let needle = common::search_key(&String::from_utf8_lossy(&pointer));
-        common::agent_records_on(socket)
-            .into_iter()
-            .filter(|r| r.pane_id_env.as_deref() == Some(pane_id.as_str()))
-            .any(|r| common::pane_search_key_on(socket, &r.id).contains(&needle))
+        let records = common::agent_records_on(socket);
+        inbox_view::messages(socket, &pane_id)
+            .iter()
+            .filter(|message| {
+                message.state == dot_agent_deck::inbox::StateName::Queued
+                    && message.deliveries == 0
+                    && message
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.contains(task))
+                    && records.iter().any(|record| {
+                        record.pane_id_env.as_deref() == Some(pane_id.as_str())
+                            && message.bind_agent.as_deref() == Some(record.id.as_str())
+                            && !common::pane_search_key_on(socket, &record.id)
+                                .contains(&common::search_key(task))
+                    })
+            })
+            .count()
+            == 1
     })
 }
 
@@ -551,7 +452,7 @@ fn wait_for_delegate_pointer(
 /// orchestration against the deck's CURRENT directory — the "normal" way a user
 /// starts one, and the CONTROL for the dispatched path.
 ///
-/// With no `[[modes]]` in the `orch-deck` fixture the Mode chip row is
+/// In the `orch-deck` fixture the Mode chip row is
 /// `[No mode] [Orch: demo-orch] [schedule]`, so ONE Right selects the
 /// orchestration; selecting one HIDES the Command field, so the second Enter
 /// submits. Mirrors `e2e_orchestration_route_isolation::open_orchestration_tab`.
@@ -565,21 +466,13 @@ fn open_orchestration_tab(deck: &TuiDeck, orch: &str) {
     deck.send_keys(b"\r"); // submit (Command is hidden for an orchestration)
 }
 
-/// Scenario: Launch the deck in the minimal fixture with real Claude credentials
-/// imported, NO experimental flag set, and its real Claude behind a launcher that
-/// withholds the agent for three seconds and reports whatever the deck typed
-/// early. Open the new-pane form (Ctrl+N → Space confirms the dir), cycle the
-/// Mode field to the "dispatcher" option (the last cycler slot after
-/// `schedule: issues`), and click [Submit] — the dispatcher must surface live as a
-/// dashboard card, nothing may have been typed before the agent existed, and the
-/// seed must reach the card's prompt history. Then type a goal asking for one unit
-/// named `probe-unit`; the seeded agent runs `dot-agent-deck dispatch probe-unit`
-/// itself and the daemon creates the sibling worktree
-/// `../<repo>-dispatch-probe-unit`, which the test waits for on disk.
+/// Scenario: Open a real Haiku dispatcher through the new-pane form behind a three-second launcher and verify no early PTY bytes, a visible envelope label and one acknowledged seed excluded from user history. Type a goal to dispatch probe-unit and verify the real agent creates its sibling worktree.
 #[spec("prompt/new-pane/016")]
 #[test]
 fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     skip_unless!(common::check_claude_available());
+
+    const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
     // Issue #1006: route the real agent behind a LAUNCHER, because without one
     // this test cannot reach the ordering it exists to exercise. The harness
@@ -600,17 +493,38 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     let staging = common::harness_tempdir().expect("launcher staging dir");
     // `command` is interpolated raw into the launcher's `exec` line (it has to
     // carry arguments), so the quoting is this caller's job — single quotes plus
-    // the POSIX escape for a `'` inside the resolved path.
+    // the POSIX escape for a `'` inside the resolved path. The `--model` pin rides
+    // after it as a plain argument (issue #1013): without one the pane ran on
+    // whatever the host's managed settings selected — measured as Opus 5 at xhigh
+    // reasoning effort — which is the opposite of what a `[reel]`-marked lane-2
+    // test should bill, and silent, since nothing reports the model it picked.
+    // Pinned HERE rather than in `real_claude_path`, which must keep returning the
+    // launcher-safe absolute PATH of the bare binary so the `exec` line cannot
+    // re-enter the launcher (itself named `claude`). Both agents this test brings
+    // up run on it: the dispatcher, and the unit it dispatches, which inherits the
+    // same `default_command`.
+    //
+    // `--allowedTools Bash` (issue #1520's lane-2 run): without it the agent's
+    // `dot-agent-deck dispatch …` call stops on Claude Code's "This command
+    // requires approval" dialog, which nothing in an unattended run answers, so
+    // all three nudges time out on a pane that has already received its seed.
+    // Measured failing 3 of 4 runs on the PR #1553 branch; both failures whose
+    // grid was captured ended on that dialog. CLAUDE.md rule 4 asks for exactly
+    // this flag.
     let real_claude = real_claude_path();
     let launcher = common::write_late_announcing_real_agent(
         staging.path(),
         LAUNCHER_LOG,
         LAUNCHER_DELAY_SECS,
-        &format!("'{}'", real_claude.to_string_lossy().replace('\'', r"'\''")),
+        &format!(
+            "'{}' --model {HAIKU_MODEL} --allowedTools Bash",
+            real_claude.to_string_lossy().replace('\'', r"'\''")
+        ),
     );
     let config = write_default_command_config(&launcher.to_string_lossy());
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_imported_claude_credentials()
         // Deliberately NO `DOT_AGENT_DECK_EXPERIMENTAL`: the dispatcher option has
         // graduated out of the flag, so reaching it from a default deck is part of
@@ -622,12 +536,12 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
         )
         // The branch build must win over any host-installed `dot-agent-deck`, or
         // the agent cannot see the `dispatch` verb at all.
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // `git worktree add` needs a real commit to branch from.
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     // Trust the fixture working directory so the daemon-spawned interactive
     // claude clears its first-run onboarding + per-folder trust gates without a
@@ -668,13 +582,10 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // Submitting closes the form and spawns the dispatcher CARD.
     deck.wait_for_absence("[Submit]");
 
-    // The dispatcher must surface live as a DASHBOARD CARD, not a mode tab.
+    // The dispatcher must surface live as a DASHBOARD CARD.
     //
-    // This is the PRD #127 card shape (`mode_config: None` + `seed_prompt`), and
-    // asserting it is the point: a mode tab routes through `render_mode_tab`'s
-    // 50/50 split, so the dispatcher — which declares no side panes — rendered at
-    // half width beside an empty column. `1 session(s)` with no tab strip is what
-    // distinguishes the fixed shape from the broken one.
+    // This is the PRD #127 card shape (a seeded single agent). `1 agent(s)`
+    // with no tab strip is what identifies the card shape.
     // Asserted on the GRID, not the raw stream: this is redrawn dashboard chrome,
     // so the bytes carrying it are interleaved with cursor-positioning escapes and
     // the text never appears contiguously in the stream. The rendered grid is the
@@ -688,12 +599,9 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // lives in `common` (Decision 21).
     const SURFACE_WAIT: Duration = Duration::from_secs(60);
     assert!(
-        common::wait_until(SURFACE_WAIT, || deck
-            .snapshot_grid()
-            .contains("1 session(s)")),
+        common::wait_until(SURFACE_WAIT, || deck.snapshot_grid().contains("1 agent(s)")),
         "the dispatcher never surfaced a LIVE dashboard card within {}s — expected a \
-         single-agent card on the dashboard (NOT a mode tab, which would split the pane \
-         50/50 with an empty side column).\n\
+         single-agent card on the dashboard.\n\
          Final grid:\n{}",
         SURFACE_WAIT.as_secs(),
         deck.snapshot_grid()
@@ -726,13 +634,9 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
          assuming a premature write.\nlauncher log:\n{handover}"
     );
 
-    // The seed really reached the pane — the delivery that makes this a
-    // *dispatcher* rather than a bare agent. The card's `Prmt:` line echoes the
-    // seed's opening words, so an unseeded pane cannot pass this.
+    // The card exposes the native hand-over as an envelope label.
     assert!(
-        common::wait_until(SURFACE_WAIT, || deck
-            .snapshot_grid()
-            .contains(DISPATCHER_SEED_OPENING)),
+        common::wait_until(SURFACE_WAIT, || deck.snapshot_grid().contains('✉')),
         "the dispatcher seed never appeared on the card within {}s — without it the agent \
          has not been taught the `dispatch` verb at all.\n\
          Final grid:\n{}",
@@ -740,21 +644,25 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
         deck.snapshot_grid()
     );
 
-    // Issue #1006, second half: the seed must have been ACTED UPON, not merely
-    // rendered. The bytes are written before a delivery goes wrong and a PTY
-    // buffers them, so the seed's text on the grid survives the failure — it is an
-    // adjacent artefact. A `UserPromptSubmit` reported back by the agent is not:
-    // it says the agent took those bytes as a prompt. Read from the daemon's
-    // registry, and BEFORE the goal is typed, since `last_user_prompt` holds only
-    // the newest one.
+    // Require hook hand-over, then prove the instructed agent can dispatch.
     assert!(
-        common::wait_until(SURFACE_WAIT, || seed_is_in_a_card_prompt_history(&deck)),
-        "the dispatcher agent never reported SUBMITTING the seed within {}s, so no card's \
-         prompt history carries it — the payload may have reached the PTY without being \
-         acted upon.\nlauncher log:\n{}\nFinal grid:\n{}",
+        common::wait_until(SURFACE_WAIT, || seed_is_acknowledged(&deck)),
+        "the dispatcher seed was not acknowledged within {}s.\nlauncher log:\n{}\nFinal grid:\n{}",
         SURFACE_WAIT.as_secs(),
         launcher_log(&deck),
         deck.snapshot_grid()
+    );
+    assert!(
+        common::agent_records_on(deck.attach_socket_path())
+            .iter()
+            .all(|record| {
+                !record
+                    .live
+                    .as_ref()
+                    .and_then(|live| live.last_user_prompt.as_deref())
+                    .is_some_and(|prompt| prompt.contains(DISPATCHER_SEED_OPENING))
+            }),
+        "the dispatcher seed must not pollute user history"
     );
 
     // Give the seeded agent an actual goal. Without one it correctly stalls
@@ -845,7 +753,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     assert!(
         common::wait_until(SURFACE_WAIT, || {
             let g = deck.snapshot_grid();
-            g.contains("2 session(s)") && g.matches("ClaudeCode").count() >= 2
+            g.contains("2 agent(s)") && g.matches("ClaudeCode").count() >= 2
         }),
         "the dispatched unit never came up as a real AGENT within {}s — a second live \
          session with an agent type on its card. `SpawnRequest.command: None` reads as \
@@ -857,29 +765,48 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     );
 }
 
-/// Scenario: Launch the deck on the two-role `orch-deck` fixture, open one ordinary
-/// `cat` pane so a registered pane exists to dispatch from, then run the REAL
-/// `dot-agent-deck dispatch <name> --orchestration demo-orch` CLI against the deck's
-/// own hook socket exactly as an agent in that pane would. A full orchestration tab
-/// labelled `demo-orch` must surface live on the tab strip, with the sibling worktree
-/// and the orchestrator's delegation context on disk. Then open the SAME orchestration
-/// the normal way with Ctrl+N as a control, and run the real `dot-agent-deck delegate`
-/// CLI from each orchestrator: both workers must receive the daemon's task pointer in
-/// their panes. Finally, delegate twice more in ways that cannot resolve — from a pane
-/// with no role, and to a role that does not exist — and require the CLI to exit
-/// non-zero naming what it could not resolve.
+/// Scenario: Dispatch the two-role `orch-deck` fixture through the real CLI and
+/// confirm that its tab, worktree, context and generation-bound inbox delegation appear, using
+/// a normally opened orchestration as a control. Delegations from an unknown
+/// pane or to an unknown role must fail loudly. After the worker reports its
+/// first task done using its delegation's task id, a delegate to it and a
+/// nonexistent role must report partial delivery without inviting a duplicate retry.
 #[spec("orchestration/dispatch/001")]
 #[test]
 fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     const UNIT: &str = "team-probe";
 
+    // Task-scoped reports require the capability issued to the worker, even
+    // under the permissive policy used for the other impersonated signals.
+    // Let the fixture's cat stand-ins export their own capabilities.
+    use std::os::unix::fs::PermissionsExt as _;
+    let stand_ins = common::harness_tempdir().expect("stand-in command directory");
+    let cat = stand_ins.path().join("cat");
+    std::fs::write(
+        &cat,
+        format!(
+            "#!/bin/sh\n{}\n",
+            common::capability_export_command("exec /bin/cat")
+        ),
+    )
+    .expect("write capability-exporting cat stand-in");
+    std::fs::set_permissions(&cat, std::fs::Permissions::from_mode(0o700))
+        .expect("make cat stand-in executable");
     let deck = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .impersonating_pane_signals()
+        .with_env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stand_ins.path().display(),
+                common::path_with_binary_dir()
+            ),
+        )
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // `git worktree add` needs a commit to branch from.
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     // One ordinary pane, so the daemon has a registered pane (with a cwd) to
     // resolve the dispatch's caller from.
@@ -893,7 +820,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     // `--orchestration=demo-orch` names the fixture's orchestration explicitly:
     // this test is about the ORCHESTRATION shape, and the flag is what a
     // dispatcher agent that picked a shape off `--list-targets` actually sends.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args([
             "dispatch",
             UNIT,
@@ -970,10 +897,21 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
         "the dispatched worktree never appeared at {}",
         expected_worktree.display()
     );
-    let context = expected_worktree.join(".dot-agent-deck/orchestrator-context.md");
+    let context = std::fs::read_dir(expected_worktree.join(".dot-agent-deck"))
+        .expect("list dispatched context files")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+        })
+        .expect("the dispatched orchestration must publish a unique context file");
     let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
         panic!(
-            "the dispatched orchestration must get an orchestrator-context.md at {} \
+            "the dispatched orchestration must get a unique context file at {} \
              — without it the orchestrator never learns it is one, and every worker \
              sits idle: {e}",
             context.display()
@@ -1045,12 +983,19 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        wait_for_delegate_pointer(&deck, "demo-orch", is_fixture, "worker", DELEGATE_WAIT),
+        wait_for_delegate_inbox(
+            &deck,
+            "demo-orch",
+            is_fixture,
+            "worker",
+            "Control delegation.",
+            DELEGATE_WAIT
+        ),
         "CONTROL FAILED: the worker of a NORMALLY-STARTED `demo-orch` never received \
-         the delegate pointer {:?} within {}s. This path is known to work (it is the \
+         the bound inbox task {:?} within {}s. This path is known to work (it is the \
          one a user falls back to), so a failure here means the harness is wrong — \
          fix it before reading anything into the dispatched case.\nFinal grid:\n{}",
-        worker_pointer("worker"),
+        "Control delegation.",
         DELEGATE_WAIT.as_secs(),
         deck.snapshot_grid()
     );
@@ -1080,7 +1025,14 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        wait_for_delegate_pointer(&deck, "demo-orch", is_worktree, "worker", DELEGATE_WAIT),
+        wait_for_delegate_inbox(
+            &deck,
+            "demo-orch",
+            is_worktree,
+            "worker",
+            "Dispatched delegation.",
+            DELEGATE_WAIT
+        ),
         "THE REPORTED BUG: the worker of a DISPATCHED `demo-orch` never received the \
          delegate pointer {:?} within {}s, while the identical delegation in the \
          control (same fixture, same roles, same CLI, started with Ctrl+N) DID \
@@ -1089,7 +1041,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
          the `StartAgent` handler, so panes spawned daemon-side are unknown to \
          `handle_delegate` and it drops the signal.\nDispatched panes: {dispatched:?}\n\
          Final grid:\n{}",
-        worker_pointer("worker"),
+        "Dispatched delegation.",
         DELEGATE_WAIT.as_secs(),
         deck.snapshot_grid()
     );
@@ -1144,6 +1096,61 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
 
     // ===== …and a HALF-landed delegate is not a failure =====================
     //
+    // The worker already received a delegation above. A second delegate is
+    // refused while it still owes work-done (#580), so finish that first task
+    // before exercising a different partial-delivery outcome.
+    let task_id = inbox_view::messages(deck.attach_socket_path(), &dispatched["worker"])
+        .into_iter()
+        .find(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("Dispatched delegation."))
+        })
+        .expect("the dispatched worker received its delegation above")
+        .id
+        .to_string();
+    let worker_agent = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.pane_id_env.as_deref() == Some(&dispatched["worker"]))
+        .expect("the dispatched worker has a live agent record")
+        .id;
+    let capability = tokio::runtime::Runtime::new()
+        .expect("capability reader runtime")
+        .block_on(common::recorded_hook_capability(
+            &expected_worktree,
+            &worker_agent,
+        ))
+        .expect("the dispatched worker exported its own capability");
+    let done = std::process::Command::new(common::contained_deck_binary())
+        .args([
+            "work-done",
+            "--task-id",
+            &task_id,
+            "--task",
+            "Dispatched delegation complete.",
+        ])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &dispatched["worker"])
+        .env("DOT_AGENT_DECK_AGENT_ID", &worker_agent)
+        .env("DOT_AGENT_DECK_PANE_CAPABILITY", &capability)
+        .output()
+        .expect("the work-done CLI should run");
+    assert!(
+        done.status.success(),
+        "`work-done` from the dispatched worker exited {:?}.\nstdout: {}\nstderr: {}",
+        done.status.code(),
+        String::from_utf8_lossy(&done.stdout),
+        String::from_utf8_lossy(&done.stderr)
+    );
+    assert!(
+        common::wait_for_path(
+            &expected_worktree.join(".dot-agent-deck/work-done-worker.md"),
+            Duration::from_secs(20)
+        ),
+        "the dispatched worker's work-done report was not written before its next delegation"
+    );
+
     // PR #466 review's blocker, from the real CLI. `--to worker
     // --to nonexistent-role` fans out to the worker for real — the task is in
     // its PTY and its idle-worker record is armed — so reporting failure would
@@ -1166,6 +1173,17 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
          stdout: {}\nstderr: {partial_err}",
         partial.status.code(),
         String::from_utf8_lossy(&partial.stdout)
+    );
+    assert!(
+        wait_for_delegate_inbox(
+            &deck,
+            "demo-orch",
+            is_worktree,
+            "worker",
+            "Half-landed delegation.",
+            DELEGATE_WAIT
+        ),
+        "partial fan-out must queue the resolvable role's task"
     );
     assert!(
         partial_err.contains("nonexistent-role") && partial_err.contains("worker"),
@@ -1233,13 +1251,14 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     const ROLES: [&str; 3] = ["orchestrator", "coder", "reviewer"];
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         // Three live agent panes in one tab; a roomy deck keeps each role card's
         // PTY wide enough for a real claude TUI to render (and for the failure
         // diagnostics to be readable).
         .with_pty_size(200, 55)
         .with_imported_claude_credentials()
         // The branch build must win over any host-installed `dot-agent-deck`.
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         // Issue #663: run the PRODUCTION post-respawn readiness buffer. The
         // harness pins it to `0` for the many e2e scenarios whose workers are
         // stand-ins that accept input the instant they exist; PRD #249's own
@@ -1255,7 +1274,6 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         // idle for the full 300s budget, and the test was deterministically red.
         // The other two real `clear = true` scenarios
         // (`orchestration/delegate/014`, `/015`) already opt back in the same way.
-        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "1000")
         // The daemon must outlive this test's OWN budget, or its failure
         // diagnostics lie. The harness's leaked-daemon backstop is 300s and
         // `WORK_WAIT` below is also 300s, so on a red run the daemon self-exited
@@ -1266,12 +1284,12 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         // leak (the test itself runs ~320s).
         .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
         .launch_with_fixture("dispatch-orch-real");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // `git worktree add` needs a commit to branch from — and the worktree is a
     // HEAD checkout, so this is also what puts `.dot-agent-deck.toml` (and its
     // three roles) inside the dispatched worktree at all.
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     // Trust BOTH the fixture dir and the dispatched WORKTREE for the interactive
     // `claude` panes, so no first-run onboarding / per-folder trust dialog can
@@ -1308,7 +1326,7 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
     // The REAL CLI, against the deck's own socket — the path an agent takes.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args([
             "dispatch",
             UNIT,
@@ -1437,12 +1455,26 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // orchestration and the team got something done".
     //
     // The observable is a uniquely-named sentinel FILE in the dispatched worktree
-    // (rule 4): it survives LLM phrasing and tool variance, and — unlike anything
+    // (CLAUDE.md rule 4): it survives LLM phrasing and tool variance, and — unlike anything
     // on the grid — it cannot be produced by an agent merely echoing the task back.
     const SENTINEL: &str = "dispatch_delegate_a41f.txt";
+    // Where a coder that took the checkout for its project would put it. A file
+    // already there is an earlier run's, and is left for whoever moves it.
+    let stray = Path::new(env!("CARGO_MANIFEST_DIR")).join(SENTINEL);
+    let stray_before = stray.exists();
+    // Where a coder that took the folder holding the deck's own link for its
+    // project would put it: measured once the checkout was out of the deck's
+    // path, with "the current directory" as the only directive (PRD #1666).
+    let misplaced = common::contained_deck_binary()
+        .parent()
+        .and_then(Path::parent)
+        .expect("the contained deck sits two levels below a directory")
+        .join(SENTINEL);
+    // `pwd` first, so "here" is the coder's own working directory rather than a
+    // directory it infers from a path in its task text.
     let worker_task = format!(
-        "Create a file named {SENTINEL} in the current directory containing the single \
-         word DONE. Do not ask what to do, offer numbered choices, or wait for a task to \
+        "Run `pwd` in your shell, then create a file named {SENTINEL} in exactly the \
+         directory it prints, containing the single word DONE. Do not ask what to do, offer numbered choices, or wait for a task to \
          be defined - this message IS the task and you have everything you need. If a \
          file you were pointed at looks empty or missing, create {SENTINEL} anyway \
          instead of asking about it."
@@ -1487,8 +1519,8 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         eprintln!("warning: not every role pane settled within 180s; proceeding anyway");
     }
 
-    // Delivered through the daemon's production prompt-delivery RPC — the same
-    // guarded write-and-submit the deck uses for a seed or orchestrator prompt.
+    // Posted to the orchestrator's inbox — the way the deck hands an agent a
+    // seed or an orchestrator prompt.
     // What the orchestrator does with it (shell `dot-agent-deck delegate`) is the
     // AGENT's own doing, which is the point: this is the decision path, not a
     // test-issued CLI call.
@@ -1500,27 +1532,18 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         .remove("orchestrator")
         .expect("the dispatched orchestration has an `orchestrator` role state")
         .agent_id;
-    let orchestrator_session_id = events.wait_for_session_start_on_pane(
+    events.wait_for_session_start_on_pane(
         &orchestrator_pane,
         &orchestrator_agent_id,
         Duration::from_secs(10),
     );
-    let resp = common::write_and_submit_with_identity_on(
+    common::post_message_on(
         deck.attach_socket_path(),
         &orchestrator_pane,
-        &directive,
         &orchestrator_agent_id,
-        Some(&orchestrator_session_id),
+        &directive,
     )
-    .expect("WriteAndSubmit to the dispatched orchestrator pane over the attach socket");
-    assert_eq!(
-        resp.send_result,
-        Some(SendResult::Applied),
-        "the daemon refused to deliver the delegate directive to the dispatched \
-         orchestrator pane {orchestrator_pane}: error={:?}, send_result={:?}",
-        resp.error,
-        resp.send_result
-    );
+    .expect("post the delegate directive to the dispatched orchestrator's inbox");
 
     // Generous: an orchestrator turn, a `clear = true` worker RESPAWN (issue
     // #584 — a fresh Haiku cold boot, its `SessionStart`, and the readiness
@@ -1529,8 +1552,31 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // read as a broken one.
     const WORK_WAIT: Duration = Duration::from_secs(300);
     let sentinel_path = expected_worktree.join(SENTINEL);
+    let done = common::wait_for_path(&sentinel_path, WORK_WAIT);
+    // Checked before the work assertion, so a coder that wrote into the
+    // developer's checkout is reported as that, and the file is removed rather
+    // than left in the repository.
+    if !stray_before && stray.exists() {
+        let _ = std::fs::remove_file(&stray);
+        panic!(
+            "a test agent wrote {SENTINEL} into the developer's checkout at {} (removed) — \
+             the agents of this test must never learn the checkout's path. \
+             Orchestrator pane {orchestrator_pane}, coder pane {coder_pane}.{}",
+            stray.display(),
+            role_diagnostics(&deck, ORCH, &ROLES),
+        );
+    }
     assert!(
-        common::wait_for_path(&sentinel_path, WORK_WAIT),
+        done || !misplaced.exists(),
+        "the coder did the work but wrote {SENTINEL} to {} instead of its own worktree {} \
+         — it took the folder holding the deck's link for its project. Orchestrator pane \
+         {orchestrator_pane}, coder pane {coder_pane}.{}",
+        misplaced.display(),
+        expected_worktree.display(),
+        role_diagnostics(&deck, ORCH, &ROLES),
+    );
+    assert!(
+        done,
         "the dispatched orchestration's `coder` never did the delegated work within {}s — \
          no {SENTINEL} at {}. A dispatched orchestration whose orchestrator cannot reach \
          its own workers looks completely healthy (panes up, cards named, tab live) and \
@@ -1583,20 +1629,36 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
 // A real single-agent completion returns to its dispatcher (PRD #220 M2.3)
 // ---------------------------------------------------------------------------
 
-/// Scenario: Open a real interactive Haiku dispatcher pane and tell it to dispatch
-/// one single agent that must inspect the isolated checkout for a uniquely named
-/// sentinel. Without any test-issued `work-done` call, the unit must report the
-/// discovered filename and the resulting completion must render in the dispatcher.
+/// Scenario: Open a real interactive Haiku dispatcher with an acknowledged inbox seed and tell it to dispatch one unit that discovers a uniquely named sentinel. Without a test-issued work-done call, the framed report must be acknowledged in the dispatcher inbox and the dispatcher must visibly relay the discovered filename.
 #[spec("dispatch/return/006")]
 #[test]
 fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
+    real_single_dispatch_round_trip(false);
+}
+
+/// Scenario: An interactive Haiku dispatcher starts a single unit that discovers
+/// a committed sentinel and reports completion. Asked to close that unit, the
+/// dispatcher runs the close CLI itself; the unit disappears while it stays alive.
+#[spec("dispatch/close-verb/008")]
+#[test]
+fn close_verb_008_real_dispatcher_closes_its_reported_single_unit() {
+    real_single_dispatch_round_trip(true);
+}
+
+fn real_single_dispatch_round_trip(close_after_report: bool) {
     // Decision 26 runtime-skip: missing CLI / credentials is environmental.
     skip_unless!(common::check_claude_available());
 
-    const UNIT: &str = "live-return-probe";
+    let unit = if close_after_report {
+        "live-close-probe"
+    } else {
+        "live-return-probe"
+    };
     const SENTINEL_PREFIX: &str = "dispatch-return-live-sentinel-";
     const SENTINEL: &str = "dispatch-return-live-sentinel-6f2c.txt";
     const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+    const CLOSE_MAX_LIFETIME_SECS: &str = "900";
+    const RETURN_MAX_LIFETIME_SECS: &str = "300";
 
     // Both the dispatcher and the unit it spawns inherit this command. Keep them
     // fully interactive (no `-p`), pin the cheap model, and pre-allow every tool
@@ -1606,7 +1668,16 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
         format!("claude --ax-screen-reader --model {HAIKU_MODEL} --allowedTools Bash Read Write");
     let config = write_default_command_config(&agent_command);
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(220, 60)
+        .with_env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            if close_after_report {
+                CLOSE_MAX_LIFETIME_SECS
+            } else {
+                RETURN_MAX_LIFETIME_SECS
+            },
+        )
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
         .with_env(
@@ -1615,9 +1686,9 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
         )
         // The agent's `dot-agent-deck dispatch` and `work-done` calls must use
         // the branch build, not a host-installed binary that predates the verbs.
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The unit receives a committed checkout. Its task names only the prefix,
     // so the full sentinel in its returned report can only come from inspecting
@@ -1627,9 +1698,9 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
         "This fixture proves the dispatched unit inspected its checkout.\n",
     )
     .expect("write the uniquely named fixture sentinel");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
-    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let expected_worktree = dispatch_worktree_of(&deck, unit);
     let _worktree_guard = SiblingWorktreeGuard(expected_worktree.clone());
 
     // Trust the not-yet-created sibling worktree before dispatch, so the unit's
@@ -1659,16 +1730,16 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     deck.click(submit_col, submit_row);
     deck.wait_for_absence("[Submit]");
 
-    // A visible Claude card plus the seed in native prompt history is the
+    // A visible Claude card plus an acknowledged native inbox seed is the
     // precondition that this is a real, instructed dispatcher rather than a
     // generic shell that happens to accept our following bytes.
     const DISPATCHER_READY_WAIT: Duration = Duration::from_secs(120);
     assert!(
         common::wait_until(DISPATCHER_READY_WAIT, || {
             let grid = deck.snapshot_grid();
-            grid.contains("1 session(s)")
+            grid.contains("1 agent(s)")
                 && grid.contains("ClaudeCode")
-                && seed_is_in_a_card_prompt_history(&deck)
+                && seed_is_acknowledged(&deck)
         }),
         "a real seeded dispatcher never became ready within {}s. The test cannot ask an \
          uninstructed pane to exercise the dispatch contract.\nFinal grid:\n{}",
@@ -1677,19 +1748,18 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     );
 
     // Let the seed turn finish painting before typing the user's goal. This is
-    // intentionally non-fatal: prompt history above is the hard readiness fact,
+    // intentionally non-fatal: seed acknowledgement is the hard delivery fact,
     // while a busy host can keep a harmless spinner repainting past the quiet
     // heuristic even after the prompt editor is usable.
-    let dispatcher_ids: Vec<String> = common::agent_records_on(deck.attach_socket_path())
+    let dispatcher_ids: Vec<String> = inbox_view::all_messages(deck.attach_socket_path())
         .into_iter()
-        .filter(|record| {
-            record
-                .live
-                .as_ref()
-                .and_then(|live| live.last_user_prompt.as_deref())
-                .is_some_and(|prompt| prompt.contains(DISPATCHER_SEED_OPENING))
+        .filter(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(DISPATCHER_SEED_OPENING))
         })
-        .map(|record| record.id)
+        .filter_map(|message| message.bind_agent)
         .collect();
     if !common::wait_until_panes_settled(
         deck.attach_socket_path(),
@@ -1706,51 +1776,67 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     // responsible for teaching the fresh agent how to signal completion.
     let directive = format!(
         "Use Bash to run exactly this command now, then wait for its result: \
-         dot-agent-deck dispatch {UNIT} --single --task \"Use Bash to list the repo root. \
+         dot-agent-deck dispatch {unit} --single --task \"Use Bash to list the repo root. \
          Find the only filename beginning {SENTINEL_PREFIX}. Report the full matching \
          filename and say whether it exists. Do not ask questions.\" \
-         Do not inspect the files or do the unit's work yourself, and do not ask me anything first."
+         Do not inspect the files or do the unit's work yourself, and do not ask me anything first. \
+         When its inbox report arrives, relay the full discovered filename to me."
     );
     deck.send_keys(directive.as_bytes());
     deck.send_keys(b"\r");
 
-    // This is one user-visible predicate over the dispatcher's current grid.
-    // `search_key` makes the completion and its two security frames
-    // wrap-insensitive while the raw-grid check retains the `dispatch:` prefix.
-    // The seed contains literal examples of all three strings, so frame lookup
-    // starts at the latest completion and searches for an opening only before
-    // its close (whose normalized text contains the normalized opening).
-    // The full sentinel was absent from every prompt, so seeing it inside the
-    // worker-report frame also proves the real unit inspected the checkout.
+    assert!(
+        common::wait_until(Duration::from_secs(90), || {
+            common::agent_records_on(deck.attach_socket_path())
+                .iter()
+                .any(|record| {
+                    record.display_name.as_deref() == Some(format!("dispatch-{unit}").as_str())
+                })
+        }),
+        "the real dispatcher must start its unit"
+    );
+    // Dispatch focuses the new unit. Select the dispatcher again so the visible
+    // filename below proves its relay rather than the worker's own output.
+    let dispatcher_title = deck.workdir().file_name().unwrap().to_string_lossy();
+    let (col, row) = deck.wait_for_in_grid(&dispatcher_title);
+    deck.click(col, row);
+
+    // Keep the security-frame check on the delivered message and require the
+    // real dispatcher to visibly relay the filename it learned from the unit.
     const RETURN_WAIT: Duration = Duration::from_secs(240);
     let completion_stem = common::search_key("dispatch: a unit you dispatched has completed");
-    let unit_frame = common::search_key(&format!(
-        "[UNTRUSTED-ROLE-LABEL: {UNIT} :END-UNTRUSTED-ROLE-LABEL]"
-    ));
+    let unit_sender = common::search_key(&format!("from the dispatch of \"{unit}\""));
     let report_open = common::search_key("[UNTRUSTED-WORKER-REPORT:");
     let report_close = common::search_key(":END-UNTRUSTED-WORKER-REPORT]");
     assert!(
         common::wait_until(RETURN_WAIT, || {
-            let grid = deck.snapshot_grid();
-            let key = common::search_key(&grid);
-            grid.contains("dispatch:")
-                && key.contains(&completion_stem)
-                && key.contains(&unit_frame)
-                && key
-                    .rfind(&completion_stem)
-                    .and_then(|completion| {
-                        let completion = &key[completion + completion_stem.len()..];
-                        completion.find(&report_close).and_then(|end| {
-                            completion[..end]
-                                .rfind(&report_open)
-                                .map(|start| &completion[start + report_open.len()..end])
-                        })
+            deck.snapshot_grid().contains(SENTINEL)
+                && inbox_view::all_messages(deck.attach_socket_path())
+                    .iter()
+                    .any(|message| {
+                        let key = common::search_key(message.text.as_deref().unwrap_or_default());
+                        message.state == dot_agent_deck::inbox::StateName::Acknowledged
+                            && message.deliveries == 1
+                            && key.contains(&completion_stem)
+                            && matches!(&message.from, dot_agent_deck::inbox::Sender::Deck { reason } if reason == &format!("dispatch:{unit}"))
+                            && key.contains(&unit_sender)
+                            && message.body_trust == dot_agent_deck::inbox::BodyTrust::Untrusted
+                            && key
+                                .rfind(&completion_stem)
+                                .and_then(|completion| {
+                                    let completion = &key[completion + completion_stem.len()..];
+                                    completion.find(&report_close).and_then(|end| {
+                                        completion[..end].rfind(&report_open).map(|start| {
+                                            &completion[start + report_open.len()..end]
+                                        })
+                                    })
+                                })
+                                .is_some_and(|report| report.contains(SENTINEL))
                     })
-                    .is_some_and(|report| report.contains(SENTINEL))
         }),
         "the real unit never returned a visible completion to the dispatcher within {}s. \
-         Expected the dispatcher's grid to carry `dispatch:`, unit {UNIT:?} in an \
-         `UNTRUSTED-ROLE-LABEL` frame, the word `completed`, and the unit-discovered \
+         Expected an acknowledged completion carrying `dispatch:`, unit {unit:?} in an \
+         authenticated inbox envelope, the word `completed`, and the unit-discovered \
          sentinel {SENTINEL:?} inside an `UNTRUSTED-WORKER-REPORT` frame. \
          worktree_exists={}. No test code invoked `work-done`, so a missing completion \
          after a started unit is a failure of the real single-agent instruction path.\n\
@@ -1768,6 +1854,88 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
             .collect::<Vec<_>>(),
         deck.snapshot_grid()
     );
+
+    if close_after_report {
+        let dashboard_shows_unit = || {
+            deck.snapshot_grid().lines().any(|line| {
+                // The dashboard uses heavy borders; the first light border
+                // starts the pane with historical paths/reports.
+                line.split('│')
+                    .next()
+                    .is_some_and(|cell| cell.contains(&format!("dispatch-{unit}")))
+            })
+        };
+        assert!(
+            common::wait_until(Duration::from_secs(30), dashboard_shows_unit),
+            "the completed unit's card must be visible before close\n{}",
+            deck.snapshot_grid()
+        );
+        let records = common::agent_records_on(deck.attach_socket_path());
+        let unit_ids: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| Path::new(cwd) == expected_worktree)
+            })
+            .map(|record| record.id.clone())
+            .collect();
+        assert!(
+            !unit_ids.is_empty(),
+            "the completed unit must still be registered before close"
+        );
+        assert_eq!(
+            dispatcher_ids.len(),
+            1,
+            "one real seeded dispatcher must own the unit"
+        );
+        assert!(
+            expected_worktree.is_dir(),
+            "unit worktree must exist before close"
+        );
+        // Wait for the completion turn to finish before entering the next user
+        // instruction into the same interactive dispatcher's prompt editor.
+        assert!(
+            common::wait_until_panes_settled(
+                deck.attach_socket_path(),
+                &dispatcher_ids,
+                Duration::from_millis(1500),
+                Duration::from_secs(8),
+                Duration::from_secs(90),
+            ),
+            "dispatcher did not settle after receiving completion\n{}",
+            deck.snapshot_grid()
+        );
+        let directive = format!(
+            "Use Bash to run exactly: dot-agent-deck close {unit}. \
+             This is the completed unit you dispatched. Run the command now, \
+             report its output, and leave your own pane open. Do not use git or \
+             any other cleanup command, do not dispatch again, and do not ask questions."
+        );
+        deck.send_keys(directive.as_bytes());
+        deck.send_keys(b"\r");
+        assert!(
+            common::wait_until(Duration::from_secs(180), || {
+                let records = common::agent_records_on(deck.attach_socket_path());
+                !expected_worktree.exists()
+                    && records.iter().all(|record| !unit_ids.contains(&record.id))
+                    && records.iter().any(|record| record.id == dispatcher_ids[0])
+                    && !dashboard_shows_unit()
+            }),
+            "the real dispatcher did not close its completed unit while staying alive. \
+             worktree_exists={}\nFinal grid:\n{}",
+            expected_worktree.exists(),
+            deck.snapshot_grid()
+        );
+        let dispatcher_text =
+            common::pane_search_key_on(deck.attach_socket_path(), &dispatcher_ids[0]);
+        assert!(
+            dispatcher_text.contains(&common::search_key(&format!("dot-agent-deck close {unit}"))),
+            "dispatcher's pane never showed the requested close command\n{}",
+            deck.snapshot_grid()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,7 +2006,7 @@ fn install_slow_git(dir: &Path, sleep_secs: u32) -> PathBuf {
 /// at the wrong card would make the assertion meaningless.
 fn confirm_close_selected(deck: &TuiDeck) {
     deck.send_keys(b"\x17"); // Ctrl+W → close confirmation
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     deck.send_keys(b"\x1b[B"); // Down → [Close] (arrows DO work inside the modal)
     deck.send_keys(b"\r"); // confirm
 }
@@ -1896,19 +2064,20 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     std::fs::write(&cfg, "default_command = \"agent-wrapper\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         // Roomy: at the default width a card's identity is ellipsized
         // (`dispatch-clo…`), so the selection check below could never match the
         // full name on the identity row.
         .with_pty_size(200, 50)
         .with_env(
             "PATH",
-            format!("{}:{}", stub_bin.display(), path_with_binary_dir()),
+            format!("{}:{}", stub_bin.display(), common::path_with_binary_dir()),
         )
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-    commit_fixture_repo(deck.workdir());
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     // Trust the dispatched WORKTREE (where the agent runs) so claude's first-run
@@ -1919,10 +2088,14 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     )
     .expect("seed Claude onboarding and project trust");
 
-    let caller_pane = open_cat_caller_pane(&deck);
+    // Issue #1602: a `--single` unit runs its dispatcher's own command, so a
+    // `cat` caller would get a `cat` unit. A caller started with NO command (a
+    // shell) is the one whose units fall back to `default_command` — the
+    // wrapper above — which is the real agent this test needs to close.
+    let caller_pane = open_caller_pane(&deck, b"");
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
@@ -2062,20 +2235,21 @@ fn dispatch_close_004_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
     std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         // Roomy, so neither the card title nor the dialog's path line is
         // ellipsized by the terminal — the path IS the assertion.
         .with_pty_size(200, 50)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-    commit_fixture_repo(deck.workdir());
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     let caller_pane = open_cat_caller_pane(&deck);
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
@@ -2114,7 +2288,7 @@ fn dispatch_close_004_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
     // Closing it must read exactly as it always has. Without this, a dialog that
     // warned on every close would pass every assertion below while being useless.
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let control = deck.snapshot_grid();
     assert!(
         !control.contains("Uncommitted work"),
@@ -2144,7 +2318,7 @@ fn dispatch_close_004_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
         deck.snapshot_grid()
     );
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let armed = deck.snapshot_grid();
     assert!(
         armed.contains("Uncommitted work here is KEPT, not deleted:"),
@@ -2195,8 +2369,8 @@ fn dispatch_close_004_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
 /// `git status --porcelain` in `dir`, as the test's own independent reading of
 /// what the deck is about to decide from.
 fn porcelain(dir: &Path) -> String {
-    let out = std::process::Command::new("git")
-        .args(["-C", &dir.to_string_lossy(), "status", "--porcelain"])
+    let out = common::fixture_git(dir, dir)
+        .args(["status", "--porcelain"])
         .output()
         .expect("git available");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -2219,18 +2393,19 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
     std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-    commit_fixture_repo(deck.workdir());
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     let caller_pane = open_cat_caller_pane(&deck);
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
@@ -2278,7 +2453,7 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
 
     // Arm the confirmation while the tree IS dirty — the dialog is right to warn.
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let armed = deck.snapshot_grid();
     assert!(
         armed.contains("Uncommitted work here is KEPT, not deleted:"),
@@ -2333,14 +2508,15 @@ fn orchestration_dispatch_004_list_targets_marks_the_declared_default() {
     const UNIT: &str = "default-probe";
 
     let deck = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .impersonating_pane_signals()
+        .with_env("PATH", common::path_with_binary_dir())
         .launch_with_fixture("orch-multi");
-    deck.wait_for_string("No active sessions");
-    commit_fixture_repo(deck.workdir());
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
     let caller_pane = open_cat_caller_pane(&deck);
 
     // The READ-ONLY half: what a dispatcher agent is shown before it chooses.
-    let listed = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let listed = std::process::Command::new(common::contained_deck_binary())
         .args(["dispatch", "--list-targets"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
@@ -2387,7 +2563,7 @@ fn orchestration_dispatch_004_list_targets_marks_the_declared_default() {
     // about, so the two are asserted in one test rather than two.
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let out = std::process::Command::new(common::contained_deck_binary())
         .args([
             "dispatch",
             UNIT,

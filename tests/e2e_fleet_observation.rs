@@ -77,8 +77,10 @@ fn start_stand_in(daemon: &DaemonProc, display_name: &str) -> String {
             tab_membership: None,
             agent_type: None,
             seed: None,
-
             isolated_clone_origin: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
         })
         .expect("StartAgent over the attach socket");
     assert!(

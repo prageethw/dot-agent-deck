@@ -1,0 +1,200 @@
+/**
+ * PRD #1497 — the voice surface's reader and speech queue, built once per
+ * mount from the runtime's seams.
+ *
+ * Besides the two objects, this keeps the one fact D8 needs: whether the app
+ * spoke at any point during the segment the microphone is recording now. The
+ * recording overlaps the work on the previous utterance (PR #1451), so a
+ * segment runs from one `voiceStop` to the next — {@link UseReadingMode.takeSegment}
+ * is called at each — and the queue's `speaking` going true marks the open
+ * segment as overlapped. Speech that starts before the backend has split the
+ * recording inside `voiceStop` also marks the segment it stopped (PRD #1631):
+ * it may be in that segment's buffer. Speech that starts after the split,
+ * while the stopped segment is still being transcribed, is not in it and marks
+ * only the next one. The backend reports the split as it happens; when that
+ * report is late or never comes, the stopped segment stays open until
+ * `voiceStop` settles, so a missing report counts the whole stop against it.
+ * "Is it speaking now" would be the wrong question: a recording of the app's
+ * own voice ends after the voice does. Nor does the
+ * next `voiceStart` begin a segment when it carries on with the kept device:
+ * that recording began at the `voiceStop`, so speech that started and ended
+ * while the previous utterance was worked on is in it. A fresh open begins its
+ * segment before `voiceStart` is called rather than when it returns: capture
+ * can be recording before the open resolves, so speech during the open is in
+ * that recording too.
+ *
+ * It also tells the reader when the open pane changes (issue #1667), so
+ * opening an agent's pane drops what was still to be said about the others.
+ */
+
+import { useEffect, useMemo, useRef } from "react";
+import { DeckReader } from "../lib/reading";
+import { SpeechQueue, providerVoice, systemVoice } from "../lib/speech";
+import type { DeckRuntimeState } from "../types";
+
+/** Said when this build's runtime has no reading seam at all (the bare preview harness). */
+export const READING_NOT_IN_THIS_RUNTIME = "Reading is not available: this app cannot read an agent's turns here.";
+
+/** A recording segment {@link UseReadingMode.takeSegment} ended, while its `voiceStop` is pending. */
+export interface StoppedSegment {
+  /** Whether the app spoke during the segment so far. */
+  overlapped: () => boolean;
+  /**
+   * The backend split the recording, or `voiceStop` settled, whichever came
+   * first: the app's speech no longer reaches this segment. Answers whether
+   * the app spoke during it, speech that started before this call included.
+   * Called again, it answers the same and marks nothing more.
+   */
+  close: () => boolean;
+}
+
+export interface UseReadingMode {
+  reader: DeckReader;
+  queue: SpeechQueue;
+  /**
+   * End the current recording segment, called as its `voiceStop` begins, and
+   * start the next. The stopped segment keeps being marked by the app's speech
+   * until its {@link StoppedSegment.close}, at the backend's split or when
+   * `voiceStop` settles.
+   */
+  takeSegment: () => StoppedSegment;
+  /**
+   * The microphone is recording again. `carried` says whether it carried on
+   * with the device kept open since the last {@link takeSegment} (PR #1451),
+   * whose buffer already holds whatever was heard while that utterance was
+   * transcribed and resolved: the app's speech in that interval stays marked
+   * on the segment. Otherwise the device is about to be opened afresh and a
+   * new segment starts now — called before the open, not after it, so the
+   * app's speech while the open is pending stays marked.
+   */
+  startSegment: (carried: boolean) => void;
+}
+
+export function useReadingMode(
+  runtime: Pick<DeckRuntimeState, "voiceSpeechPlan" | "voiceSpeechAudio" | "voiceReadingStart" | "voiceReadingStop" | "onVoiceReadingConsentOff" | "onVoiceReadingConsentOn">,
+  openPane: () => { deckId: string; agentId: string } | undefined,
+  onProblem?: (reason: string) => void,
+  onReadingProblem?: (sentence: string) => void,
+): UseReadingMode {
+  const runtimeRef = useRef(runtime);
+  runtimeRef.current = runtime;
+  const openPaneRef = useRef(openPane);
+  openPaneRef.current = openPane;
+  const onProblemRef = useRef(onProblem);
+  onProblemRef.current = onProblem;
+  const onReadingProblemRef = useRef(onReadingProblem);
+  onReadingProblemRef.current = onReadingProblem;
+  /* Settles once this window can hear a consent-off save (below); reading
+     starts only after it, and not at all if it rejects. */
+  const listening = useRef<Promise<void> | undefined>(undefined);
+  /* Settles once this window can hear a consent-on save, or could not
+     install that listener and has told the reader so. Reading starts only
+     after it too, so a save reported on after a start read the settings is
+     never missed (audit A1). */
+  const hearingOn = useRef<Promise<void> | undefined>(undefined);
+
+  const { reader, queue } = useMemo(() => {
+    const speech = new SpeechQueue({
+      plan: () => runtimeRef.current.voiceSpeechPlan?.() ?? Promise.resolve({ kind: "system" as const }),
+      provider: providerVoice((text) => runtimeRef.current.voiceSpeechAudio?.(text) ?? Promise.reject(new Error("this app has no speech service"))),
+      system: systemVoice(),
+      onProblem: (reason) => onProblemRef.current?.(reason),
+    });
+    const deckReader = new DeckReader({
+      start: async (target, onSentence) => {
+        const start = runtimeRef.current.voiceReadingStart;
+        if (start === undefined) return { kind: "unavailable" as const, sentence: READING_NOT_IN_THIS_RUNTIME, scope: "deck" as const };
+        /* A window that cannot hear the switch go off never reads, and that is
+           about every agent, so it is said once. A rejection of the start
+           itself is that one agent's failure, said as such. */
+        try {
+          await listening.current;
+        } catch {
+          return { kind: "unavailable" as const, sentence: READING_NOT_IN_THIS_RUNTIME, scope: "deck" as const };
+        }
+        await hearingOn.current;
+        return start(target, onSentence);
+      },
+      stop: (session) => runtimeRef.current.voiceReadingStop?.(session) ?? Promise.resolve(),
+      speech,
+      openPane: () => openPaneRef.current(),
+      onProblem: (sentence) => onReadingProblemRef.current?.(sentence),
+    });
+    return { reader: deckReader, queue: speech };
+  }, []);
+
+  const spoke = useRef(false);
+  /* The segment whose `voiceStop` is pending, if any. */
+  const stopping = useRef<{ spoke: boolean } | null>(null);
+  useEffect(() => queue.subscribe((speaking) => {
+    if (!speaking) return;
+    spoke.current = true;
+    if (stopping.current) stopping.current.spoke = true;
+  }), [queue]);
+  /* A save from any window that turned reading's switch off ends reading
+     here too — a start in progress included, which the Rust side has no
+     session for (PR #1617's fourth review). Reading waits for this listener,
+     and a window that could not install it never reads: it would not hear
+     the switch go off (PR #1617's fifth review). A save that left it on
+     retries a start that read the document before that save reached it. */
+  useEffect(() => {
+    const unsubscribe: Array<() => void> = [];
+    let gone = false;
+    const keep = (stop: () => void) => {
+      if (gone) stop();
+      else unsubscribe.push(stop);
+    };
+    const subscribeOff = runtimeRef.current.onVoiceReadingConsentOff;
+    const installed = (subscribeOff?.(() => { reader.consentOff(); }) ?? Promise.reject(new Error("no consent-off listener"))).then(keep);
+    listening.current = installed;
+    installed.catch(() => undefined);
+    /* A window that cannot hear a save report the switch on still reads: the
+       reader asks a refused agent again on its own schedule instead of
+       waiting for that report (PR #1617's Qodo review). It is told before
+       any start runs, since starts wait for this. Asked inside a promise, so
+       a seam that throws counts as one that rejected. */
+    const subscribeOn = runtimeRef.current.onVoiceReadingConsentOn;
+    if (subscribeOn !== undefined) {
+      hearingOn.current = Promise.resolve().then(() => subscribeOn(() => { reader.consentOn(); })).then(keep, () => { reader.consentOnUnheard(); });
+    } else {
+      reader.consentOnUnheard();
+    }
+    return () => {
+      gone = true;
+      for (const stop of unsubscribe) stop();
+    };
+  }, [reader]);
+  /* Issue #1667 — an agent's pane opening drops what was still to be said
+     about every other agent. Keyed on the pane's identity, so a render that
+     leaves the same pane open drops nothing. */
+  const open = openPane();
+  const openDeck = open?.deckId;
+  const openAgent = open?.agentId;
+  useEffect(() => {
+    reader.focus(openDeck === undefined || openAgent === undefined ? undefined : { deckId: openDeck, agentId: openAgent });
+  }, [reader, openDeck, openAgent]);
+  // Unmounting stops every session and silences the app, without a sentence.
+  useEffect(() => () => { reader.dispose(); }, [reader]);
+
+  return {
+    reader,
+    queue,
+    takeSegment: () => {
+      const stopped = { spoke: spoke.current || queue.speaking };
+      stopping.current = stopped;
+      spoke.current = queue.speaking;
+      let closed: boolean | undefined;
+      return {
+        overlapped: () => closed ?? stopped.spoke,
+        close: () => {
+          if (stopping.current === stopped) stopping.current = null;
+          closed ??= stopped.spoke;
+          return closed;
+        },
+      };
+    },
+    startSegment: (carried) => {
+      spoke.current = carried ? spoke.current || queue.speaking : queue.speaking;
+    },
+  };
+}

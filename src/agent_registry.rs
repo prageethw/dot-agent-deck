@@ -22,7 +22,10 @@
 //! later milestone — the registry is meant to be the single source of truth per
 //! the PRD success criteria.
 
+use std::borrow::Cow;
+
 use ratatui::style::Color;
+use serde::{Deserialize, Serialize};
 
 use crate::event::AgentType;
 
@@ -57,114 +60,173 @@ pub enum IntegrationStrategy {
     Wrapper,
 }
 
-/// Issue #243: what a FRESHLY STARTED instance of this agent announces BEFORE it
-/// is given a prompt — i.e. what a readiness gate can actually wait for.
+/// PRD #1541: the keys that edit or interrupt this agent's prompt — what voice
+/// control presses to interrupt a turn, clear the prompt, or remove what it last
+/// typed.
 ///
-/// This exists because the gate used to ask `hook_install.is_some()`, which
-/// correctly answers "does this agent have native hooks" and was standing in for
-/// a different question entirely: *will a real `SessionStart` arrive before this
-/// agent needs a prompt?* Codex and OpenCode both satisfy the first and neither
-/// satisfies the second — one mis-predicate, two victims — so a `clear = true`
-/// delegate to either burned the full [`crate::state::SESSION_START_WAIT_TIMEOUT`]
-/// (measured at 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s on production Codex delegates)
-/// and only the timeout fallback ever delivered.
+/// **Measured, per agent and per version, and only for the versions named.**
+/// Each value below was driven against the real agent in a private tmux server
+/// on 2026-10-03 (`prds/done/1541-voice-agent-prompt-control.md`, "Verified per-agent
+/// key table"): Claude Code 2.1.289, Codex 0.160.0, OpenCode 1.18.34 and Pi
+/// 0.87.1. An agent upgrade can move a key, so a reader citing one of these
+/// should cite the version beside it, and a change here is a re-measurement, not
+/// an edit.
 ///
-/// Say what is meant instead. The value is a per-agent FACT, established by
-/// measurement and recorded next to everything else the deck knows about that
-/// agent, so the gate reads it rather than inferring it from an unrelated field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrePromptReadiness {
-    /// The agent's own integration announces an initialized session before the
-    /// first prompt: a genuine, unmarked `SessionStart` (Claude Code, Devin).
+/// **Devin carries none.** It was logged out on the box the table was measured
+/// on, so none of its keys could be verified; its entry is `None` until someone
+/// measures it logged in. The neutral [`NONE`] placeholder carries none either —
+/// the deck does not know what is in that pane.
+///
+/// **`Ctrl+C` (`0x03`) is never one of these keys, deliberately.** On an empty
+/// prompt it quits Codex and OpenCode outright, and a second one quits Pi, so a
+/// misheard or repeated command could end the agent. The interrupt is `ESC`
+/// instead, which ends the turn and keeps the agent, its session and any draft
+/// typed mid-turn in every measured agent. A unit test pins that no sequence
+/// here contains `0x03`.
+///
+/// **Served by the daemon, not compiled into a client** (PRD #1541 M1 decision
+/// 7, CLAUDE.md rule 18): a deck answers for the agent versions on its own host, the way
+/// [`crate::agent_pty::AgentRecord::cli_name`] answers which binary it forked
+/// (issue #856). It reaches clients as
+/// [`crate::agent_pty::AgentRecord::prompt_keys`], an additive optional field.
+///
+/// The strings are the exact bytes to write to the agent's PTY, unbracketed —
+/// the same path the user's own keystrokes take. They are all ASCII control
+/// characters today, and `str` rather than bytes so a JSON client can hand them
+/// to its terminal-write call unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptKeys {
+    /// Interrupt the agent's current turn: the steps to write in order, each
+    /// followed by its pause. One `ESC` for Claude Code, Codex and Pi; `ESC`,
+    /// ~300 ms, `ESC` for OpenCode, whose first `ESC` only arms "esc again to
+    /// interrupt".
     ///
-    /// Note what this does NOT promise: `SessionStart` means "a session exists",
-    /// not "the TUI interprets `\r` as submit". Claude Code fires it early in its
-    /// boot sequence, which is why the gate still holds the prompt for
-    /// [`crate::state::DELEGATE_READINESS_BUFFER`] afterwards (#199, #249, #663).
-    NativeSessionStart,
-    /// Nothing arrives from the agent itself before the prompt, but the deck's
-    /// own `dot-agent-deck wrap` hosts the child's PTY and announces its
-    /// interface once it can SEE it — a `SessionStart` carrying
-    /// [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] or
-    /// [`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] (Codex;
-    /// PRD #211's Gemini inherits this).
-    ///
-    /// The best readiness fact the deck has, because in the honest case it is an
-    /// observation of the child rather than an announcement about it — which is
-    /// why the strong half of it is what the readiness gate releases on. It is
-    /// NOT an input-readiness signal, and does not skip the post-readiness
-    /// buffer: a full-screen TUI clears `ICANON`/`ECHO` at init, ~85 ms in on
-    /// real codex-cli, and goes on discarding keystrokes until it has finished
-    /// drawing. See `crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`.
-    ///
-    /// **"Observation, not announcement" describes the honest case; it is not a
-    /// security property, and nothing the deck does rests on it alone** (issue
-    /// #243 audit F2). Both facts are read off the INNER PTY, which is not private
-    /// to the child: a same-uid process can find it (`/proc/<wrapper-pid>/fd` →
-    /// the pts node, mode `0620`) and either `tcsetattr` away `ICANON`/`ECHO` or
-    /// write one byte and go quiet, making the genuine wrapper emit a genuine
-    /// event about a child that is not ready. Suspected from the permissions, not
-    /// reproduced, and it grants nothing beyond forging the event outright — but
-    /// it is why `crate::state::dispatch_one_owned` reads the frozen launch shape
-    /// and the operator's own interval as well as this fact. What that guards is
-    /// smaller than it once was: with no buffer suppression left to buy, a forged
-    /// or driven fact can only release a gate that an unmarked `SessionStart`
-    /// already released.
-    WrapperInterfaceReady,
-    /// MEASURED: this agent emits nothing at all before its first prompt, and no
-    /// wrapper is watching it either, so there is no signal for a gate to wait
-    /// for and waiting is a DEAD wait.
-    ///
-    /// OpenCode is the case (#146, measured against `opencode 1.18.16`): a 35 s
-    /// idle cold boot produced zero `session.*` events, and `session.created`
-    /// then landed 16 ms AFTER the prompt was accepted. It is a `Plugin` agent,
-    /// so [`IntegrationStrategy::Wrapper`] cannot cover it — the ceiling is to
-    /// skip straight to a bounded buffer, which is what the gate does.
-    ///
-    /// **That buffer is this value's whole safety margin, so it is sized against
-    /// a real one** ([`crate::state::NO_SIGNAL_READINESS_BUFFER`], 8 s). The dead
-    /// wait it replaces was also, accidentally, the only thing giving the agent
-    /// time to boot; the interval inherited when the wait was first deleted was
-    /// PRD #249's warm-case-doubled 1000 ms, and measurement says a replacement
-    /// OpenCode swallows a prompt written that early at every load level tested.
-    /// Declaring this for a new agent is therefore also a statement that the
-    /// shipped interval covers ITS cold start — measure, do not assume.
-    NoSignal,
-    /// Not established. The conservative default: the gate keeps waiting exactly
-    /// as it does today, because "we have not measured this" is not evidence that
-    /// skipping the wait is safe.
-    ///
-    /// Carried by the neutral [`NONE`] placeholder — an unrecognized command,
-    /// where the deck genuinely does not know what is in the pane — and
-    /// deliberately by Pi as well: Pi structurally never emits
-    /// `EventType::SessionStart` (PRD #201), so [`Self::NoSignal`] is the
-    /// literally true classification, but nobody has measured Pi's boot window
-    /// and issue #243 measured only Codex and OpenCode. Claiming it would take
-    /// the scheduler's Pi delivery from a 30 s wait to a ~1 s buffer on no
-    /// evidence, and buy nothing on the delegate path, which bypasses this gate
-    /// for Pi entirely (the native seed hand-off in
-    /// [`crate::state::dispatch_one_owned`]). Reclassify when Pi's boot is
-    /// measured.
+    /// **Only while the agent is working.** On an IDLE agent a repeated `ESC`
+    /// opens Rewind in Claude Code (and clears a draft), the transcript browser
+    /// in Codex and the Session Tree in Pi, so the sender's guard — send only
+    /// while the status says working, and never twice in quick succession — is
+    /// part of this key's contract, not an option.
+    pub interrupt: Cow<'static, [KeyStep]>,
+    /// Clear the whole prompt.
+    pub clear: ClearKey,
+    /// Delete the one character before the cursor.
+    pub delete_char: DeleteCharKey,
+}
+
+/// One write in a [`PromptKeys`] sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyStep {
+    /// The bytes to write.
+    pub bytes: Cow<'static, str>,
+    /// How long to wait after this write before the next step, in
+    /// milliseconds. `0` on the last step.
+    #[serde(default)]
+    pub pause_after_ms: u32,
+}
+
+/// How [`PromptKeys::clear`] empties the prompt: one key, pressed as many times
+/// as the prompt needs.
+///
+/// **Over-counting is harmless** in every measured agent — an extra press on an
+/// empty prompt does nothing — so a sender that cannot see the prompt should
+/// round up rather than risk leaving text behind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearKey {
+    /// The key to press. `Ctrl+U` (`0x15`, NAK) in every measured agent.
+    pub bytes: Cow<'static, str>,
+    /// What one press removes, so the sender can count the presses a prompt
+    /// needs.
+    pub presses: ClearPresses,
+    /// The most presses to put in one write; `None` where no limit was
+    /// observed. Claude Code ignores a single write of 64 or more NAKs
+    /// ENTIRELY (10 to 63 worked), so its writes are capped well below that, at
+    /// 32. Codex, OpenCode and Pi took 300 in one write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_presses_per_write: Option<u32>,
+    /// How long to wait between two writes of one clear, in milliseconds;
+    /// `None` where back-to-back writes were measured to work. Claude Code
+    /// reads two 32-press writes sent back to back as ONE read of 64, which it
+    /// ignores whole like a single write of 64, so its writes are 1 s apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_between_writes_ms: Option<u32>,
+}
+
+/// What one [`ClearKey`] press removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearPresses {
+    /// One press per WRAPPED screen row (Claude Code): a prompt of `n`
+    /// characters in a pane `cols` wide needs `ceil(n / cols)` presses, plus
+    /// one per newline in a multi-line draft.
+    PerWrappedRow,
+    /// One press per logical line (Codex, OpenCode, Pi): a single-line prompt
+    /// needs one press however long it is, and a multi-line draft two per line.
+    PerLine,
+    /// Forward-compat catch-all: a rule a NEWER daemon names that this build
+    /// does not know. A client cannot count presses for it and must treat the
+    /// key as unsupported. Never produced by this build.
+    #[serde(other)]
     Unknown,
 }
 
-impl PrePromptReadiness {
-    /// Issue #243: is there a pre-prompt readiness signal for a gate to wait
-    /// FOR? `false` only for [`Self::NoSignal`] — an agent that has positively
-    /// declared it announces nothing, which is the one case where waiting is
-    /// provably dead time. [`Self::Unknown`] answers `true`: we cannot know it is
-    /// safe to skip, so it keeps waiting.
-    pub fn has_signal(self) -> bool {
-        !matches!(self, PrePromptReadiness::NoSignal)
-    }
+/// How [`PromptKeys::delete_char`] removes text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteCharKey {
+    /// The key that deletes one character. `DEL` (`0x7f`) in every measured
+    /// agent; bursts of 150 in one write were exact.
+    pub bytes: Cow<'static, str>,
+    /// The longest single unbracketed write, in characters, that this agent is
+    /// measured to keep as typed text — so that pressing [`Self::bytes`] once
+    /// per character removes it exactly. Above it the agent collapses the write
+    /// into a paste placeholder that ONE delete removes whole: Claude Code
+    /// above 800 characters (`[Pasted text #N]`), Codex above 1000 (`[Pasted
+    /// Content …]`). `None` where no collapse was observed (OpenCode and Pi
+    /// kept 2290 characters as text).
+    ///
+    /// This is the AGENT's measured figure, not voice's policy. Voice refuses
+    /// to remove a write longer than 800 characters for every agent (PRD #1541
+    /// M1), so a sender applies `min(800, this)` — the per-agent value exists so
+    /// that policy is a client decision that can be revisited against the
+    /// deck's own measurement rather than baked into the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_literal_write_chars: Option<u32>,
 }
+
+/// `ESC`: the interrupt key in every measured agent.
+const ESC: &str = "\x1b";
+/// `Ctrl+U` (NAK): deletes to the start of the line in every measured agent.
+const CTRL_U: &str = "\x15";
+/// `DEL`: deletes one character in every measured agent.
+const DEL: &str = "\x7f";
+
+/// The single `ESC` that interrupts Claude Code, Codex and Pi.
+static SINGLE_ESC: [KeyStep; 1] = [KeyStep {
+    bytes: Cow::Borrowed(ESC),
+    pause_after_ms: 0,
+}];
+
+/// OpenCode's interrupt: the first `ESC` only arms "esc again to interrupt",
+/// the second, ~300 ms later, interrupts.
+static OPENCODE_DOUBLE_ESC: [KeyStep; 2] = [
+    KeyStep {
+        bytes: Cow::Borrowed(ESC),
+        pause_after_ms: 300,
+    },
+    KeyStep {
+        bytes: Cow::Borrowed(ESC),
+        pause_after_ms: 0,
+    },
+];
 
 /// PRD #20 finding #15: an integration-hook handler (install / uninstall) —
 /// `Ok(())` on success, `Err(message)` on a reported failure.
 pub type HookFn = fn() -> Result<(), String>;
 
-/// PRD #20 finding #15: a spawn-time materialize handler (the `Extension`
-/// strategy). Receives the spawn env so it can honor `HOME` / deck env vars.
+/// PRD #20 finding #15: a materialize handler (the `Extension` strategy).
+/// Receives an env so it can honor `HOME` / deck env vars. No production code
+/// calls it through [`AgentSpec::materialize`]: Pi's extension is materialized
+/// once at daemon startup instead (PRD #201, the #210 fix — see the note in
+/// `AgentPtyRegistry::spawn_agent_with_dir`).
 pub type MaterializeFn = fn(&[(String, String)]);
 
 /// One cohesive registry entry per agent — the single place per-agent data
@@ -185,12 +247,8 @@ pub struct AgentSpec {
     /// Which integration mechanism carries this agent's events to the deck.
     /// `None` for the neutral placeholder (not a real agent).
     pub strategy: Option<IntegrationStrategy>,
-    /// Issue #243: what this agent announces BEFORE its first prompt — the fact
-    /// the readiness gate needs and used to infer, wrongly, from
-    /// [`Self::hook_install`]. See [`PrePromptReadiness`].
-    pub pre_prompt_readiness: PrePromptReadiness,
     /// Per-agent badge colour, rendered on session cards when the fork #339
-    /// agent-type badge toggle (`Ctrl+m` / `m`) is on. A named ANSI colour
+    /// agent-type badge toggle (`b`) is on. A named ANSI colour
     /// only (no absolute `Color::Rgb`), matching the palette policy
     /// (`src/palette.rs`) so terminal themes can remap it.
     pub badge_color: Color,
@@ -206,8 +264,9 @@ pub struct AgentSpec {
     /// extension materialize; the neutral placeholder has none at all).
     pub hook_install: Option<HookFn>,
     pub hook_uninstall: Option<HookFn>,
-    /// Materialize a bundled artifact into the agent's HOME just before spawn
-    /// (the `Extension` strategy).
+    /// Materialize a bundled artifact into the agent's HOME (the `Extension`
+    /// strategy). Capability metadata: the daemon materializes Pi's extension
+    /// once at startup, and the spawn path calls no materialize (#210).
     pub materialize: Option<MaterializeFn>,
     /// PRD #20 R20-010: this agent's OWN startup auto-install action — the
     /// silent, best-effort install the TUI runs at launch for every shipped
@@ -218,10 +277,369 @@ pub struct AgentSpec {
     /// installer. With the action on the spec, `main.rs` iterates [`ALL`] and
     /// calls `spec.startup_auto_install` directly, and a new agent slots in its
     /// own installer here. `None` where the agent has no startup install step —
-    /// a spawn-time `Extension` (Pi materializes at spawn), a `Wrapper` (Codex
+    /// an `Extension` (Pi's is materialized once at daemon startup, outside
+    /// this loop), a `Wrapper` (Codex
     /// synthesizes events from stdout), or the neutral placeholder.
-    pub startup_auto_install: Option<fn()>,
+    ///
+    /// Issue #1637: it returns what the agent's hooks are pinned to afterwards,
+    /// so `daemon serve` can name the binary an agent's events come from before
+    /// any hook fires. The TUI ignores it.
+    pub startup_auto_install: Option<fn() -> Vec<crate::hook_binary::HookPin>>,
+    /// Issue #1637: what this agent's hook config pins NOW, read back without
+    /// installing, writing or taking over anything, for the daemon's periodic
+    /// [`crate::hook_binary::PinRefresh`]. `Some(pins)` when the config was
+    /// read, an empty list meaning it names no deck binary; `None` when it
+    /// could not be read (missing, unparseable, unreadable, or the agent is
+    /// not installed), which leaves the pins the daemon already knows. `None`
+    /// for an agent with no startup install step.
+    pub configured_pins: Option<fn() -> Option<Vec<crate::hook_binary::HookPin>>>,
+    /// PRD #1666 part 3, R-3: [`Self::startup_auto_install`]'s own install,
+    /// run for `hooks refresh`, saying whether the agent is installed here and
+    /// what the install could not read or write, which the startup install
+    /// only logs. `None` exactly where `startup_auto_install` is.
+    pub refresh_install: Option<fn() -> crate::hooks_refresh::InstallAttempt>,
+    /// PRD #1541: the keys that interrupt this agent's turn and edit its
+    /// prompt, as measured against the versions [`PromptKeys`] names. `None`
+    /// where they are unmeasured (Devin) or there is no agent to press them at
+    /// (the neutral placeholder). See [`PromptKeys`].
+    pub prompt_keys: Option<PromptKeys>,
+    /// PRD #1666 S7 (decision A): recognises this agent's empty composer in
+    /// the pane's screen rows, for an agent whose wrapper reports it Idle while
+    /// a start dialog may still be up. Until the agent's own hooks report, the
+    /// doorbell writes no byte unless this matches
+    /// ([`crate::agent_pty::AgentPtyRegistry::write_doorbell`]). `None` where
+    /// the agent's status comes only from its own hooks, so it reads Unknown,
+    /// and is never rung, until they report.
+    pub doorbell_composer: Option<fn(&[String]) -> bool>,
+    /// Recognises, in the composer [`Self::doorbell_composer`] guards, the
+    /// line the doorbell last typed into this pane, left unsubmitted because
+    /// its Enter was not taken. Such a screen is not empty, so without this
+    /// the bare CR that flushes the line would wait for an empty composer
+    /// forever. Called with the screen rows, the cursor (as
+    /// [`crate::pane_screen_text::visible_rows_and_cursor`] reports them)
+    /// and that exact line. `Some` exactly where `doorbell_composer` is.
+    pub doorbell_stranded_line: Option<StrandedLineRecogniser>,
+    /// PRD #1666 part 2 (`inbox/doorbell/008`): recognises, in the pane's
+    /// screen rows, this agent's prompt being up, for an agent whose own
+    /// `SessionStart` arrives before it is ([`crate::state::ReadinessLevel`]).
+    /// Until the generation's own hooks report Idle, the doorbell writes no
+    /// byte to it unless this matches. `None` where the agent's own
+    /// `SessionStart` is readiness enough, or where [`Self::doorbell_composer`]
+    /// already guards every write.
+    pub doorbell_ready_screen: Option<fn(&[String]) -> bool>,
+    /// PRD #1631: the options this agent draws on screen but never reports in
+    /// a payload — its permission and plan menus, and the free-text entries it
+    /// appends to a multiple-choice list — with the keys that pick each where
+    /// the deck answers by keys. Read by the producers that build a
+    /// [`crate::question::PendingQuestion`] and by the daemon's keys channel
+    /// ([`crate::question::answer_keys`]). `None` for an agent with no such
+    /// menus (Pi, whose dialogs report their own options) and the placeholder.
+    pub questions: Option<&'static QuestionTables>,
 }
+
+/// [`AgentSpec::doorbell_stranded_line`]: screen rows, cursor, the line the
+/// doorbell left.
+pub type StrandedLineRecogniser =
+    fn(&[String], crate::pane_screen_text::ScreenCursor, &str) -> bool;
+
+/// PRD #1631: one agent's per-version option tables (decision 3). The deck
+/// does not read question options off the screen (the doorbell reads only the
+/// composer rows), so every option an agent draws without reporting it comes
+/// from here, keyed on the versions it was verified on; the lane-2
+/// `question/live/*` tests are what pin them.
+#[derive(Debug)]
+pub struct QuestionTables {
+    /// The oldest version these tables are known to describe. A version below
+    /// it lists the table's options keyboard-only and refuses the keys channel.
+    /// An unknown version (no producer reports one today) is treated as covered:
+    /// the lane-2 tests are the guard.
+    pub verified_from: (u64, u64, u64),
+    /// The newest version the tables were verified on, for the docs and for
+    /// whoever next measures them.
+    pub verified_on: (u64, u64, u64),
+    pub menus: &'static [MenuTable],
+}
+
+impl QuestionTables {
+    /// The options of `kind`, empty when the agent has no such menu.
+    pub fn menu(&self, kind: MenuKind) -> &'static [TableOption] {
+        self.menus
+            .iter()
+            .find(|m| m.menu == kind)
+            .map(|m| m.options)
+            .unwrap_or(&[])
+    }
+
+    /// Whether `version` is one these tables describe; `None` (not reported)
+    /// is.
+    pub fn covers(&self, version: Option<(u64, u64, u64)>) -> bool {
+        version.is_none_or(|v| v >= self.verified_from)
+    }
+}
+
+/// Which on-screen menu a [`MenuTable`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKind {
+    /// A tool-permission prompt.
+    Permission,
+    /// The options an agent appends after a multiple-choice question's own.
+    ChoiceAppended,
+    /// Claude Code's plan approval.
+    Plan,
+}
+
+#[derive(Debug)]
+pub struct MenuTable {
+    pub menu: MenuKind,
+    /// In on-screen order.
+    pub options: &'static [TableOption],
+}
+
+/// When a table option is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableWhen {
+    Always,
+    /// Claude Code's "always" option beside an `addDirectories` suggestion.
+    SuggestionAddDirectories,
+    /// Claude Code's "always" option beside a `setMode` suggestion.
+    SuggestionSetMode,
+    /// Claude Code's "always" option beside any other suggestion.
+    SuggestionOther,
+    /// Claude Code's "Yes, and switch to auto mode", which its Bash prompt
+    /// draws in the default and accept-edits permission modes.
+    AutoModeOffer,
+}
+
+#[derive(Debug)]
+pub struct TableOption {
+    /// The on-screen label. `{dir}`, `{mode}`, `{detail}` and `{patterns}` are
+    /// filled from the payload.
+    pub label: &'static str,
+    pub role: crate::question::OptionRole,
+    /// What the keys channel types to pick this option, with no Enter after it.
+    /// `None` where the agent is answered another way, or where the keys are
+    /// unknown.
+    pub keys: Option<&'static str>,
+    /// The deck shows this option but cannot pick it.
+    pub keyboard_only: bool,
+    /// The agent may or may not draw this option, on something its payload
+    /// does not say ([`crate::question::QuestionOption::maybe_hidden`]).
+    pub maybe_hidden: bool,
+    /// For an "always" option: what it covers, for the confirmation.
+    pub scope: Option<&'static str>,
+    pub when: TableWhen,
+}
+
+const fn table_option(
+    label: &'static str,
+    role: crate::question::OptionRole,
+    keys: Option<&'static str>,
+) -> TableOption {
+    TableOption {
+        label,
+        role,
+        keys,
+        keyboard_only: false,
+        maybe_hidden: false,
+        scope: None,
+        when: TableWhen::Always,
+    }
+}
+
+const fn keyboard_only(mut option: TableOption) -> TableOption {
+    option.keyboard_only = true;
+    option
+}
+
+const fn maybe_hidden(mut option: TableOption) -> TableOption {
+    option.maybe_hidden = true;
+    option
+}
+
+const fn scoped(mut option: TableOption, scope: &'static str) -> TableOption {
+    option.scope = Some(scope);
+    option
+}
+
+const fn when(mut option: TableOption, when: TableWhen) -> TableOption {
+    option.when = when;
+    option
+}
+
+use crate::question::OptionRole::{AllowAlways, AllowOnce, Choice, Deny, FreeText};
+
+/// Claude Code, verified on 2.1.289 (PRD #1631 M1 and follow-up b). The
+/// `PermissionRequest` hook it rests on is installed from 2.1.136
+/// ([`crate::hooks_manage::PERMISSION_REQUEST_MIN_CLAUDE_VERSION`]). Permission
+/// and choice answers go through the held hook, so they name no keys; plan
+/// approval is answered by keys because a hook decision does not dismiss it.
+pub static CLAUDE_CODE_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (2, 1, 136),
+    verified_on: (2, 1, 289),
+    menus: &[
+        MenuTable {
+            menu: MenuKind::Permission,
+            options: &[
+                table_option("Yes", AllowOnce, None),
+                // The "always" options carry no `scope` here: what "always"
+                // grants is the permission update the hook sends, so the
+                // producer writes the confirmation's sentence from that update
+                // itself (`crate::question::claude_update_scope`) and makes
+                // the option keyboard-only when it cannot describe it.
+                //
+                // The labels are Claude Code's own on-screen text, kept short
+                // on purpose: the `setMode` label drops the two parentheticals
+                // Claude draws ("(auto-approve file edits and common file
+                // commands)" and the "(shift+tab)" key hint) [observed text in
+                // PRD #1631 follow-up b], which are hints rather than what the
+                // option is. Claude draws "from this project" beside an
+                // `addDirectories` suggestion whose destination is `session`
+                // [observed]; the label keeps Claude's words and the
+                // confirmation says what is actually sent.
+                when(
+                    table_option(
+                        "Yes, and always allow access to {dir} from this project",
+                        AllowAlways,
+                        None,
+                    ),
+                    TableWhen::SuggestionAddDirectories,
+                ),
+                // `{mode}` is filled per mode; only "accept edits" was seen.
+                when(
+                    table_option(
+                        "Yes, and switch to {mode} for this session",
+                        AllowAlways,
+                        None,
+                    ),
+                    TableWhen::SuggestionSetMode,
+                ),
+                // Label and index unverified: M1 saw only the two suggestion
+                // kinds above.
+                when(
+                    table_option("Yes, and don't ask again", AllowAlways, None),
+                    TableWhen::SuggestionOther,
+                ),
+                // Read from 2.1.296's own bundle (PR #1698): its Bash prompt
+                // puts this after the "always" option and before No when the
+                // permission mode is `default` or `acceptEdits`, auto mode is
+                // available to the account, and neither a matched "ask" rule,
+                // an organisation cap nor the command's display rules it out.
+                // The payload carries only the mode, so the producer lists it
+                // in those two modes for Bash, marked as one Claude may leave
+                // out: where it does, No is drawn one number lower than the
+                // deck's, so a client takes No by name, not number.
+                // Keyboard-only: picking it switches Claude's mode on Claude's
+                // side, which a hook decision cannot do.
+                when(
+                    maybe_hidden(keyboard_only(table_option(
+                        "Yes, and switch to auto mode",
+                        AllowAlways,
+                        None,
+                    ))),
+                    TableWhen::AutoModeOffer,
+                ),
+                table_option("No", Deny, None),
+            ],
+        },
+        MenuTable {
+            menu: MenuKind::ChoiceAppended,
+            options: &[
+                table_option("Type something.", FreeText, None),
+                keyboard_only(table_option("Chat about this", Choice, None)),
+            ],
+        },
+        MenuTable {
+            menu: MenuKind::Plan,
+            options: &[
+                // `1` is inferred from `2` [observed].
+                scoped(
+                    table_option("Yes, auto-accept edits", AllowAlways, Some("1")),
+                    "file edits for the rest of this session (auto-accept)",
+                ),
+                table_option("Yes, manually approve edits", AllowOnce, Some("2")),
+                keyboard_only(table_option("Tell Claude what to change", FreeText, None)),
+            ],
+        },
+    ],
+};
+
+/// Codex, verified on 0.160.0 (PRD #1631 M1 and follow-up c). Answered by
+/// keys: each acts without Enter.
+pub static CODEX_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (0, 160, 0),
+    verified_on: (0, 160, 0),
+    menus: &[
+        MenuTable {
+            menu: MenuKind::Permission,
+            options: &[
+                table_option("Yes, proceed", AllowOnce, Some("1")),
+                scoped(
+                    table_option(
+                        "Yes, and don't ask again for commands that start with the prefix shown",
+                        AllowAlways,
+                        Some("p"),
+                    ),
+                    "commands that start with the prefix Codex shows for `{detail}`",
+                ),
+                table_option("No, and tell Codex what to do differently", Deny, Some("3")),
+            ],
+        },
+        MenuTable {
+            menu: MenuKind::ChoiceAppended,
+            // Its notes are typed after Tab, which is not measured.
+            options: &[keyboard_only(table_option(
+                "None of the above",
+                FreeText,
+                None,
+            ))],
+        },
+    ],
+};
+
+/// OpenCode, verified on 1.18.34 (PRD #1631 M1 and follow-up d). Answered
+/// through the plugin's reply API, so no keys.
+pub static OPEN_CODE_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (1, 18, 34),
+    verified_on: (1, 18, 34),
+    menus: &[
+        MenuTable {
+            menu: MenuKind::Permission,
+            options: &[
+                table_option("Allow once", AllowOnce, None),
+                scoped(
+                    table_option("Allow always", AllowAlways, None),
+                    "requests matching {patterns}",
+                ),
+                table_option("Reject", Deny, None),
+            ],
+        },
+        MenuTable {
+            menu: MenuKind::ChoiceAppended,
+            options: &[table_option("Type your own answer", FreeText, None)],
+        },
+    ],
+};
+
+/// Devin 3000.11.3, from its documentation only: no logged-in Devin has run
+/// it, so every entry here — the labels, their order and both keys — is
+/// UNVERIFIED. Only Allow once and Deny are answerable.
+pub static DEVIN_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (3000, 11, 3),
+    verified_on: (3000, 11, 3),
+    menus: &[MenuTable {
+        menu: MenuKind::Permission,
+        options: &[
+            table_option("Allow once", AllowOnce, Some("\r")),
+            keyboard_only(table_option("Allow for session", AllowAlways, None)),
+            keyboard_only(table_option("Allow for project", AllowAlways, None)),
+            keyboard_only(table_option("Allow for project (local)", AllowAlways, None)),
+            keyboard_only(table_option("Allow globally", AllowAlways, None)),
+            keyboard_only(table_option("Edit command", FreeText, None)),
+            keyboard_only(table_option("Describe change to command", FreeText, None)),
+            table_option("Deny", Deny, Some("\x1b")),
+        ],
+    }],
+};
 
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
 // module's signature to the spec's handler shape. Keeping them here (as the
@@ -305,7 +723,28 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
              to stdout classification. Set DOT_AGENT_DECK_LOG to log the expected command.)",
             if listed == 1 { "entry" } else { "entries" }
         ),
-        Ok(TrustOutcome::Trusted(count)) => println!("Trusted hooks: {count}"),
+        Ok(TrustOutcome::Trusted {
+            count, turned_off, ..
+        }) => {
+            println!("Trusted hooks: {count}");
+            // Issue #1027 item 2: the deck leaves a user's `/hooks` toggle alone,
+            // so a hook they turned off stays off — and says so, on its own line
+            // so the count above stays a bare number (`codex_hooks_005`).
+            if !turned_off.is_empty() {
+                let (noun, pronoun) = if turned_off.len() == 1 {
+                    ("hook", "it")
+                } else {
+                    ("hooks", "them")
+                };
+                println!(
+                    "Note: the deck's Codex {noun} for {} {} turned off in Codex's /hooks list, \
+                     so Codex reports nothing through {pronoun}. The deck leaves {pronoun} off; \
+                     turn {pronoun} back on in Codex's /hooks list to restore that detail.",
+                    turned_off.join(", "),
+                    if turned_off.len() == 1 { "is" } else { "are" },
+                );
+            }
+        }
         // Say it on stderr as well as in the log. This is the one arm that
         // printed nothing at all, so the user got no trust line whatsoever and
         // exit 0 — and the log half needs `DOT_AGENT_DECK_LOG` to have been set
@@ -333,7 +772,9 @@ fn codex_uninstall() -> Result<(), String> {
     // nothing else, so on a machine without `DOT_AGENT_DECK_LOG` set the whole
     // of what the user saw was exit 0 and silence — while the command went on to
     // delete the definitions regardless. That leaves `[hooks.state]` rows whose
-    // definitions are gone, which nothing in the deck currently collects.
+    // definitions are gone. Only a later install collects one, and only once
+    // Codex lists the deck's hook again somewhere else (issue #1027 item 1, the
+    // stale-record sweep in `trust_deck_hooks_in`); until then it stays.
     //
     // Not a failure, for the same reason the install arm is not: the primary
     // operation is the DEFINITIONS, and removing them still succeeds (or reports
@@ -364,13 +805,72 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     // Claude Code posts its native `SessionStart` early in boot, before any
     // prompt — the delegate gate's healthy fast path (3.80-4.39 s end to end
     // on the production samples in #243).
-    pre_prompt_readiness: PrePromptReadiness::NativeSessionStart,
     badge_color: Color::LightMagenta,
     hook_install: Some(claude_install),
     hook_uninstall: Some(claude_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::hooks_manage::auto_install),
+    configured_pins: Some(crate::hooks_manage::configured_pins),
+    refresh_install: Some(crate::hooks_manage::refresh_install),
+    // PRD #1541, measured on Claude Code 2.1.289: one ESC interrupts; one
+    // Ctrl+U per WRAPPED row, and a single write of 64+ is ignored, so 32 per
+    // write; an unbracketed write over 800 characters collapses to a paste.
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&SINGLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerWrappedRow,
+            max_presses_per_write: Some(32),
+            pause_between_writes_ms: Some(1000),
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: Some(800),
+        },
+    }),
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
+    // PRD #1666 part 2: its `SessionStart` arrives early in boot (above),
+    // before its prompt is drawn, so a generation that has not yet reported
+    // Idle is rung only once that prompt is on screen.
+    doorbell_ready_screen: Some(claude_prompt_on_screen),
+    questions: Some(&CLAUDE_CODE_QUESTIONS),
 };
+
+/// PRD #1666 part 2 (`inbox/doorbell/008`): do `rows`, one trimmed screen row
+/// each, show Claude Code's prompt up — a row opening with its `❯` (or `>`)
+/// marker that is not a numbered menu option, a rule of `─` directly above it,
+/// and another below it within [`CLAUDE_PROMPT_MAX_ROWS`] rows, as Claude Code
+/// 2.1.300 draws its input box. The rows are read as
+/// [`crate::pane_screen_text::visible_rows_and_cursor`] gives them, which
+/// shortens a rule to a few characters, so a rule is any row of `─` alone. Says only that the prompt is drawn, not that
+/// it is empty: the doorbell's draft tracking guards a draft. A dialog whose
+/// selected option opens with the same marker is a numbered option and does
+/// not match.
+pub fn claude_prompt_on_screen(rows: &[String]) -> bool {
+    let rule = |row: &str| !row.is_empty() && row.chars().all(|c| c == '─');
+    rows.iter().enumerate().skip(1).any(|(at, row)| {
+        let Some(rest) = row.strip_prefix('❯').or_else(|| row.strip_prefix('>')) else {
+            return false;
+        };
+        let option = rest
+            .trim_start()
+            .split_once('.')
+            .is_some_and(|(number, _)| {
+                !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+            });
+        !option
+            && rule(&rows[at - 1])
+            && rows[at + 1..]
+                .iter()
+                .take(CLAUDE_PROMPT_MAX_ROWS)
+                .any(|below| rule(below))
+    })
+}
+
+/// How many rows below its marker [`claude_prompt_on_screen`] looks for the
+/// rule that closes Claude Code's prompt: a draft that wraps pushes it down.
+const CLAUDE_PROMPT_MAX_ROWS: usize = 8;
 
 /// OpenCode — plugin strategy (shipped).
 pub static OPEN_CODE: AgentSpec = AgentSpec {
@@ -385,12 +885,32 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     // prompt the gate withholds. `server.connected` is NOT the missing event: it
     // is synthesized as the first frame of the SSE `/event` response, never
     // reaches the plugin hook, and would fire on the deck's own connect.
-    pre_prompt_readiness: PrePromptReadiness::NoSignal,
     badge_color: Color::LightGreen,
     hook_install: Some(opencode_install),
     hook_uninstall: Some(opencode_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::opencode_manage::auto_install),
+    configured_pins: Some(crate::opencode_manage::configured_pins),
+    refresh_install: Some(crate::opencode_manage::refresh_install),
+    // PRD #1541, measured on OpenCode 1.18.34: ESC, ~300 ms, ESC interrupts;
+    // one Ctrl+U per line; no paste collapse of an unbracketed write.
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&OPENCODE_DOUBLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerLine,
+            max_presses_per_write: None,
+            pause_between_writes_ms: None,
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: None,
+        },
+    }),
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
+    questions: Some(&OPEN_CODE_QUESTIONS),
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -400,15 +920,36 @@ pub static PI: AgentSpec = AgentSpec {
     detect_basenames: &["pi"],
     default_command: Some("pi"),
     strategy: Some(IntegrationStrategy::Extension),
-    // Pi emits no `EventType::SessionStart` at all, so `NoSignal` is literally
-    // true — and deliberately not claimed here. See `PrePromptReadiness::Unknown`.
-    pre_prompt_readiness: PrePromptReadiness::Unknown,
     badge_color: Color::LightCyan,
     hook_install: None,
     hook_uninstall: None,
     materialize: Some(pi_materialize),
-    // Pi materializes its extension at SPAWN time, not startup.
+    // Pi's extension is materialized at DAEMON startup
+    // (`orchestrator_ext::auto_materialize`, called by `daemon serve`), not by
+    // a startup install step, and refreshed per spawn only for a spawn detected
+    // as Pi (`agent_pty::pi_spawn`, PRD #1666 G6; #210).
     startup_auto_install: None,
+    configured_pins: None,
+    refresh_install: None,
+    // PRD #1541, measured on Pi 0.87.1: one ESC interrupts; one Ctrl+U per
+    // line; no paste collapse of an unbracketed write.
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&SINGLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerLine,
+            max_presses_per_write: None,
+            pause_between_writes_ms: None,
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: None,
+        },
+    }),
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
+    questions: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -427,7 +968,6 @@ pub static CODEX: AgentSpec = AgentSpec {
     // a prompt is submitted (measured on 0.145.0 and still true on 0.149.0), so
     // it is useless as a gate. The wrapper that hosts its PTY announces the
     // child's interface instead (#243).
-    pre_prompt_readiness: PrePromptReadiness::WrapperInterfaceReady,
     badge_color: Color::LightYellow,
     // Codex is a HYBRID (PRD #20 W1): the wrapper is its PTY host, but its rich
     // events come from Codex's Claude-Code-compatible NATIVE hooks — so unlike a
@@ -442,7 +982,196 @@ pub static CODEX: AgentSpec = AgentSpec {
     // basename isn't `codex` (`devbox run codex-big`), which the spawn-command
     // seam can't detect and which therefore got NO integration before.
     startup_auto_install: Some(crate::codex_hooks_manage::auto_install_and_trust_at_startup),
+    configured_pins: Some(crate::codex_hooks_manage::configured_pins),
+    refresh_install: Some(crate::codex_hooks_manage::refresh_install),
+    // PRD #1541, measured on Codex 0.160.0: one ESC interrupts; one Ctrl+U per
+    // line; an unbracketed write over 1000 characters collapses to a paste.
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&SINGLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerLine,
+            max_presses_per_write: None,
+            pause_between_writes_ms: None,
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: Some(1000),
+        },
+    }),
+    // PRD #1666 S7: Codex's wrapper reports raw input while its start
+    // dialogs are up, so the doorbell needs the composer itself.
+    doorbell_composer: Some(codex_composer_on_screen),
+    doorbell_stranded_line: Some(codex_composer_holds_doorbell_line),
+    doorbell_ready_screen: None,
+    questions: Some(&CODEX_QUESTIONS),
 };
+
+/// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
+/// row each — show Codex's composer **empty**, as measured on Codex 0.160.0:
+///
+/// ```text
+/// › Ask Codex to do anything
+///
+///   GPT-5.6-Luna low · /path/to/project
+///   ? for shortcuts                                  ⚠ 1 warning · f2 to view
+/// ```
+///
+/// The footer must be the last row with text and hold `? for shortcuts`,
+/// either at its start or after a `· ` separator (measured on a real 0.160.0
+/// after a turn: `← for agents · ? for shortcuts`). A `›` prompt row that is
+/// not a numbered choice must sit at most
+/// [`CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER`] rows above it, holding nothing or
+/// one of Codex's placeholders ([`CODEX_COMPOSER_PLACEHOLDERS`]), with a
+/// blank row right below it. Codex's start dialogs (update, folder trust,
+/// hooks review) put `›` on a numbered choice and end in a key-hint footer
+/// instead, so none of them matches; nor does any screen this does not know.
+///
+/// **Empty, not merely present** (decision 2): Codex can keep a human's text
+/// in the composer after an Enter it took as a newline (a paste burst), so
+/// the input tracker can believe a draft was submitted while it is still on
+/// screen. Any text on the prompt row other than a placeholder, or a second
+/// composer row below it, is a draft the doorbell must not join.
+///
+/// **This is the one place that knows what Codex's composer looks like.** A
+/// Codex release that redraws it makes this return `false`, and the effect is
+/// the safe one: the doorbell holds, and queued messages wait for the `Stop`
+/// hand-over or for a recognised empty composer, never typed into a screen
+/// the deck does not recognise. Re-measure and update this function, and the
+/// fixture `tests/fixtures/codex-inbox/composer.txt`, together.
+pub fn codex_composer_on_screen(rows: &[String]) -> bool {
+    let Some(footer) = rows.iter().rposition(|row| !row.is_empty()) else {
+        return false;
+    };
+    let footer_row = &rows[footer];
+    if !(footer_row.starts_with("? for shortcuts") || footer_row.contains("· ? for shortcuts")) {
+        return false;
+    }
+    let first = footer.saturating_sub(CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER);
+    let Some(prompt) = (first..footer).rev().find(|&n| {
+        rows[n].strip_prefix('›').is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            !(digits > 0 && rest[digits..].starts_with('.'))
+        })
+    }) else {
+        return false;
+    };
+    let content = rows[prompt].strip_prefix('›').unwrap_or_default().trim();
+    let empty = content.is_empty() || CODEX_COMPOSER_PLACEHOLDERS.contains(&content);
+    empty && rows.get(prompt + 1).is_some_and(String::is_empty)
+}
+
+/// PRD #1666: do `rows` show Codex's composer holding `line` — the doorbell
+/// line ([`crate::doorbell::doorbell_line`]) the deck last typed into this
+/// pane — unsubmitted, in one of the two states measured on Codex 0.160.0.
+/// The cursor is marked `▏`.
+///
+/// Its Enter was dropped, and the cursor sits right after the text (live
+/// `codex/worker/001`: on the prompt row at column 95):
+///
+/// ```text
+/// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch▏
+///
+///   GPT-5.6-Luna low · /path/to/project
+///                                                    ⚠ 1 warning · f2 to view
+/// ```
+///
+/// Or, under CPU pressure, its Enter became a newline in the composer, and
+/// the cursor sits on the empty row directly below the text, at the
+/// composer indent (live `inbox/load/004`: row 36, cell column 2, below the
+/// line on row 35):
+///
+/// ```text
+/// ›  dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
+///   ▏
+///
+///   GPT-5.6-Luna low · /path/to/project
+///                                                    ⚠ 1 warning · f2 to view
+/// ```
+///
+/// Codex hides `? for shortcuts` while its composer holds text, so the
+/// composer is found from the bottom instead: the lowest `›` row that is not a
+/// numbered choice, at most [`CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM`] rows
+/// above the last row with text. Its text, with any wrapped rows below it
+/// joined up to the first blank row, must be `line` exactly, message id
+/// included; a row with text must follow below the cursor (Codex's model
+/// line); and the cursor must sit at the end of the composer's last text
+/// row, or on the blank row directly below it at
+/// [`CODEX_COMPOSER_INDENT`]. A human draft, an edited line, a
+/// doorbell-shaped line naming another message and a dialog do not match,
+/// and neither does `line` itself with the cursor anywhere else. `line` comes
+/// from the doorbell's record of what it typed, so with no record the
+/// doorbell does not ask.
+///
+/// **This narrows the match; it does not authenticate the screen.** Text
+/// on a screen carries no record of who wrote it: a process that controls
+/// what this pane renders can draw this exact frame, line and cursor, and a
+/// human can type the same line by hand. Either earns the one bare CR the
+/// flush sends, which goes to whatever then owns the pane's input. The
+/// writer's other guards — the pane's agent identity, no unsent draft, and
+/// the doorbell's admission re-checked before the byte — still apply.
+pub fn codex_composer_holds_doorbell_line(
+    rows: &[String],
+    cursor: crate::pane_screen_text::ScreenCursor,
+    line: &str,
+) -> bool {
+    let Some(bottom) = rows.iter().rposition(|row| !row.is_empty()) else {
+        return false;
+    };
+    let first = bottom.saturating_sub(CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM);
+    let Some(prompt) = (first..=bottom).rev().find(|&n| {
+        rows[n].strip_prefix('›').is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            !(digits > 0 && rest[digits..].starts_with('.'))
+        })
+    }) else {
+        return false;
+    };
+    let mut text = rows[prompt]
+        .strip_prefix('›')
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut last = prompt;
+    for row in rows[prompt + 1..].iter().take_while(|row| !row.is_empty()) {
+        text.push(' ');
+        text.push_str(row.trim());
+        last += 1;
+    }
+    if text != line.trim() {
+        return false;
+    }
+    // The Enter was dropped: the cursor right after the text.
+    let after_text =
+        last < bottom && cursor.row == last && cursor.through == rows[last].chars().count();
+    // The Enter became a newline: the cursor on the composer's new, empty
+    // row, which `take_while` above stopped at, so it is blank.
+    let on_new_row =
+        last + 1 < bottom && cursor.row == last + 1 && cursor.cell == CODEX_COMPOSER_INDENT;
+    after_text || on_new_row
+}
+
+/// The cell column where Codex 0.160.0's composer text starts, after `› `,
+/// and where it puts the cursor on an empty composer row (measured: cell
+/// column 2 in live `inbox/load/004`).
+pub const CODEX_COMPOSER_INDENT: usize = 2;
+
+/// How far above the last row with text [`codex_composer_holds_doorbell_line`]'s
+/// prompt row may be: the composer's wrapped rows, a blank row, the model
+/// line and the footer.
+const CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM: usize = 6;
+
+/// The texts Codex 0.160.0 shows in an empty composer: the first at start
+/// and after a turn (measured), the second from the binary's strings
+/// (unmeasured on screen). Anything else on the prompt row is a draft.
+const CODEX_COMPOSER_PLACEHOLDERS: [&str; 2] =
+    ["Ask Codex to do anything", "Ask a follow-up question"];
+
+/// How far above [`codex_composer_on_screen`]'s footer the prompt row may be:
+/// the prompt, a blank row, the model line, plus room for a wrapped prompt.
+const CODEX_COMPOSER_MAX_ROWS_ABOVE_FOOTER: usize = 6;
 
 /// Devin CLI — native-hooks strategy. The second agent to reuse
 /// [`IntegrationStrategy::NativeHooks`], and the reason the strategy dispatch had
@@ -454,11 +1183,6 @@ pub static CODEX: AgentSpec = AgentSpec {
 /// hook socket. Unlike Codex it needs neither a wrapper (its own TUI runs
 /// directly on the deck's PTY) nor a hook-trust ceremony, which makes it the
 /// cheapest possible registry addition: pure `NativeHooks` + one `hook.rs` arm.
-///
-/// `hook_install` is `Some`, which the PRD #225 readiness gate reads as the
-/// promise that a real (unmarked) `SessionStart` still arrives — Devin documents
-/// a `SessionStart` hook, and being unwrapped it emits no fork-time marked event
-/// at all, so the gate simply waits for the genuine one.
 pub static DEVIN: AgentSpec = AgentSpec {
     agent_type: AgentType::Devin,
     label: "Devin",
@@ -477,7 +1201,6 @@ pub static DEVIN: AgentSpec = AgentSpec {
     // — which is why it ships unmeasured rather than as `Unknown`, and why a
     // future reader should not cite it as evidence the way the other four can be
     // cited. Measure it before treating this as established.
-    pre_prompt_readiness: PrePromptReadiness::NativeSessionStart,
     // A named ANSI colour not used by Claude (LightMagenta), OpenCode
     // (LightGreen), Pi (LightCyan) or Codex (LightYellow), and never the neutral
     // DarkGray reserved for the "No agent" placeholder.
@@ -486,6 +1209,15 @@ pub static DEVIN: AgentSpec = AgentSpec {
     hook_uninstall: Some(devin_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::devin_hooks_manage::auto_install),
+    configured_pins: Some(crate::devin_hooks_manage::configured_pins),
+    refresh_install: Some(crate::devin_hooks_manage::refresh_install),
+    // PRD #1541: unsupported, not measured — Devin was logged out on the box
+    // the key table was measured on, so none of its keys could be verified.
+    prompt_keys: None,
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
+    questions: Some(&DEVIN_QUESTIONS),
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -501,12 +1233,19 @@ pub static NONE: AgentSpec = AgentSpec {
     strategy: None,
     // Not an agent: nothing is known about what is in the pane, so the gate keeps
     // its conservative wait.
-    pre_prompt_readiness: PrePromptReadiness::Unknown,
     badge_color: Color::DarkGray,
     hook_install: None,
     hook_uninstall: None,
     materialize: None,
     startup_auto_install: None,
+    configured_pins: None,
+    refresh_install: None,
+    // Not an agent: there is nothing to press keys at.
+    prompt_keys: None,
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
+    questions: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
@@ -619,6 +1358,86 @@ pub fn resolve_type_alias(alias: &str) -> Option<AgentType> {
 mod tests {
     use super::*;
 
+    /// The rows the doorbell's gate reads for a fixture screen: one trimmed
+    /// row per line, as `crate::pane_screen_text` produces them.
+    fn rows(screen: &str) -> Vec<String> {
+        screen.lines().map(|line| line.trim().to_string()).collect()
+    }
+
+    /// PRD #1666 part 2: the Claude Code prompt recogniser accepts the input
+    /// box Claude Code 2.1.300 draws, empty or holding a draft that wraps, and
+    /// refuses a boot banner with no box, a numbered dialog option under a
+    /// rule, and a marker with no rule closing it — both on rows built here
+    /// and on the rows the doorbell's writer reads off a rendered screen,
+    /// which shorten each rule.
+    #[test]
+    fn claude_prompt_is_recognised_and_dialogs_are_not() {
+        let rendered = |screen: &str| {
+            crate::pane_screen_text::visible_rows_and_cursor(
+                screen.replace('\n', "\r\n").as_bytes(),
+                24,
+                80,
+            )
+            .expect("parsed")
+            .0
+        };
+        let rule = "─".repeat(78);
+        let frame =
+            format!("▐▛███▜▌   Claude Code v2.1.300\n\n{rule}\n❯\n{rule}\n  ? for shortcuts");
+        assert!(claude_prompt_on_screen(&rendered(&frame)));
+        assert!(!claude_prompt_on_screen(&rendered(&format!(
+            "{rule}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n{rule}"
+        ))));
+        let prompt =
+            format!("▐▛███▜▌   Claude Code v2.1.300\n\n{rule}\n❯\n{rule}\n  ? for shortcuts");
+        assert!(claude_prompt_on_screen(&rows(&prompt)));
+        let wrapped = format!("{rule}\n❯ a draft that\n  wraps onto a second row\n{rule}\n");
+        assert!(claude_prompt_on_screen(&rows(&wrapped)));
+        assert!(!claude_prompt_on_screen(&rows(
+            "▐▛███▜▌   Claude Code v2.1.300\nDOORBELL-STANDIN-READY"
+        )));
+        let dialog = format!("{rule}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n{rule}\n");
+        assert!(!claude_prompt_on_screen(&rows(&dialog)));
+        let unclosed = format!("{rule}\n❯\n\n  ? for shortcuts");
+        assert!(!claude_prompt_on_screen(&rows(&unclosed)));
+    }
+
+    /// PRD #1666 S7: the Codex composer recogniser accepts the measured 0.160.0
+    /// composer, with or without the warning indicator on its footer row, and
+    /// refuses every measured start dialog, an unknown dialog, a composer with
+    /// output below it, and a blank screen.
+    #[test]
+    fn codex_composer_is_recognised_and_dialogs_are_not() {
+        let composer = include_str!("../tests/fixtures/codex-inbox/composer.txt");
+        assert!(codex_composer_on_screen(&rows(composer)));
+        let warned = composer.replace(
+            "? for shortcuts",
+            "? for shortcuts                       ⚠ 1 warning · f2 to view",
+        );
+        assert!(codex_composer_on_screen(&rows(&warned)));
+        // Measured on a real 0.160.0 after a turn.
+        let agents = composer.replace("? for shortcuts", "← for agents · ? for shortcuts");
+        assert!(codex_composer_on_screen(&rows(&agents)));
+        let empty_line_draft =
+            composer.replace("› Ask Codex to do anything\n", "›\n  typed below\n");
+        assert!(!codex_composer_on_screen(&rows(&empty_line_draft)));
+        for dialog in [
+            include_str!("../tests/fixtures/codex-inbox/update.txt"),
+            include_str!("../tests/fixtures/codex-inbox/folder.txt"),
+            include_str!("../tests/fixtures/codex-inbox/hooks.txt"),
+            include_str!("../tests/fixtures/codex-inbox/unknown.txt"),
+        ] {
+            assert!(!codex_composer_on_screen(&rows(dialog)), "{dialog}");
+        }
+        assert!(!codex_composer_on_screen(&rows(&format!(
+            "{composer}\n  something printed below"
+        ))));
+        let numbered = composer.replace("› Ask Codex to do anything", "› 1. Ask Codex");
+        assert!(!codex_composer_on_screen(&rows(&numbered)));
+        assert!(!codex_composer_on_screen(&rows("\n\n")));
+        assert!(!codex_composer_on_screen(&[]));
+    }
+
     // Pure-data registry lookups — plain `#[test]` unit tests (no `#[spec]` /
     // CATALOG reproducer needed; these assert compiled-in data, not runtime
     // TUI behaviour).
@@ -703,10 +1522,33 @@ mod tests {
     /// PRD #20 R20-010: startup auto-install is resolved PER SPEC, not by
     /// mapping the reusable `IntegrationStrategy` enum to a hardcoded incumbent.
     /// The two agents with a startup install step (Claude native hooks, OpenCode
-    /// plugin) carry an action; the spawn-time `Extension` (Pi), the `Wrapper`
+    /// plugin) carry an action; the `Extension` (Pi), the `Wrapper`
     /// (Codex), and the neutral placeholder carry `None` — so a future agent
     /// reusing `NativeHooks`/`Plugin` runs ITS OWN installer, never another
     /// agent's.
+    /// Issue #1637: every agent whose startup install reports a hook pin has a
+    /// read-back of the same config, so the daemon's periodic refresh sees a
+    /// pin change for every agent whose startup pin it knows, and none for an
+    /// agent it has none for.
+    #[test]
+    fn every_startup_install_has_a_configured_pins_read_back() {
+        for spec in ALL {
+            assert_eq!(
+                spec.startup_auto_install.is_some(),
+                spec.configured_pins.is_some(),
+                "{:?}",
+                spec.agent_type
+            );
+            // PRD #1666 part 3, R-3: and `hooks refresh` runs it.
+            assert_eq!(
+                spec.startup_auto_install.is_some(),
+                spec.refresh_install.is_some(),
+                "{:?}",
+                spec.agent_type
+            );
+        }
+    }
+
     #[test]
     fn startup_auto_install_is_resolved_per_spec() {
         assert!(
@@ -878,6 +1720,196 @@ mod tests {
                 "a shipped agent's badge should not reuse the neutral placeholder colour"
             );
         }
+    }
+
+    fn keys(agent_type: AgentType) -> &'static PromptKeys {
+        spec(&agent_type)
+            .prompt_keys
+            .as_ref()
+            .unwrap_or_else(|| panic!("{agent_type:?} should carry prompt keys"))
+    }
+
+    fn step(bytes: &'static str, pause_after_ms: u32) -> KeyStep {
+        KeyStep {
+            bytes: Cow::Borrowed(bytes),
+            pause_after_ms,
+        }
+    }
+
+    /// PRD #1541: each measured agent's keys, pinned by value against the
+    /// verified table in the PRD. A change here is a re-measurement — update
+    /// the versions in [`PromptKeys`]'s doc comment with it.
+    #[test]
+    fn prompt_keys_match_the_verified_table() {
+        let claude = keys(AgentType::ClaudeCode);
+        assert_eq!(claude.interrupt.as_ref(), &[step("\x1b", 0)]);
+        assert_eq!(claude.clear.bytes, "\x15");
+        assert_eq!(claude.clear.presses, ClearPresses::PerWrappedRow);
+        assert_eq!(claude.clear.max_presses_per_write, Some(32));
+        assert_eq!(claude.clear.pause_between_writes_ms, Some(1000));
+        assert_eq!(claude.delete_char.bytes, "\x7f");
+        assert_eq!(claude.delete_char.max_literal_write_chars, Some(800));
+
+        let codex = keys(AgentType::Codex);
+        assert_eq!(codex.interrupt.as_ref(), &[step("\x1b", 0)]);
+        assert_eq!(codex.clear.bytes, "\x15");
+        assert_eq!(codex.clear.presses, ClearPresses::PerLine);
+        assert_eq!(codex.clear.max_presses_per_write, None);
+        assert_eq!(codex.clear.pause_between_writes_ms, None);
+        assert_eq!(codex.delete_char.bytes, "\x7f");
+        assert_eq!(codex.delete_char.max_literal_write_chars, Some(1000));
+
+        let opencode = keys(AgentType::OpenCode);
+        assert_eq!(
+            opencode.interrupt.as_ref(),
+            &[step("\x1b", 300), step("\x1b", 0)],
+            "OpenCode's first ESC only arms the interrupt"
+        );
+        assert_eq!(opencode.clear.bytes, "\x15");
+        assert_eq!(opencode.clear.presses, ClearPresses::PerLine);
+        assert_eq!(opencode.clear.max_presses_per_write, None);
+        assert_eq!(opencode.clear.pause_between_writes_ms, None);
+        assert_eq!(opencode.delete_char.bytes, "\x7f");
+        assert_eq!(opencode.delete_char.max_literal_write_chars, None);
+
+        let pi = keys(AgentType::Pi);
+        assert_eq!(pi.interrupt.as_ref(), &[step("\x1b", 0)]);
+        assert_eq!(pi.clear.bytes, "\x15");
+        assert_eq!(pi.clear.presses, ClearPresses::PerLine);
+        assert_eq!(pi.clear.max_presses_per_write, None);
+        assert_eq!(pi.clear.pause_between_writes_ms, None);
+        assert_eq!(pi.delete_char.bytes, "\x7f");
+        assert_eq!(pi.delete_char.max_literal_write_chars, None);
+    }
+
+    /// PRD #1541: Devin is unsupported until measured logged in, and the
+    /// neutral placeholder has no agent to press keys at — so neither carries
+    /// keys, and a client refuses rather than guessing.
+    #[test]
+    fn devin_and_the_placeholder_have_no_prompt_keys() {
+        assert!(spec(&AgentType::Devin).prompt_keys.is_none());
+        assert!(spec(&AgentType::None).prompt_keys.is_none());
+    }
+
+    /// PRD #1541: no key sequence contains `Ctrl+C` (`0x03`), which quits Codex
+    /// and OpenCode on an empty prompt. Checked over every entry, so a future
+    /// agent's keys are held to it too.
+    #[test]
+    fn no_prompt_key_contains_ctrl_c() {
+        let entries = ALL.iter().copied().chain(std::iter::once(&NONE));
+        for agent in entries {
+            let Some(keys) = agent.prompt_keys.as_ref() else {
+                continue;
+            };
+            let sequences = keys
+                .interrupt
+                .iter()
+                .map(|step| step.bytes.as_ref())
+                .chain([keys.clear.bytes.as_ref(), keys.delete_char.bytes.as_ref()]);
+            for bytes in sequences {
+                assert!(
+                    !bytes.is_empty(),
+                    "{}: an empty key presses nothing",
+                    agent.label
+                );
+                assert!(
+                    !bytes.as_bytes().contains(&0x03),
+                    "{}: a prompt key must never contain Ctrl+C",
+                    agent.label
+                );
+            }
+            assert!(
+                !keys.interrupt.is_empty(),
+                "{}: an interrupt needs at least one step",
+                agent.label
+            );
+            assert_eq!(
+                keys.interrupt.last().map(|step| step.pause_after_ms),
+                Some(0),
+                "{}: nothing follows the last interrupt step, so it waits for nothing",
+                agent.label
+            );
+        }
+    }
+
+    /// PRD #1541 A-B1: every entry's keys are within the desktop's exact
+    /// allowlist (`map_prompt_keys` in `desktop/src-tauri/src/dto.rs`), which
+    /// drops a whole set that strays from it: one or two interrupt steps of a
+    /// single `ESC` each, pausing 2 s at most in total; `Ctrl+U` to clear;
+    /// `DEL` or `0x08` to delete. A new key here needs that allowlist widened
+    /// in the same change, or the desktop refuses every voice prompt command
+    /// for the agent.
+    #[test]
+    fn prompt_keys_stay_within_the_desktop_allowlist() {
+        let entries = ALL.iter().copied().chain(std::iter::once(&NONE));
+        for agent in entries {
+            let Some(keys) = agent.prompt_keys.as_ref() else {
+                continue;
+            };
+            assert!(
+                (1..=2).contains(&keys.interrupt.len()),
+                "{}: an interrupt is one or two steps",
+                agent.label
+            );
+            for step in keys.interrupt.iter() {
+                assert_eq!(
+                    step.bytes, ESC,
+                    "{}: each interrupt step is one ESC",
+                    agent.label
+                );
+            }
+            let pause: u64 = keys
+                .interrupt
+                .iter()
+                .map(|step| u64::from(step.pause_after_ms))
+                .sum();
+            assert!(pause <= 2_000, "{}: interrupt pauses over 2 s", agent.label);
+            assert_eq!(keys.clear.bytes, CTRL_U, "{}: the clear key", agent.label);
+            assert!(
+                [DEL, "\x08"].contains(&keys.delete_char.bytes.as_ref()),
+                "{}: the delete key",
+                agent.label
+            );
+            assert_ne!(keys.clear.presses, ClearPresses::Unknown);
+        }
+    }
+
+    /// PRD #1541: the wire spelling of the keys — snake_case, the bytes as a
+    /// JSON string, absent limits as absent keys — and a round trip back.
+    #[test]
+    fn prompt_keys_round_trip_through_json() {
+        let claude = keys(AgentType::ClaudeCode);
+        let value = serde_json::to_value(claude).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "interrupt": [{"bytes": "\u{1b}", "pause_after_ms": 0}],
+                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "max_presses_per_write": 32, "pause_between_writes_ms": 1000},
+                "delete_char": {"bytes": "\u{7f}", "max_literal_write_chars": 800},
+            })
+        );
+        let back: PromptKeys = serde_json::from_value(value).expect("deserializes");
+        assert_eq!(&back, claude);
+
+        let pi = serde_json::to_value(keys(AgentType::Pi)).expect("serializes");
+        assert!(pi["clear"].get("max_presses_per_write").is_none());
+        assert!(pi["clear"].get("pause_between_writes_ms").is_none());
+        assert!(pi["delete_char"].get("max_literal_write_chars").is_none());
+    }
+
+    /// PRD #1541: a clear rule a NEWER daemon names decodes as `Unknown`
+    /// rather than failing the whole record — an older client must keep
+    /// listing agents, and treats the key as unsupported.
+    #[test]
+    fn an_unknown_clear_rule_decodes_as_unknown() {
+        let newer = serde_json::json!({
+            "interrupt": [{"bytes": "\u{1b}"}],
+            "clear": {"bytes": "\u{15}", "presses": "per_paragraph", "future_field": 1},
+            "delete_char": {"bytes": "\u{7f}"},
+        });
+        let keys: PromptKeys = serde_json::from_value(newer).expect("a newer shape decodes");
+        assert_eq!(keys.clear.presses, ClearPresses::Unknown);
+        assert_eq!(keys.interrupt[0].pause_after_ms, 0);
     }
 
     /// PRD #381 Open Question 4 / M6: the `hooks install --agent codex` adapter

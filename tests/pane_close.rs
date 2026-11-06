@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use dot_agent_deck::agent_pty::AgentRecord;
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_REQ, read_frame, write_resp,
+    AttachRequest, AttachResponse, KIND_REQ, PROTOCOL_VERSION, read_frame, write_resp,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
@@ -202,6 +202,17 @@ async fn handle_connection(
         serde_json::from_slice(&payload).expect("decode synthetic daemon request");
 
     match request {
+        // Auto-reattach checks the protocol before every lookup (PRD #1666
+        // part 2), and attaches only after a positive answer, as the real
+        // daemon gives one.
+        AttachRequest::Hello { .. } => {
+            write_resp(
+                &mut stream,
+                &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
+            )
+            .await
+            .expect("reply to Hello");
+        }
         AttachRequest::StartAgent { .. } => {
             // PRD #365 M2: the real daemon mints `pane_id` itself now and
             // returns it on `AttachResponse::pane_id` — the client no
@@ -343,13 +354,14 @@ async fn handle_connection(
                         cols: 80,
                         live: None,
                         spawned_at_ms: None,
-                        daemon_boot_id: None,
-                        registration_generation: None,
                         cli_name: None,
+                        prompt_keys: None,
                         crashed: None,
                         outstanding_delegation: None,
-                        silence_watch: None,
                         delegation_commission: None,
+                        orchestrator_context_path: None,
+                        authoring_kind: None,
+                        inbox: None,
                     }]
                 })
                 .unwrap_or_default();
@@ -386,7 +398,7 @@ fn assert_unverified_warning(warnings: Vec<String>, pane_id: &str, reason: &str)
     );
     let warning = &warnings[0];
     assert!(
-        warning.contains(&format!("Closed pane {pane_id}")),
+        warning.contains(&format!("Closed agent {pane_id}")),
         "the warning must say that the requested pane was closed: {warning}"
     );
     assert!(
@@ -411,7 +423,7 @@ fn assert_slot_churn_warning(warnings: Vec<String>, pane_id: &str) {
     );
     let warning = &warnings[0];
     assert!(
-        warning.contains(&format!("Closed pane {pane_id}")),
+        warning.contains(&format!("Closed agent {pane_id}")),
         "the warning must say that the requested pane was closed: {warning}"
     );
     assert!(

@@ -1,18 +1,30 @@
----
-sidebar_position: 3
-title: Installation
----
-
 # Installation
+
+dot-agent-deck is one binary, `dot-agent-deck`, which is the TUI, the background daemon and the CLI. The [desktop app](desktop/index.md) is a separate, optional download and a second client of the same daemon. Install the binary first; the desktop app is a client of a daemon, and can start one (see [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon)).
+
+After installing, `dot-agent-deck docs` lists the documentation built into the binary, and `dot-agent-deck docs <topic>` prints one page. That copy always matches the installed version, so prefer it over the website when the two might differ. If `dot-agent-deck docs` reports an unrecognized subcommand, the installed version predates it: read the documentation at [agent-deck.devopstoolkit.ai/llms.txt](https://agent-deck.devopstoolkit.ai/llms.txt) instead, keeping in mind that the website follows the latest release rather than your installed version.
 
 ## Platform Support
 
-| Platform | Status |
+| Platform | Binary (TUI, daemon, CLI) | Desktop app (alpha) |
+|---|---|---|
+| Linux amd64 | Yes | Yes (`.deb`, for Debian, Ubuntu and other `apt`-based distributions) |
+| Linux arm64 | Yes | No |
+| macOS Apple silicon | Yes | Yes (`.dmg`) |
+| macOS Intel | Yes | No |
+| Windows via WSL | Yes, install the Linux binary inside WSL | No |
+| Windows native | No ([#164](https://github.com/vfarcic/dot-agent-deck/issues/164)) | No |
+
+## Choose an install method
+
+| Method | Use it when |
 |---|---|
-| macOS (Intel & Apple Silicon) | Supported |
-| Linux (amd64 & arm64) | Supported |
-| Windows (via WSL) | Supported (runs as Linux) |
-| Windows (native) | Not yet — the daemon still reports `Unsupported` on Windows and there is no `.exe` in the release artifacts. Progress is tracked in [#164](https://github.com/vfarcic/dot-agent-deck/issues/164); comment there if you need this. |
+| [Homebrew](#homebrew-macos--linux) | macOS or Linux, and `brew` is already installed |
+| [Download a binary](#download-binary) | No package manager, or you want a specific release file |
+| [Nix](#nix) | Nix with flakes, NixOS or home-manager (not Intel macOS) |
+| [Build from source](#build-from-source) | Contributing, or a platform with no published binary |
+
+Every method installs the same `dot-agent-deck` binary. Then [check the install](#verify) and read [Agent hooks](#agent-hooks).
 
 ## Homebrew (macOS / Linux)
 
@@ -21,17 +33,55 @@ brew tap vfarcic/tap
 brew install dot-agent-deck
 ```
 
+Pre-releases are published as a separate formula, `vfarcic/tap/dot-agent-deck-beta`. The two formulas conflict with each other, so uninstall one before installing the other.
+
+On Linux, either formula also installs `dot-agent-deck-collector`, the optional program that reports each run's CPU, memory and disk ([CPU, memory and disk per run](telemetry.md#cpu-memory-and-disk-per-run)). It does nothing until you start it.
+
+## Download Binary
+
+Release assets are named `dot-agent-deck-<os>-<arch>`:
+
+| Platform | Asset |
+|---|---|
+| Linux amd64 | `dot-agent-deck-linux-amd64` |
+| Linux arm64 | `dot-agent-deck-linux-arm64` |
+| macOS Intel | `dot-agent-deck-darwin-amd64` |
+| macOS Apple silicon | `dot-agent-deck-darwin-arm64` |
+
+Download the one for your platform from the latest release, make it executable and put it on your `PATH` as `dot-agent-deck`:
+
+```bash
+ASSET=dot-agent-deck-linux-amd64   # pick from the table above
+mkdir -p ~/.local/bin
+curl -fsSL -o ~/.local/bin/dot-agent-deck \
+  "https://github.com/vfarcic/dot-agent-deck/releases/latest/download/$ASSET"
+chmod +x ~/.local/bin/dot-agent-deck
+```
+
+- If `dot-agent-deck --version` then reports `command not found`, `~/.local/bin` is not on your `PATH`. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file and open a new shell.
+- On macOS, if the binary is refused because it was downloaded from the internet, run `xattr -d com.apple.quarantine ~/.local/bin/dot-agent-deck`.
+- For a specific release, replace `latest/download` with `download/<tag>`, for example `download/v0.44.0`.
+
+**Optional: check where the file came from.** The release binaries, and the `checksums.txt` manifest beside them, carry build provenance from this repository's release workflow. With the [GitHub CLI](https://cli.github.com/) installed:
+
+```bash
+gh attestation verify ~/.local/bin/dot-agent-deck \
+  --repo vfarcic/dot-agent-deck \
+  --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
+```
+
+It should report a verified attestation. If it does not, delete the file and download it again from the release page.
+
 ## Nix
 
-Requires Nix with flakes enabled (`nix-command` and `flakes` in `experimental-features`). The flake builds from source against the committed `Cargo.lock`, so there is no per-release hash to maintain, and it pins the released version, so `dot-agent-deck --version` reports the real version rather than a source-build placeholder. It covers `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`. Intel Macs are served by the release binaries and the Homebrew tap instead, because the nixpkgs this flake pins has dropped `x86_64-darwin`.
+Requires Nix with flakes enabled (`nix-command` and `flakes` in `experimental-features`). The flake builds from source and supports `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`. It has no `x86_64-darwin` (Intel Mac) build; use Homebrew or a downloaded binary there. `dot-agent-deck --version` reports the released version the flake pins.
 
-Run it once without installing anything:
+Run it once without installing:
 
 ```bash
 nix run github:vfarcic/dot-agent-deck
+nix run github:vfarcic/dot-agent-deck -- hooks install   # arguments after -- reach the binary
 ```
-
-Arguments after `--` reach the binary, so `nix run github:vfarcic/dot-agent-deck -- hooks install` works too. Pin a specific release by appending its tag: `github:vfarcic/dot-agent-deck/<tag>`. That works for any release from the first one that ships the flake onwards; earlier tags predate it, so there is no flake at that revision to build.
 
 Install it into your user profile:
 
@@ -39,12 +89,15 @@ Install it into your user profile:
 nix profile install github:vfarcic/dot-agent-deck
 ```
 
-**As a flake input.** NixOS and home-manager users add the flake as an input and take the package from it:
+To pin a release, append its tag: `github:vfarcic/dot-agent-deck/<tag>`. Tags from before the flake was added have no flake and fail to build.
+
+**As a flake input** (NixOS or home-manager):
 
 ```nix
 {
   inputs.dot-agent-deck.url = "github:vfarcic/dot-agent-deck";
-  # Optional. Build against your nixpkgs rather than the one this flake pins.
+  # Optional: build against your nixpkgs instead of the one this flake pins.
+  # Your nixpkgs must then carry rustc 1.99.0 or newer.
   inputs.dot-agent-deck.inputs.nixpkgs.follows = "nixpkgs";
 
   # NixOS
@@ -55,23 +108,18 @@ nix profile install github:vfarcic/dot-agent-deck
 }
 ```
 
-The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of two, paid for by building against a nixpkgs this project has not tested against, which has to be recent enough to carry rustc 1.85 or newer.
-
-**Via the overlay.** If you would rather reach it as `pkgs.dot-agent-deck` everywhere, apply the overlay instead:
+**Via the overlay**, to reach it as `pkgs.dot-agent-deck`. The overlay builds against your nixpkgs, so it needs rustc 1.99.0 or newer there; an older rustc makes cargo stop and name the version it needs.
 
 ```nix
 {
   nixpkgs.overlays = [ inputs.dot-agent-deck.overlays.default ];
-
   environment.systemPackages = [ pkgs.dot-agent-deck ];
 }
 ```
 
-The overlay always builds against *your* nixpkgs, never the pinned one, so that rustc 1.85 minimum applies here whether or not you set `follows`. The crate is edition 2024, which is where the floor comes from.
-
 ### The home-manager module
 
-`homeModules.default` installs the binary and writes your configuration declaratively. Import it and turn it on:
+`homeModules.default` installs the package and can write `~/.config/dot-agent-deck/config.toml` and `~/.config/dot-agent-deck/keybindings.toml`:
 
 ```nix
 {
@@ -80,17 +128,17 @@ The overlay always builds against *your* nixpkgs, never the pinned one, so that 
   programs.dot-agent-deck = {
     enable = true;
 
-    # ~/.config/dot-agent-deck/config.toml
+    # Rendered to ~/.config/dot-agent-deck/config.toml
     settings = {
       default_command = "claude";
-      worker_response_timeout_minutes = 90;
+      bell.on_idle = true;
     };
 
-    # ~/.config/dot-agent-deck/keybindings.toml
+    # Rendered to ~/.config/dot-agent-deck/keybindings.toml
     keybindings = {
       global = {
         toggle_layout = "Alt+Shift+l";
-        new_pane = "";            # empty string unbinds an action
+        new_pane = "";            # an empty string unbinds the action
       };
       dashboard.help = "F1";
     };
@@ -98,85 +146,384 @@ The overlay always builds against *your* nixpkgs, never the pinned one, so that 
 }
 ```
 
-`settings` and `keybindings` are freeform attribute sets rendered to TOML, so anything the two files accept can go in them. See [Configuration](configuration.md) for `config.toml` and [Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings) for the keybinding actions and their defaults. Each file is written only when its attribute set is non-empty, so `enable = true` on its own installs the package and leaves any config you already have untouched.
+| Option | Type | Default | Effect |
+|---|---|---|---|
+| `enable` | bool | `false` | Installs the package. |
+| `package` | package | `pkgs.dot-agent-deck` when the overlay is applied, otherwise this flake's package built against your nixpkgs | The package to install. Set it to `inputs.dot-agent-deck.packages.${pkgs.system}.default` to build against the flake's pinned nixpkgs. |
+| `settings` | TOML attribute set | `{ }` | Content of `config.toml`. Keys: see [Configuration](configuration.md). No file is written while it is empty. |
+| `keybindings` | TOML attribute set | `{ }` | Content of `keybindings.toml`. Actions and key notation: see [Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings). No file is written while it is empty. |
 
-`package` defaults to this flake's package built against your own nixpkgs, which is exactly what the overlay produces, so applying the overlay and importing the module gets you one build of the tool rather than two. Set it explicitly to `inputs.dot-agent-deck.packages.${pkgs.system}.default` if you would rather build against the nixpkgs this flake pins.
+home-manager links these files from the Nix store, so change `settings` and `keybindings` rather than editing the files or running `dot-agent-deck config set`. It does not manage `session.toml`, `remotes.toml` or `schedules.toml`, which the deck and its CLI write themselves. It does not run `dot-agent-deck hooks install`; run that once yourself after the first activation (see [Agent hooks](#agent-hooks)).
 
-**What the module deliberately does not manage.** Only `config.toml` and `keybindings.toml`. The other three files in that directory are left alone on purpose:
-
-| File | Why it is left alone |
-|---|---|
-| `session.toml` | Runtime state the deck writes itself (your saved workspace). home-manager symlinks its files read-only out of the Nix store, so managing it would stop the deck saving. |
-| `remotes.toml` | Written imperatively by `dot-agent-deck remote add`, same problem. |
-| `schedules.toml` | The one file whose location honours `$XDG_CONFIG_HOME`, unlike its neighbours. Managing it correctly needs handling the other two files must not get, so it is left for a follow-up. |
-
-**Hooks are still a one-off imperative step.** The module does not run `dot-agent-deck hooks install` for you, because that command edits *other* tools' configuration (Claude, OpenCode, Codex and friends), which sits outside home-manager's ownership and does not roll back when you switch generations. Run it once yourself after the first activation:
-
-```bash
-dot-agent-deck hooks install
-```
-
-### Contributing?
-
-`nix develop` is a consumer-oriented shell carrying just the Rust toolchain; contributors should use devbox instead, which pins the toolchain version and ships the recording and docs tooling the test suites need.
-
-## Download Binary
-
-Download the latest binary for your platform from the [Releases](https://github.com/vfarcic/dot-agent-deck/releases/latest) page. Binaries are available for Linux (amd64, arm64) and macOS (amd64, arm64).
+`nix develop` gives a shell with the Rust toolchain only. To work on this repository, use the repository's devbox environment instead.
 
 ## Build from Source
+
+Requires Rust 1.99.0 or newer.
 
 ```bash
 git clone https://github.com/vfarcic/dot-agent-deck.git
 cd dot-agent-deck
-cargo build --release
+cargo build --release --locked
 ```
 
-The binary will be at `target/release/dot-agent-deck`.
+The binary is `target/release/dot-agent-deck`. Copy it onto your `PATH` rather than running it from `target/`, because agent hooks record the binary's path. A source build's `--version` reports a version derived from `git describe`.
 
 ## Verify
 
 ```bash
-dot-agent-deck --help
+dot-agent-deck --version    # prints: dot-agent-deck <version>
+dot-agent-deck --help       # lists the subcommands
+dot-agent-deck docs         # lists the embedded documentation topics
 ```
+
+If `--version` prints the version you installed, the binary works. If another copy is found first on your `PATH`, `command -v dot-agent-deck` shows which one runs.
+
+## Agent hooks
+
+The deck learns each agent's status (Thinking, Working, Needs Input, and so on) from hooks or plugins installed into that agent's own configuration. Whenever the TUI or the daemon starts, it installs them for every agent it detects:
+
+| Agent | Installed when | What is written |
+|---|---|---|
+| Claude Code | `~/.claude` exists | Hook entries in `~/.claude/settings.json`. The `StopFailure` hook (used for **Error** and **Blocked**) and the `PostToolUseFailure` hook (which tells the deck that a tool call that failed has ended) only when `claude --version` reports 2.1.78 or newer. |
+| OpenCode | `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`, also when `XDG_CONFIG_HOME` is empty or not an absolute path), `~/.opencode` or `$OPENCODE_CONFIG_DIR` exists; and every time the deck starts an OpenCode agent, even on a machine where OpenCode has never run | The plugin file `plugin/dot-agent-deck.js` in `$XDG_CONFIG_HOME/opencode`, which the deck creates if it is missing, and in `$OPENCODE_CONFIG_DIR` when that exists; `dot-agent-deck-tui.js` and `plugins/dot-agent-deck-tui/` for OpenCode's interface. See [OpenCode 1.x and 2.x](#opencode-1x-and-2x). |
+| Codex | `codex` is on the daemon's `PATH` | Hooks in `$CODEX_HOME/hooks.json` (default `~/.codex`), and trust for those hooks. |
+| Devin | `devin` is on the daemon's `PATH` | Hook entries in `$XDG_CONFIG_HOME/devin/config.json` (default `~/.config/devin/config.json`). |
+| Pi | Every time the deck starts a Pi pane | A bundled extension; nothing to install. |
+
+The hooks call the installed binary by its absolute path, so moving or deleting the binary breaks them until you reinstall them.
+
+The deck only points hooks at a copy that nobody but you and root can change, because your agents run it as you at every hook. The copy, every directory above it, and any symlink on the way must belong to you or root, and no other account may be able to write to them. Group write is fine when the group holds only you (the private group Debian and Ubuntu give each account) and, on macOS, for the `admin` group Homebrew and `/Applications` use. A directory such as `/tmp`, where each account can change only its own files, is fine too. A copy that fails this is skipped for the next one the deck finds. When no copy passes, the one you are running included, no hooks are installed, and `dot-agent-deck hooks install` fails with a reason that names the file or directory, for example that `/srv/tools` is writable by every account, and lists the copies it skipped. Run `chmod go-w` on what it names, or install the deck in `~/.local/bin`, then install the hooks again.
+
+For OpenCode, the deck also checks the plugin every time it starts an OpenCode agent, from the TUI, the desktop app or a scheduled task, and installs or repairs it before the agent starts. So an OpenCode you set up after the deck started, or a plugin that names a copy of the deck you have since deleted, is fixed when the agent starts, without restarting the deck. A plugin that calls another installed copy keeps calling it, by the same rules as starting the deck (next paragraph); when the plugin's contents are too old for this deck, the deck updates them and keeps that copy. If the deck cannot write the plugin, the agent's card says so ([A card says the deck integration is out of date](troubleshooting.md#a-card-says-the-deck-integration-is-out-of-date-too-old-or-not-connected)).
+
+The deck keeps one entry of its own per hook event, except where removing an extra one would move a hook of yours that follows it in the same rule: that one is kept, and calls the same copy as the deck's main entry. If you have more than one copy installed (for example Homebrew's and one in `~/.local/bin`), the hooks move to a newer copy when you run one: starting an installed copy of a newer release switches them to that copy, in place, so there is still one set. Starting an older copy, or another copy of the same release, leaves them calling the copy they call, and so does starting a copy from a temporary directory, a mounted disk image or a build directory. The desktop app's bundled copy does not take the hooks over from a CLI you installed; when that CLI is older than the app, the app tells you so instead (see [When hooks run an older copy](#when-hooks-run-an-older-copy)). The hooks also switch to another installed copy when the one they call has been deleted, or, on macOS and Linux, when its path contains a backslash (`\`), and they switch to a copy you choose when you run `dot-agent-deck hooks install` from it. If that copy is older, they stay on it until a newer installed copy next starts. The deck changes only entries it recognises as its own; your own hooks, and their order, are left alone. When the hooks are already current, starting the deck leaves the agent's configuration file untouched, so Codex has nothing new to ask you to review. After the hooks switch to a newer copy, Codex may ask you once to review the changed hooks. When a startup does change a file, the deck's log names the file and the binary the hooks now call ([Logs and diagnostics](troubleshooting.md#logs-and-diagnostics) says how to turn the log on).
+
+When the TUI starts and installs or repairs an agent's hooks, its status line says so for a few seconds, for example `Installed or repaired the deck's hooks for Claude Code and Codex.`; when they were already current it says nothing. When it cannot update an agent's hooks, for example because `~/.claude/settings.json` is not valid JSON, the deck leaves that file exactly as it was rather than writing over your settings, and the status line says `<agent>'s hooks could not be updated: <reason>.` The same line is printed when you quit the TUI. Fix what the reason names, then start the TUI again or run `dot-agent-deck hooks refresh`. The desktop app runs the same install when it starts its daemon but does not show either note yet; run `dot-agent-deck hooks refresh` to check the hooks it left.
+
+To install or reinstall by hand (for example, after installing an agent for the first time, or after moving the binary):
+
+```bash
+dot-agent-deck hooks install                    # Claude Code (the default)
+dot-agent-deck hooks install --agent opencode
+dot-agent-deck hooks install --agent codex
+dot-agent-deck hooks install --agent devin
+```
+
+`--agent` accepts `claude-code` (default), `opencode`, `codex` and `devin`; Pi has no hooks to install.
+
+Unlike the automatic install, `hooks install` writes the configuration even when the agent's directory does not exist yet. On success it prints what it installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex, followed by a note naming any of the deck's hooks you have turned off in Codex's `/hooks` list ([Codex events not showing](troubleshooting.md#codex-events-not-showing)). On failure it prints `Failed to install <agent> hooks: <reason>` and exits non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
+
+`dot-agent-deck hooks refresh` does what starting the deck does, for every agent at once: it updates each installed agent's hooks to the copy you run it from, leaving hooks that call another installed copy of the same or a newer release as they are. Like starting the deck, and unlike `hooks install`, it leaves alone an agent it does not find installed. It then says what each agent's hooks call, for example `Claude Code and Codex hooks now run this copy (v0.48.0). Restart agents that were already running so they use them.` When it left an agent's hooks on another copy that is older, or whose version it could not read, it names that copy, prints the `hooks install --agent <agent>` command that moves them to the copy you ran, and exits non-zero. When it could not update an installed agent's hooks at all, for example because the agent's settings file is not valid JSON, which it leaves as it was, or cannot be written, it says `<agent>'s hooks could not be updated: <reason>.`, prints that agent's `hooks install --agent <agent>` command, and exits non-zero; fix what the reason names (the install command says it again), then run the command. An upgrade of the CLI from the TUI, `dot-agent-deck upgrade` or the desktop app runs it for you ([After upgrading](#after-upgrading)); `--json` prints the same report as JSON.
+
+An agent that was already running when the hooks were installed may need a restart to load them. If a card stays on its first status while the agent works, see [Troubleshooting → Hooks](troubleshooting.md#hooks).
+
+### When hooks run an older copy
+
+If an agent's hooks call a `dot-agent-deck` older than the deck you are running, for example after you upgrade the desktop app but not the Homebrew copy the hooks call, the deck tells you which agents, which copy, both versions and what to do:
+
+- **TUI:** a line at the bottom of the dashboard, such as `⚠ Claude Code, Codex hooks run dot-agent-deck 0.45.1 (/opt/homebrew/bin/dot-agent-deck); this deck is 0.46.0 — Run: brew upgrade dot-agent-deck`. When the terminal is narrow, the rest of the line gets shorter before the fix does: first the path, from the middle, then the other agents' names and the wording, always keeping the first agent and both versions. A fix is never cut off: a command too wide for the line is replaced by the upgrade-or-reinstall advice when that fits, and when neither fits whole the line shows the notice without a fix; a wider terminal or the desktop app shows it. When there is more than one notice, the line shows the first and how many more there are.
+- **Desktop app:** a strip under that daemon's header, on the dashboard and on the daemon's own screen, with the same words and, when the fix is a command, the whole command, wrapped onto more lines when it is long, and a **Copy** button that copies exactly the command shown. Only the affected daemon shows it, and it does not block anything.
+
+The fix is one of:
+
+- `Run: brew upgrade dot-agent-deck`: the hooks call a Homebrew copy. Upgrade it.
+- `Run: <path> hooks install --agent <agent>`: the deck you are running can take the hooks over. Run the command it shows. On Windows it is written for PowerShell, as `& '<path>' hooks install --agent <agent>`, with `;` between the commands for several agents.
+- ``Upgrade the dot-agent-deck the hooks run, or run `hooks install` from the copy you want the hooks to use.``: the deck cannot offer a command for that copy. Upgrade or replace the copy the notice names, or run `hooks install` from the copy you want the hooks to call.
+
+A copy so old that it does not report its version is named as one that "predates version reporting", and a copy that did not answer when asked its version as one that "did not report its version". The fix is the same. When an agent's hooks call more than one copy, for example a different copy for some of Codex's events, each older copy has its own notice. A notice goes away as soon as the copy it names sends an event as a current release. The deck also reads the agents' hook settings again every minute, so once the hooks no longer call the old copy, because you ran `hooks install` from the copy you want or upgraded the old copy, its notice goes away within about a minute without a restart. A notice about a copy the hooks are still set up to call stays, even while that copy has nothing to send, as with a hook for one of Codex's events that has not happened yet. A copy the agent's own hook settings do not name, for example one a project's settings call, is known only from its events, so its notice goes away with one of the agent's events once that copy has sent nothing for at least five minutes. If an agent's hook settings call the deck by name alone, such as `dot-agent-deck` with no path, the deck cannot tell which copy that is until the agent sends an event: a copy too old to report its version then raises a notice naming the command as written, and it goes away once you run `hooks install` from the copy you want, which writes the full path. Restarting the daemon checks the same way: a notice whose copy is now current goes away, and one whose copy is still older stays.
+
+If you open the desktop app on macOS straight from its disk image, or before moving it out of Downloads (macOS then runs it from a temporary location), and no other copy of `dot-agent-deck` is installed in `~/.local/bin` or on your `PATH`, it installs no hooks, and both clients say `Agent hooks are off` with `Move Agent Deck to /Applications and reopen it to turn agent hooks on.` Do that, and the hooks are installed when the app starts again.
+
+Pi is not affected: its extension always runs the copy that started the pane.
+
+### OpenCode 1.x and 2.x
+
+The deck works with OpenCode 1.18.29 and later 1.x releases, and with OpenCode 2. An OpenCode 2 agent gets the same card, deck messages and delegated tasks as an OpenCode 1.x agent, in the TUI and the desktop app, except for the differences in this section.
+
+**You do not tell the deck which version you run.** The deck sets its plugin up so that OpenCode 1.x and OpenCode 2 both load it: in `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`), and in `$OPENCODE_CONFIG_DIR` when you set it, removing the deck's own older copy from `~/.opencode`, which OpenCode 2 would otherwise refuse as a duplicate plugin. So upgrading OpenCode from 1.x to 2, going back, or running both on one machine needs nothing from you; restart OpenCode agents that were already running when you upgraded. Before it starts an OpenCode agent, the deck also asks the OpenCode that the agent's command runs for its version, to start OpenCode 2 the way it needs and to tell you about a version it does not support.
+
+**OpenCode older than 1.18.29 is not supported.** When the deck knows the version the agent runs, the agent's card says so, for example `Upgrade OpenCode to 1.18.29 or later, then restart: version 1.18.28 is too old for the deck`. [Troubleshooting](troubleshooting.md#an-opencode-card-says-to-add---standalone-to-install-the-plugin-or-to-upgrade) says when the deck knows it for an agent started through a wrapper.
+
+**OpenCode 2 has to run with its own server in each pane.** By default OpenCode 2 connects every `opencode` you start to one shared background service, and in that service the deck cannot tell one pane's agent from another's. Its `--standalone` flag gives each OpenCode its own server instead.
+
+- When the agent's command runs `opencode` directly, for example `opencode`, `opencode mini`, `opencode --continue`, `/usr/local/bin/opencode` or `./opencode` (found from the agent's working directory), the deck adds `--standalone` for you when it finds OpenCode 2. It adds the flag only as it starts the agent: the command you configured stays as you wrote it. A command that already says `--standalone` or `--server` is left alone.
+- When the command starts OpenCode through a wrapper, such as a script, an alias or `devbox run oc`, the deck cannot add the flag. Add `--standalone` to the `opencode` command inside the wrapper, or run `opencode service set disabled true` once, which makes every OpenCode 2 on the machine run with its own server. Also declare the agent, `agent = "opencode"`, on the role ([Declaring the agent behind a launcher command](orchestration.md#declaring-the-agent-behind-a-launcher-command)), so the deck knows the pane runs OpenCode and can warn you on its card when something is wrong.
+
+If an OpenCode 2 agent runs on the shared service anyway, its card says `Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent` when the deck knows the agent runs OpenCode 2; when it does not, the card's not-reporting notice names `--standalone` as the first fix. [An OpenCode card says to add --standalone, to install the plugin, or to upgrade](troubleshooting.md#an-opencode-card-says-to-add---standalone-to-install-the-plugin-or-to-upgrade) lists each OpenCode card message and what to do.
+
+**Choosing the model on OpenCode 2.** OpenCode 2's full interface (`opencode`) refuses the `--model` flag, so a command such as `opencode --model gpt-4o` written for OpenCode 1.x does not start on OpenCode 2. Set the model in OpenCode's configuration instead, or start `opencode mini --model <provider/model>`.
+
+**Questions and forms.** When OpenCode 2 asks you something with a form, its card shows **Needs Input** in both clients. In OpenCode's full interface (`opencode`), the deck knows the form's questions and options, so in the desktop app you can [answer it by voice](desktop/voice.md#answering-an-agents-question), as you can on OpenCode 1.x; in the TUI, which has no voice control, you answer it in the pane. These forms are answered in OpenCode's pane in both clients:
+
+- every form in `opencode mini`: the card shows `answer this form in OpenCode: <the form's title>`;
+- a form with a question that appears only after another one is answered, a hidden field, or a field OpenCode fills in from elsewhere.
+
+**Deck messages in `opencode mini`.** A deck message or delegated task reaches OpenCode 2's `mini` and leaves what you were typing in place. An `opencode mini` agent may not receive deck messages when another OpenCode session starts in the same directory while that mini is starting, for example a second `opencode mini` started at the same moment, or your own `opencode` or `opencode run` there: the deck cannot tell the two sessions apart, so it delivers to neither, and shows those messages as not delivered. Start `opencode mini` agents a few seconds apart from each other and from other OpenCode sessions in that directory, give each its own directory, or start each with `--session <id>`. By default, OpenCode 2's `mini` does not show the commands the agent runs or their output, so a delegated task's work can look shorter in the pane than it was; that is OpenCode's own display setting, not the deck's.
+
+**A message that arrives on OpenCode 2's home screen.** When a deck message opens a new session from OpenCode 2's home screen while you have unsent text there, the text moves into the new session's prompt, so you do not lose it.
+
+**Going back from OpenCode 2 to 1.x.** OpenCode 1.x cannot open the data OpenCode 2 has used, and stops with `Database is not empty and has no session table`. This is OpenCode's behaviour, with or without the deck; see OpenCode's documentation before you downgrade.
+
+## Desktop app
+
+The desktop app is published alongside the CLI in releases, as an **alpha**: its assets are named `dot-agent-deck-desktop-alpha-*` and are not covered by the CLI's support expectations. What it does and lacks compared with the TUI is on [Desktop app](desktop/index.md).
+
+| Platform | Asset | Signed |
+|---|---|---|
+| macOS Apple silicon | `dot-agent-deck-desktop-alpha-macos-arm64.dmg` | Signed and notarized from v0.42.0, unless that release's notes say otherwise |
+| Linux amd64 | `dot-agent-deck-desktop-alpha-linux-amd64.deb` | Unsigned |
+
+Download from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest) and read that release's notes: when the release has a `.dmg`, they say whether it is signed. A release the project built without signing ships an unsigned `.dmg`, and its notes say so. If the macOS package fails to build or to sign, the release ships no `.dmg` at all rather than an unsigned one. A release can also ship without one or both desktop packages while its CLI binaries are published as usual, so check the assets on the release you open.
+
+### Verify the download
+
+Check the file's build provenance before installing it. For the unsigned `.deb` it is the only check. It needs the [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify dot-agent-deck-desktop-alpha-macos-arm64.dmg \
+  --repo vfarcic/dot-agent-deck \
+  --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
+```
+
+Use the name of the file you downloaded. A pass reports a verified attestation from this repository's release workflow. If it does not, do not install the file and do not override any warning your OS raises about it.
+
+The same check works on every file a release uploads: the CLI binaries, the desktop packages, and both checksum manifests, `checksums.txt` and `checksums-desktop-alpha.txt`. It does not cover GitHub's own **Source code** archives, which GitHub generates from the tag rather than the release workflow uploading them.
+
+### macOS
+
+1. Open the `.dmg` and drag **Agent Deck** to **Applications**.
+2. Launch **Agent Deck** from Applications. For a signed release, macOS asks only to confirm opening an app downloaded from the internet.
+
+If macOS reports the app as damaged or from an unidentified developer:
+
+- The release notes say the `.dmg` is signed and notarized: do not override the warning; [report it](https://github.com/vfarcic/dot-agent-deck/issues).
+- The release notes say the `.dmg` is unsigned: the warning is expected. Once the file has passed [the provenance check](#verify-the-download), follow the workaround in those notes.
+
+The app carries its own copy of the binary at `/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck` and does not put it on your `PATH`. To use `dot-agent-deck` in a terminal, install the CLI too, at the same version as the app; the app's upgrade dialog then upgrades both ([Keep the CLI and the desktop app on the same release](#keep-the-cli-and-the-desktop-app-on-the-same-release)).
+
+### Linux
+
+```bash
+curl -fsSL -O \
+  https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-desktop-alpha-linux-amd64.deb
+# verify it as above, then:
+sudo apt install ./dot-agent-deck-desktop-alpha-linux-amd64.deb
+```
+
+`apt` installs the dependencies (`libwebkit2gtk-4.1-0`, `libgtk-3-0`); `sudo dpkg -i` does not. The package is named `agent-deck`. It adds **Agent Deck** to the application menu and installs `/usr/bin/dot-agent-deck-desktop` (the app) and `/usr/bin/dot-agent-deck` (the same binary as the CLI downloads). If another `dot-agent-deck` comes earlier on your `PATH`, `command -v dot-agent-deck` shows which one runs.
+
+Launch it from the application menu or with `dot-agent-deck-desktop`. Remove it with `sudo apt remove agent-deck`.
+
+### How the desktop app gets a daemon
+
+With no daemon running, the desktop app's Dashboard shows **Daemon disconnected** with a **Start daemon** button: press it and confirm, and the app starts the daemon and connects ([Desktop app → Daemons → Start a daemon from the app](desktop/daemons.md#start-a-daemon-from-the-app)). You can also start a daemon yourself:
+
+- **Run the TUI**: `dot-agent-deck` starts a daemon if none is running. Both clients can be open at once.
+- **Run the daemon alone**: `dot-agent-deck daemon serve` runs it in the foreground of that terminal until `Ctrl+C`. On macOS without a CLI install: `"/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck" daemon serve`.
+
+A daemon with no clients, no agents and no enabled [schedules](scheduled-tasks.md) exits after about 30 seconds, and a daemon that has just started counts as having no clients. So:
+
+- A `daemon serve` that nothing connects to within 30 seconds exits. Connect promptly, or run `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve` to keep it up until it is stopped.
+- While the desktop app is connected, or any agent is running, the daemon stays up.
+- Quitting the TUI with **Detach** leaves the daemon running under the same rule. Quitting it with **Stop** shuts the daemon down, and the desktop app then shows **Daemon disconnected**.
+- Quitting the desktop app leaves agents running.
+
+The app looks for the daemon at the same default socket as the TUI. If you set `DOT_AGENT_DECK_ATTACH_SOCKET` for the TUI, set it in the app's environment too. A **remote** daemon needs the deck installed on its host; the app can then start the daemon there. See [Desktop app → Daemons](desktop/daemons.md#what-a-remote-daemon-must-already-have).
+
+### Keep the app and the daemon on the same release
+
+When it connects, the app checks whether it and the daemon can work together:
+
+| Situation | What the Dashboard shows | What to do |
+|---|---|---|
+| The two are compatible | Connects normally | Nothing |
+| One of them is older, and the app could misread some of what the daemon reports | **Incompatible daemon**, saying which of the two is older and that the app has not connected, with **Connect anyway** | Update the older one; for a remote daemon older than the app, press **Upgrade** ([Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)). **Connect anyway** connects until you quit the app, but some of what the daemon shows may be wrong. |
+| The two cannot work together | **Incompatible daemon**, saying which of the two is older, without Connect anyway | For a remote daemon older than the app, press **Upgrade**. Otherwise update the older one, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
+
+**Technical details** under the message shows the exact versions on each side, which is what to include in a bug report.
+
+When the daemon on this machine is an older release that the app can still work with, the app restarts it onto the app's version without being asked when nothing is running on it, and asks first, listing what would stop, when agents are running. See [Desktop app → Daemons → Upgrade the CLI and the daemon on this machine](desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine).
+
+`daemon restart` refuses while agents or orchestration roles are live; see [Recycling the local daemon](#recycling-the-local-daemon). Upgrade the CLI and the desktop app together to avoid all of this: `dot-agent-deck upgrade` and the TUI offer to upgrade the desktop app too, and the desktop app offers the CLI on its Dashboard's **Local daemon** section ([Keep the CLI and the desktop app on the same release](#keep-the-cli-and-the-desktop-app-on-the-same-release)).
 
 ## How it runs
 
-The first time you run `dot-agent-deck`, the binary auto-spawns a small per-user background daemon and connects to it over a Unix socket (under `$XDG_RUNTIME_DIR` when available, otherwise a per-uid path in `/tmp`). The same daemon is used for both local and remote (`dot-agent-deck connect`) sessions; there is no separate "local mode".
+The first `dot-agent-deck` run starts a per-user background daemon and connects to it over a Unix socket: `$XDG_RUNTIME_DIR/dot-agent-deck-attach.sock` when `XDG_RUNTIME_DIR` is set, otherwise a per-user directory under the system temp directory. `DOT_AGENT_DECK_ATTACH_SOCKET` overrides the path. The same daemon serves local runs; a [remote](remote-environments.md) host runs its own.
 
-The daemon outlives the TUI: detach the deck, your agents keep running, reattach later and they're still there. About 30 seconds after the TUI has detached *and* every managed agent is gone, the daemon exits on its own. Set `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` to override the window (`0` keeps it up indefinitely).
+The daemon owns the agents. Quitting the TUI with **Detach** leaves them running, and the next `dot-agent-deck` shows them again. About 30 seconds after the last client disconnects, if no agent is running and no enabled schedule is registered, the daemon exits. `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` sets that window in seconds; `0` disables it.
 
 ## Upgrading
 
-After upgrading the `dot-agent-deck` binary, just relaunch it:
+### Notice a new release
+
+Both clients tell you when a newer release exists:
+
+- **TUI**: it checks when it starts and every 6 hours while it runs. When this machine's CLI or desktop app is behind, the right end of the footer shows a notice naming the copy, such as `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0) · u to upgrade` or `Agent Deck (desktop app): update available: …`. Press `u` in command mode, or click the notice, to open the upgrade dialog, which covers both copies when both are behind: the desktop app first, then the CLI ([Upgrade from the TUI](#upgrade-from-the-tui)). `dot-agent-deck upgrade` in another terminal works too.
+- **Desktop app**: it checks when it starts and every 6 hours while it runs. When the app is behind, an upgrade button (an arrow in a circle) appears at the bottom of the rail on every screen, and a banner such as `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)` with an **Upgrade…** button appears at the top of the Dashboard. Either one opens the upgrade dialog, which upgrades the app and, when this machine's `dot-agent-deck` CLI is behind too, the CLI after it ([Desktop App → Upgrade the app](desktop/index.md#upgrade-the-app)). Dismissing the banner hides it until a newer release appears or the app restarts; the rail button stays. Once the app has upgraded itself, the notice says `Agent Deck v<new> is installed. Relaunch to run it.` until the app restarts, and the dialog it opens offers **Relaunch**. When only this machine's CLI is behind, the banner and the rail button do not appear: the Dashboard's **Local daemon** section offers **Upgrade** instead, which upgrades the CLI and, when the daemon on this machine is older than the app, restarts it ([Desktop App → Daemons → Upgrade the CLI and the daemon on this machine](desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)).
+
+Neither client upgrades anything until you confirm. If the check cannot reach GitHub, nothing new is shown, and both clients try again later.
+
+**TUI:**
+
+![The Upgrade to v0.47.0 dialog over the TUI's dashboard, with the footer's notice dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0) · u to upgrade at the right end of the command bar: one section for the CLI, a downloaded binary at /home/dev/.local/bin/dot-agent-deck, saying what upgrading downloads and checks, that build provenance will not be checked because the GitHub CLI is not logged in, and that upgrading does not restart the daemon on this machine, then the question Upgrade dot-agent-deck CLI to v0.47.0? with Cancel selected above Upgrade](/img/self-upgrade-tui.png)
+
+**Desktop:**
+
+![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: the plan for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, below it the plan for the dot-agent-deck CLI installed with Homebrew, saying upgrading runs brew update, then brew upgrade dot-agent-deck, the line The dot-agent-deck CLI here is behind too, so it follows Agent Deck, and the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
+
+### Upgrade from the TUI
+
+Press `u` in command mode, or click the update notice in the footer, to open a dialog titled **Upgrade to v<new>**. The key can be remapped as `open_upgrade` ([Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings)). It shows the same plan as `dot-agent-deck upgrade`: one section for the CLI you are running and, when the desktop app is installed on this machine, one for the app, above the CLI's. Each says which version you have, how that copy was installed, what upgrading it does, and whether the download's build provenance will be checked. The dialog keeps the plan it opened with, and **Upgrade** carries out exactly that plan, even if a newer check finishes while the dialog is open.
+
+1. The dialog asks about one copy at a time, the desktop app first when it is behind too, then the CLI, for example `Upgrade dot-agent-deck CLI to v0.47.0?`. The CLI's plan also says that upgrading does not restart the daemon on this machine, so its agents keep running, and that the next time you start the TUI it restarts a daemon running another version onto its own, asking first when agents are running ([After upgrading](#after-upgrading)). **Cancel** is selected; press `Down` (or `j`) to select **Upgrade**, then `Enter`. Nothing changes until you choose **Upgrade**: `Enter` on **Cancel**, or `Esc`, closes the dialog having done nothing. After one copy is upgraded, **Cancel** skips the next copy instead. If the plan does not fit in your terminal, `↑ more` or `↓ more` marks the text above or below; scroll it with `PageUp` / `PageDown` or the mouse wheel. **Upgrade** works only once you have scrolled through the whole of that copy's plan, including any command and the line about build provenance; until then, `Enter` on **Upgrade** scrolls on, and the hint at the bottom says `PageDown to read the whole plan`. In a terminal too small to show any of the plan, the dialog says how many columns and rows it needs and offers only **Close**; make the terminal larger and the plan appears.
+2. While a copy upgrades, its section says **Upgrading…**, and the TUI keeps running; `Esc` does not close the dialog until the upgrade finishes.
+3. The result appears under that copy's section, then the dialog asks about the next copy, if any. After the CLI you are running is upgraded, the result says `Quit the TUI and start it again to run v<new>.`: the TUI you have open still runs the old version until you restart it (see [After upgrading](#after-upgrading)). Until you do, the TUI no longer offers that copy: the footer names only the desktop app if it is still behind, and otherwise shows `Quit the TUI and start it again to run v<new>.` in place of the notice. If the CLI was only downloaded and checked, because you still have to run the install command, it stays on offer. Once the CLI is installed, the result also says what your agents' hooks call now ([After upgrading](#after-upgrading)), before the line about restarting the TUI.
+4. When nothing is left to ask, `Enter` or `Esc` closes the dialog; after an upgrade, the TUI then checks again.
+
+A copy that cannot be upgraded from the TUI, such as a CLI installed with Nix or built from source, says what to do instead, and the dialog offers only **Close**. Where the plan shows a command to run, such as the `sudo install` command for a directory you cannot write, select it in your terminal to copy it; most terminals need `Shift` held while you drag, because the TUI uses the mouse.
+
+### Upgrade with `dot-agent-deck upgrade`
+
+```bash
+dot-agent-deck upgrade           # show what would be done, then ask before each upgrade
+dot-agent-deck upgrade --check   # only show what would be done; change nothing
+dot-agent-deck upgrade --yes     # upgrade without asking
+```
+
+It prints a plan for the copy you ran, and for the desktop app when one is installed on this machine, the app's first: the version you have, the newest release, how the copy was installed, and what upgrading it does. For each copy it can upgrade itself, it then asks, for example `Upgrade dot-agent-deck CLI to v0.47.0? [y/N]`. Only `y` or `yes` upgrades; anything else prints `Skipped.`. When its input is not a terminal (a script), it asks nothing, upgrades nothing, and says to run `dot-agent-deck upgrade --yes`. It exits non-zero when it cannot look the release up or an upgrade it attempted failed. Pressing Ctrl+C once it is upgrading a copy (after you answered `y`, or with `--yes`) cancels that upgrade: it stops the command it is running, such as `brew upgrade`, or the download, prints `Cancelled.` and upgrades nothing further. Ctrl+C at a `[y/N]` question ends it at once.
+
+When a copy is already current it prints, for example, `dot-agent-deck CLI is up to date (v<version>).`
+
+A copy built from source without a version (no `DAD_VERSION` set and no git tags in the checkout) cannot tell which release it is, and its `--version` ends in `+unknown`. No upgrade is offered for it, the footer and the desktop app show no notice for it, and `dot-agent-deck upgrade` prints `dot-agent-deck CLI does not know which release it is (it reports v0.1.0+unknown), so no upgrade is offered.` Install a release, or rebuild with `DAD_VERSION=<x.y.z>` set, to get upgrade notices again.
+
+### What upgrading does for each install method
+
+Each copy is upgraded the way it was installed. The same plan is shown by `dot-agent-deck upgrade`, the TUI's upgrade dialog and the desktop app's dialog.
+
+| Copy | Installed with | What upgrading does |
+| --- | --- | --- |
+| CLI | [Homebrew](#homebrew-macos--linux) | Runs `brew update`, which refreshes Homebrew's copy of the tap so a release published in the last few hours is found, then `brew upgrade dot-agent-deck` (or `brew upgrade dot-agent-deck-beta` for the beta formula; see [Beta and stable](#beta-and-stable)), then checks that the CLI now reports the new version. If `brew update` fails, the upgrade still runs `brew upgrade`. If the `brew` of the Homebrew installation the CLI came from cannot be found, it shows the command to run instead. |
+| CLI | [A downloaded binary](#download-binary) in a directory you can write, such as `~/.local/bin` | Downloads the new binary, checks it, and replaces the file in place. |
+| CLI | A downloaded binary in a directory you cannot write, such as `/usr/local/bin` | Downloads the new binary and checks it, then shows the command that installs it, which starts with `sudo`. The desktop app on Linux asks for your password instead and installs it, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the same command. |
+| CLI | [Nix](#nix) | Changes nothing. It says to update your flake input (for example `nix flake update`) and rebuild, or run `nix profile upgrade`. |
+| CLI | [A source build](#build-from-source), including `cargo install` and a binary run from `target/` | Changes nothing. It says to check out the new release's tag and rebuild. |
+| CLI | Another system package | Changes nothing. It says to upgrade that package with your package manager. |
+| Desktop app | The `.dmg`, in `/Applications` or another folder you can write | Downloads the new `.dmg`, checks it, including its signature and notarization, replaces the app, and offers **Relaunch**. |
+| Desktop app | The `.dmg`, in a folder you cannot write, or an unsigned app | Changes nothing. It gives the download link and says to drag **Agent Deck** into that folder, replacing the old one. |
+| Desktop app | The `.deb` | Downloads the new `.deb` and checks it. The desktop app asks for your password and installs it, then offers **Relaunch**, when the system has a graphical password prompt (`pkexec`); if it has none, or you dismiss the prompt, or it fails, the app shows the `sudo apt install` command to run. `dot-agent-deck upgrade` and the TUI always show that command. The `dot-agent-deck` in `/usr/bin` comes with the package and is upgraded with it. |
+
+Where no desktop app exists for the platform (Linux arm64, macOS Intel, WSL), only the CLI is upgraded, and nothing is reported as missing. Inside WSL, the CLI is upgraded the same way as on Linux.
+
+**What is checked before anything is replaced.** The download's checksum must match the release's checksum file, or nothing changes. When the [GitHub CLI](https://cli.github.com/) is installed and logged in, the checksum file's build provenance is also checked; when it is not, the plan says `Build provenance will NOT be checked:` and why, before you confirm, so install and log in to `gh` first if you want that check. A new CLI binary must report the release's version before it replaces the old one. A command shown for you to run starts by checking the downloaded file's checksum again, so `sudo` only installs the checked file.
+
+### Keep the CLI and the desktop app on the same release
+
+The CLI and the desktop app come from the same release and should run the same version. Whichever one you upgrade from also finds the other on this machine and offers to upgrade it, each through its own install method (a Homebrew CLI next to a `.dmg` app is upgraded with `brew upgrade`, for example): `dot-agent-deck upgrade` and the TUI's dialog offer the app first, then the CLI, and the desktop app offers the CLI on its Dashboard's **Local daemon** section, apart from the app's own upgrade dialog, with the app first there too while the app is behind. Upgrading the app first keeps the app, the CLI and the daemon on one release.
+
+- `dot-agent-deck upgrade` and the TUI look for the desktop app in `/Applications` and `~/Applications` on macOS, and for the `agent-deck` package on Linux.
+- The desktop app looks for `dot-agent-deck` on your login shell's `PATH`, then in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `/home/linuxbrew/.linuxbrew/bin`. The copy of the binary inside the app is upgraded with the app.
+
+A copy counts as installed only when it runs and reports its version. Where the other copy cannot be upgraded from the client you are in, the plan shows the command for it instead.
+
+### Beta and stable
+
+A CLI installed from the `dot-agent-deck-beta` formula, or any copy running a pre-release version (such as `0.47.0-beta.1`), follows pre-releases: it is offered the newest pre-release, and a stable release once that is newer than every pre-release. Every other copy follows stable releases only. Each copy on the machine follows its own channel, whichever client you upgrade from: a CLI from the stable formula next to a pre-release desktop app is offered the newest stable release, and a pre-release app next to a stable CLI the newest pre-release.
+
+The beta formula only ever receives pre-releases, so `brew upgrade dot-agent-deck-beta` cannot install a stable release. When a stable release is newer than what the beta formula offers, the plan says so and shows the switch to the stable formula:
+
+```bash
+brew uninstall dot-agent-deck-beta && brew install vfarcic/tap/dot-agent-deck
+```
+
+### When an upgrade fails
+
+The error is printed in place of the result, and says whether anything changed. The common ones:
+
+| Message | What to do |
+| --- | --- |
+| `Cannot check for a newer release: …` | The release could not be looked up, usually no network or GitHub refusing the request. Try again later. |
+| `Cannot download …` | The download failed. Nothing was changed. Try again. |
+| `… does not match … Nothing was changed.` or `… has no entry for …` | The download did not match the release's checksum file. Try again; if it keeps happening, [report it](https://github.com/vfarcic/dot-agent-deck/issues) and do not install the file by hand. |
+| `The build provenance of … could not be verified, so nothing was changed.` | `gh attestation verify` refused the release's checksum file. Do not install the release by hand; [report it](https://github.com/vfarcic/dot-agent-deck/issues). |
+| `The upgrade plan said build provenance would be checked, but it cannot be now: …` | `gh` was removed or logged out between the plan and the upgrade. Log in with `gh auth login` and run the upgrade again. |
+| `` `pkexec …` failed: … `` followed by `It was downloaded and checked, but not installed. Install it with:` | The password prompt was dismissed or refused, so nothing was installed. Run the command shown. |
+| `` `pkexec …` failed: … `` followed by `The install did not finish in time and may still be running, …`, `The install was cancelled but could not be stopped and may still be running, …` or `The install's exit could not be read and it may still be running, …` | The install behind the password prompt may still be going, or be stuck, and the deck cannot stop it or cannot tell whether it ended. Do not start it again: wait a few minutes, then run the command shown (`<path> --version` for the CLI, `dpkg -s agent-deck` for the app's `.deb`) to see which version is installed. The desktop app does not offer that copy again until you restart the app. |
+| `` `pkexec …` failed: … `` followed by `The install did not complete, so … may be partly written.` (or, for the `.deb`, `may be partly installed.`) | The install behind the password prompt started and then failed or was stopped. The next line says what is installed now. If it is the new version, there is nothing more to do. If it is still the previous version, or the file or package is damaged, run the install command shown. After `WARNING: it matches neither the previous version nor …`, do not run that copy until you have reinstalled it. |
+| `` `brew upgrade …` finished, but dot-agent-deck still reports v<old>, not v<new>: Homebrew's tap does not carry v<new> yet, even after `brew update`. Once it does, refresh it and upgrade again: `` and the command to run, such as `/opt/homebrew/bin/brew update && /opt/homebrew/bin/brew upgrade dot-agent-deck`, with the `brew` the upgrade ran | The release is out on GitHub, but the Homebrew formula has not been updated to it yet. Nothing was upgraded; the copy stays on offer. Run the command shown a little later, or upgrade again from the deck. |
+| `` `brew upgrade …` finished, but dot-agent-deck still reports v<old>, not v<new>. Homebrew's copy of the tap may predate v<new>, and refreshing it failed: … `` and the command to run, such as `/opt/homebrew/bin/brew update && /opt/homebrew/bin/brew upgrade dot-agent-deck`, with the `brew` the upgrade ran | `brew update` could not refresh the tap, usually no network or another tap that cannot be fetched, so Homebrew may not know the release yet. Nothing was upgraded. Fix what the error names, then run the command shown. |
+| `` `…` failed: it did not finish within … and was stopped `` | A command the upgrade ran stopped answering, and the deck stopped it. Try again; if it keeps happening, run the command shown in a terminal to see where it hangs. When the command was the install behind the password prompt, the lines after the message say what was installed (the rows above). |
+| `` `…` failed: it was cancelled and stopped ``, `` `…` failed: it finished, but the upgrade was cancelled before its result was used ``, `` `…` failed: it was not started, because the upgrade was cancelled `` or `The upgrade was cancelled before it changed the installed copy. Nothing was changed.`, followed by `Cancelled.` | You pressed Ctrl+C (or `dot-agent-deck upgrade` got `SIGTERM`) while it upgraded a copy. It stopped, did not use the result of what it was doing, and did nothing further. A command that had already finished, such as `brew upgrade`, may have upgraded the copy: run the upgrade again when you are ready, and its plan shows which version you have. If it says instead `it was cancelled and could not be stopped, so it may still be running`, the command is still going: wait for it to finish before you run the upgrade again. |
+| `Warning: the release's disk image is still attached at …` | The Mac app was upgraded (or the upgrade stopped), but the downloaded disk image could not be detached. Run the `hdiutil detach -force …` command shown. |
+| `Warning: the release's disk image is still attached, at a folder whose path cannot be shown safely.` | As above, but the folder's name has characters the deck will not put in a command. Run `/usr/bin/hdiutil info`, find the image mounted under the deck's `upgrade` folder, and run `hdiutil detach -force` with its mount point. |
+| `An earlier upgrade of this copy did not finish and may still be running, so it is not started again.` | The desktop app's install of that copy is the one the row above about `may still be running` describes. Wait for it, check the installed version, then restart the app to upgrade that copy again. |
+| `(A command is left out here, because it contains characters that cannot be shown safely.)` | `dot-agent-deck upgrade` would not print a command it would have had to change to show. Upgrade manually from the release page. |
+| `The upgrade plan this dialog shows is no longer current, so nothing was changed.` | The desktop app's dialog stayed open across several newer checks. Close it and open it again to see the current plan. |
+| `The download folder … is not safe to use: …` | The folder the deck downloads into is not private to you (it is a link, belongs to another user, or others can write to it). Remove it or make it private to you, then try again. |
+| `WARNING: … was installed, but it is NOT the verified build …` | The installed file is not the one that was checked. Do not run it; reinstall from the release page the message names. |
+
+### After upgrading
+
+Relaunch the TUI:
 
 ```bash
 dot-agent-deck
 ```
 
-On every launch, the TUI performs a build-version handshake with the running daemon. If a daemon spawned by the previous version is still alive, the binary versions differ and the TUI resolves it for you — what happens depends only on whether managed agents are running:
+Upgrading does not stop a running daemon or its agents. On launch the TUI compares its build with the running daemon's. If they differ:
 
-- **No agents running** — the stale daemon is restarted **silently**. There is nothing to lose, so you are not prompted; the TUI lazy-spawns a fresh daemon at the new version and continues into the dashboard. This is the common case after a quiet upgrade.
-- **Agents running** — the TUI prompts you in your terminal. The prompt **names the live agents** and warns that restarting the daemon stops them. Press **S** to restart and continue on a fresh daemon at the new version (your agents are stopped), or press any other key to **keep the current daemon** and stay attached to it with your agents intact. Declining never strands you — you always land on a working session.
+- **No agents running**: the old daemon is restarted on the new binary without asking.
+- **Agents running, TUI in a terminal**: the TUI prints `Daemon version mismatch`, the two builds, and the agents a restart would stop. Press `S` to restart the daemon (stopping those agents), or any other key to keep the current daemon and attach to it with your agents intact. Upgrade later, when no agents are running.
+- **Agents running, protocol changed**: the prompt says this binary cannot attach. `S` restarts as above. Any other key exits with `error: daemon speaks attach protocol vN, but this binary speaks vM` and leaves the daemon and its agents running. To keep working with them, run the binary version the daemon came from (the message names it). To move to the new binary, stop the daemon when you are ready to lose those agents (see [Recycling the local daemon](#recycling-the-local-daemon)).
+- **Agents running, TUI not attached to a terminal** (a script or CI): it cannot ask, so it prints a recovery hint to stderr and exits non-zero. Run `dot-agent-deck daemon stop` first, then relaunch.
 
-You are never forced to upgrade-and-restart just to keep working: declining the prompt keeps you on the existing daemon, and you can finish or detach your agents and relaunch later, at which point (with no agents running) the daemon restarts silently.
+If you keep an older daemon, features added by the newer release may not work against it; see [Troubleshooting → Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon).
 
-If the TUI is not attached to a terminal (CI, scripts, piped stdout) **and** agents are running, it cannot prompt for the restart, so it prints a recovery hint to stderr and exits non-zero. In that case, run `dot-agent-deck daemon stop` explicitly before relaunching — see [Recycling the local daemon](#recycling-the-local-daemon) below. (With no agents running, the non-interactive case still restarts silently.)
+#### Your agents' hooks after an upgrade
 
-See [Troubleshooting › Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon) for the symptom you'll see if you keep an older daemon and then expect newer features to work against it.
+When the TUI, `dot-agent-deck upgrade` or the desktop app installs a new CLI, it runs `dot-agent-deck hooks refresh` from the new copy ([Agent hooks](#agent-hooks)), whether or not the daemon restarts, and the result says what happened. The copy doing the upgrade is what runs the refresh, so an upgrade made from a release that does not have it leaves the hooks as they were, and that includes the upgrade that first brings this feature in. After such an upgrade, run `dot-agent-deck hooks refresh` with the new copy, or start the TUI from the new copy, which updates the hooks as it starts; then restart agents that were already running.
+
+| What the result says | What it means | What to do |
+|---|---|---|
+| `<agents> hooks now run this copy (v<new>). Restart agents that were already running so they use them.` | The hooks call the new copy. | Restart agents that were running before the upgrade; agents started from now on use the new hooks. |
+| `<agent>'s hooks run another copy, <path> (v<version>), which was left as it is.` | The hooks call another installed copy of the same or a newer release. | Nothing, unless you want them on this copy: then run `dot-agent-deck hooks install --agent <agent>` from it. |
+| `<agent>'s hooks still run an older copy, <path> (v<version>).` or `… still run another copy, <path>.`, then `To have them run this copy, run:` and a command | The hooks call a copy the refresh did not replace: an older one, or one whose version it could not read. | Run the command shown, then restart the affected agents. The desktop app's **Copy** button copies it; in the TUI, select it in your terminal. |
+| `<agent>'s hooks could not be updated: <reason>.`, then `To have them run this copy, run:` and a command | The refresh could not change that agent's hook settings, for example because the file is not valid JSON, which it left as it was, or cannot be written. | Fix what the reason names, run the command shown, then restart the affected agents. |
+| `The CLI was upgraded, but its agent hooks could not be checked: <reason>.` and a `hooks install --agent claude-code` command | The new copy did not answer the refresh. | Run the command shown, then restart the affected agents. For another agent, run `hooks install --agent <agent>` from the new copy. When the new copy's path cannot be shown safely, the result says to run `hooks install --agent claude-code` with the upgraded dot-agent-deck instead of showing a command. |
+| `Agent hooks were not updated. Once it is installed, update them with:` and a `hooks refresh` command | The CLI was only downloaded and checked, not installed. | Install it with the command above that line, then run the `hooks refresh` command. When the install's path cannot be shown safely, the result says to run `hooks refresh` with the installed dot-agent-deck instead of showing a command. |
+
+The result says nothing about hooks when Homebrew did not reach the new release, or when only the desktop app was upgraded. If you upgrade the CLI another way (with `brew upgrade` yourself, Nix, a package manager, a download you install yourself, or by building it), run `dot-agent-deck hooks refresh` from the new copy, or start the TUI, which updates the hooks the same way when it starts. Either way, restart agents that were already running: they keep the hooks they started with.
+
+When the upgraded desktop app finds the daemon on this machine running the older release, it restarts the daemon onto its own version as the TUI does, asking first when agents are running ([Desktop app → Daemons → Upgrade the CLI and the daemon on this machine](desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)); if its Dashboard says **Incompatible daemon**, see [Keep the app and the daemon on the same release](#keep-the-app-and-the-daemon-on-the-same-release).
+
+### When the deck, the app and the hooks are on different releases
+
+Some releases change how the deck's parts talk to each other, and then an older part and a newer one refuse to work together rather than misread each other. Each part says so, and the usual fix is to bring the older part up to the newer release:
+
+| What is older | What you see | What to do |
+|---|---|---|
+| The daemon, compared with the TUI | When the TUI starts, the mismatch prompt says `This binary cannot attach to it`; if the daemon is replaced while the TUI is open, a footer row says `⚠ Not attaching: daemon speaks attach protocol vN, but this binary speaks vM` | Restart the daemon on the new release (`S` in the prompt, which stops its agents), or keep using the TUI release the daemon came from. See [Troubleshooting](troubleshooting.md#daemon-speaks-attach-protocol-vn-but-this-binary-speaks-vm). |
+| The TUI, compared with the daemon | When the TUI starts, the same refusal, naming the two protocols. An older TUI that was already open when the daemon was replaced may not show it | Quit the older TUI and run the TUI from the daemon's release. |
+| The daemon or the desktop app, compared with the other | **Incompatible daemon** on the Dashboard, saying which of the two is older and that the two cannot work together | Update the older one ([Keep the app and the daemon on the same release](#keep-the-app-and-the-daemon-on-the-same-release)); for a remote daemon older than the app, press **Upgrade**. |
+| Claude Code's or Codex's hooks, compared with the daemon | The agent's card or tile says `this agent's deck hooks run a dot-agent-deck too old for its messages`, with the command to run when the deck knows which agent it is, and the agent's messages wait. Hooks from a release before 0.47 never ask for messages: when their events identify the agent, the card says the same as soon as the agent starts, for Codex's hooks too, while the agent still gets its messages the older way, through the doorbell that asks it to run `dot-agent-deck inbox fetch`, as long as the `dot-agent-deck` on the agent's `PATH` is from the daemon's release: an older one takes nothing (next row). Hooks too old to carry the deck's [hook capability token](troubleshooting.md#work-done-dispatch-or-delegate-fails-with-refused--hook-capability-token) get no such notice | Run the command it names, usually `dot-agent-deck hooks install --agent claude-code` or `--agent codex`, then restart the agent. See [A card says the deck integration is out of date, too old, or not connected](troubleshooting.md#a-card-says-the-deck-integration-is-out-of-date-too-old-or-not-connected). |
+| `dot-agent-deck inbox fetch`, compared with the daemon | The agent's messages wait. `inbox fetch` prints `The deck refused to fetch messages: this dot-agent-deck is older than the deck daemon and can no longer take messages` where it runs | Upgrade the `dot-agent-deck` on the agent's `PATH`, or run `inbox fetch` with the `dot-agent-deck` the daemon runs. See [Codex's deck hook or `inbox fetch` shows an error](troubleshooting.md#codexs-deck-hook-or-inbox-fetch-shows-an-error). |
+| The daemon, compared with Claude Code's hooks | Claude Code shows an error from the deck's hook saying the deck daemon did not answer in time or did not confirm that it serves message receipts, and the agent's messages wait | Restart the daemon on the hooks' release, or run `dot-agent-deck hooks install --agent claude-code` with the release the daemon runs, then restart the agent. See [Claude Code shows an error from the deck's hook](troubleshooting.md#claude-code-shows-an-error-from-the-decks-hook). |
+| The daemon, compared with Codex's hooks or `dot-agent-deck inbox fetch` | The agent's messages wait. Codex's deck hook takes none and fails with an error that starts with `dot-agent-deck:`, which Codex may not show you. `inbox fetch` prints `Could not fetch messages: the deck daemon did not confirm that it can hand them to this dot-agent-deck inbox fetch` (or that it did not answer in time) where it runs: to see it, ask the agent to run `dot-agent-deck inbox fetch` and show you what it prints | Restart the daemon on the newer release, or use the release the daemon runs: `dot-agent-deck hooks install --agent codex` with it for Codex's hooks, then restart the agent. See [Codex's deck hook or `inbox fetch` shows an error](troubleshooting.md#codexs-deck-hook-or-inbox-fetch-shows-an-error). |
+
+On a remote host, upgrade the remote deck before connecting to it from a newer desktop app.
 
 ## Versioning
 
-`dot-agent-deck` is still in its `0.x` series, and the version digits follow a compatibility-first cadence while the major version is `0`:
+While the version is `0.x`:
 
-- A **protocol-/compatibility-breaking** change — one where an older and a newer build can no longer safely interoperate — bumps the **minor** digit (for example `0.31.x → 0.32.0`).
-- **New features and bug fixes** are **patch** releases (for example `0.31.1 → 0.31.2`).
+- A change after which an older and a newer build can no longer safely work together bumps the **minor** digit (`0.31.x` → `0.32.0`).
+- Features and fixes bump the **patch** digit (`0.31.1` → `0.31.2`).
 
-So while in `0.x` the minor digit signals **"compatibility broke"**, not "has new features". A bump from `0.31.x` to `0.32.0` is the cue to align both sides (see [Recycling the local daemon](#recycling-the-local-daemon) locally, or `dot-agent-deck remote upgrade` for a [remote](remote-environments.md)); a patch bump is always safe to mix.
+A minor bump is the cue to upgrade the daemon, the TUI and the desktop app together, and to run `dot-agent-deck remote upgrade` for each [remote](remote-environments.md). Builds that differ only in the patch digit work together.
 
 ## Inspecting the local daemon
 
-`dot-agent-deck daemon status` prints a read-only snapshot of the agents the local daemon is managing. It is a diagnostic: it never starts, stops, attaches to, or writes to anything, so it is safe to run at any time — including from a script, a `watch`, or while the TUI is open in another terminal.
+`dot-agent-deck daemon status` prints what the local daemon is managing. It is read-only: it does not start a daemon, and it changes nothing.
 
 ```bash
 dot-agent-deck daemon status
@@ -184,27 +531,27 @@ dot-agent-deck daemon status
 
 ```text
 PANE	AGENT	ROLE	STATUS	TOOL	LABEL	CWD
-1	1	mode:review	Thinking	-	api	/home/you/src/api
+1	1	lead (orchestrator)	Thinking	-	api	/home/you/src/api
 2	2	-	Working	Bash	api	/home/you/src/api
 ```
 
-The columns are tab-separated, so pipe the output through `column -t -s $'\t'` if you want it aligned in a terminal. A `-` means the daemon has no value for that cell yet.
+The columns are tab-separated (`column -t -s $'\t'` aligns them). `-` means no value.
 
-| Column | What it holds |
+| Column | Content |
 |---|---|
-| `PANE` | The pane id, the same value a managed agent sees as `DOT_AGENT_DECK_PANE_ID`. |
-| `AGENT` | The daemon's own id for the agent. |
-| `ROLE` | `mode:<name>` for a pane launched into a [mode](configuration.md), the role name for an [orchestration](orchestration.md) pane (suffixed `(orchestrator)` for the start role), `-` for a plain dashboard pane. |
-| `STATUS` | The live status: one of `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error`. A `Working` currently held up by a monitored external wait (`dot-agent-deck wait start`) rather than real agent activity shows as `Observing`. So does an `Idle` orchestrator with at least one delegation it issued still outstanding; in `--json` that row keeps `"status": "Idle"`, leaves `wait_observing` as `false`, and reports `"observing_delegations": true`. A pane that itself still owes a `work-done` is never reported as observing. |
-| `TOOL` | The name of the tool the agent is running right now — the name only, never its arguments. |
+| `PANE` | Pane id; a managed agent sees it as `DOT_AGENT_DECK_PANE_ID`. |
+| `AGENT` | The daemon's id for the agent. |
+| `ROLE` | The role name for an [orchestration](orchestration.md) pane (with `(orchestrator)` on the start role), `mode:<name>` for an agent still running from a workspace mode started by a release before 0.44.0, `-` otherwise. |
+| `STATUS` | `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error` or `Blocked`. See [Session statuses](session-management.md#session-statuses). A `Working` currently held up by a monitored external wait (`dot-agent-deck wait start`) rather than real agent activity shows as `Observing`. So does an `Idle` orchestrator with at least one delegation it issued still outstanding; in `--json` that row keeps `"status": "Idle"`, leaves `wait_observing` as `false`, and reports `"observing_delegations": true`. A pane that itself still owes a `work-done` is never reported as observing. |
+| `TOOL` | The name of the tool running now, without its arguments. |
 | `LABEL` | The pane's display name. |
-| `CWD` | The directory the agent was launched in. |
+| `CWD` | The directory the agent was started in. |
 
-When no agents are managed, the command prints `no managed agents` and still exits 0 — an empty deck is a successful answer, not a failure.
+With no agents it prints `no managed agents` and exits 0.
 
 ### JSON for scripts
 
-`--json` emits a versioned document instead of the table. This is the form to parse; the human table's columns are not a stable interface. The command prints it on a single line — the example below is reformatted for readability.
+Parse `--json`, not the table. It prints one line; reformatted here:
 
 ```bash
 dot-agent-deck daemon status --json
@@ -214,28 +561,8 @@ dot-agent-deck daemon status --json
 {
   "schema_version": 2,
   "agents": [
-    {
-      "agent_id": "1",
-      "pane_id": "1",
-      "label": "api",
-      "cwd": "/home/you/src/api",
-      "role": "mode:review",
-      "status": "Thinking",
-      "shell_synthetic_working": false,
-      "wait_observing": false,
-      "observing_delegations": false
-    },
-    {
-      "agent_id": "2",
-      "pane_id": "2",
-      "label": "api",
-      "cwd": "/home/you/src/api",
-      "status": "Working",
-      "shell_synthetic_working": false,
-      "wait_observing": false,
-      "observing_delegations": false,
-      "active_tool": { "name": "Bash" }
-    },
+    { "agent_id": "1", "pane_id": "1", "label": "api", "cwd": "/home/you/src/api", "role": "lead (orchestrator)", "status": "Thinking", "shell_synthetic_working": false, "wait_observing": false, "observing_delegations": false },
+    { "agent_id": "2", "pane_id": "2", "label": "api", "cwd": "/home/you/src/api", "status": "Working", "shell_synthetic_working": false, "wait_observing": false, "observing_delegations": false, "active_tool": { "name": "Bash" } },
     {
       "agent_id": "3",
       "pane_id": "3",
@@ -247,7 +574,6 @@ dot-agent-deck daemon status --json
       "wait_observing": false,
       "observing_delegations": false,
       "outstanding_delegation": { "armed_secs_ago": 42, "orchestrator_pane_id": "1" },
-      "silence_watch": { "armed_secs_ago": 42, "orchestrator_pane_id": "1" },
       "delegation_commission": {
         "outstanding": 1,
         "oldest_armed_secs_ago": 42,
@@ -258,72 +584,50 @@ dot-agent-deck daemon status --json
 }
 ```
 
-`schema_version` is the contract. It is bumped when a field is **removed** or changes meaning; new fields can appear without a bump, so parse tolerantly and ignore keys you do not recognise. Version `2` removed `active_tool.detail`, which version `1` carried — a script written against v1 that read the tool's arguments gets nothing under v2 rather than something subtly different.
-
-`outstanding_delegation` and `silence_watch` report the two independent watches on a delegated worker pane — the idle-worker and silent-worker detectors — each as `{ "armed_secs_ago": <seconds>, "orchestrator_pane_id": <pane> }` when currently armed. `delegation_commission` reports the commission ledger: how many delegations to this pane still owe a `work-done`, as `{ "outstanding": <count>, "oldest_armed_secs_ago": <seconds>, "orchestrator_pane_id": <pane> }`. All three are per-pane and independent of each other, but they are **not** independent of the detector config in the same way: `delegation_commission`'s expiry ages out on its own fixed window, unrelated to `worker_response_timeout_minutes` or any other switchable detector (PRD #586). `outstanding_delegation` and `silence_watch`, by contrast, are each armed and windowed by their own existing detector config (PRD #126 and PRD #249 respectively) — `outstanding_delegation` is never armed at all when `worker_response_timeout_minutes = 0`, and `silence_watch`'s window follows the same resolution path unless `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS` overrides it. On a deck where either detector is disabled, that key is **absent** from the JSON entirely — absence means "detector off," not "nothing outstanding."
-
-Every field except `agent_id` is optional and is **omitted entirely** when the daemon has no value for it, which is what the table renders as `-`. In the document above, agent `2` has no `role` key, agent `1` has no `active_tool` key, and neither `1` nor `2` has any of the three delegation-watch keys. Read them with a fallback rather than assuming they are present:
-
-```bash
-dot-agent-deck daemon status --json | jq --raw-output '.agents[] | "\(.pane_id)\t\(.status // "unknown")\t\(.active_tool.name // "-")"'
-```
-
-```text
-1	Thinking	-
-2	Working	Bash
-```
-
-With no agents managed the document is `{"schema_version":2,"agents":[]}` and the exit code is still 0, so a filter like the one above simply produces no lines.
-
-Both forms deliberately omit your prompt text and the tool's arguments. A pane whose card reads `Bash — cargo test --package billing -- --nocapture` in the TUI appears as the bare tool name `Bash` in the table and as `{"name": "Bash"}` in the JSON. A status snapshot is routinely pasted into a bug report or run in a terminal someone else is watching, so it carries diagnostics and nothing private.
+- `schema_version` increases when a field is removed or changes meaning. New fields can appear without an increase, so ignore keys you do not recognise.
+- `outstanding_delegation` reports the idle-worker watch on a delegated worker pane as `{ "armed_secs_ago": <seconds>, "orchestrator_pane_id": <pane> }` while a delegation to it is outstanding. `delegation_commission` reports the commission ledger: how many delegations to this pane still owe a `work-done`, as `{ "outstanding": <count>, "oldest_armed_secs_ago": <seconds>, "orchestrator_pane_id": <pane> }`. The two are per-pane and independent of each other: `delegation_commission` ages out on its own fixed window, unrelated to `worker_response_timeout_minutes` (PRD #586), whereas `outstanding_delegation` is never armed when `worker_response_timeout_minutes = 0`, so on a deck where that detector is disabled the key is **absent** from the JSON entirely: absence means "detector off", not "nothing outstanding".
+- Every field except `agent_id` is omitted when it has no value, so read with a fallback, for example `jq -r '.agents[] | "\(.pane_id)\t\(.status // "unknown")\t\(.active_tool.name // "-")"'`.
+- With no agents the document is `{"schema_version":2,"agents":[]}` and the exit code is 0.
+- Neither form includes prompt text or tool arguments.
 
 ### When the daemon is unreachable
 
-If the query gets no answer, the command writes a one-line reason to **stderr**, prints nothing to stdout, and exits **1**. Unlike `daemon stop`, this is not treated as a benign no-op: a status query that got no answer learned nothing about the daemon, so reporting success would be a lie.
+The command writes one line to stderr, nothing to stdout, and exits **1**:
 
 ```text
-# no daemon has ever run for this user
-daemon status: unavailable (I/O error talking to daemon: No such file or directory (os error 2))
-
-# a daemon ran and has since exited, leaving its socket behind
-daemon status: unavailable (I/O error talking to daemon: Connection refused (os error 111))
-
-# a daemon is listening but wedged
-daemon status: unavailable (no response within 3s)
+daemon status: unavailable (I/O error talking to daemon: No such file or directory (os error 2))   # no daemon has run
+daemon status: unavailable (I/O error talking to daemon: Connection refused (os error 111))        # daemon exited, socket left behind
+daemon status: unavailable (no response within 3s)                                                # daemon is not answering
 ```
 
-The whole round trip is bounded at 3 seconds. On expiry the command **abandons** the query rather than retrying — a retry loop would add load to the exact daemon you are trying to diagnose.
-
-Exit 1 is reserved for "the daemon did not answer". A malformed invocation exits **2** instead, so a script can tell an unreachable daemon apart from a binary that is too old to understand the subcommand at all.
-
-**Status inspection never starts a daemon.** Launching the TUI lazy-spawns one (see [How it runs](#how-it-runs) above); `daemon status` never does, in either output form. Spawning a daemon to answer "is a daemon running?" would make the question unanswerable, so an absent daemon is reported as the failure above and the socket is left exactly as it was found.
-
-> Like `daemon stop`, this reports on the daemon on **this machine** only. Each remote attach has its own per-host daemon, covered in [Remote Environments](remote-environments.md).
+It waits at most 3 seconds and does not retry. Exit code **2** means the invocation itself was malformed (for example, a binary too old to know `daemon status`). This command covers only the daemon on this machine; each remote has its own (see [Remote Environments](remote-environments.md)).
 
 ## Recycling the local daemon
-
-`dot-agent-deck daemon stop` shuts down the running daemon gracefully. Use it after a binary upgrade or any time you want to start a fresh daemon process.
 
 ```bash
 dot-agent-deck daemon stop
 ```
 
-- **Idempotent.** If no daemon is running, the command prints `no daemon running` and exits 0.
-- **Data-loss guard.** If managed agents are still alive, the command refuses with a list of agent IDs and exits non-zero — terminating the daemon would kill those agents. Detach the agents first (close their panes, or quit the TUI to detach the deck while keeping the agents running), or pass `--force`. Run [`daemon status`](#inspecting-the-local-daemon) first if you want to see what is running before you decide.
-- **Orchestration guard.** If the daemon is holding [orchestration](orchestration.md) roles whose panes still have a live agent, the command refuses with the pane id, role name and orchestration of each one, and exits non-zero. This is a *different* loss from the one above, and the reason it gets its own refusal: the daemon keeps its role registrations in memory only, so stopping it deletes them for good. An agent that survives the stop keeps running and keeps reporting its status — its card looks completely healthy — but its `dot-agent-deck delegate` is refused from then on with "the daemon holds no orchestration role for pane …", and there is no recovery short of re-dispatching the orchestration. Let the orchestration finish, or pass `--force` knowing that is what you are spending.
-- **Grace window.** Sends `SIGTERM` and polls for the socket to disappear for up to 5 seconds. With `--force`, escalates to `SIGKILL` after that window. A `SIGTERM` timeout without `--force` exits non-zero so you can re-run with `--force` consciously.
+- **No daemon running**: prints `no daemon running` and exits 0.
+- **Managed agents running**: refuses, lists their ids and exits non-zero, because stopping the daemon stops them. Detach or close them first, or pass `--force`.
+- **Orchestration roles held**: if the daemon holds [orchestration](orchestration.md) roles whose panes still have a live agent, it refuses and lists each pane id, role and orchestration. The daemon keeps role registrations in memory only, so after a forced stop an agent that survives keeps running but can no longer delegate; its card is marked `orphaned` (see [Session statuses](session-management.md#diagnostic-markers-on-a-card)). Let the orchestration finish, or pass `--force` accepting that.
+- **Shutdown**: sends `SIGTERM` and waits up to 5 seconds for the daemon to stop. If it has not, the command exits non-zero; with `--force` it sends `SIGKILL` instead.
 
 ```bash
-# Force shutdown even when managed agents or orchestration roles are live.
-# This kills the managed agents, and permanently strands any orchestration
-# whose agent survives.
-dot-agent-deck daemon stop --force
+dot-agent-deck daemon stop --force   # stops managed agents and strands live orchestrations
 ```
 
-`dot-agent-deck daemon restart` is a thin wrapper: it runs `daemon stop`, then returns. The next `dot-agent-deck` invocation lazy-spawns a fresh daemon (see [How it runs](#how-it-runs) above). `--force` works the same way.
+`dot-agent-deck daemon restart` (also `--force`) runs `daemon stop`. The next `dot-agent-deck` starts a fresh daemon. A daemon that runs as a service stays stopped until the service starts it again ([Run the Daemon as a Service](daemon-service.md#what-the-service-changes)). Both commands act only on this machine's daemon; remotes are covered in [Remote Environments](remote-environments.md).
+
+## Uninstall
 
 ```bash
-dot-agent-deck daemon restart
+dot-agent-deck daemon stop                     # add --force if it refuses and you accept losing the agents
+for agent in claude-code opencode codex devin; do
+  dot-agent-deck hooks uninstall --agent "$agent"
+done
+brew uninstall dot-agent-deck                  # Homebrew; or delete the downloaded binary, or `nix profile remove`
+sudo apt remove agent-deck                     # desktop app on Linux; on macOS delete /Applications/Agent Deck.app
 ```
 
-> Stopping a *remote* daemon works differently — each remote attach has its own per-host daemon, governed by the lifecycle in [Remote Environments](remote-environments.md). The local `daemon stop` only touches the daemon on this machine.
+Your settings, keybindings, saved workspace and registered remotes are in `~/.config/dot-agent-deck/`, and schedules are in `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is set to an absolute path (otherwise the same directory). Delete them to remove your configuration too.

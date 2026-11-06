@@ -37,7 +37,7 @@
 //! return you to, but it accepts no keys. The Cyan accent originally rendered
 //! in both cases, which made the loudest border signal on screen claim "type
 //! here" while the keyboard was driving the deck — the mode was invisible on a
-//! full-screen mode tab, where nothing else in the frame changes.
+//! full-screen pane, where nothing else in the frame changes.
 //!
 //! So for panes, (2) applies only in `UiMode::PaneInput`
 //! (`TerminalWidget::with_input_active`). In command mode the focused pane
@@ -269,6 +269,10 @@ pub fn status_color(status: &SessionStatus) -> Color {
         SessionStatus::Compacting => STATUS_THINKING,
         SessionStatus::WaitingForInput => STATUS_WAITING,
         SessionStatus::Error => STATUS_ERROR,
+        // Issue #714: a quota-blocked agent needs a person exactly as an
+        // erroring one does, so it shares the error role rather than adding a
+        // palette role (which would re-open `theme/contrast`).
+        SessionStatus::Blocked => STATUS_ERROR,
         SessionStatus::Idle => STATUS_IDLE,
         // PRD #162 forward-compat: an unknown wire status renders with the
         // neutral idle color so it never masquerades as an active state.
@@ -298,11 +302,11 @@ pub fn status_color_for(status: &SessionStatus, observing: bool) -> Color {
 
 /// This status's rank in the PRD #333 fixed priority order — lower ranks
 /// win. Mirrors the aliasing [`status_color`] already applies (Compacting
-/// shares Thinking's rank, Unknown shares Idle's) so a status that resolves
-/// to the same color also resolves to the same priority.
+/// shares Thinking's rank, Unknown shares Idle's, Blocked shares Error's) so a
+/// status that resolves to the same color also resolves to the same priority.
 fn priority_rank(status: &SessionStatus) -> u8 {
     match status {
-        SessionStatus::Error => 0,
+        SessionStatus::Error | SessionStatus::Blocked => 0,
         SessionStatus::WaitingForInput => 1,
         SessionStatus::Working => 2,
         SessionStatus::Thinking | SessionStatus::Compacting => 3,
@@ -322,6 +326,33 @@ pub fn highest_priority_status(statuses: &[SessionStatus]) -> SessionStatus {
         .min_by_key(|status| priority_rank(status))
         .cloned()
         .unwrap_or(SessionStatus::Idle)
+}
+
+/// PRD #1258: a host reading the daemon judged healthy. The working role's
+/// green, so "fine" reads the same on a host reading as on an agent.
+pub const HEALTH_OK: Color = STATUS_WORKING;
+/// PRD #1258: a host reading past its warn threshold. Yellow, the colour the
+/// TUI already gives a caution in its status line.
+pub const HEALTH_WARN: Color = Color::Yellow;
+/// PRD #1258: a host reading past its critical threshold — the error role's red.
+pub const HEALTH_CRITICAL: Color = STATUS_ERROR;
+
+/// Issue #1781: GitHub's amber, for a pull request's pending checks and a
+/// review it still needs. Yellow is the ANSI slot for it, with the light-theme
+/// caveat [`STATUS_WAITING`] records; the badge's glyph shapes carry the
+/// meaning, so the colour never says it alone.
+pub const PR_ATTENTION: Color = Color::Yellow;
+
+/// PRD #1258: the colour of a host reading at `level`. Named ANSI colours, so a
+/// terminal theme remaps them like every other status colour. Never the only
+/// signal: the overlay writes the level's word beside every non-ok value.
+pub fn health_color(level: crate::daemon_protocol::HealthLevel) -> Color {
+    use crate::daemon_protocol::HealthLevel;
+    match level {
+        HealthLevel::Ok => HEALTH_OK,
+        HealthLevel::Warn => HEALTH_WARN,
+        HealthLevel::Critical => HEALTH_CRITICAL,
+    }
 }
 
 #[cfg(test)]

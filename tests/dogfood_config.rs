@@ -90,7 +90,9 @@ fn the_repo_config_declares_mixed_as_its_default_orchestration() {
 }
 
 /// **The sync guarantee.** `anthropic` and `GPT` must differ from `mixed` in
-/// nothing but each role's `command`.
+/// nothing but each role's `command` — and the `agent` that command launches,
+/// which has to move with it (issue #1243, see
+/// `every_role_declares_the_agent_its_launcher_runs`).
 ///
 /// This is the mechanical form of the promise #705 makes to a contributor: pick
 /// whichever provider you have credentials for and get *the same process*, not a
@@ -156,6 +158,11 @@ fn devbox_script_bodies() -> serde_json::Map<String, serde_json::Value> {
 
 /// What one role's `command` ends up running, as a flat string. `None` for a
 /// command that is not a `devbox run <script>` indirection.
+///
+/// For a multi-line script it is the LAST line: devbox runs the lines in order
+/// and stops at the first that fails, so earlier lines are preflight checks
+/// (`codex-big` runs `scripts/box/require-codex-version.sh` first) and the last is
+/// what launches the agent.
 fn launched_program(
     scripts: &serde_json::Map<String, serde_json::Value>,
     command: &str,
@@ -169,10 +176,67 @@ fn launched_program(
         serde_json::Value::Array(lines) => lines
             .iter()
             .filter_map(|l| l.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
+            .next_back()
+            .unwrap_or_else(|| panic!("devbox script `{script}` has no command line"))
+            .to_string(),
         other => panic!("devbox script `{script}` is neither a string nor an array: {other}"),
     })
+}
+
+/// The program a script line runs, as the shell reads it: the first word after
+/// any leading `NAME=value` environment assignments, whose value may be quoted,
+/// spaces and all. PRD #2050's OpenCode 2 scripts set their model inline,
+/// `OPENCODE_CONFIG_CONTENT='{…}' opencode --standalone`, and the program there
+/// is `opencode`.
+fn program_word(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    loop {
+        let end = shell_word_end(rest);
+        let word = &rest[..end];
+        if word.is_empty() {
+            return None;
+        }
+        let assignment = word.split_once('=').is_some_and(|(name, _)| {
+            name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        });
+        if !assignment {
+            return Some(word);
+        }
+        rest = rest[end..].trim_start();
+    }
+}
+
+/// Where the shell word that starts `text` ends: the first unquoted whitespace.
+fn shell_word_end(text: &str) -> usize {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c.is_whitespace() => return at,
+            None => {}
+        }
+    }
+    text.len()
+}
+
+/// The program word skips leading environment assignments, quoted values with
+/// spaces included, and is the first word of a line that has none.
+#[test]
+fn program_word_skips_leading_environment_assignments() {
+    assert_eq!(program_word("claude --model x"), Some("claude"));
+    assert_eq!(
+        program_word(r#"OPENCODE_CONFIG_CONTENT='{"model":"a/b"}' opencode --standalone"#),
+        Some("opencode")
+    );
+    assert_eq!(
+        program_word(r#"A=1 B="two words" codex exec"#),
+        Some("codex")
+    );
+    assert_eq!(program_word("./run=me --flag"), Some("./run=me"));
+    assert_eq!(program_word("   "), None);
 }
 
 /// Every role command resolves to a devbox script that exists.
@@ -212,7 +276,7 @@ fn each_single_provider_variant_launches_only_that_provider() {
                 )
             });
             assert!(
-                launched.split_whitespace().next() == Some(program),
+                program_word(&launched) == Some(program),
                 "'{variant}' role '{}' runs `{}` -> `{launched}`, which is not {program}. A \
                  single-provider orchestration with one foreign role is worse than no variant at \
                  all: it fails partway through a run, on the credential the contributor picked \
@@ -224,6 +288,71 @@ fn each_single_provider_variant_launches_only_that_provider() {
     }
 }
 
+/// **The agent-identity guarantee (issue #1243).** Every role resolves to the agent
+/// its `devbox run <script>` actually launches — which, because the command is a
+/// launcher, means every role DECLARES it with `agent = "…"`.
+///
+/// `AgentType::from_command` sees `devbox` and nothing behind it, so an
+/// undeclared role is an agent the deck cannot identify, and what the deck keys
+/// on the RESOLVED type at spawn — the wrapper and the card's agent — is lost.
+/// Before PRD #1666 replaced the readiness gate with the inbox it cost a wait
+/// as well: on one day of this very file, 0 of 17 delegations to the Codex
+/// tester, 0 of 6 to the Pi reviewer and 0 of 6 to the OpenCode auditor saw
+/// readiness, each paying the full 30 s fallback.
+///
+/// Compared against what the script launches rather than against a hard-coded
+/// list so that swapping a role's commented-out alternative launcher in — the
+/// thing this file invites — fails here until `agent` is swapped with it. A
+/// variant that `extends` another INHERITS the parent's `agent` when its patch
+/// restates only `command`, so the variants must restate it too, and this is
+/// what notices when one does not.
+#[test]
+fn every_role_declares_the_agent_its_launcher_runs() {
+    use dot_agent_deck::event::AgentType;
+
+    let scripts = devbox_script_bodies();
+    let mut wrong = Vec::new();
+    for orch in &dogfood_config().orchestrations {
+        for role in &orch.roles {
+            let launched =
+                launched_program(&scripts, &role.command).unwrap_or_else(|| role.command.clone());
+            // This repo's `devbox run <script>` wrappers (`claude-opus-devbox "$@"`,
+            // `codex-devbox "$@"`, ...) launch the agent through another wrapper
+            // on PATH, so the script BODY alone often names no program
+            // `AgentType::from_command` recognizes. Fall back to the deck's own
+            // presentation-side resolution of the ORIGINAL `devbox run <script>`
+            // command (`from_command_including_devbox`, PRD #536), which reads
+            // the agent off the script name the way the deck does for a card.
+            let launched_type = AgentType::from_command(Some(&launched))
+                .or_else(|| AgentType::from_command_including_devbox(Some(&role.command)));
+            assert!(
+                launched_type.is_some(),
+                "'{}' role '{}' runs `{}` -> `{launched}`, which is not an agent the deck knows",
+                orch.name,
+                role.name,
+                role.command
+            );
+            if role.resolved_agent_type() != launched_type {
+                wrong.push(format!(
+                    "'{}' role '{}': `{}` launches {:?}, but the role resolves to {:?}",
+                    orch.name,
+                    role.name,
+                    role.command,
+                    launched_type,
+                    role.resolved_agent_type()
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "these roles do not resolve to the agent they launch, so their cards get no agent from \
+         the config and a Codex one runs without the deck's wrapper (issue #1243) — declare \
+         `agent = \"…\"` beside the command:\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// And `mixed` earns its name: it is not silently one provider.
 #[test]
 fn mixed_actually_spans_more_than_one_launcher() {
@@ -233,7 +362,7 @@ fn mixed_actually_spans_more_than_one_launcher() {
         .roles
         .iter()
         .filter_map(|r| launched_program(&scripts, &r.command))
-        .filter_map(|p| p.split_whitespace().next().map(str::to_string))
+        .filter_map(|p| program_word(&p).map(str::to_string))
         .collect();
     assert!(
         programs.len() > 1,
@@ -242,21 +371,10 @@ fn mixed_actually_spans_more_than_one_launcher() {
     );
 }
 
-/// The `[[modes]]` half of the same file, kept honest for the same reason: it is
-/// what `dot-agent-deck` opens for a `dev` pane on this repo.
-#[test]
-fn the_repo_config_still_defines_its_dev_mode() {
-    let config = dogfood_config();
-    assert!(
-        config.modes.iter().any(|m| m.name == "dev"),
-        "the `dev` mode is what a pane opened on this repo uses; losing it is silent"
-    );
-}
-
 /// A guard on the file's own most-documented trap: a top-level key written below
 /// the first table header is silently absorbed into that table, and `validate`
 /// still reports the config as valid. `worker_response_timeout_minutes` sits
-/// above `[[modes]]` for exactly this reason — assert it survived, since the
+/// above the first `[[orchestrations]]` for exactly this reason — assert it survived, since the
 /// symptom of losing it is only that a silent worker is never reported.
 #[test]
 fn the_top_level_timeout_key_is_still_above_the_first_table_header() {

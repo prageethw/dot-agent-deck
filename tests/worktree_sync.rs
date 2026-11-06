@@ -164,9 +164,56 @@ exec "$cmd_word" "$FAKE_SSH_REAL_REPO"
 /// against it to a real local repository instead.
 const FAKE_ORIGIN_URL: &str = "git@github.com:test-org/test-repo.git";
 
+/// Ambient git LOCATION variables, cleared so a fixture command's repository is
+/// the one at its cwd and nothing else. Mirrors `AMBIENT_LOCATION_VARS` in
+/// `src/worktree_owner.rs`, `tests/common/mod.rs` and
+/// `xtask/linkage-check/src/repo_state.rs`.
+const AMBIENT_LOCATION_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// `git` in `dir` with the ambient git environment switched off in both groups
+/// issue #834 names: *location* (git resolves `GIT_DIR` and its siblings in
+/// preference to the process cwd) and *configuration* (the commit identity comes
+/// from the environment, not from the developer's own `~/.gitconfig`).
+///
+/// A file-local copy of `tests/worktree_reclaim.rs`'s helper, for the same
+/// reason: this is a fast-tier test and `mod common;` would drag the PTY harness
+/// into it. `dir` doubles as the ceiling: every call site is a repository or
+/// linked-worktree ROOT, and a ceiling equal to the cwd still permits discovery
+/// at that directory while blocking any ascent above it.
+fn fixture_git(dir: &Path) -> Command {
+    // Same standing as `common::fixture_git`: the single bare constructor this
+    // file's every other `git` goes through.
+    let mut cmd = Command::new("git"); // linkage-check:allow-bare-git
+    cmd.current_dir(dir);
+    for var in AMBIENT_LOCATION_VARS {
+        cmd.env_remove(var);
+    }
+    let absent = dir.join("no-such-gitconfig");
+    cmd.env("GIT_CONFIG_GLOBAL", &absent)
+        .env("GIT_CONFIG_SYSTEM", &absent)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@t.t")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@t.t")
+        .env("GIT_CEILING_DIRECTORIES", dir);
+    cmd
+}
+
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
+    let out = fixture_git(dir)
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -178,8 +225,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
+    let out = fixture_git(dir)
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));

@@ -1,16 +1,34 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot } from "./data/fixture";
-import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
-import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState } from "./types";
+import { createFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_DAEMON_ID } from "./data/fixture";
+import { agentKey } from "./lib/agentKey";
+import { WINDOWS_ORCHESTRATION_BLOCK_REASON } from "./lib/platform";
+import { DEFAULT_DESKTOP_SETTINGS, DEFAULT_VOICE_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
+import { LaunchCleanupError } from "./lib/actionError";
+import type { UpgradeEvent, UpgradeOutcome } from "./lib/upgrade";
+import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
 
 vi.mock("./components/TerminalViewport", () => ({
-  TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
+  TerminalViewport: ({ agentId, label, inputState, readOnly = false }: {
+    agentId: string;
+    label: string;
+    inputState?: SendResult;
+    readOnly?: boolean;
+  }) => (
+    <div
+      data-testid={`terminal-${agentId}`}
+      data-input-state={inputState}
+      role="group"
+      aria-label={`${label} terminal`}
+      aria-disabled={readOnly}
+    >
+      <textarea className="xterm-helper-textarea" aria-label={`${label} terminal input`} disabled={readOnly} />
+    </div>
+  ),
 }));
 
-import { ControlDeck } from "./App";
+import { ControlDeck, DeckShell } from "./App";
 import { SETTINGS_SECTIONS } from "./lib/settingsRegistry";
 
 /**
@@ -19,11 +37,20 @@ import { SETTINGS_SECTIONS } from "./lib/settingsRegistry";
  * Backed by a plain object so a remount reads back what an earlier render
  * saved, which is what makes the persistence assertions mean anything.
  */
-function settingsStore(initial?: Partial<DesktopSettingsDto>, path?: string) {
+/** What a reader sees without opening any `<details>`: the element's text with every disclosure removed. */
+function textOutsideDisclosures(element: HTMLElement): string {
+  const copy = element.cloneNode(true) as HTMLElement;
+  copy.querySelectorAll("details").forEach((disclosure) => disclosure.remove());
+  return copy.textContent ?? "";
+}
+
+function settingsStore(initial?: Partial<DesktopSettingsDto>, path?: string, problem?: string) {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS, ...initial };
   return {
     get current() { return document; },
-    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path })),
+    // `problem` is why the document could not be read (issue #1072); absent for
+    // every store but the one test that is about it.
+    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path, problem })),
     saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
       document = structuredClone(next);
       return structuredClone(document);
@@ -36,10 +63,15 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const settings = settingsStore();
   return {
     mode: "fixture",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot: base,
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult),
+    // PRD #1487 M5: Upgrade and Replace daemon. A daemon that restarts with
+    // nothing running unless a test says otherwise.
+    upgradeDaemon: vi.fn(async () => ({ outcome: "restarted", fromVersion: "0.44.0", toVersion: "0.45.0", stopped: { agents: [], roles: [] } }) as UpgradeOutcome),
+    decideUpgrade: vi.fn(async () => undefined),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
@@ -57,13 +89,18 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
       deck: selection,
       state: "ssh_unavailable" as const,
       ok: false,
-      message: "No deck is reachable from this test runtime.",
+      message: "No daemon is reachable from this test runtime.",
       disclosureKnown: false,
       forwards: [],
       knownHosts: [],
       clientProtocolVersion: 0,
       clientBuildVersion: "test",
     })),
+    // PRD #802 M4: no OS keychain is reachable from a test runtime, and the
+    // state that says so is the same one the browser preview reports.
+    secretStatus: vi.fn(async () => ({ stored: false, problem: "No credential store is reachable from this test runtime." })),
+    storeSecret: vi.fn(async () => { throw new Error("No credential store is reachable from this test runtime."); }),
+    forgetSecret: vi.fn(async () => { throw new Error("No credential store is reachable from this test runtime."); }),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
     ...overrides,
@@ -145,7 +182,7 @@ function liveSnapshot(agents: AgentSession[]) {
 }
 
 /**
- * One pane in `cwd`, built off a real fixture agent so every field the deck
+ * One pane in `cwd`, built off a real fixture agent so every field the daemon
  * renders is populated and only the seed differs.
  */
 function agentIn(id: string, cwd: string): AgentSession {
@@ -159,10 +196,116 @@ async function chooseTheOnlyProject() {
   await waitFor(() => expect(screen.getByRole("button", { name: /deck/ })).toBeVisible());
   fireEvent.click(screen.getByRole("button", { name: /deck/ }));
   await waitFor(() => expect(screen.getByTestId("selected-project")).toBeVisible());
-  fireEvent.click(screen.getByRole("button", { name: "Configure workflow" }));
+  fireEvent.click(screen.getByRole("button", { name: "Configure orchestration" }));
 }
 
 describe("ControlDeck", () => {
+  describe("starting a disconnected deck (issue #1490)", () => {
+    function disconnectedDeck(deckKind: "local" | "remote", kind: "not-running" | "running-not-connected" | "unknown" = "not-running") {
+      const snapshot = createFixtureSnapshot("disconnected");
+      const host = deckKind === "local" ? "this machine" : "deploy@build-box:2222";
+      snapshot.agents = [];
+      snapshot.connection = {
+        ...snapshot.connection, deckId: deckKind === "local" ? "deck-0000000000001490" : "deck-0000000000001491", deckKind,
+        socketPath: deckKind === "local" ? "/tmp/start-daemon-test.sock" : host,
+        disconnectedReason: {
+          kind, action: kind === "not-running" ? "start-daemon" : "reconnect", host,
+          message: kind === "not-running" ? `No daemon is running on ${host}.`
+            : kind === "unknown" ? `The app cannot reach ${host}. Check that the host is up and reachable from this machine.`
+              : `A daemon is running on ${host}, but the app is not connected to it. Reconnect to try again.`,
+        },
+      };
+      return snapshot;
+    }
+
+    /// Scenario: With experimental features off, start a deck from its dashboard card while a different deck is selected.
+    /// Cancel sends nothing; confirmation names that deck's host and starts that deck alone.
+    it.each(["local", "remote"] as const)("confirms the host and targets the %s overview deck", async (deckKind) => {
+      window.history.replaceState({}, "", "/");
+      const target = disconnectedDeck(deckKind);
+      const selected = createFixtureSnapshot("connected");
+      const live = runtime({ mode: "live", snapshot: selected, fleet: [selected, target], desktopFeatures: fixtureDesktopFeatures("") });
+      render(<DeckShell runtime={live} />);
+      expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
+      const card = screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === target.connection.deckId)!;
+      const start = within(card).getByTestId("start-daemon");
+      fireEvent.click(start);
+      const dialog = screen.getByRole("alertdialog");
+      expect(dialog).toHaveTextContent(target.connection.disconnectedReason!.host);
+      expect(dialog).not.toHaveTextContent("local daemon");
+      expect(live.runAction).not.toHaveBeenCalled();
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(live.runAction).not.toHaveBeenCalled();
+      fireEvent.click(start);
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Start daemon" }));
+      await waitFor(() => expect(live.runAction).toHaveBeenCalledExactlyOnceWith({ type: "start_daemon", deckId: target.connection.deckId }));
+      expect(live.reconnect).not.toHaveBeenCalled();
+    });
+
+    /// Scenario: A failed start from a local or remote dashboard card displays the runtime's user-facing rejection sentence.
+    it.each(["local", "remote"] as const)("shows a rejected start on the %s overview deck", async (deckKind) => {
+      window.history.replaceState({}, "", "/");
+      const snapshot = disconnectedDeck(deckKind);
+      const sentence = `The daemon was started on ${snapshot.connection.disconnectedReason!.host} but did not answer at /tmp/deck.sock within 25s. Check that this deck's daemon socket setting is where the daemon listens.`;
+      const live = runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures(""), runAction: vi.fn(async () => { throw new Error(sentence); }) });
+      render(<DeckShell runtime={live} />);
+      fireEvent.click(screen.getByTestId("start-daemon"));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Start daemon" }));
+      expect(await screen.findByText(sentence)).toBeVisible();
+      expect(live.runAction).toHaveBeenCalledExactlyOnceWith({ type: "start_daemon", deckId: snapshot.connection.deckId });
+    });
+
+    /// Scenario: A failed start on the dashboard card shows its sentence with the technical detail behind a disclosure (PR #1623 review).
+    it("shows a failed start's technical detail on the overview deck", async () => {
+      window.history.replaceState({}, "", "/");
+      const { StartDaemonError } = await import("./lib/actionError");
+      const snapshot = disconnectedDeck("local");
+      const live = runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures(""), runAction: vi.fn(async () => { throw new StartDaemonError("Could not start the daemon on this machine.", "start-failed", "spawn: No such file or directory"); }) });
+      render(<DeckShell runtime={live} />);
+      fireEvent.click(screen.getByTestId("start-daemon"));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Start daemon" }));
+      const error = await screen.findByTestId("overview-start-error");
+      expect(error).toHaveTextContent("Could not start the daemon on this machine.");
+      expect(within(error).getByTestId("connection-detail")).toHaveTextContent("spawn: No such file or directory");
+    });
+
+    /// Scenario: On the Daemons screen a disconnected deck's banner leads with the reason's sentence and keeps the
+    /// connection's own error in its technical details rather than dropping it (PR #1623 review).
+    it("keeps the connection error in the Daemons banner's details", () => {
+      const snapshot = disconnectedDeck("remote", "running-not-connected");
+      snapshot.connection = { ...snapshot.connection, message: "ssh tunnel to deploy@build-box:2222 failed: handshake refused", detail: undefined };
+      render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
+      const banner = screen.getByRole("alert");
+      expect(within(banner).getByTestId("connection-banner-message")).toHaveTextContent(snapshot.connection.disconnectedReason!.message);
+      expect(within(banner).getByTestId("connection-detail")).toHaveTextContent("ssh tunnel to deploy@build-box:2222 failed: handshake refused");
+    });
+
+    /// Scenario: The experimental Daemons screen offers one remedy for a local or remote disconnected deck, and its Start confirmation uses that host.
+    it.each((["local", "remote"] as const).flatMap((deckKind) =>
+      (["not-running", "running-not-connected", "unknown"] as const).map((kind) => ({ deckKind, kind }))))(
+      "offers one banner action for $deckKind / $kind", async ({ deckKind, kind }) => {
+        const snapshot = disconnectedDeck(deckKind, kind);
+        const live = runtime({ mode: "live", snapshot });
+        render(<ControlDeck runtime={live} />);
+        const banner = screen.getByRole("alert");
+        const actions = within(banner).getAllByRole("button");
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toHaveAccessibleName(kind === "not-running" ? "Start daemon" : "Reconnect");
+        expect(banner).toHaveTextContent(snapshot.connection.disconnectedReason!.message);
+        if (kind !== "not-running") {
+          expect(within(banner).queryByTestId("start-daemon")).not.toBeInTheDocument();
+          return;
+        }
+        fireEvent.click(within(banner).getByTestId("start-daemon"));
+        const dialog = screen.getByRole("alertdialog");
+        expect(dialog).toHaveTextContent(snapshot.connection.disconnectedReason!.host);
+        expect(dialog).not.toHaveTextContent("local daemon");
+        fireEvent.click(within(dialog).getByRole("button", { name: "Start daemon" }));
+        await waitFor(() => expect(live.runAction).toHaveBeenCalledExactlyOnceWith({ type: "start_daemon", deckId: snapshot.connection.deckId }));
+      });
+  });
+
   beforeEach(() => {
     window.localStorage.clear();
     vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
@@ -185,7 +328,8 @@ describe("ControlDeck", () => {
     document.documentElement.removeAttribute("data-theme");
   });
 
-  it("renders the deterministic four-agent cockpit with evidence and stable test seams", () => {
+  /** Scenario: Renders the deterministic four-agent cockpit with evidence and stable test seams. */
+  it("renders the deterministic four-agent cockpit with events and stable test seams", () => {
     render(<ControlDeck runtime={runtime()} />);
     expect(screen.getByText("DEMO DATA")).toBeVisible();
     expect(screen.getByTestId("run-health")).toHaveTextContent("healthy");
@@ -193,6 +337,207 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("agent-tile-builder")).toBeVisible();
     expect(screen.getByTestId("terminal-builder")).toBeVisible();
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
+    expect(screen.getByRole("region", { name: "Live delegations" })).toHaveTextContent("DELEGATIONS");
+    expect(screen.getByRole("region", { name: "Live delegations" })).toHaveTextContent("delegated → delivered → work-done");
+    expect(screen.getByRole("complementary", { name: "Transition events" })).toHaveTextContent("EVENTS");
+  });
+
+  /**
+   * Scenario: open the orchestration editor with only the old preview key saved.
+   * Its rows keep the saved role order and the app writes that order under the new key.
+   */
+  it("migrates the saved orchestration preview order from the legacy key", async () => {
+    const order = ["release", "tester", "auditor", "reviewer", "coder", "orchestrator"];
+    window.localStorage.setItem("dot-agent-deck.desktop.workflow-preview.v1.fixture", JSON.stringify({ order }));
+    render(<ControlDeck runtime={runtime()} />);
+
+    await waitFor(() => expect(JSON.parse(window.localStorage.getItem("dot-agent-deck.desktop.orchestration-preview.v1.fixture") ?? "null")).toEqual({ order }));
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
+    const editor = await screen.findByTestId("orchestration-editor");
+    const visibleOrder = Array.from(editor.querySelectorAll(".orchestration-editor-row strong"), (role) => role.firstChild?.textContent?.toLowerCase());
+    expect(visibleOrder).toEqual(order);
+  });
+
+  /**
+   * Scenario: start from a saved profile draft that lacks the Release profile, reset the profiles to their defaults, and open the orchestration editor.
+   * The restored Release row joins the saved order, and its Move up and Move down buttons reorder it.
+   */
+  it("lets a profile restored by a reset move in the orchestration order", async () => {
+    window.localStorage.setItem("dot-agent-deck.desktop.agent-profiles.v1.fixture", JSON.stringify(DEFAULT_PROFILES.filter((profile) => profile.id !== "release")));
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("open-agent-profiles"));
+    fireEvent.click(screen.getByRole("button", { name: /Coder/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Reset defaults/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Close agent profiles" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
+    const editor = await screen.findByTestId("orchestration-editor");
+    const visibleOrder = () => Array.from(editor.querySelectorAll(".orchestration-editor-row strong"), (role) => role.firstChild?.textContent?.toLowerCase());
+    expect(visibleOrder()).toEqual(["orchestrator", "coder", "reviewer", "auditor", "tester", "release"]);
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Move Release up" }));
+    fireEvent.click(within(editor).getByRole("button", { name: "Move Release up" }));
+    expect(visibleOrder()).toEqual(["orchestrator", "coder", "reviewer", "release", "auditor", "tester"]);
+    fireEvent.click(within(editor).getByRole("button", { name: "Move Release down" }));
+    expect(visibleOrder()).toEqual(["orchestrator", "coder", "reviewer", "auditor", "release", "tester"]);
+    await waitFor(() => expect(JSON.parse(window.localStorage.getItem("dot-agent-deck.desktop.orchestration-preview.v1.fixture") ?? "null")).toEqual({ order: ["orchestrator", "coder", "reviewer", "auditor", "release", "tester"] }));
+  });
+
+  /** Scenario: the command palette describes the Projects screen with the canonical project and orchestration names. */
+  it("offers projects and orchestrations from the command palette", () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.keyDown(document.body, { key: "k", metaKey: true });
+    expect(screen.getByRole("button", { name: /Manage projects/ })).toHaveTextContent("Choose projects & orchestrations");
+  });
+
+  /**
+   * Scenario: two runs of one orchestration each have a Coder, beside a
+   * standalone agent. The command palette's Focus entries name each Coder by
+   * its run's title and its role (issue #1668) and the standalone agent by its
+   * role as before, and the second run's entry selects that run's tile.
+   */
+  it("names the palette's Focus entries for orchestration agents by run title and role", () => {
+    const member = (id: string, run: string, title: string): AgentSession => ({ ...agentIn(id, "/tmp/project"), role: "Coder", displayName: "Coder", tab: { kind: "orchestration", orchestrationId: run, name: "mixed", displayTitle: title, roleName: "coder", roleIndex: 1, isStartRole: false } });
+    const standalone = { ...agentIn("solo", "/tmp/project"), role: "Claude code", displayName: "Changelog sweep" };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: liveSnapshot([member("coder-a", "run-a", "prd-1401"), member("coder-b", "run-b", "prd-1500"), standalone]) })} />);
+    fireEvent.keyDown(document.body, { key: "k", metaKey: true });
+    expect(screen.getByRole("button", { name: /Focus prd-1401 Coder/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Focus Claude code/ })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /^Focus Coder/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Focus prd-1500 Coder/ }));
+    const [first, second] = screen.getAllByTestId("agent-tile-coder");
+    expect(second.className).toContain("is-selected");
+    expect(first.className).not.toContain("is-selected");
+  });
+
+  /**
+   * Scenario: render the daemon and activate Planner's keyboard-reachable open
+   * control. The tile navigates with Planner's composite identity and records
+   * that closing the resulting agent pane must return to the daemon.
+   */
+  it("opens a daemon tile as an agent view whose origin is the daemon", () => {
+    const onNavigate = vi.fn();
+    render(<ControlDeck runtime={runtime()} onNavigate={onNavigate} />);
+
+    const tile = screen.getByTestId("agent-tile-planner");
+    const open = within(tile).getByRole("button", { name: "Open Planner agent" });
+    expect(open.tagName).toBe("BUTTON");
+    open.focus();
+    expect(open).toHaveFocus();
+
+    fireEvent.click(open);
+    expect(onNavigate).toHaveBeenCalledOnce();
+    expect(onNavigate).toHaveBeenCalledWith({
+      kind: "agent",
+      deckId: FIXTURE_DAEMON_ID,
+      agentId: "planner",
+      from: "deck",
+    });
+  });
+
+  /**
+   * Scenario: render the crowded deck, including its coordinator tiles, on the
+   * default terminal tab. Each tile must expose just xterm's own input surface;
+   * the role-labelled composer, its textarea, and its Send control are absent.
+   */
+  it("mounts one terminal input per agent and no per-tile message composer", () => {
+    const snapshot = createFixtureSnapshot("crowded");
+    render(<ControlDeck runtime={runtime({ snapshot })} />);
+
+    const tiles = screen.getAllByTestId(/^agent-tile-/);
+    const terminalInputs = tiles.flatMap((tile) => Array.from(tile.querySelectorAll("textarea.xterm-helper-textarea")));
+    const secondInputs = tiles.flatMap((tile) => Array.from(tile.querySelectorAll("textarea:not(.xterm-helper-textarea)")));
+
+    expect(tiles).toHaveLength(snapshot.agents.length);
+    expect(terminalInputs).toHaveLength(snapshot.agents.length);
+    expect.soft(screen.queryAllByTestId(/^composer-/)).toHaveLength(0);
+    expect.soft(secondInputs).toHaveLength(0);
+    expect.soft(screen.queryAllByText("Message orchestrator", { exact: true })).toHaveLength(0);
+    const sendControls = tiles.flatMap((tile) => within(tile).queryAllByRole("button", { name: "Send" }));
+    expect.soft(sendControls).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: render a running agent whose daemon-reported write lease is live.
+   * Its terminal remains enabled, carries the applied state, and shows no
+   * input-unavailable notice.
+   */
+  it("keeps a terminal input enabled when delivery is applied", () => {
+    const snapshot = liveSnapshot([{ ...agentIn("input-applied", "/tmp/project"), status: "running", writeLease: "write" }]);
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
+
+    const terminal = screen.getByTestId("terminal-input-applied");
+    expect(terminal).toHaveAttribute("data-input-state", "applied");
+    expect(terminal).toHaveAttribute("aria-disabled", "false");
+    expect(within(terminal).getByRole("textbox", { name: "Planner terminal input" })).toBeEnabled();
+    expect(screen.queryByTestId("terminal-input-status-input-applied")).toBeNull();
+  });
+
+  /**
+   * Scenario: render running panes that the daemon classifies as history-only or
+   * without a live target. Their terminal input is disabled and a named status
+   * region explains the exact non-delivery instead of accepting keystrokes.
+   */
+  it.each([
+    ["history-only", "read", "the agent has no live pane — only its history remains"],
+    ["no-live-target", "none", "there is nothing live to write to"],
+  ] satisfies [SendResult, AgentSession["writeLease"], string][])(
+    "marks and disables terminal input for %s",
+    (inputState, writeLease, reason) => {
+      const id = `input-${inputState}`;
+      const snapshot = liveSnapshot([{ ...agentIn(id, "/tmp/project"), status: "running", writeLease }]);
+      render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
+
+      const terminal = screen.getByTestId(`terminal-${id}`);
+      expect.soft(terminal).toHaveAttribute("data-input-state", inputState);
+      expect.soft(terminal).toHaveAttribute("aria-disabled", "true");
+      expect.soft(within(terminal).getByRole("textbox", { name: "Planner terminal input" })).toBeDisabled();
+      const status = screen.queryByTestId(`terminal-input-status-${id}`);
+      expect(status, `missing terminal-input-status-${id}`).not.toBeNull();
+      expect(status!).toHaveAttribute("role", "status");
+      expect(status!).toHaveTextContent(`Terminal input unavailable — ${reason}.`);
+    },
+  );
+
+  /**
+   * Scenario: open the Reader over an agent and read what it offers. Issue
+   * #1042 took the composer out of this overlay too — it was the Reader's ONLY
+   * send path rather than a duplicate of one, and a second input box floating
+   * in a reading overlay is the parallel-input surface that issue collapses. So
+   * the Reader is what its construction always said it was: read-only.
+   */
+  it("opens the Reader with no input surface of its own", () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("reader-open-planner"));
+
+    const reader = screen.getByTestId("reader-planner");
+    expect(within(reader).getByRole("button", { name: /Copy all/ })).toBeVisible();
+    expect(reader.querySelectorAll("textarea")).toHaveLength(0);
+    expect(within(reader).queryAllByTestId(/^composer-/)).toHaveLength(0);
+    expect(within(reader).queryAllByRole("button", { name: "Send" })).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: run the command palette's "Message orchestrator…" entry. It used
+   * to focus a composer that issue #1042 deletes, so it now selects the
+   * coordinator and puts its TERMINAL on screen — the input path that carries
+   * the agent CLI's own grammar. It still sends nothing.
+   */
+  it("points the palette's coordinator entry at the orchestrator's terminal", () => {
+    const coordinator = { ...agentIn("coordinator", "/tmp/project"), status: "running" as const, isStartRole: true };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: liveSnapshot([coordinator]) })} />);
+
+    // Off the terminal tab first, so switching back is observable rather than
+    // the default the tile already opens on.
+    const tile = screen.getByTestId("agent-tile-planner");
+    fireEvent.click(within(tile).getByRole("tab", { name: "Diff" }));
+    expect(screen.queryByTestId("terminal-coordinator")).toBeNull();
+
+    fireEvent.keyDown(document.body, { key: "k", metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: /Message orchestrator/ }));
+
+    expect(screen.getByTestId("terminal-coordinator")).toBeVisible();
+    expect(screen.getByTestId("agent-tile-planner").className).toContain("is-selected");
   });
 
   /**
@@ -201,7 +546,7 @@ describe("ControlDeck", () => {
    * directory and a workflow name into it, and asserted the pair reappeared in
    * `localStorage` under `dot-agent-deck.desktop.projects.v1` and then in the
    * launcher. Every step of that is now a defect — the project comes from the
-   * daemon, the workflow list comes from the project, and nothing is stored.
+   * daemon, the orchestration list comes from the project, and nothing is stored.
    *
    * What it pins now is the chain that replaced it, plus the one thing the old
    * one could not have said: that the path reaching the launch form is the
@@ -211,6 +556,7 @@ describe("ControlDeck", () => {
    * went with the library it was about. There is nothing to remove from a
    * picker over what the daemon currently knows.
    */
+  /** Scenario: Picks a daemon-listed project, resolves it, and carries the daemon's canonical path into the launcher. */
   it("picks a daemon-listed project, resolves it, and carries the daemon's canonical path into the launcher", async () => {
     const resolveProject = vi.fn(async (path: string) => daemonResolvedProject(
       // The daemon answers with a DIFFERENT spelling: `/home/dev/current` is a
@@ -240,10 +586,10 @@ describe("ControlDeck", () => {
     expect(resolveProject).toHaveBeenCalledWith("/home/dev/current");
     expect(screen.getByLabelText("Resolved project path")).toHaveValue("/home/dev/code/clipmaker");
 
-    fireEvent.click(screen.getByRole("button", { name: "Configure workflow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Configure orchestration" }));
     // The workflow list is the PROJECT's, and its default is pre-selected —
     // daemon, then project, then workflow, in that order.
-    expect(screen.getByLabelText("Workflow name")).toHaveValue("clipmaker-loop");
+    expect(screen.getByLabelText("Orchestration name")).toHaveValue("clipmaker-loop");
     // Read-only, and carrying the daemon's spelling rather than the clicked one.
     const directory = screen.getByLabelText("Absolute project directory") as HTMLInputElement;
     expect(directory).toHaveValue("/home/dev/code/clipmaker");
@@ -326,6 +672,7 @@ describe("ControlDeck", () => {
    * state rather than an error, and the listing is refreshed so the picker
    * stops offering something that is gone.
    */
+  /** Scenario: Presents a project that left the daemon's known set like the empty state. */
   it("presents a project that left the daemon's known set like the empty state", async () => {
     const listProjects = vi.fn(async () => ({ projects: [daemonProject("/home/dev/stale", "stale")] }));
     const live = runtime({
@@ -340,7 +687,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByRole("button", { name: /stale/ }));
 
     await waitFor(() => expect(screen.getByTestId("projects-nothing-known")).toBeVisible());
-    expect(screen.getByTestId("projects-nothing-known")).toHaveTextContent("no longer one this deck knows");
+    expect(screen.getByTestId("projects-nothing-known")).toHaveTextContent("no longer one this daemon knows");
     // Like the empty state: the daemon's refusal text is NOT shown as a fault.
     expect(screen.queryByTestId("project-resolve-error")).toBeNull();
     // And the listing is re-asked, because it is now known to be out of date.
@@ -352,14 +699,15 @@ describe("ControlDeck", () => {
    * one. Order matters: workflows come out of the project's own config, so
    * there is nothing to offer before a project is chosen.
    */
+  /** Scenario: Blocks a live launch until a project is chosen. */
   it("blocks a live launch until a project is chosen", async () => {
     const live = runtime({ mode: "live", listProjects: vi.fn(async () => ({ projects: [] })) });
     render(<ControlDeck runtime={live} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
-    await waitFor(() => expect(screen.getByTestId("workflow-editor")).toBeVisible());
-    expect(screen.getByTestId("workflow-needs-project")).toBeVisible();
-    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
+    await waitFor(() => expect(screen.getByTestId("orchestration-editor")).toBeVisible());
+    expect(screen.getByTestId("orchestration-needs-project")).toBeVisible();
+    expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
     expect(screen.getByLabelText("Absolute project directory")).toHaveValue("");
   });
 
@@ -378,11 +726,12 @@ describe("ControlDeck", () => {
     expect(window.localStorage.getItem("dot-agent-deck.desktop.agent-profiles.v1.fixture")).toContain("gpt-5.6-sol-fast");
   });
 
+  /** Scenario: Launches the provider-derived command after CLI, model, effort, and permission edits. */
   it("launches the provider-derived command after CLI, model, effort, and permission edits", async () => {
     const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close orchestration editor" }));
     fireEvent.click(screen.getByTestId("open-agent-profiles"));
     fireEvent.click(screen.getByRole("button", { name: /Coder/ }));
     fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "/Applications/Codex Nightly/bin/codex" } });
@@ -391,28 +740,29 @@ describe("ControlDeck", () => {
     fireEvent.change(screen.getByLabelText("Permission mode"), { target: { value: "full-access" } });
     fireEvent.click(screen.getByRole("button", { name: "Close agent profiles" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build the project switcher polish." } });
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("All 6 commands are generated from the current provider, CLI, model, effort, and permission fields.");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("sends your task prompt to the coordinator");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("sends your task prompt to the orchestrator");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Among generated commands, 1 role runs unrestricted");
-    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
     await waitFor(() => {
       const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
-      expect(launch).toMatchObject({ type: "start_workflow" });
-      if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      expect(launch).toMatchObject({ type: "activate_orchestration" });
+      if (launch?.type !== "activate_orchestration") throw new Error("expected orchestration activation");
       expect(launch.taskPrompt).toBe("Build the project switcher polish.");
       expect(launch.roles.find((role) => role.role === "coder")?.command).toBe("'/Applications/Codex Nightly/bin/codex' --model gpt-5.6-sol-fast --sandbox danger-full-access --ask-for-approval on-request -c model_reasoning_effort=high");
     });
   });
 
+  /** Scenario: Requires an explicit advanced toggle for a custom command and calls out the bypass at launch. */
   it("requires an explicit advanced toggle for a custom command and calls out the bypass at launch", async () => {
     const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close orchestration editor" }));
     fireEvent.click(screen.getByTestId("open-agent-profiles"));
     fireEvent.click(screen.getByRole("button", { name: /Coder/ }));
     fireEvent.change(screen.getByLabelText("Permission mode"), { target: { value: "full-access" } });
@@ -421,33 +771,32 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("agent-profiles-panel")).toHaveTextContent("Permissions are unmanaged here and must be encoded and reviewed in that command.");
     fireEvent.click(screen.getByRole("button", { name: "Close agent profiles" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Use the custom coder to fix failing tests." } });
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("1 explicit custom command override bypasses those fields");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Custom commands may carry arbitrary permissions and are not covered by structured permission claims.");
     expect(screen.getByRole("alertdialog")).not.toHaveTextContent("role runs unrestricted");
-    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
     await waitFor(() => {
       const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
-      if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      if (launch?.type !== "activate_orchestration") throw new Error("expected orchestration activation");
       expect(launch.roles.find((role) => role.role === "coder")?.command).toBe("devbox run agent-coder");
     });
   });
 
-  it("confirmation-gates live workflow launch and keeps orchestrator as the start role", async () => {
+  /** Scenario: Confirmation-gates live orchestration activation and keeps orchestrator as the start role. */
+  it("confirmation-gates live orchestration activation and keeps orchestrator as the start role", async () => {
     const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
-    expect(screen.getByText("Add the task you want the coordinator to run.")).toBeVisible();
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Wire the launch prompt into the workflow." } });
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Wire the launch prompt into the orchestration." } });
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(live.runAction).not.toHaveBeenCalled();
-    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
     await waitFor(() => expect(live.runAction).toHaveBeenCalledWith(expect.objectContaining({
-      type: "start_workflow",
+      type: "activate_orchestration",
       // The workflow name is now the ORCHESTRATION the daemon offered for the
       // chosen project, selected from a list rather than typed — and the cwd
       // and revision come from the same resolve, so the launch carries the
@@ -455,14 +804,179 @@ describe("ControlDeck", () => {
       name: "dot-agent-deck",
       cwd: "/home/dev/code/deck",
       configRevision: "revision-1",
-      taskPrompt: "Wire the launch prompt into the workflow.",
+      taskPrompt: "Wire the launch prompt into the orchestration.",
       roles: expect.arrayContaining([expect.objectContaining({ role: "orchestrator", start: true }), expect.objectContaining({ role: "coder", start: false })]),
     })));
   });
 
   /**
+   * Issue #1044. Scenario: choose the project and press Activate without typing
+   * a task. The button is enabled — neither the daemon nor the TUI requires a
+   * task — the sheet says the orchestrator will wait, the confirmation says so
+   * too instead of promising to send a prompt, and the activation goes out with an
+   * empty task for the daemon to compose around.
+   */
+  it("activates with no task, saying the orchestrator will wait for one", async () => {
+    const live = liveWithProject();
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+
+    expect(screen.getByTestId("orchestration-no-task")).toHaveTextContent("type the task into its pane");
+    expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("briefs the orchestrator with no task, so it waits for you to type one into its pane");
+    expect(dialog).not.toHaveTextContent("sends your task prompt");
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
+
+    await waitFor(() => {
+      const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
+      if (launch?.type !== "activate_orchestration") throw new Error("expected orchestration activation");
+      expect(launch.taskPrompt).toBe("");
+    });
+  });
+
+  /**
+   * Issue #1044. Scenario: the selected daemon already runs this project's
+   * orchestration as `deck-orchestrator-1`, in another directory. Opening the sheet
+   * suggests `deck-orchestrator-2` in Run name — the TUI's
+   * `<basename>-orchestrator-N` past the live titles — and the confirmation
+   * names it; the activation sends it as the run's title. Typing a different name
+   * sends that one, and a Name emptied by the user sends no title at all, so
+   * the run takes the orchestration's own name as a TUI run with an empty Name does.
+   */
+  it("suggests a run name past the daemon's live orchestrations and sends what the user leaves there", async () => {
+    const running = { ...agentIn("running", "/srv/other"), tab: { kind: "orchestration" as const, orchestrationId: "o-1", name: "dot-agent-deck", displayTitle: "deck-orchestrator-1", roleName: "orchestrator", roleIndex: 0, isStartRole: true, cwd: "/srv/other" } };
+    const launched = async (live: DeckRuntimeState, index: number) => {
+      fireEvent.click(screen.getByTestId("activate-orchestration"));
+      fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
+      let launch: import("./types").DeckAction | undefined;
+      await waitFor(() => {
+        launch = vi.mocked(live.runAction).mock.calls.filter(([action]) => action.type === "activate_orchestration")[index]?.[0];
+        expect(launch).toBeDefined();
+      });
+      if (launch?.type !== "activate_orchestration") throw new Error("expected orchestration activation");
+      return launch;
+    };
+
+    const live = liveWithProject({ snapshot: liveSnapshot([running]) });
+    const { unmount } = render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-2");
+    expect(screen.queryByTestId("orchestration-same-directory")).toBeNull();
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("The run is named deck-orchestrator-2.");
+    fireEvent.click(screen.getAllByRole("button", { name: "Cancel" }).at(-1)!);
+    expect((await launched(live, 0)).displayTitle).toBe("deck-orchestrator-2");
+    unmount();
+
+    const typed = liveWithProject({ snapshot: liveSnapshot([running]) });
+    const second = render(<ControlDeck runtime={typed} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "release-review" } });
+    expect((await launched(typed, 0)).displayTitle).toBe("release-review");
+    second.unmount();
+
+    const cleared = liveWithProject({ snapshot: liveSnapshot([running]) });
+    render(<ControlDeck runtime={cleared} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "" } });
+    expect(screen.getByLabelText("Run name")).toHaveAttribute("placeholder", "dot-agent-deck");
+    expect(await launched(cleared, 0)).not.toHaveProperty("displayTitle");
+  });
+
+  /**
+   * PR #1333 review. Scenario: type a Run name, close the Orchestrations sheet and
+   * open it again. The sheet is a fresh activation, as a TUI `Ctrl+n` form is, so
+   * the typed name is gone and the suggestion is back — otherwise a name typed
+   * for one activation comes back as a collision with the run it named.
+   */
+  it("offers a fresh suggestion each time the sheet opens, not the last typed name", async () => {
+    const live = liveWithProject();
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-1");
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "my-run" } });
+    fireEvent.click(screen.getByRole("button", { name: "Close orchestration editor" }));
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
+    expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-1");
+  });
+
+  /**
+   * PR #1333 review. Scenario: type a Run name the desktop crate would refuse
+   * — a terminal escape, or more than 128 bytes. The sheet says why and keeps
+   * Activate disabled, instead of offering a confirmation for an activation the crate
+   * then refuses; a usable name brings Activate back.
+   */
+  it("refuses an unusable run name in the sheet, before any confirmation", async () => {
+    const live = liveWithProject();
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    for (const bad of ["run\u001b[2J", "x".repeat(129)]) {
+      fireEvent.change(screen.getByLabelText("Run name"), { target: { value: bad } });
+      expect(screen.getByTestId("orchestration-run-name-unusable")).toHaveTextContent("at most 128 bytes and contain no control or text-direction characters");
+      expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
+    }
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "fine" } });
+    expect(screen.queryByTestId("orchestration-run-name-unusable")).toBeNull();
+    expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
+  });
+
+  /**
+   * PR #1333 review. Scenario: press Activate with the suggested name, and while
+   * the confirmation is open another orchestration on the daemon takes that very
+   * title. Confirming re-checks against the titles live NOW: nothing is sent,
+   * and the notice gives the collision refusal.
+   */
+  it("re-checks the run name for a collision when the activation is confirmed", async () => {
+    const live = liveWithProject();
+    const { rerender } = render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-1");
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+
+    const rival = { ...agentIn("rival", "/srv/elsewhere"), tab: { kind: "orchestration" as const, orchestrationId: "o-rival", name: "dot-agent-deck", displayTitle: "deck-orchestrator-1", roleName: "orchestrator", roleIndex: 0, isStartRole: true, cwd: "/srv/elsewhere" } };
+    const snapshot = { ...live.snapshot, agents: [...live.snapshot.agents, rival] };
+    rerender(<ControlDeck runtime={{ ...live, snapshot, fleet: [snapshot] }} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
+
+    await waitFor(() => expect(screen.getByTestId("toast")).toHaveTextContent("Nothing was started: This name is already in use by a live orchestration on this daemon."));
+    expect(vi.mocked(live.runAction).mock.calls.some(([action]) => action.type === "activate_orchestration")).toBe(false);
+  });
+
+  /**
+   * Issue #1044. Scenario: the selected daemon already runs an orchestration
+   * titled `busy` in this very project directory. The sheet warns that the
+   * two would share the directory and still lets Activate through — the TUI's
+   * same-directory warning never blocks. Typing `busy` as the Run name
+   * replaces the warning with the TUI's collision refusal and disables Activate;
+   * clearing the name makes the run's title the orchestration's name, which is not
+   * taken, so Activate comes back.
+   */
+  it("warns about a shared directory without blocking, and refuses a run name a live orchestration holds", async () => {
+    const busy = { ...agentIn("busy", "/home/dev/code/deck"), tab: { kind: "orchestration" as const, orchestrationId: "o-busy", name: "other-workflow", displayTitle: "busy", roleName: "orchestrator", roleIndex: 0, isStartRole: true, cwd: "/home/dev/code/deck" } };
+    const live = liveWithProject({ snapshot: liveSnapshot([busy]) });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+
+    expect(screen.getByTestId("orchestration-same-directory")).toHaveTextContent("This directory already runs an orchestration on this daemon.");
+    expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "busy" } });
+    expect(screen.getByTestId("orchestration-title-taken")).toHaveTextContent("This name is already in use by a live orchestration on this daemon.");
+    expect(screen.queryByTestId("orchestration-same-directory")).toBeNull();
+    expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "" } });
+    expect(screen.queryByTestId("orchestration-title-taken")).toBeNull();
+    expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
+    expect(live.runAction).not.toHaveBeenCalled();
+  });
+
+  /**
    * The role sets have to agree, and the daemon is the authority on what the
-   * workflow's roles are. A project whose orchestration does not carry a role
+   * orchestration's roles are. A project whose orchestration does not carry a role
    * the enabled profiles supply is refused here, before the launch, and the
    * message names the mismatch rather than restating a hardcoded six.
    */
@@ -502,62 +1016,183 @@ describe("ControlDeck", () => {
     await chooseTheOnlyProject();
 
     // Rendered: the escaped twin, and nowhere the raw byte.
-    const projectPath = screen.getByTestId("workflow-project-path") as HTMLInputElement;
+    const projectPath = screen.getByTestId("orchestration-project-path") as HTMLInputElement;
     expect(projectPath.value).toBe("/home/dev/code/deck");
-    expect(screen.getByLabelText("Workflow name")).toHaveTextContent("dot-agent-deck (default)");
+    expect(screen.getByLabelText("Orchestration name")).toHaveTextContent("dot-agent-deck (default)");
     expect(document.body.textContent).not.toContain("\u0001");
 
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
     // The confirmation dialog names both values, and it is a text node too.
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("Launch dot-agent-deck?");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Activate dot-agent-deck?");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("in /home/dev/code/deck and sends");
     expect(document.body.textContent).not.toContain("\u0001");
-    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
-    // Submitted: the daemon's own spelling of the path AND of the workflow
+    // Submitted: the daemon's own spelling of the path AND of the orchestration
     // name — and neither display twin rides along to the daemon.
     await waitFor(() => {
       const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
-      if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      if (launch?.type !== "activate_orchestration") throw new Error("expected orchestration activation");
       expect(launch.cwd).toBe(rawPath);
       expect(launch.name).toBe(rawWorkflow);
       expect(launch).not.toHaveProperty("displayName");
       expect(launch).not.toHaveProperty("displayPath");
     });
     // And the success notice is the escaped twin as well.
-    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("dot-agent-deck launched with 6 configured roles."));
+    //
+    // Addressed by test id rather than by `getByRole("status")`: issue #1042
+    // put a `role="status"` line under every terminal whose pane cannot take
+    // input, so the daemon now has several live regions and a bare role query is
+    // ambiguous. The assertion itself is unchanged.
+    await waitFor(() => expect(screen.getByTestId("toast")).toHaveTextContent("dot-agent-deck activated with 6 configured roles."));
+    // The test id only disambiguates the query; the toast is still expected to
+    // be a live region, which is what `getByRole("status")` used to prove.
+    expect(screen.getByTestId("toast")).toHaveAttribute("role", "status");
     expect(document.body.textContent).not.toContain("\u0001");
   });
 
   /**
    * PRD #819 audit fix: `stale-preparation` is the refusal an ORDINARY second
-   * launch in the same project produces, because the coordinator context is
+   * launch in the same project produces, because the orchestrator context is
    * published at a path fixed per project and the later preparation is the one
    * that survives. Nothing was started, and the remedy is a real one — prepare
    * again — so the screen must say that rather than showing the daemon's raw
    * refusal, and must re-read the project so the next attempt is fresh.
    */
+  /** Scenario: Presents a stale preparation as a re-launchable outcome and re-reads the project. */
   it("presents a stale preparation as a re-launchable outcome and re-reads the project", async () => {
     const live = liveWithProject({
       runAction: vi.fn(async () => {
-        throw new Error("failed to start workflow role coder: stale-preparation: that preparation no longer describes what it approved; prepare the workflow again; rolled back 1 role");
+        throw new Error("failed to activate orchestration role coder: stale-preparation: that preparation no longer describes what it approved; prepare the orchestration again; rolled back 1 role");
       }),
     });
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
     const resolvesAfterPick = vi.mocked(live.resolveProject).mock.calls.length;
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
+    // By test id for the reason given on the launch test above: the terminals
+    // carry `role="status"` notices of their own since issue #1042.
     await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent("no longer matches what the deck approved");
+      expect(screen.getByTestId("toast")).toHaveTextContent("no longer matches what the daemon approved");
     });
-    expect(screen.getByRole("status")).toHaveTextContent("Nothing was started");
-    expect(screen.getByRole("status")).toHaveTextContent("launch again");
+    expect(screen.getByTestId("toast")).toHaveTextContent("Nothing was started");
+    expect(screen.getByTestId("toast")).toHaveTextContent("activate again");
+    expect(screen.getByTestId("toast")).toHaveAttribute("role", "status");
     // Re-read, so the next attempt carries the project's current revision.
     expect(vi.mocked(live.resolveProject).mock.calls.length).toBeGreaterThan(resolvesAfterPick);
+  });
+
+  /**
+   * Scenario (PRD #1223 audit V7): a launch failed with roles its rollback
+   * could not confirm stopped, and the dialog that would have shown them is
+   * gone — the runtime is the only holder left. The toast must show those
+   * roles as their own alert rather than only the sentence that names them
+   * last, and must render both through the sanitised presenters: a role name
+   * reaches the sentence too, so a bidi override in one could otherwise
+   * reorder what the user reads.
+   */
+  /** Scenario: Shows the runtime's unconfirmed roles on the toast, with the sentence sanitised. */
+  it("shows the runtime's unconfirmed roles on the toast, with the sentence sanitised", () => {
+    const hostile = "plan\u202Ener";
+    render(<ControlDeck runtime={runtime({
+      error: `failed to start orchestration role ${hostile}: refused; cleanup could not confirm stop for 1 of 1 already-started role(s)`,
+      cleanupWarnings: [{ id: 1, stops: [hostile] }],
+    })} />);
+
+    const toast = screen.getByTestId("toast");
+    const warning = screen.getByTestId("toast-cleanup-warning");
+    expect(warning).toHaveTextContent("1 role may still be running on this daemon");
+    expect(warning).toHaveTextContent("planner");
+    expect(warning.textContent).not.toContain("\u202E");
+    expect(toast).toHaveTextContent("failed to start orchestration role");
+    expect(toast.textContent).not.toContain("\u202E");
+  });
+
+  /**
+   * Scenario (issue #1234): a cleanup warning is queued and the deck then
+   * raises a notice of its own — here, a local deck the user starts. The
+   * notice takes the message slot, as it always has, and the warning must
+   * STAY on screen beside it: it used to be tied to whichever sentence the
+   * toast showed, so a notice hid it until the notice was dismissed. Dismissing
+   * the notice leaves the warning; only the warning's own dismiss ends it.
+   */
+  it("keeps a cleanup warning on screen while a deck notice holds the toast", async () => {
+    const started = "Local daemon started and control channel reconnected.";
+    const dismissCleanupWarning = vi.fn();
+    render(<ControlDeck runtime={runtime({
+      mode: "live",
+      snapshot: disconnectedLive(),
+      cleanupWarnings: [{ id: 7, stops: ["orchestrator"] }],
+      dismissCleanupWarning,
+    })} />);
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
+    expect(await screen.findByText(started)).toBeInTheDocument();
+    expect(screen.getByTestId("toast-cleanup-warning")).toHaveTextContent("orchestrator");
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+    await waitFor(() => expect(screen.queryByText(started)).not.toBeInTheDocument());
+    expect(screen.getByTestId("toast-cleanup-warning")).toHaveTextContent("orchestrator");
+    expect(dismissCleanupWarning).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByLabelText("Dismiss cleanup warning"));
+    expect(dismissCleanupWarning).toHaveBeenCalledWith(7);
+  });
+
+  /**
+   * Scenario (issue #1234 review): warnings pile up oldest first, with the
+   * message last, in a stack that scrolls once it is taller than its cap. A
+   * newly queued warning must not land below the visible part of it, so the
+   * stack is scrolled to its bottom when one arrives.
+   */
+  it("scrolls the message stack to the newest cleanup warning", () => {
+    const view = render(<ControlDeck runtime={runtime({ cleanupWarnings: [{ id: 1, stops: ["planner"] }] })} />);
+    const stack = view.container.querySelector(".toast-stack") as HTMLDivElement;
+    let scrolledTo = 0;
+    Object.defineProperty(stack, "scrollHeight", { configurable: true, get: () => 900 });
+    Object.defineProperty(stack, "scrollTop", { configurable: true, get: () => scrolledTo, set: (value: number) => { scrolledTo = value; } });
+
+    view.rerender(<ControlDeck runtime={runtime({ cleanupWarnings: [{ id: 1, stops: ["planner"] }, { id: 2, stops: ["coder"] }] })} />);
+
+    expect(scrolledTo).toBe(900);
+  });
+
+  /**
+   * PRD #1223 audit V2: a stale-preparation refusal of a LATER role, after an
+   * earlier one had started, whose rollback stop the daemon then refused. The
+   * sentence carries `stale-preparation:`, which the case above translates
+   * into "Nothing was started" — false here, since the first role may still be
+   * running. The structured rejection is checked first, so the toast keeps the
+   * deck's own sentence, which names that role. (The role list itself is the
+   * runtime's queued warning since issue #1234 — this fake runtime queues
+   * nothing; `OverviewRuntimeFailure.test.tsx` drives the real one.)
+   */
+  /** Scenario: Warns about a role the rollback could not stop before translating a refusal code. */
+  it("warns about a role the rollback could not stop before translating a refusal code", async () => {
+    const live = liveWithProject({
+      runAction: vi.fn(async () => {
+        throw new LaunchCleanupError(
+          "failed to activate orchestration role coder: stale-preparation: that preparation no longer describes what it approved; prepare the orchestration again; cleanup could not confirm stop for 1 of 1 already-started role(s): orchestrator (agent-0: stop refused)",
+          ["orchestrator"],
+        );
+      }),
+    });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("toast")).toHaveTextContent("cleanup could not confirm stop");
+    });
+    expect(screen.getByTestId("toast")).toHaveTextContent("orchestrator");
+    expect(screen.getByTestId("toast")).not.toHaveTextContent("Nothing was started");
   });
 
   /**
@@ -568,29 +1203,33 @@ describe("ControlDeck", () => {
    * through — it already names what to do instead — and closes the launcher
    * instead of inviting another attempt.
    */
+  /** Scenario: Presents an unsupported-platform refusal without inviting a retry. */
   it("presents an unsupported-platform refusal without inviting a retry", async () => {
     const live = liveWithProject({
       runAction: vi.fn(async () => {
-        throw new Error("unsupported-platform: this deck offers the project verbs but withholds `prepare-workflow`. Nothing was started. Launch this workflow from the TUI on that deck's own host, or point the app at a deck on a Unix host.");
+        throw new Error("unsupported-platform: this daemon offers the project verbs but withholds `prepare-orchestration`. Nothing was started. Activate this orchestration from the TUI on that daemon's own host, or point the app at a daemon on a Unix host.");
       }),
     });
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
     const resolvesAfterPick = vi.mocked(live.resolveProject).mock.calls.length;
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
+    // By test id for the reason given on the launch test above.
     await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent("Launch this workflow from the TUI on that deck's own host");
+      expect(screen.getByTestId("toast")).toHaveTextContent("Activate this orchestration from the TUI on that daemon's own host");
     });
-    expect(screen.queryByTestId("workflow-editor")).toBeNull();
+    expect(screen.getByTestId("toast")).toHaveAttribute("role", "status");
+    expect(screen.queryByTestId("orchestration-editor")).toBeNull();
     // No re-resolve: nothing about the project changed, and trying again cannot
     // help until the daemon does.
     expect(vi.mocked(live.resolveProject).mock.calls.length).toBe(resolvesAfterPick);
   });
 
-  it("refuses to launch when the enabled profiles do not match the workflow's roles", async () => {
+  /** Scenario: Refuses to launch when the enabled profiles do not match the orchestration's roles. */
+  it("refuses to launch when the enabled profiles do not match the orchestration's roles", async () => {
     const live = liveWithProject({
       resolveProject: vi.fn(async () => daemonResolvedProject(
         "/home/dev/code/deck",
@@ -603,9 +1242,9 @@ describe("ControlDeck", () => {
     await chooseTheOnlyProject();
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Anything." } });
 
-    expect(screen.getByTestId("workflow-role-mismatch")).toHaveTextContent("pair defines orchestrator, coder");
-    expect(screen.getByTestId("workflow-role-mismatch")).toHaveTextContent("Not in this workflow: reviewer");
-    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    expect(screen.getByTestId("orchestration-role-mismatch")).toHaveTextContent("pair defines orchestrator, coder");
+    expect(screen.getByTestId("orchestration-role-mismatch")).toHaveTextContent("Not in this orchestration: reviewer");
+    expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
     expect(live.runAction).not.toHaveBeenCalled();
   });
 
@@ -615,7 +1254,7 @@ describe("ControlDeck", () => {
    * This screen assumed the role named `orchestrator` always starts, so an
    * orchestration that marks any other role as its start role was offered as a
    * ready-to-launch button and then refused three layers down —
-   * `order_workflow_roles` compares every submitted start marker against the
+   * `order_orchestration_roles` compares every submitted start marker against the
    * daemon's projection, and since the P1(a) fix the daemon refuses the spawn
    * itself with `preparation-mismatch`.
    *
@@ -624,8 +1263,9 @@ describe("ControlDeck", () => {
    * and `orchestrator` does not, and the launch has to say the same. The START
    * badge is asserted alongside the submitted markers because they are two
    * readings of one fact: a screen that submitted the right marker while
-   * labelling the wrong row would be lying about which agent is the coordinator.
+   * labelling the wrong row would be lying about which agent is the orchestrator.
    */
+  /** Scenario: Submits the start marker the orchestration declares rather than assuming `orchestrator`. */
   it("submits the start marker the orchestration declares rather than assuming `orchestrator`", async () => {
     const live = liveWithProject({
       resolveProject: vi.fn(async () => daemonResolvedProject(
@@ -643,13 +1283,13 @@ describe("ControlDeck", () => {
     expect(startBadges[0].parentElement?.textContent).toContain("Coder");
 
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
-    expect(screen.getByTestId("launch-live-loop")).toBeEnabled();
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+    expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
     await waitFor(() => {
       const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
-      if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      if (launch?.type !== "activate_orchestration") throw new Error("expected orchestration activation");
       expect(launch.roles.find((role) => role.role === "coder")?.start).toBe(true);
       expect(launch.roles.find((role) => role.role === "orchestrator")?.start).toBe(false);
       expect(launch.roles.filter((role) => role.start)).toHaveLength(1);
@@ -659,10 +1299,11 @@ describe("ControlDeck", () => {
   /**
    * PRD #819, Greptile P1(b), the other half: an orchestration that marks NO
    * role as its start role cannot be launched from this app at all —
-   * `validate_desktop_coordinator` has nothing to make the coordinator out of.
-   * Refuse it here, naming the workflow, rather than enabling a button whose
+   * `validate_desktop_coordinator` has nothing to make the orchestrator out of.
+   * Refuse it here, naming the orchestration, rather than enabling a button whose
    * only outcome is a bridge error after the confirmation dialog.
    */
+  /** Scenario: Refuses an orchestration that declares no start role, before the launch button. */
   it("refuses an orchestration that declares no start role, before the launch button", async () => {
     const live = liveWithProject({
       resolveProject: vi.fn(async () => daemonResolvedProject(
@@ -678,10 +1319,10 @@ describe("ControlDeck", () => {
     await chooseTheOnlyProject();
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
 
-    expect(screen.getByTestId("workflow-no-start-role")).toHaveTextContent("marks no role as its start role");
+    expect(screen.getByTestId("orchestration-no-start-role")).toHaveTextContent("marks no role as its start role");
     expect(document.querySelectorAll(".start-role")).toHaveLength(0);
-    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(live.runAction).not.toHaveBeenCalled();
   });
 
@@ -779,13 +1420,13 @@ describe("ControlDeck", () => {
    * Two decks agreeing on status, agent count, working directories AND schedule
    * revision is not exotic: it is what a second deck running the same project
    * looks like. Before the socket path led the key, switching to it left the
-   * key identical and the picker kept offering the projects of the deck the
+   * key identical and the picker kept offering the projects of the daemon the
    * user had just switched away from.
    *
    * The second rerender is the control: the same deck again must not re-list,
    * or this would pass against a key that changes on every render.
    */
-  it("re-lists projects when the deck changes, even when everything else about it matches", async () => {
+  it("re-lists projects when the daemon changes, even when everything else about it matches", async () => {
     const listProjects = vi.fn(async () => ({ projects: [daemonProject("/home/dev/code/deck", "deck")] }));
     const agents = [agentIn("1", "/home/dev/code/deck")];
     const onDeck = (socketPath: string) => {
@@ -806,30 +1447,31 @@ describe("ControlDeck", () => {
     expect(listProjects.mock.calls.length).toBe(afterSecond);
   });
 
-  it("explains and disables live workflow launch on Windows before confirmation", () => {
+  /** Scenario: Explains and disables live orchestration activation on Windows before confirmation. */
+  it("explains and disables live orchestration activation on Windows before confirmation", () => {
     const live = runtime({ mode: "live" });
-    render(<ControlDeck runtime={live} workflowPlatformIssue={WINDOWS_WORKFLOW_BLOCK_REASON} />);
-    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    render(<ControlDeck runtime={live} orchestrationPlatformIssue={WINDOWS_ORCHESTRATION_BLOCK_REASON} />);
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Try to launch on Windows." } });
 
-    expect(screen.getByTestId("workflow-platform-issue")).toHaveTextContent("unavailable in this Windows preview");
-    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(screen.getByTestId("orchestration-platform-issue")).toHaveTextContent("unavailable in this Windows preview");
+    expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(live.runAction).not.toHaveBeenCalled();
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 
   /**
    * Scenario: the connected deck does not advertise the verbs a launch needs, so
-   * the workflow panel says which ones and the Launch button is disabled.
+   * the orchestration panel says which ones and the Launch button is disabled.
    *
    * PRD #741 M8. This is the mechanism the build stamp is demoted in favour of:
-   * the deck is COMPATIBLE — the wire agreed and the app is connected — and it
+   * the daemon is COMPATIBLE — the wire agreed and the app is connected — and it
    * still cannot do this particular thing, which no version digit or git stamp
    * can express. The reason is the daemon's own, derived from its advertised
    * capability set, so the surface and `DaemonClient`'s refusal cannot disagree.
    */
-  it("explains and disables a launch against a deck that withholds the project verbs", () => {
+  it("explains and disables a launch against a daemon that withholds the project verbs", () => {
     const live = runtime({ mode: "live" });
     const withheld = {
       ...live,
@@ -837,24 +1479,25 @@ describe("ControlDeck", () => {
         ...live.snapshot,
         connection: {
           ...live.snapshot.connection,
-          projectActionsReason: "This deck does not advertise prepare-workflow, so projects and workflows cannot be started from here. Agents already running on it stay visible and usable.",
+          projectActionsReason: "This daemon cannot offer projects or activate orchestrations from here. Agents already running on it stay visible and usable.",
         },
       },
     };
     render(<ControlDeck runtime={withheld} />);
-    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Try to launch against an older deck." } });
 
-    expect(screen.getByTestId("workflow-capability-issue")).toHaveTextContent("does not advertise prepare-workflow");
+    expect(screen.getByTestId("orchestration-capability-issue")).toHaveTextContent("cannot offer projects or activate orchestrations");
+    expect(screen.getByTestId("orchestration-capability-issue")).not.toHaveTextContent("prepare-orchestration");
     // A degraded deck is not a broken one, and the sentence says so.
-    expect(screen.getByTestId("workflow-capability-issue")).toHaveTextContent("stay visible and usable");
-    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(screen.getByTestId("orchestration-capability-issue")).toHaveTextContent("stay visible and usable");
+    expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(withheld.runAction).not.toHaveBeenCalled();
   });
 
   /**
-   * Scenario: the stored selection names a deck that is no longer configured,
+   * Scenario: the stored selection names a daemon that is no longer configured,
    * so the app is on the local deck and connected. The banner appears anyway
    * and says which of the two reasons it was.
    *
@@ -874,13 +1517,13 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: fellBack })} />);
 
     expect(screen.getByTestId("selection-fallback")).toHaveTextContent("has no remote socket path yet");
-    expect(screen.getByRole("alert")).toHaveTextContent("Using the deck on this machine");
+    expect(screen.getByRole("alert")).toHaveTextContent("Using the daemon on this machine");
     // Still a local deck, so the lifecycle controls are still the user's.
     expect(screen.queryByTestId("remote-deck-notice")).not.toBeInTheDocument();
   });
 
   /**
-   * Scenario: the app is talking to a deck on another machine. Stop, Start and
+   * Scenario: the app is talking to a daemon on another machine. Stop, Start and
    * Replace are gone, and the banner says why.
    *
    * PRD #741 M7. This is rendering a refusal that already exists:
@@ -900,7 +1543,7 @@ describe("ControlDeck", () => {
       daemonDetected: true,
       runningAgentCount: 0,
       localOnlyReason:
-        "Stop deck is not available for the remote deck deploy@build-box: it acts on a process on this machine, which is not the machine that deck runs on",
+        "Stop daemon is not available for the remote deck deploy@build-box: it acts on a process on this machine, which is not the machine that daemon runs on",
     };
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: remote })} />);
 
@@ -909,28 +1552,34 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("stop-run")).toBeDisabled();
     expect(screen.getByTestId("stop-run")).toHaveAttribute(
       "title",
-      expect.stringContaining("not the machine that deck runs on"),
+      expect.stringContaining("not the machine that daemon runs on"),
     );
     expect(screen.getByTestId("remote-deck-notice")).toHaveTextContent("acts on a process on this machine");
   });
 
+  /// Scenario: Confirm starting a disconnected local daemon on this machine, without a second reconnect action.
+  /// While the start is in flight, its confirmation is disabled and the request names that deck.
   it("confirmation-gates an explicit daemon start from the disconnected state", async () => {
     const disconnected = createFixtureSnapshot("disconnected");
     disconnected.agents = [];
+    disconnected.connection.disconnectedReason = { kind: "not-running", action: "start-daemon", host: "this machine", message: "No daemon is running on this machine." };
     let releaseStart!: () => void;
     const runAction = vi.fn(() => new Promise<import("./types").DeckActionResult>((resolve) => { releaseStart = () => resolve({ ok: true }); }));
     const live = runtime({ mode: "live", snapshot: disconnected, runAction });
     render(<ControlDeck runtime={live} />);
     fireEvent.click(screen.getByTestId("start-daemon"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("this machine");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("local daemon");
     expect(live.runAction).not.toHaveBeenCalled();
-    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
     expect(screen.getByRole("button", { name: "Starting…" })).toBeDisabled();
     expect(screen.queryByText("Stopping…")).not.toBeInTheDocument();
     releaseStart();
-    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "start_daemon" }));
+    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "start_daemon", deckId: disconnected.connection.deckId }));
     expect(live.reconnect).not.toHaveBeenCalled();
   });
 
+  /** Scenario: Stops the daemon from the topbar when no agent is selected. */
   it("stops the daemon from the topbar when no agent is selected", async () => {
     const connectedNoAgents = createFixtureSnapshot("connected");
     connectedNoAgents.agents = [];
@@ -940,14 +1589,15 @@ describe("ControlDeck", () => {
     const live = runtime({ mode: "live", snapshot: connectedNoAgents, runAction });
     render(<ControlDeck runtime={live} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Stop deck" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop daemon" }));
     expect(live.runAction).not.toHaveBeenCalled();
-    fireEvent.click(screen.getAllByRole("button", { name: "Stop deck" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Stop daemon" }).at(-1)!);
 
     await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "stop_daemon" }));
-    expect(screen.getByText("Local deck stopped.")).toBeVisible();
+    expect(screen.getByText("Local daemon stopped.")).toBeVisible();
   });
 
+  /** Scenario: Replaces an incompatible zero-agent daemon through an explicit confirmation, on the shared upgrade path. */
   it("replaces an incompatible zero-agent daemon through an explicit confirmation", async () => {
     const incompatible = createFixtureSnapshot("error");
     incompatible.agents = [];
@@ -961,18 +1611,133 @@ describe("ControlDeck", () => {
       daemonDetected: true,
       runningAgentCount: 0,
     };
-    const runAction = vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult);
-    const live = runtime({ mode: "live", snapshot: incompatible, runAction });
+    incompatible.connection.deckId = "deck-local";
+    const live = runtime({ mode: "live", snapshot: incompatible });
     render(<ControlDeck runtime={live} />);
 
-    expect(screen.getByRole("button", { name: "Stop deck" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
     fireEvent.click(screen.getByTestId("replace-daemon"));
-    expect(live.runAction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("exact build bundled with this desktop app");
-    fireEvent.click(screen.getAllByRole("button", { name: "Replace deck" }).at(-1)!);
+    expect(live.upgradeDaemon).not.toHaveBeenCalled();
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("starts the one that came with this app");
+    fireEvent.click(screen.getByTestId("upgrade-start"));
 
-    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "restart_daemon" }));
-    expect(screen.getByText("Matching deck started and reconnected.")).toBeVisible();
+    // PRD #1487 D10: the local deck, through the shared procedure — no
+    // `restart_daemon` action exists any more.
+    await waitFor(() => expect(live.upgradeDaemon).toHaveBeenCalledWith("deck-local", expect.any(Function)));
+    expect(live.runAction).not.toHaveBeenCalled();
+    expect(await screen.findByTestId("upgrade-outcome")).toHaveTextContent("now runs 0.45.0");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon replaced");
+  });
+
+  /**
+   * PRD #1487 D10: Replace daemon is no longer withheld while agents run. The
+   * daemon names each one and the dialog asks; Keep current daemon stops
+   * nothing and says so.
+   */
+  /** Scenario: Offers Replace daemon while agents run, names them in the question, and keeps the daemon when told to. */
+  it("offers Replace daemon while agents run and asks before stopping them", async () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.connection = {
+      status: "error",
+      deckId: "deck-local",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
+      message: "build mismatch",
+      daemonDetected: true,
+      runningAgentCount: 2,
+    };
+    const atStake = { agents: [{ id: "1", label: "coder", paneId: "4", cwd: "/work/app" }], roles: [{ paneId: "4", role: "coder", orchestration: "tdd", isOrchestrator: false }] };
+    const upgradeDaemon = vi.fn(async (deckId: string, onEvent: (event: UpgradeEvent) => void) => {
+      onEvent({ type: "progress", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage: "installing" } });
+      onEvent({ type: "progress", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage: "restarting" } });
+      onEvent({ type: "decision", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", questionId: 1, atStake, stale: false });
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake } } as UpgradeOutcome;
+    });
+    let release!: () => void;
+    const live = runtime({ mode: "live", snapshot: incompatible, upgradeDaemon });
+    render(<ControlDeck runtime={live} />);
+
+    expect(textOutsideDisclosures(screen.getByRole("alert"))).toMatch(/2 agents are running on it, and you are shown which before any is stopped/);
+    fireEvent.click(screen.getByTestId("replace-daemon"));
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+
+    const question = await screen.findByTestId("upgrade-decision");
+    expect(question).toHaveTextContent("stops 1 agent and 1 orchestration role");
+    expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Agent coder (pane 4, in /work/app)");
+    expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Role coder of tdd, pane 4");
+    fireEvent.click(screen.getByTestId("upgrade-keep-current"));
+    expect(live.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
+    release();
+
+    const outcome = await screen.findByTestId("upgrade-outcome");
+    expect(outcome).toHaveAttribute("data-tone", "neutral");
+    expect(outcome).toHaveTextContent("as you chose");
+    expect(outcome).toHaveTextContent("Press Replace daemon again when they have finished.");
+    fireEvent.click(screen.getByTestId("upgrade-close"));
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: Offers Upgrade in the Daemons-screen banner for an older refused remote daemon, and runs it against that deck. */
+  it("offers Upgrade in the banner for an older refused remote daemon", async () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.connection = {
+      status: "error",
+      deckId: "deck-remote",
+      socketPath: "dev@build-box",
+      deckKind: "remote",
+      localOnlyReason: "Stop daemon acts on a process on this machine.",
+      message: "This daemon is older than this app.",
+      daemonDetected: true,
+      runningAgentCount: 0,
+      buildStampMismatchOnly: true,
+      upgradeOffer: { kind: "offered", from: "0.44.0", to: "0.45.0" },
+    };
+    const live = runtime({ mode: "live", snapshot: incompatible });
+    render(<ControlDeck runtime={live} />);
+
+    const banner = screen.getByRole("alert");
+    const buttons = within(banner).getAllByRole("button").map((button) => button.textContent?.trim() ?? "");
+    expect(buttons).toEqual(["Upgrade", "Connect anyway", "Reconnect"]);
+    expect(textOutsideDisclosures(banner)).toMatch(/Upgrade installs this app's version on that machine/);
+    // In the banner, so not on the top bar as well.
+    expect(screen.queryByTestId("upgrade-daemon")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("upgrade-daemon-banner"));
+    expect(screen.getByTestId("upgrade-confirm-body")).toHaveTextContent("installs 0.45.0 on dev@build-box (its daemon runs 0.44.0 now)");
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    await waitFor(() => expect(live.upgradeDaemon).toHaveBeenCalledWith("deck-remote", expect.any(Function)));
+    expect(await screen.findByTestId("upgrade-outcome")).toHaveTextContent("The daemon on dev@build-box now runs 0.45.0 (it was 0.44.0).");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon upgraded");
+  });
+
+  /** Scenario: Offers Upgrade on the top bar for a connected remote daemon on an older release, and never for one at the app's release. */
+  it("offers Upgrade on the top bar only when the crate offers it", () => {
+    const connected = createFixtureSnapshot("connected");
+    connected.connection = {
+      status: "connected",
+      deckId: "deck-remote",
+      socketPath: "dev@build-box",
+      deckKind: "remote",
+      message: "Daemon responding",
+      daemonDetected: true,
+      runningAgentCount: 4,
+      upgradeOffer: { kind: "offered", from: "0.44.0", to: "0.45.0" },
+    };
+    const { unmount } = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
+    expect(screen.getByTestId("upgrade-daemon")).toBeVisible();
+    unmount();
+
+    for (const upgradeOffer of [{ kind: "current" }, { kind: "daemon-newer", daemon: "0.46.0" }, { kind: "unknown" }] as const) {
+      const current = structuredClone(connected);
+      current.connection.upgradeOffer = upgradeOffer;
+      const view = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: current })} />);
+      expect(screen.queryByTestId("upgrade-daemon"), upgradeOffer.kind).not.toBeInTheDocument();
+      view.unmount();
+    }
   });
 
   /**
@@ -980,6 +1745,7 @@ describe("ControlDeck", () => {
    * the wire, differs only in its build stamp, and owns live agents — so
    * Replace daemon is correctly refused and used to be the only thing offered.
    */
+  /** Scenario: Offers Connect anyway for a stamp-only mismatch even while agents are live. */
   it("offers Connect anyway for a stamp-only mismatch even while agents are live", async () => {
     const incompatible = createFixtureSnapshot("error");
     incompatible.agents = [];
@@ -989,7 +1755,8 @@ describe("ControlDeck", () => {
       status: "error",
       socketPath: "/tmp/dot-agent-deck.sock",
       deckKind: "local",
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. The deck reports 9 live agents; stop them individually before replacing the deck, or Connect anyway to keep this one.",
+      message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.",
+      detail: "The daemon lacks these declared compatibility breaks: 505-unsolicited-work-done-label-reworded. Both sides speak protocol 10. Builds: app 0.43.0, daemon 0.42.0.",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: true,
@@ -999,20 +1766,102 @@ describe("ControlDeck", () => {
     const live = runtime({ mode: "live", snapshot: incompatible, runAction, reconnect });
     render(<ControlDeck runtime={live} />);
 
-    // Replacement stays refused: it is the one that would kill nine agents.
-    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
+    // PRD #1487 D10: Replace is offered beside it now, and says it will ask
+    // before stopping the nine agents rather than being withheld.
+    expect(screen.getByTestId("replace-daemon")).toBeVisible();
+    const banner = screen.getByRole("alert");
+    expect(banner).toHaveTextContent("Incompatible daemon");
+    expect(textOutsideDisclosures(banner)).toMatch(/9 agents are running on it, and you are shown which before any is stopped/);
 
     fireEvent.click(screen.getByTestId("connect-anyway"));
     expect(runAction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("a stamp difference can still mean divergent behaviour behind an identical wire");
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("may show some of this daemon's information wrongly");
+    expect(dialog.textContent).not.toMatch(/contract|protocol|mismatch|declared|wire|stamp/i);
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
-    // The allowance is only read by the NEXT handshake, so the reconnect is
-    // what actually connects.
-    await waitFor(() => expect(reconnect).toHaveBeenCalled());
-    expect(screen.getByText("Connected to the differently-built deck. The mismatch stays in the connection banner for this session.")).toBeVisible();
+    // The crate connects and emits the deck's snapshot itself (issue #1472),
+    // so nothing re-establishes the fleet behind it.
+    expect(await screen.findByText("Connected anyway. The warning stays at the top of this screen until you quit the app.")).toBeVisible();
+    expect(reconnect).not.toHaveBeenCalled();
+  });
+
+  /*
+   * Found by hand on 2026-10-01 (PR #1451): the banner read `contract mismatch:
+   * the daemon is behind this app across 505-…. Protocol 10 matched on both
+   * sides, so the frames decode — …` under the title "Desktop bridge error".
+   * The banner now titles an incompatible daemon as one, says which side is
+   * older in the crate's plain sentence, names every button it renders with
+   * what that button does, and keeps the slug and protocol number behind a
+   * Technical details disclosure.
+   */
+  /** Scenario: Explains an incompatible daemon in plain words, names each of its buttons, and keeps the technical detail behind a disclosure. */
+  it("explains an incompatible daemon in plain words and names each button it offers", () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.stages = [];
+    incompatible.evidence = [];
+    incompatible.connection = {
+      status: "error",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
+      message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.",
+      detail: "The daemon lacks these declared compatibility breaks: 505-unsolicited-work-done-label-reworded. Both sides speak protocol 10. Builds: app 0.43.0, daemon 0.42.0.",
+      daemonDetected: true,
+      runningAgentCount: 0,
+      buildStampMismatchOnly: true,
+    };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible })} />);
+
+    const banner = screen.getByRole("alert");
+    expect(banner).toHaveTextContent("Incompatible daemon");
+    expect(banner).not.toHaveTextContent("Desktop bridge error");
+    const visible = textOutsideDisclosures(banner);
+    expect(visible).toContain("This daemon is older than this app");
+    expect(visible).not.toMatch(/contract|protocol|mismatch|handshake|declared|wire|build stamp/i);
+    expect(visible).not.toContain("505-unsolicited-work-done-label-reworded");
+    const buttons = within(banner).getAllByRole("button").map((button) => button.textContent?.trim() ?? "");
+    expect(buttons).toEqual(["Replace daemon", "Connect anyway", "Reconnect"]);
+    for (const label of buttons) {
+      expect(visible, `the banner explains its "${label}" button`).toMatch(new RegExp(`${label} (uses|tries|goes|stops) `));
+    }
+    const detail = within(banner).getByTestId("connection-detail");
+    expect(detail.tagName).toBe("DETAILS");
+    expect(within(detail).getByText("Technical details")).toBeInTheDocument();
+    expect(detail).toHaveTextContent("505-unsolicited-work-done-label-reworded");
+    expect(detail).toHaveTextContent("Both sides speak protocol 10");
+  });
+
+  /**
+   * Issue #1472: a click never silently does nothing. When the crate cannot
+   * connect after all, its reason is what the user reads, not the success line.
+   */
+  /** Scenario: Confirms Connect anyway against a daemon that then fails to connect, and shows why instead of announcing a connection. */
+  it("says why when Connect anyway does not connect", async () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.connection = {
+      status: "error",
+      deckId: "local:/tmp/dot-agent-deck.sock",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
+      message: "contract mismatch: the daemon is behind this app across 505-unsolicited-work-done-label-reworded.",
+      daemonDetected: true,
+      runningAgentCount: 0,
+      buildStampMismatchOnly: true,
+    };
+    const runAction = vi.fn(async () => {
+      throw new Error("Could not connect to this daemon: it did not respond as expected, and its card shows what went wrong. The app keeps trying and connects to it as soon as it responds.");
+    });
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible, runAction })} />);
+
+    fireEvent.click(screen.getByTestId("connect-anyway"));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
+
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: "local:/tmp/dot-agent-deck.sock" }));
+    expect(await screen.findByText(/it did not respond as expected/)).toBeVisible();
+    expect(screen.queryByText(/Connected anyway\./)).not.toBeInTheDocument();
   });
 
   /**
@@ -1042,11 +1891,12 @@ describe("ControlDeck", () => {
    * keeps the mismatch in the connection message after connecting, and the
    * banner renders whatever that message says.
    */
+  /** Scenario: Keeps the build-mismatch caveat in the banner after connecting anyway. */
   it("keeps the build-mismatch caveat in the banner after connecting anyway", () => {
     const connected = createFixtureSnapshot("connected");
     connected.connection = {
       status: "connected",
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: true,
@@ -1054,7 +1904,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
 
     const banner = screen.getByRole("alert");
-    expect(banner).toHaveTextContent("Connected to a differently-built deck");
+    expect(banner).toHaveTextContent("Connected to a daemon from a different version");
     expect(banner).toHaveTextContent("Connected anyway for this session");
     // Accepted, not re-offered: the override is already in force.
     expect(screen.queryByTestId("connect-anyway")).not.toBeInTheDocument();
@@ -1065,9 +1915,10 @@ describe("ControlDeck", () => {
    * `buildStampMismatchOnly` being defined: an ordinary healthy connection
    * still shows no banner at all.
    */
+  /** Scenario: Shows no connection banner for a healthy matching daemon. */
   it("shows no connection banner for a healthy matching daemon", () => {
     const connected = createFixtureSnapshot("connected");
-    connected.connection = { status: "connected", message: "Deck responding", daemonDetected: true, runningAgentCount: 4, buildStampMismatchOnly: false };
+    connected.connection = { status: "connected", message: "Daemon responding", daemonDetected: true, runningAgentCount: 4, buildStampMismatchOnly: false };
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
 
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -1075,15 +1926,16 @@ describe("ControlDeck", () => {
 
   /**
    * Issue #801, the case that used to prompt every day. The stamps differ but
-   * name the same release, so the crate connected silently — and the deck must
+   * name the same release, so the crate connected silently — and the daemon must
    * stay silent too: no banner, and no Connect anyway to press. The complement
    * of the differing-minor test above, which still gets both.
    */
+  /** Scenario: Shows no banner when the differing stamps name the same release. */
   it("shows no banner when the differing stamps name the same release", () => {
     const connected = createFixtureSnapshot("connected");
     connected.connection = {
       status: "connected",
-      message: "Deck responding",
+      message: "Daemon responding",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: false,
@@ -1096,7 +1948,8 @@ describe("ControlDeck", () => {
     expect(screen.queryByTestId("connect-anyway")).not.toBeInTheDocument();
   });
 
-  it("does not offer daemon replacement while an incompatible daemon reports live agents", () => {
+  /** Scenario: Offers daemon replacement while an incompatible daemon reports live agents, since the replacement now asks first (PRD #1487 D10). */
+  it("offers daemon replacement while an incompatible daemon reports live agents", () => {
     const incompatible = createFixtureSnapshot("error");
     incompatible.agents = [];
     incompatible.connection = {
@@ -1107,10 +1960,11 @@ describe("ControlDeck", () => {
     };
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible })} />);
 
-    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Stop deck" })).toBeEnabled();
+    expect(screen.getByTestId("replace-daemon")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
   });
 
+  /** Scenario: Never reports daemon-start success when the start action fails. */
   it("never reports daemon-start success when the start action fails", async () => {
     const disconnected = createFixtureSnapshot("disconnected");
     disconnected.agents = [];
@@ -1122,14 +1976,15 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={live} />);
 
     fireEvent.click(screen.getByTestId("start-daemon"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
 
     await waitFor(() => expect(screen.getByText("daemon start timed out")).toBeVisible());
     expect(live.reconnect).not.toHaveBeenCalled();
-    expect(screen.queryByText("Local deck started and control channel reconnected.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Local daemon started and control channel reconnected.")).not.toBeInTheDocument();
   });
 
-  it("keeps the mobile summary visible on first load and opens Evidence on demand", () => {
+  /** Scenario: The narrow layout keeps its agent summary visible, then opens the Events drawer on demand. */
+  it("keeps the mobile summary visible on first load and opens Events on demand", () => {
     vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
       matches: false,
       media: query,
@@ -1144,9 +1999,9 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime()} />);
     expect(screen.queryByTestId("evidence-drawer")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-planner")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Stop Planner" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Close Planner" })).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Evidence" }));
+    fireEvent.click(screen.getByRole("button", { name: "Events" }));
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
   });
 
@@ -1210,8 +2065,9 @@ describe("ControlDeck", () => {
     // still that the real registry reaches the real sheet. The column's own two
     // states stay pinned with stub sections in
     // `components/SettingsSheet.test.tsx`, so this does not become their only
-    // coverage. PRD #741's Decks row took it to three.
-    expect(SETTINGS_SECTIONS).toHaveLength(3);
+    // coverage. PRD #741's Daemons row took it to three and PRD #802 M4's Voice
+    // row to four, and PRD #1401's GitHub row to five.
+    expect(SETTINGS_SECTIONS).toHaveLength(5);
     expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 
@@ -1287,12 +2143,12 @@ describe("ControlDeck", () => {
     // The whole document crosses the bridge, so a save can never drop a section
     // this build's UI has not loaded. `zoom` riding along untouched here IS
     // that guarantee — the Appearance panel knows nothing about PRD #744's
-    // section and still cannot lose it.
-    expect(store.saveSettings).toHaveBeenCalledWith({
-      version: 1,
-      appearance: { mode: "dark" },
-      zoom: { level: 1 },
-    });
+    // section and still cannot lose it. The second argument is the document
+    // the edit was made against, so the Rust side writes only the edit (#828).
+    expect(store.saveSettings).toHaveBeenCalledWith(
+      { version: 1, appearance: { mode: "dark" }, zoom: { level: 1 } },
+      { version: 1, appearance: { mode: "system" }, zoom: { level: 1 } },
+    );
     expect(store.current.appearance.mode).toBe("dark");
 
     first.unmount();
@@ -1429,8 +2285,66 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario (issue #1072): the `desktop.toml` on disk cannot be read, so the
+   * app came up on defaults. Open Settings and the panel says what is wrong and
+   * where in the file, before the user has touched anything — and the footer
+   * says the same instead of claiming the settings are stored in that file,
+   * which the app is refusing to save to (issue #829).
+   *
+   * The symptom this replaces is the whole point: the app looked like a fresh
+   * install, said nothing anybody would see, and destroyed the document on the
+   * next click.
+   */
+  it("says why the settings look reset when the document on disk cannot be read", async () => {
+    const store = settingsStore(
+      undefined,
+      "/home/dev/.config/dot-agent-deck/desktop.toml",
+      "The desktop settings file cannot be read: line 3, column 9 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.",
+    );
+    // `live`, because the footer's answer to "where" is the other half of this
+    // and the browser preview has no file to name.
+    render(<ControlDeck runtime={runtime({ mode: "live", getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("line 3, column 9");
+    expect(alert).toHaveTextContent("nothing will be saved over the file");
+    // Not a failed save: the user has made no change, and claiming one would
+    // send them looking for a click they never made.
+    expect(alert).not.toHaveTextContent("saving it failed");
+    expect(store.saveSettings).not.toHaveBeenCalled();
+    const location = screen.getByTestId("settings-location");
+    expect(location).toHaveTextContent("line 3, column 9");
+    expect(location).not.toHaveTextContent("Stored in");
+    expect(location).not.toHaveTextContent("desktop.toml");
+  });
+
+  /**
+   * Scenario (issue #829): the app came up with a settings problem, then a
+   * save succeeded — which the backend only allows once the document is one it
+   * can use. Open Settings, choose Dark, and the footer goes from the problem
+   * back to naming the file, because the path is now genuinely the store.
+   */
+  it("names the settings file again once a save proves the document usable", async () => {
+    const store = settingsStore(
+      undefined,
+      "/home/dev/.config/dot-agent-deck/desktop.toml",
+      "The desktop settings file cannot be read: line 3, column 9 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.",
+    );
+    render(<ControlDeck runtime={runtime({ mode: "live", getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    await waitFor(() => expect(screen.getByTestId("settings-location")).toHaveTextContent("line 3, column 9"));
+
+    fireEvent.click(screen.getByRole("radio", { name: /Dark/ }));
+    await waitFor(() => expect(screen.getByTestId("settings-location"))
+      .toHaveTextContent("Stored in /home/dev/.config/dot-agent-deck/desktop.toml"));
+  });
+
+  /**
    * Scenario: render the four-agent deck with every tile on its default
-   * terminal tab and watch what the deck tells the bridge. It must declare all
+   * terminal tab and watch what the daemon tells the bridge. It must declare all
    * four ids in ONE call, because `setShownTerminals` is declarative: four
    * single-id calls would leave three of the four in the bridge's warm set and
    * the bound would start evicting visible panes (PRD #745 M7).
@@ -1444,9 +2358,11 @@ describe("ControlDeck", () => {
    * keys need no teaching — that is not what the row is for.
    *
    * Note this overlay is not today a complete list of everything the app binds:
-   * `AgentComposer` distinguishes `Enter` from `Shift+Enter` and neither
-   * appears. That predates PRD #744 and is recorded as its Open Question 5
-   * rather than fixed here.
+   * the `⌘ K` row below has the same pre-existing gap. That predates PRD #744
+   * and is recorded as its Open Question 5 rather than fixed here. The
+   * `AgentComposer` Enter/Shift+Enter binding this note used to cite went with
+   * the widget in issue #1042; the terminal's own input is the agent CLI's, and
+   * the app binds nothing in it.
    */
   it("lists the zoom keys in the shortcut overlay", () => {
     render(<ControlDeck runtime={runtime()} />);
@@ -1466,7 +2382,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ setShownTerminals })} />);
 
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
-    expect(setShownTerminals).toHaveBeenCalledWith(["planner", "builder", "reviewer", "tester"]);
+    expect(setShownTerminals).toHaveBeenCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, { deckId: FIXTURE_DAEMON_ID, agentId: "builder" }, { deckId: FIXTURE_DAEMON_ID, agentId: "reviewer" }, { deckId: FIXTURE_DAEMON_ID, agentId: "tester" }]);
   });
 
   /**
@@ -1484,7 +2400,7 @@ describe("ControlDeck", () => {
     fireEvent.click(within(tile).getByRole("tab", { name: "Diff" }));
 
     expect(setShownTerminals).toHaveBeenCalledTimes(2);
-    expect(setShownTerminals).toHaveBeenLastCalledWith(["planner", "reviewer", "tester"]);
+    expect(setShownTerminals).toHaveBeenLastCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, { deckId: FIXTURE_DAEMON_ID, agentId: "reviewer" }, { deckId: FIXTURE_DAEMON_ID, agentId: "tester" }]);
   });
 
   /**
@@ -1508,7 +2424,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ snapshot: hostile, setShownTerminals })} />);
 
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
-    expect(setShownTerminals).toHaveBeenCalledWith(["agent-a\nagent-b"]);
+    expect(setShownTerminals).toHaveBeenCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "agent-a\nagent-b" }]);
   });
 
   it("declares an empty shown set when the daemon owns no agents", () => {
@@ -1521,8 +2437,8 @@ describe("ControlDeck", () => {
   });
 
   /**
-   * Scenario: render the deck against a snapshot mapped from a real daemon DTO
-   * — the live path, not the fixture. Every place the deck used to assert an
+   * Scenario: render the daemon against a snapshot mapped from a real daemon DTO
+   * — the live path, not the fixture. Every place the daemon used to assert an
    * attempt count now shows the em dash it shows for anything else the daemon
    * does not report, and the branch chip is gone rather than printing the
    * literal "Unavailable" where a branch name belongs (PRD #745 M8).
@@ -1542,12 +2458,12 @@ describe("ControlDeck", () => {
     expect(screen.getByText("ATTEMPT").parentElement).toHaveTextContent("—");
     expect(screen.getByTestId("workflow-node-agent-7")).not.toHaveTextContent("att");
     expect(container.querySelector(".agent-attempt strong")?.textContent).toBe("—");
-    expect(container.querySelector(".agent-attempt")).toHaveAttribute("title", "No attempt count is reported by the deck");
+    expect(container.querySelector(".agent-attempt")).toHaveAttribute("title", "No attempt count is reported by the daemon");
 
     // No branch chip at all, and nothing standing in for one.
     expect(container.querySelector(".branch-line svg")).toBeNull();
     expect(container.querySelector(".branch-line")?.textContent).toBe("/tmp/project");
-    // Scoped to the branch line on purpose: the deck still prints its own
+    // Scoped to the branch line on purpose: the daemon still prints its own
     // "Unavailable" for `model` and for the lease footer, which have no daemon
     // source and are not M8's to change. The branch is the one that used to.
     expect(container.querySelector(".repo-context")?.textContent ?? "").not.toContain("Unavailable");
@@ -1557,7 +2473,7 @@ describe("ControlDeck", () => {
    * Scenario: a daemon reports a prompt built to attack the screen — every
    * control and bidi codepoint the render seam strips, then 64 KiB of text,
    * which is the per-prompt ceiling `daemon_client.rs` enforces. The snapshot
-   * is mapped by the LIVE path and rendered on the deck, which is the screen
+   * is mapped by the LIVE path and rendered on the daemon, which is the screen
    * the app opens on and the one that renders the prompt through
    * `AgentSession.task`. Nothing raw reaches the DOM: no stripped codepoint in
    * any text node or `title`, and no run of prompt text longer than the budget
@@ -1568,7 +2484,7 @@ describe("ControlDeck", () => {
    * `agent.task` — which M8 had just changed from a hardcoded placeholder into
    * the daemon's free-form prompt — straight into a text node.
    */
-  it("puts no raw daemon prompt in the deck's DOM, however hostile the prompt", async () => {
+  it("puts no raw daemon prompt in the daemon's DOM, however hostile the prompt", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
     const { DISPLAY_LIMITS } = await import("./lib/displayText");
     const stripped = [
@@ -1654,9 +2570,9 @@ describe("ControlDeck", () => {
    * fix moved that substitution off the model and onto this render seam, so
    * that a daemon reporting a directory genuinely NAMED "Unavailable" is no
    * longer indistinguishable from one reporting nothing. Nothing the user sees
-   * on the deck changed.
+   * on the daemon changed.
    */
-  it("prints the deck's own stand-in for a working directory the daemon did not report", async () => {
+  it("prints the daemon's own stand-in for a working directory the daemon did not report", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
     const agent = { id: "7", displayName: "Coder", rows: 32, cols: 120, agentType: "claude_code" as const, status: "working" as const, toolCount: 3, tab: { kind: "dashboard" as const } };
     const connection = { status: "connected" as const, deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" };
@@ -1673,7 +2589,7 @@ describe("ControlDeck", () => {
   });
 
   /**
-   * Issue #1046: a deck whose `error` is real state, cleared by the same
+   * Issue #1046: a daemon whose `error` is real state, cleared by the same
    * `clearError` the button calls — which is what `useDeckRuntime` gives the
    * app. A fake whose `clearError` were only a spy would let the assertions
    * below pass while the toast stayed on screen for a user, since the toast
@@ -1690,7 +2606,7 @@ describe("ControlDeck", () => {
     return <ControlDeck runtime={{ ...base, error, clearError: () => setError(undefined) }} />;
   }
 
-  /** A live deck with no daemon, which is what puts the Start deck button up. */
+  /** A live deck with no daemon, which is what puts the Start daemon button up. */
   function disconnectedLive() {
     const snapshot = createFixtureSnapshot("disconnected");
     snapshot.agents = [];
@@ -1699,7 +2615,7 @@ describe("ControlDeck", () => {
 
   /**
    * Scenario: a daemon-side failure fills the toast through `runtime.error`
-   * rather than through the deck's own `notice`, and the user clicks the X. The
+   * rather than through the daemon's own `notice`, and the user clicks the X. The
    * toast goes. It used to stay: the handler cleared `notice` — which was
    * already undefined — and left the error that was actually on screen, so the
    * button was inoperative for every error-sourced message and the two sources
@@ -1733,7 +2649,7 @@ describe("ControlDeck", () => {
     expect(await screen.findByText(hidden)).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("start-daemon"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
     expect(await screen.findByText("daemon start timed out")).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText("Dismiss message"));
@@ -1761,7 +2677,7 @@ describe("ControlDeck", () => {
     }} />);
 
     fireEvent.click(screen.getByTestId("start-daemon"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
     expect(await screen.findByText(message)).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText("Dismiss message"));
@@ -1770,16 +2686,95 @@ describe("ControlDeck", () => {
   });
 
   /**
-   * The other half of the same click: the deck's own notices still clear, and
+   * Scenario: a start fails on the Daemons screen with technical detail, so the
+   * toast reads the sentence with the detail appended while `runAction` recorded
+   * the sentence alone, and the user clicks the X. The toast stays closed. It
+   * used to come straight back as the bare sentence (PR #1623 review): the two
+   * strings differed, so dismissing cleared the notice and kept the error.
+   *
+   * The fake records the error the way `useDeckRuntime`'s `runAction` does —
+   * the sentence alone, set before the rejection reaches the handler — since
+   * that recording is what the toast fell back to.
+   */
+  function DeckWithFailingStart({ failure }: { failure: Error }) {
+    const base = useMemo(() => runtime({ mode: "live", snapshot: disconnectedLive() }), []);
+    const [error, setError] = useState<string | undefined>();
+    const runAction = useCallback(async () => {
+      setError(failure.message);
+      throw failure;
+    }, [failure]);
+    return <ControlDeck runtime={{ ...base, error, clearError: () => setError(undefined), runAction }} />;
+  }
+
+  it("keeps a dismissed start failure with technical detail closed", async () => {
+    const { StartDaemonError } = await import("./lib/actionError");
+    const sentence = "Could not start the daemon on this machine.";
+    const detail = "spawn: No such file or directory";
+    render(<DeckWithFailingStart failure={new StartDaemonError(sentence, "start-failed", detail)} />);
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
+    expect(await screen.findByText(`${sentence} (${detail})`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    await waitFor(() => expect(screen.queryByText(`${sentence} (${detail})`)).not.toBeInTheDocument());
+    expect(screen.queryByText(sentence)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Dismiss message")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: a start fails with technical detail, but before its rejection
+   * reaches the handler a different failure — a reconnect, another action — is
+   * recorded in the runtime's one error slot. The toast reports the start; once
+   * the user dismisses it, the newer failure is still there and takes its place
+   * instead of having been wiped by the start's handler (PR #1623 review: it
+   * cleared the shared error unconditionally to keep its own toast closed).
+   */
+  function DeckWithOvertakenStart({ failure, newer }: { failure: Error; newer: string }) {
+    const base = useMemo(() => runtime({ mode: "live", snapshot: disconnectedLive() }), []);
+    const [error, setError] = useState<string | undefined>();
+    const runAction = useCallback(async () => {
+      setError(failure.message);
+      setError(newer);
+      throw failure;
+    }, [failure, newer]);
+    return <ControlDeck runtime={{ ...base, error, clearError: () => setError(undefined), runAction }} />;
+  }
+
+  it("keeps a newer error recorded while a start failed instead of clearing it", async () => {
+    const { StartDaemonError } = await import("./lib/actionError");
+    const sentence = "Could not start the daemon on this machine.";
+    const detail = "spawn: No such file or directory";
+    const newer = "daemon returned error: reconnect-failed";
+    render(<DeckWithOvertakenStart failure={new StartDaemonError(sentence, "start-failed", detail)} newer={newer} />);
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
+    expect(await screen.findByText(`${sentence} (${detail})`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    expect(await screen.findByText(newer)).toBeInTheDocument();
+    expect(screen.queryByText(`${sentence} (${detail})`)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    await waitFor(() => expect(screen.queryByText(newer)).not.toBeInTheDocument());
+  });
+
+  /**
+   * The other half of the same click: the daemon's own notices still clear, and
    * they clear through `setNotice` rather than through the runtime — so a
    * runtime that never errored is not asked to do anything on its behalf.
    */
-  it("still dismisses a notice the deck raised itself", async () => {
-    const started = "Local deck started and control channel reconnected.";
+  /** Scenario: Still dismisses a notice the daemon raised itself. */
+  it("still dismisses a notice the daemon raised itself", async () => {
+    const started = "Local daemon started and control channel reconnected.";
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: disconnectedLive() })} />);
 
     fireEvent.click(screen.getByTestId("start-daemon"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
     expect(await screen.findByText(started)).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText("Dismiss message"));
@@ -1839,5 +2834,258 @@ describe("ControlDeck", () => {
     expect(container.querySelector(".agent-attempt strong")?.textContent).toBe("01");
     expect(screen.getByTestId("workflow-node-build")).toHaveTextContent("att 2");
     expect(container.querySelector(".branch-line")).toHaveTextContent("codex/visual-control-deck");
+  });
+
+  /**
+   * Scenario (#1083): the stored selection is All daemons and the deck under it
+   * is the local one, running its fixture agents. The Runs screen shows "Select
+   * a daemon to see its runs" — as a note, not an alert — and no tile, terminal
+   * or run instrument of the local deck, and the last shown-terminal
+   * declaration is empty. Choosing the local deck in the Daemon selector, which
+   * stays live, brings the tiles back and stores the choice.
+   */
+  it("shows Select a daemon on the Runs screen under All daemons, and the selector still switches", async () => {
+    const store = settingsStore({ endpoints: { remote: [], selection: "all" } });
+    const live = runtime({ mode: "live", getSettings: store.getSettings, saveSettings: store.saveSettings });
+    render(<ControlDeck runtime={live} />);
+
+    const note = await screen.findByTestId("deck-select-deck");
+    expect(note).toHaveTextContent("Select a daemon to see its runs");
+    expect(note.closest("[role='alert']")).toBeNull();
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All daemons");
+    expect(screen.queryByTestId("agent-tile-builder")).toBeNull();
+    expect(screen.queryByTestId("terminal-builder")).toBeNull();
+    expect(screen.queryByTestId("run-health")).toBeNull();
+    expect(screen.queryByTestId("evidence-drawer")).toBeNull();
+    await waitFor(() => expect(vi.mocked(live.setShownTerminals).mock.calls.at(-1)?.[0]).toEqual([]));
+
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    fireEvent.click(screen.getByTestId("deck-selector-option-local"));
+
+    await waitFor(() => expect(screen.getByTestId("agent-tile-builder")).toBeVisible());
+    expect(screen.queryByTestId("deck-select-deck")).toBeNull();
+    expect(store.current.endpoints?.selection).toBe("local");
+  });
+
+  /**
+   * Scenario (#1083): All daemons is stored and the settings read has not come
+   * back, so the webview still holds the defaults, which select the local
+   * deck. The crate's snapshot of the local deck arrives marked `allDecks`.
+   * The Runs screen shows "Select a daemon" from the first render, and no local
+   * tile or terminal is ever declared shown — there is no startup flash.
+   */
+  it("shows Select a daemon from the first render when the snapshot says All daemons before settings load", () => {
+    const live = runtime({
+      mode: "live",
+      snapshot: { ...createFixtureSnapshot("connected"), allDecks: true },
+      getSettings: vi.fn(() => new Promise<never>(() => undefined)),
+    });
+    render(<ControlDeck runtime={live} />);
+
+    expect(screen.getByTestId("deck-select-deck")).toHaveTextContent("Select a daemon to see its runs");
+    expect(screen.queryByTestId("agent-tile-builder")).toBeNull();
+    expect(screen.queryByTestId("evidence-drawer")).toBeNull();
+    expect(vi.mocked(live.setShownTerminals).mock.calls.every(([targets]) => targets.length === 0)).toBe(true);
+  });
+
+  /**
+   * Scenario (#1083): on the local deck, pick the daemon's one project and
+   * write a task, so the Orchestrations sheet's Activate is enabled (the control).
+   * Then select All daemons and reopen it: the sheet says "Select a daemon to
+   * activate an orchestration", Activate is disabled and pressing it sends
+   * nothing, and the Projects sheet says "Select a daemon to see its projects" without asking
+   * any deck for its projects.
+   */
+  it("never activates an orchestration once All daemons is selected, even with a project already chosen", async () => {
+    const live = liveWithProject();
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "List the files." } });
+    expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Close orchestration editor" }));
+
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    fireEvent.click(screen.getByTestId("deck-selector-option-all"));
+    await screen.findByTestId("deck-select-deck");
+    const listings = vi.mocked(live.listProjects).mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
+    expect(screen.getByTestId("orchestration-select-deck")).toHaveTextContent("Select a daemon to activate an orchestration");
+    expect(screen.queryByLabelText("Task prompt")).toBeNull();
+    expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(vi.mocked(live.runAction).mock.calls.some(([action]) => action.type === "activate_orchestration")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Close orchestration editor" }));
+
+    fireEvent.click(screen.getByTestId("open-projects"));
+    expect(screen.getByTestId("projects-select-deck")).toHaveTextContent("Select a daemon to see its projects");
+    expect(screen.queryByTestId("selected-project")).toBeNull();
+    expect(vi.mocked(live.listProjects).mock.calls.length).toBe(listings);
+  });
+});
+
+/**
+ * Issue #1636 — the app upgrading the local daemon on its own when it finds it
+ * running an older release, as the TUI does at launch: straight away with
+ * nothing running on it, asking first with agents running, and once per
+ * daemon version while the app runs.
+ */
+describe("upgrading an older local daemon at launch (issue #1636)", () => {
+  const OLDER = { kind: "offered", from: "0.44.0", to: "0.45.0" } as const;
+  function olderLocal(runningAgentCount = 0) {
+    const snapshot = createFixtureSnapshot("connected");
+    snapshot.agents = [];
+    snapshot.connection = {
+      status: "connected",
+      deckId: "deck-local",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
+      message: "Daemon responding",
+      daemonDetected: true,
+      runningAgentCount,
+      daemonBuildVersion: "0.44.0-gabc1234",
+      upgradeOffer: OLDER,
+    };
+    return snapshot;
+  }
+  beforeEach(() => window.history.replaceState({}, "", "/"));
+
+  /** Scenario: Launch against an older local daemon with nothing running; the app restarts it onto its own version without being asked and says so. */
+  it("restarts an idle older local daemon without asking, and says so", async () => {
+    const snapshot = olderLocal();
+    const live = runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures("") });
+    const view = render(<DeckShell runtime={live} />);
+
+    await waitFor(() => expect(live.upgradeDaemon).toHaveBeenCalledExactlyOnceWith("deck-local", expect.any(Function)));
+    expect(screen.queryByTestId("upgrade-start")).not.toBeInTheDocument();
+    const outcome = await screen.findByTestId("upgrade-outcome");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon upgraded");
+    expect(outcome).toHaveTextContent("The daemon on this machine now runs 0.45.0 (it was 0.44.0).");
+    expect(outcome).toHaveTextContent("Nothing was running, so nothing was stopped.");
+    fireEvent.click(screen.getByTestId("upgrade-close"));
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+
+    // A later snapshot of the same daemon version is not a new reason to restart.
+    view.rerender(<DeckShell runtime={{ ...live, snapshot: structuredClone(snapshot), fleet: [structuredClone(snapshot)] }} />);
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+    expect(live.upgradeDaemon).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: Launch against an older local daemon with an agent running; the app lists it, Keep current daemon stops nothing, the app does not ask again, and Upgrade on the daemon's section asks on demand. */
+  it("asks before stopping agents, keeps the daemon on Keep, and leaves Upgrade for later", async () => {
+    const snapshot = olderLocal(1);
+    const atStake = { agents: [{ id: "1", label: "coder", paneId: "4", cwd: "/work/app" }], roles: [] };
+    let release!: () => void;
+    const upgradeDaemon = vi.fn(async (deckId: string, onEvent: (event: UpgradeEvent) => void) => {
+      onEvent({ type: "progress", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage: "restarting" } });
+      onEvent({ type: "decision", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", questionId: 1, atStake, stale: false });
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake } } as UpgradeOutcome;
+    });
+    const live = runtime({ mode: "live", snapshot, upgradeDaemon, desktopFeatures: fixtureDesktopFeatures("") });
+    const view = render(<DeckShell runtime={live} />);
+
+    const question = await screen.findByTestId("upgrade-decision");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Restart and stop these?");
+    expect(question).toHaveTextContent("Restarting the daemon on this machine stops 1 agent");
+    expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Agent coder (pane 4, in /work/app)");
+    expect(within(question).getByTestId("upgrade-restart-now")).toHaveTextContent("Restart now");
+    fireEvent.click(within(question).getByTestId("upgrade-keep-current"));
+    expect(live.decideUpgrade).toHaveBeenCalledExactlyOnceWith("upgrade-1", 1, "keep-current");
+    await act(async () => release());
+    const outcome = await screen.findByTestId("upgrade-outcome");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon kept running");
+    expect(outcome).toHaveTextContent("The daemon keeps running 0.44.0, as you chose, so these keep running:");
+    expect(outcome).toHaveTextContent("Press Upgrade again when they have finished.");
+    fireEvent.click(screen.getByTestId("upgrade-close"));
+
+    view.rerender(<DeckShell runtime={{ ...live, snapshot: structuredClone(snapshot), fleet: [structuredClone(snapshot)] }} />);
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+    expect(upgradeDaemon).toHaveBeenCalledTimes(1);
+
+    const upgrade = screen.getByTestId("daemon-upgrade");
+    expect(upgrade).toHaveAccessibleName("Upgrade the daemon on this machine");
+    fireEvent.click(upgrade);
+    expect(screen.getByTestId("upgrade-confirm-body")).toHaveTextContent("The daemon on this machine runs 0.44.0, and this app is 0.45.0.");
+    expect(upgradeDaemon).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: With another modal open (an agent pane, New agent), the app waits and opens its Upgrade dialog only once that modal has closed, so its buttons are never inert behind it. */
+  it("waits for another modal to close before upgrading on its own", async () => {
+    const live = runtime({ mode: "live", snapshot: olderLocal(), desktopFeatures: fixtureDesktopFeatures("") });
+    const other = document.createElement("div");
+    other.setAttribute("aria-modal", "true");
+    document.body.appendChild(other);
+    try {
+      render(<DeckShell runtime={live} />);
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1200)); });
+      expect(live.upgradeDaemon).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+    } finally {
+      other.remove();
+    }
+    await waitFor(() => expect(live.upgradeDaemon).toHaveBeenCalledExactlyOnceWith("deck-local", expect.any(Function)), { timeout: 3000 });
+  });
+
+  /** Scenario: The app starts nothing on its own for a local daemon at its own release or newer, for a remote daemon, for a refused local daemon, or in the fixture preview. */
+  it("starts nothing on its own unless the connected local daemon is older", () => {
+    const cases: [string, Partial<DeckRuntimeState>][] = [];
+    for (const upgradeOffer of [{ kind: "current" }, { kind: "daemon-newer", daemon: "0.46.0" }, { kind: "unknown" }] as const) {
+      const snapshot = olderLocal();
+      snapshot.connection.upgradeOffer = upgradeOffer;
+      cases.push([upgradeOffer.kind, { mode: "live", snapshot }]);
+    }
+    const remote = olderLocal();
+    remote.connection = { ...remote.connection, deckId: "deck-remote", socketPath: "dev@build-box", deckKind: "remote" };
+    cases.push(["remote", { mode: "live", snapshot: remote }]);
+    const refused = olderLocal();
+    refused.connection = { ...refused.connection, status: "error", message: "build mismatch" };
+    cases.push(["refused", { mode: "live", snapshot: refused }]);
+    cases.push(["fixture", { mode: "fixture", snapshot: olderLocal() }]);
+
+    for (const [name, overrides] of cases) {
+      const live = runtime({ ...overrides, desktopFeatures: fixtureDesktopFeatures("") });
+      const view = render(<DeckShell runtime={live} />);
+      expect(live.upgradeDaemon, name).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("upgrade-dialog"), name).not.toBeInTheDocument();
+      view.unmount();
+    }
+  });
+});
+
+/**
+ * Issue #1667 — what Reading is told to call each agent: an orchestration
+ * agent by its run's title (the overview's group heading) and its name, a
+ * standalone agent by its name.
+ */
+describe("Reading's agent labels", () => {
+  beforeEach(() => window.history.replaceState({}, "", "/"));
+
+  /** Scenario: Reading is on with a titled run's coder, an untitled run's coder and a standalone agent on the deck; Reading names the first "prd-1401 Coder", the second by its orchestration's name and "Coder", and the standalone agent by its own name — the same titles the overview shows as the group headings. */
+  it("names an orchestration agent by the run title and its name", async () => {
+    const coder = (id: string, orchestrationId: string, displayTitle: string | undefined): AgentSession => ({
+      ...agentIn(id, "/work/app"),
+      displayName: "Coder",
+      tab: { kind: "orchestration", orchestrationId, name: "mixed", displayTitle, roleName: "coder", roleIndex: 1, isStartRole: false },
+    });
+    const solo = { ...agentIn("3", "/work/app"), displayName: "Reviewer" };
+    const snapshot = liveSnapshot([coder("1", "run-a", "prd-1401"), coder("2", "run-b", undefined), solo]);
+    const settings = settingsStore({ voice: { ...DEFAULT_VOICE_SETTINGS, reading: "on", reading_notice: "shown" } });
+    const voiceReadingStart = vi.fn(async (_target: { deckId: string; agentId: string; label: string }) => ({ kind: "started" as const, session: 1 }));
+    const live = runtime({
+      snapshot,
+      ...settings,
+      voiceSpeechPlan: vi.fn(async () => ({ kind: "system" as const })),
+      voiceReadingStart,
+      voiceReadingStop: vi.fn(async () => undefined),
+      onVoiceReadingConsentOff: vi.fn(async () => () => undefined),
+      onVoiceReadingConsentOn: vi.fn(async () => () => undefined),
+    });
+    render(<DeckShell runtime={live} />);
+
+    await waitFor(() => expect(voiceReadingStart).toHaveBeenCalledTimes(3));
+    const labels = Object.fromEntries(voiceReadingStart.mock.calls.map(([target]) => [target.agentId, target.label]));
+    expect(labels).toEqual({ "1": "prd-1401 Coder", "2": "mixed Coder", "3": "Reviewer" });
   });
 });

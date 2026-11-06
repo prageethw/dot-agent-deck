@@ -40,8 +40,10 @@ use crate::daemon_client::LocalEndpoint;
 /// a round number, and that derivation is the point.** The daemon we spawn does
 /// real work *before* it binds: `main`'s `DaemonCmd::Serve` arm runs
 /// `apply_login_shell_path` (an interactive-login `$SHELL`, up to
-/// `CAPTURE_TIMEOUT`), then materializes the pi extension and the Codex hooks —
-/// all ahead of `IpcListener::bind`. So the launcher's budget must cover the
+/// `CAPTURE_TIMEOUT`), then materializes the pi extension and runs every
+/// agent's startup hook install — all ahead of `IpcListener::bind`. Since issue
+/// #1157 that includes Claude Code's, which runs a bounded `claude --version`
+/// probe (issue #714, up to `CLAUDE_VERSION_PROBE_TIMEOUT`). So the launcher's budget must cover the
 /// daemon's worst-case *pre-bind* budget, or it is guaranteed to time out while
 /// the daemon is still healthy.
 ///
@@ -59,6 +61,55 @@ use crate::daemon_client::LocalEndpoint;
 /// milliseconds.
 pub const DAEMON_START_POLL_TIMEOUT: Duration =
     crate::login_shell::CAPTURE_TIMEOUT.saturating_add(Duration::from_secs(5));
+
+/// e2e seam (PRD #1258): the variable an `e2e` build reads to widen
+/// [`DAEMON_START_POLL_TIMEOUT`] for [`ensure_external_daemon_or_die`], in
+/// milliseconds. The TUI harness (`tests/common/mod.rs`) sets it to the default
+/// load-scaled, because on a starved box (io stalled ~70% of the window, load
+/// 17 on 16 cores) a debug daemon measurably bound after the fixed 15 s and the
+/// deck gave up while its daemon was still healthy.
+///
+/// The name is compiled into every build so the harness, which is also built
+/// without the feature, can spell it; only an `e2e` build reads it (see
+/// [`daemon_start_poll_timeout`]), for the reason `effective_current_exe` in
+/// `src/platform/paths.rs` is gated: a shipped binary has no switch that moves
+/// its start bound.
+pub const DAEMON_START_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_DAEMON_START_TIMEOUT_MS";
+
+/// The most [`DAEMON_START_TIMEOUT_ENV`] can widen the start bound to: past
+/// this, a start that has not bound is hung rather than slow, and waiting
+/// longer only delays the error that says so.
+#[cfg(feature = "e2e")]
+pub const DAEMON_START_POLL_TIMEOUT_MAX: Duration = Duration::from_secs(120);
+
+/// Parse a [`DAEMON_START_TIMEOUT_ENV`] value. Unset, empty or unparseable
+/// yields [`DAEMON_START_POLL_TIMEOUT`]; a number is clamped into
+/// `[DAEMON_START_POLL_TIMEOUT, DAEMON_START_POLL_TIMEOUT_MAX]`, so the seam
+/// can only widen the bound, never shorten it below the daemon's own pre-bind
+/// budget (see [`DAEMON_START_POLL_TIMEOUT`]'s doc for why that would fail).
+#[cfg(feature = "e2e")]
+pub fn parse_daemon_start_timeout(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(DAEMON_START_POLL_TIMEOUT, |ms| {
+            Duration::from_millis(ms)
+                .clamp(DAEMON_START_POLL_TIMEOUT, DAEMON_START_POLL_TIMEOUT_MAX)
+        })
+}
+
+/// The bound [`ensure_external_daemon_or_die`] polls with, and `daemon
+/// install` waits for the service's daemon with:
+/// [`DAEMON_START_POLL_TIMEOUT`], widened by [`DAEMON_START_TIMEOUT_ENV`] in an
+/// `e2e` build only.
+#[cfg(feature = "e2e")]
+pub fn daemon_start_poll_timeout() -> Duration {
+    parse_daemon_start_timeout(std::env::var(DAEMON_START_TIMEOUT_ENV).ok().as_deref())
+}
+
+#[cfg(not(feature = "e2e"))]
+pub fn daemon_start_poll_timeout() -> Duration {
+    DAEMON_START_POLL_TIMEOUT
+}
 
 /// How often [`ensure_external_daemon_or_die`] re-checks for the endpoint.
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -93,14 +144,33 @@ pub enum AttachError {
     },
     #[error(
         "refusing to connect to daemon attach socket {path}: {reason}. \
-         Another user (or a hostile same-uid process) may have placed this file."
+         Another user (or a hostile same-uid process) may have placed this file. \
+         The deck will not remove it — it refuses rather than unlink an entry it cannot \
+         vouch for, and in a sticky directory such as /tmp it could not anyway. Set \
+         DOT_AGENT_DECK_ATTACH_SOCKET to a path only you can write, for example under \
+         $XDG_RUNTIME_DIR or your home directory."
     )]
     SocketUntrusted { path: PathBuf, reason: String },
+    // Issue #1121 round two. Not reachable from any caller in `src/` today —
+    // `run_tui_session` never hands a legacy address to the bootstrap — which
+    // is precisely why the refusal is here as well as there: the property is
+    // "this function never unlinks or polls an address this build does not
+    // bind", and a property enforced only at one call site is one edit away
+    // from being gone with every test still green.
+    #[error(
+        "refusing to lazy-spawn or recover a daemon at {path}: that is the pre-#1121 \
+         compatibility endpoint, which this build binds only as a best-effort alias beside \
+         its own. A daemon started now binds the current endpoint first and may not bind \
+         this one at all, so unlinking this address and then polling it could wait out the \
+         full start timeout while a healthy daemon was already running."
+    )]
+    NotAPrimaryEndpoint { path: PathBuf },
 }
 
 /// If `socket_path` doesn't exist, run `spawn_fn` to start a detached
-/// daemon, then poll for the socket file at `poll_interval` until either
-/// it appears (Ok) or `poll_timeout` elapses (`DaemonStartTimeout`).
+/// daemon, then poll at `poll_interval` until either the socket accepts a
+/// connection (Ok) or `poll_timeout` elapses (`DaemonStartTimeout`). The file
+/// appearing is not enough: it exists from `bind(2)`, before `listen(2)`.
 ///
 /// Concurrent callers serialize on an exclusive `flock(2)` over
 /// `<state_dir>/spawn.lock` so only one of them runs `spawn_fn`; losers see
@@ -138,6 +208,19 @@ where
     // particular is safe only because `verify_socket_trusted` just proved the
     // inode is ours. `Endpoint::as_local()` is the only route to this type.
     let socket_path = endpoint.path();
+    // Issue #1121 round two: and not merely a local one — a *primary* one.
+    // Everything below is a write against the address: `remove_file` on a
+    // stale inode, `spawn_fn`, then a poll loop waiting for the spawned daemon
+    // to appear there. A daemon started now binds `paths::attach_socket_path()`
+    // and nothing else, so for the compatibility spelling all three are wrong:
+    // the unlink removes our own old socket, and the poll waits out its whole
+    // budget on an address that will never be bound. See
+    // `endpoint_resolve::client_attach_endpoint`.
+    if !endpoint.is_primary() {
+        return Err(AttachError::NotAPrimaryEndpoint {
+            path: socket_path.to_path_buf(),
+        });
+    }
     // Lock file lives inside the state dir, so we have to make sure the dir
     // exists first. `ensure_owner_only_dir` creates idempotently AND enforces
     // mode 0o700 unconditionally — including repairing a pre-existing dir
@@ -170,7 +253,7 @@ where
     // process HERE — so the presence it asks is the local one, and the third
     // answer (a deck on another machine) is unreachable rather than handled.
     if crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE.is_daemon_owned_inode() {
-        if socket_path.exists() {
+        if endpoint_entry_present(socket_path) {
             verify_socket_trusted(socket_path)?;
             // Trust check only validates the inode (type, owner, mode) — it
             // doesn't know whether anyone is listening. A daemon that died
@@ -196,9 +279,17 @@ where
     let start = Instant::now();
     loop {
         if crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE.is_daemon_owned_inode() {
-            if socket_path.exists() {
+            if endpoint_entry_present(socket_path) {
                 verify_socket_trusted(socket_path)?;
-                return Ok(());
+                // The inode appears at `bind(2)`, a moment before the daemon's
+                // `listen(2)`, and a connect in between is refused. Our caller
+                // connects straight away (the build-version handshake), so a
+                // daemon preempted in that gap on a loaded machine used to fail
+                // startup with "Connection refused". Ready means accepting a
+                // connection; until then keep polling.
+                if probe_socket_alive(socket_path).await {
+                    return Ok(());
+                }
             }
         } else if probe_socket_alive(socket_path).await {
             return Ok(());
@@ -214,6 +305,29 @@ where
     }
 }
 
+/// Is there a directory entry at `path` at all — `lstat`, not `stat`.
+///
+/// `Path::exists()` follows symlinks, so a **dangling** symlink planted at the
+/// endpoint path read as absent: lazy-spawn skipped the trust check, ran
+/// `spawn_fn`, and the daemon it started then failed its own `bind(2)` with
+/// `EADDRINUSE`, because `bind` refuses any path that already has an entry —
+/// link included. The operator got a spawn failure naming neither the squatter
+/// nor the path's real problem, and on a sticky `/tmp` no amount of retrying
+/// helps, since the deck cannot unlink an entry another uid owns.
+///
+/// With the `lstat`, every shape of planted entry — live link, dangling link,
+/// regular file, foreign socket — reaches [`verify_socket_trusted`] and comes
+/// back as one [`AttachError::SocketUntrusted`] that names the path and says
+/// what to do (issue #1020). It does not make the path *usable* again; that
+/// needs the endpoint out of the world-writable directory, which is
+/// [#1121](https://github.com/vfarcic/dot-agent-deck/issues/1121).
+///
+/// Nothing this function reports changes for a real socket, an absent path, or
+/// a regular file: `lstat` and `stat` agree on all three.
+fn endpoint_entry_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 /// Verify `path` is a trusted endpoint (a Unix socket owned by the current uid
 /// at mode 0o600) before any caller connects.
 ///
@@ -221,10 +335,13 @@ where
 /// path before the real daemon binds: in that scenario `bind(2)` fails with
 /// `EADDRINUSE` for the daemon and `connect(2)` succeeds for us against the
 /// attacker's socket. Validating ownership and mode out-of-band closes the
-/// gap. Stat is not racy here because we never re-stat after this check —
-/// the FD we then connect to is anchored to the inode the kernel resolves
-/// during this single call (and any swap underneath us produces an obvious
-/// connection error from `UnixStream::connect`).
+/// gap.
+///
+/// This comment carried the same false "anchored … during this single call"
+/// claim its platform counterpart did; the accurate statement, and where the
+/// replacement window is actually closed, is written out once at
+/// [`crate::platform::fsperm::verify_endpoint_trusted`] (issue #1121 round
+/// two).
 ///
 /// PRD #42 M1: the platform check lives in
 /// [`crate::platform::fsperm::verify_endpoint_trusted`]; here we just map its
@@ -293,6 +410,22 @@ pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std
     crate::platform::detach::spawn_daemon_serve_detached_with_exe(state_dir, exe)
 }
 
+/// PRD #1487: spawn the daemon that replaces this one after an accepted
+/// `restart-daemon`, detached as [`spawn_daemon_serve_detached_with_exe`] does
+/// and inheriting this daemon's environment so it binds the same endpoint —
+/// except the test-only orphan watchdog. That watchdog ties a daemon's life to
+/// the process that started it, and the successor's starter is the daemon it
+/// replaces, which exits by design; inherited, it shuts the successor down
+/// about a second after the old daemon is gone. The test max-lifetime backstop
+/// is still inherited.
+pub fn spawn_restart_successor(state_dir: &Path, exe: &Path) -> std::io::Result<u32> {
+    crate::platform::detach::spawn_daemon_serve_detached_without_env(
+        state_dir,
+        exe,
+        &[crate::agent_pty::DOT_AGENT_DECK_EXIT_WHEN_ORPHANED],
+    )
+}
+
 /// Returns true if `DOT_AGENT_DECK_VIA_DAEMON` is set to a truthy value
 /// (`1`, `true`, `yes`, case-insensitive). Pre-PRD-93 this controlled the
 /// in-process-vs-external decision directly; now (PRD #93 M1.1) the default
@@ -326,7 +459,8 @@ pub fn via_daemon_enabled() -> bool {
 /// stderr and exits nonzero — there is no in-process fallback). Polling uses
 /// [`DAEMON_START_POLL_TIMEOUT`] at [`DAEMON_START_POLL_INTERVAL`]; see the
 /// former's docs for why the budget is derived from the daemon's own pre-bind
-/// work rather than hardcoded.
+/// work rather than hardcoded. An `e2e` build lets the test harness widen it
+/// through [`DAEMON_START_TIMEOUT_ENV`].
 pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(), AttachError> {
     let state = state_dir();
     let state_for_spawn = state.clone();
@@ -335,7 +469,7 @@ pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(
         &state,
         move || spawn_daemon_serve_detached(&state_for_spawn),
         DAEMON_START_POLL_INTERVAL,
-        DAEMON_START_POLL_TIMEOUT,
+        daemon_start_poll_timeout(),
     )
     .await
 }
@@ -353,14 +487,105 @@ mod tests {
     /// nothing but this assertion couples them. A timing test would be flaky
     /// and would only fail on a machine with a slow interactive shell — the
     /// ordering is the real invariant, so assert the ordering.
+    ///
+    /// Issue #714 x #1157: the Claude Code version probe now runs pre-bind too,
+    /// so it is counted in the budget rather than left to the slack.
     #[test]
     fn attach_poll_timeout_exceeds_daemon_pre_bind_budget() {
         assert!(
-            DAEMON_START_POLL_TIMEOUT > crate::login_shell::CAPTURE_TIMEOUT,
+            DAEMON_START_POLL_TIMEOUT
+                > crate::login_shell::CAPTURE_TIMEOUT
+                    + crate::hooks_manage::CLAUDE_VERSION_PROBE_TIMEOUT,
             "lazy-spawn would time out on a healthy but slow daemon: launcher waits \
              {DAEMON_START_POLL_TIMEOUT:?} but the daemon may spend up to {:?} in the \
-             login-shell PATH capture before it even calls bind",
+             login-shell PATH capture plus {:?} in the Claude Code version probe before it \
+             even calls bind",
             crate::login_shell::CAPTURE_TIMEOUT,
+            crate::hooks_manage::CLAUDE_VERSION_PROBE_TIMEOUT,
+        );
+    }
+
+    /// PRD #1258: the e2e start-bound seam only ever widens the bound, and
+    /// within a ceiling. Unset, empty and junk fall back to the default; a value
+    /// below the daemon's pre-bind budget is raised to it rather than honoured,
+    /// because shortening it would reintroduce the healthy-but-slow failure
+    /// [`attach_poll_timeout_exceeds_daemon_pre_bind_budget`] guards.
+    #[cfg(feature = "e2e")]
+    #[test]
+    fn daemon_start_timeout_override_parses_and_clamps() {
+        let ms = |d: Duration| d.as_millis();
+        let default = ms(DAEMON_START_POLL_TIMEOUT);
+        let max = ms(DAEMON_START_POLL_TIMEOUT_MAX);
+        for (input, expected) in [
+            (None, default),
+            (Some(""), default),
+            (Some("   "), default),
+            (Some("soon"), default),
+            (Some("-5"), default),
+            (Some("12.5"), default),
+            (Some("99999999999999999999999"), default),
+            (Some("0"), default),
+            (Some("1000"), default),
+            (Some(" 40000 "), 40_000),
+            (Some("90000"), 90_000),
+            (Some("600000"), max),
+            (Some(&*u64::MAX.to_string()), max),
+        ] {
+            assert_eq!(
+                ms(parse_daemon_start_timeout(input)),
+                expected,
+                "input {input:?}"
+            );
+        }
+        assert!(DAEMON_START_POLL_TIMEOUT_MAX > DAEMON_START_POLL_TIMEOUT);
+    }
+
+    /// Issue #1121 round two, B6: a non-primary endpoint — the pre-#1121
+    /// compatibility spelling — is refused before anything is unlinked or
+    /// spawned. The planted socket must survive untouched and `spawn_fn` must
+    /// never run; both are the damage the refusal exists to prevent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_primary_endpoint_is_refused_before_anything_is_unlinked_or_spawned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = dir.path().join("legacy.sock");
+        // A dead socket: bound, then the listener dropped, so the inode stays
+        // and nothing answers — exactly the state that sends a *primary*
+        // endpoint down the `remove_file` branch.
+        drop(std::os::unix::net::UnixListener::bind(&legacy).expect("bind"));
+        crate::platform::fsperm::set_endpoint_mode_owner_only(&legacy).expect("0o600");
+
+        let endpoint = LocalEndpoint::from_resolved(crate::platform::paths::ResolvedEndpoint::new(
+            legacy.clone(),
+            crate::platform::paths::EndpointSource::LegacyCompat,
+        ));
+        assert!(!endpoint.is_primary());
+
+        let spawned = AtomicBool::new(false);
+        let error = ensure_daemon_running(
+            &endpoint,
+            &dir.path().join("state"),
+            || {
+                spawned.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a legacy address must be refused");
+
+        assert!(
+            matches!(error, AttachError::NotAPrimaryEndpoint { .. }),
+            "{error}"
+        );
+        assert!(!spawned.load(Ordering::SeqCst), "nothing may be spawned");
+        assert!(
+            legacy.exists(),
+            "our own legacy socket must not be unlinked: {}",
+            legacy.display()
         );
     }
 
@@ -374,5 +599,267 @@ mod tests {
             "poll interval {DAEMON_START_POLL_INTERVAL:?} is too coarse for a \
              {DAEMON_START_POLL_TIMEOUT:?} budget",
         );
+    }
+
+    /// Issue #1020 at the level a client actually reaches it. The unit tests on
+    /// `verify_endpoint_trusted` pin the predicate; this pins that lazy-spawn
+    /// *consults* it for each shape of planted entry, which is a separate
+    /// property — `Path::exists()` follows links, so before this a dangling one
+    /// routed around the check entirely.
+    ///
+    /// Three things are asserted per case, and the middle one is the point:
+    /// the call fails `SocketUntrusted` naming the path, **`spawn_fn` never
+    /// runs**, and the planted entry is left alone rather than unlinked. A fix
+    /// that refused but still started a daemon would leave the operator with a
+    /// process that cannot bind and an error about the wrong thing.
+    ///
+    /// `spawn_fn` is a `FnOnce`, so "did it run" is recorded through an `Arc`
+    /// rather than returned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_running_refuses_a_planted_symlink_without_spawning() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+        let real = root.path().join("real.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&real).expect("bind");
+        crate::platform::fsperm::set_endpoint_mode_owner_only(&real).expect("0o600");
+
+        for (label, target) in [
+            // The issue's own case: a link to a socket that would be trusted
+            // under its own name, which is what used to be accepted.
+            ("live", real.clone()),
+            // And the one `Path::exists()` hid: a link to nothing resolves to
+            // nothing, but `bind(2)` still sees an entry and returns EADDRINUSE.
+            ("dangling", root.path().join("nowhere")),
+        ] {
+            let planted = root.path().join(format!("{label}.sock"));
+            std::os::unix::fs::symlink(&target, &planted).expect("plant the symlink");
+
+            let spawned = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&spawned);
+            let err = ensure_daemon_running(
+                &LocalEndpoint::at(&planted),
+                &state,
+                move || {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                Duration::from_millis(5),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err(&format!(
+                "a {label} symlink at the endpoint must be refused"
+            ));
+
+            assert!(
+                matches!(err, AttachError::SocketUntrusted { .. }),
+                "a {label} symlink must refuse as untrusted, not as a spawn or timeout \
+                 failure: {err}"
+            );
+            let rendered = err.to_string();
+            assert!(rendered.contains("symlink"), "{rendered}");
+            assert!(
+                rendered.contains(&planted.display().to_string()),
+                "the refusal must name the path so the operator can clear it: {rendered}"
+            );
+            assert!(
+                !spawned.load(Ordering::SeqCst),
+                "a {label} symlink must be refused BEFORE a daemon is started — the one we \
+                 spawn could not bind over it anyway"
+            );
+            assert!(
+                std::fs::symlink_metadata(&planted)
+                    .expect("lstat the planted link")
+                    .file_type()
+                    .is_symlink(),
+                "the stale-inode unlink must not reach a path we refused to vouch for"
+            );
+        }
+    }
+
+    /// The control, and the half that matters most: the shapes lazy-spawn
+    /// exists for still work. A trusted socket with a live listener short-
+    /// circuits without spawning, and an absent path spawns exactly once.
+    ///
+    /// Without this, `endpoint_entry_present` returning a constant `true` or
+    /// `false` would pass every assertion in the test above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_running_still_accepts_a_real_socket_and_spawns_for_an_absent_one() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+
+        let live = root.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).expect("bind");
+        crate::platform::fsperm::set_endpoint_mode_owner_only(&live).expect("0o600");
+
+        let spawned = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&spawned);
+        ensure_daemon_running(
+            &LocalEndpoint::at(&live),
+            &state,
+            move || {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("a live 0o600 socket of ours is exactly what lazy-spawn short-circuits on");
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "a live daemon must not be double-spawned"
+        );
+
+        // Nothing at the path: spawn, and the closure creating the socket is
+        // what the poll loop then finds.
+        let fresh = root.path().join("fresh.sock");
+        let fresh_for_spawn = fresh.clone();
+        let fresh_holder = Arc::new(std::sync::Mutex::new(None));
+        let fresh_holder_for_spawn = Arc::clone(&fresh_holder);
+        ensure_daemon_running(
+            &LocalEndpoint::at(&fresh),
+            &state,
+            move || {
+                // The post-spawn branch re-checks presence and trust, then
+                // probes, so the listener must outlive this closure: a dropped
+                // one leaves an inode nobody listens on, which is not a daemon.
+                // It need not accept — a listening socket's backlog completes
+                // the probe's connect before any `accept`.
+                let listener = std::os::unix::net::UnixListener::bind(&fresh_for_spawn)?;
+                crate::platform::fsperm::set_endpoint_mode_owner_only(&fresh_for_spawn)?;
+                *fresh_holder_for_spawn.lock().unwrap() = Some(listener);
+                Ok(())
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("an absent endpoint must be spawned for, not refused");
+        drop(fresh_holder);
+    }
+
+    /// A Unix socket bound with `bind(2)` but not yet `listen(2)`ed: the inode
+    /// is on disk at `0o600` and every `connect(2)` is refused. That is the
+    /// state a freshly spawned daemon is in for the instant between the two
+    /// calls inside `UnixListener::bind`. Returns the fd, which the caller
+    /// later `listen`s on (or closes).
+    #[cfg(unix)]
+    fn bind_without_listening(path: &Path) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: plain socket/bind syscalls on a zeroed `sockaddr_un` whose
+        // path fits (asserted), with the fd owned by the returned `OwnedFd`.
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+            let owned = std::os::fd::OwnedFd::from_raw_fd(fd);
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = path.as_os_str().as_bytes();
+            assert!(bytes.len() < addr.sun_path.len(), "socket path too long");
+            for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+                *dst = *src as libc::c_char;
+            }
+            let rc = libc::bind(
+                fd,
+                std::ptr::addr_of!(addr).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            );
+            assert_eq!(rc, 0, "bind: {}", std::io::Error::last_os_error());
+            owned
+        }
+    }
+
+    /// The post-spawn poll must not report the daemon ready until it is
+    /// LISTENING, not merely bound. Lazy-spawn's caller connects straight away
+    /// (the build-version handshake), so returning on the inode alone handed it
+    /// a socket that refused the connection whenever the daemon was preempted
+    /// between `bind(2)` and `listen(2)` — the startup failure
+    /// `build-version handshake probe failed: Connection refused (os error
+    /// 111)` seen under heavy load. Here the stand-in daemon binds, then
+    /// listens only after a delay; the first connect after `Ok` must succeed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_running_waits_for_a_listener_not_just_the_inode() {
+        use std::os::fd::AsRawFd;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+        let sock = root.path().join("slow.sock");
+        let sock_for_spawn = sock.clone();
+        let (fd_tx, fd_rx) = std::sync::mpsc::channel();
+
+        let listener_thread = std::thread::spawn(move || {
+            let fd: std::os::fd::OwnedFd = fd_rx.recv().expect("spawn_fn sends the fd");
+            std::thread::sleep(Duration::from_millis(300));
+            // SAFETY: `fd` is a bound AF_UNIX stream socket this thread owns.
+            let rc = unsafe { libc::listen(fd.as_raw_fd(), 16) };
+            assert_eq!(rc, 0, "listen: {}", std::io::Error::last_os_error());
+            fd // keep it open until the test is done
+        });
+
+        ensure_daemon_running(
+            &LocalEndpoint::at(&sock),
+            &state,
+            move || {
+                let fd = bind_without_listening(&sock_for_spawn);
+                crate::platform::fsperm::set_endpoint_mode_owner_only(&sock_for_spawn)?;
+                fd_tx.send(fd).expect("listener thread is waiting");
+                Ok(())
+            },
+            Duration::from_millis(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a daemon that starts listening within the budget is ready");
+
+        std::os::unix::net::UnixStream::connect(&sock).expect(
+            "lazy-spawn reported the daemon ready, so the caller's first connect must succeed",
+        );
+        drop(listener_thread.join().expect("listener thread"));
+    }
+
+    /// And the converse: an inode that never starts listening is not a daemon,
+    /// so the poll runs out its budget with `DaemonStartTimeout` (naming the
+    /// log to read) instead of returning `Ok` for the caller's connect to fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_running_times_out_on_an_inode_that_never_listens() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+        let sock = root.path().join("mute.sock");
+        let sock_for_spawn = sock.clone();
+        let holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let holder_for_spawn = std::sync::Arc::clone(&holder);
+
+        let error = ensure_daemon_running(
+            &LocalEndpoint::at(&sock),
+            &state,
+            move || {
+                let fd = bind_without_listening(&sock_for_spawn);
+                crate::platform::fsperm::set_endpoint_mode_owner_only(&sock_for_spawn)?;
+                *holder_for_spawn.lock().unwrap() = Some(fd);
+                Ok(())
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("a bound socket nobody listens on must not read as a ready daemon");
+        assert!(
+            matches!(error, AttachError::DaemonStartTimeout { .. }),
+            "{error}"
+        );
+        drop(holder);
     }
 }

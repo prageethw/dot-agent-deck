@@ -15,6 +15,28 @@
 # disagreement, so `cargo test-fast` locally and CI both say so instead of
 # nobody saying anything.
 #
+# Issue #1262 added a third class, pnpm, pinned in `devbox.json` and as
+# `pnpm/action-setup`'s `version:` input. The workflow half had been a bare
+# major (`version: 12`) while devbox.json pinned 11.22.0, so the two disagreed
+# by a whole major and CI took each new 12.x unreviewed; 12.6.0 hung the
+# `desktop-browser` job. Its scanner differs from the other two in how it finds
+# a site and in what it accepts as readable — see `scan_workflow_pnpm`.
+#
+# `--pnpm-sites` prints that scanner's raw findings and exits 0 whatever they
+# are: one `<file>:<line> <version>` per site and one `!ERR <message>` per
+# unreadable one. It exists for `pin_lockstep.rs`, which compares those sites
+# against what renovate.json's pnpm regex extracts from the same files.
+# `--toolchain-sites` does the same for the Rust toolchain scanner, which
+# `pin_lockstep.rs` compares against renovate.json's workflow `rustc` regex
+# (issue #1478). `--rwx-sites` does the same for the RWX configs, below.
+#
+# RWX (docs/develop/rwx.md) is a THIRD place the toolchain is pinned:
+# `.rwx/ci.yml` and `.rwx/sandbox.yml` install the Rust toolchain, nextest,
+# pnpm and go-task by exact version in their own syntax. Their sites join the
+# CI side of each class, so devbox.json, .github/workflows/ and .rwx/ must all
+# agree. go-task is a class only against RWX: the workflows install it as a
+# floating `3.x` through arduino/setup-task, which pins nothing to compare.
+#
 # WHERE IT RUNS
 #
 #   * `cargo test-fast` — via `xtask/linkage-check/src/pin_lockstep.rs`, which
@@ -52,7 +74,7 @@
 # this script never needs touching when a pin moves — only when a new pin class
 # starts being duplicated across the two.
 #
-# Usage: scripts/check-pin-lockstep.sh [REPO_ROOT]
+# Usage: scripts/check-pin-lockstep.sh [--pnpm-sites | --toolchain-sites | --rwx-sites] [REPO_ROOT]
 # Exit:  0 = the pins agree, 1 = they do not (details on stderr).
 
 set -euo pipefail
@@ -61,6 +83,18 @@ case "${1:-}" in
   -h | --help)
     sed -n '2,/^# Exit:/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
+    ;;
+  --pnpm-sites)
+    pnpm_sites_only=1
+    shift
+    ;;
+  --toolchain-sites)
+    toolchain_sites_only=1
+    shift
+    ;;
+  --rwx-sites)
+    rwx_sites_only=1
+    shift
     ;;
 esac
 
@@ -243,6 +277,181 @@ scan_workflow_nextest() {
   done < <(workflow_files)
 }
 
+# Emits "<file>:<line> <version>" per site. `pnpm/action-setup`'s `version:`
+# input (issue #1262).
+#
+# This pin is NOT on one line with a token of its own, which is why it gets an
+# awk walk rather than `pin_lines`. `version:` is a key half the actions in the
+# world take, so the only thing that makes a given `version:` a pnpm pin is
+# that it sits in the same STEP as `uses: pnpm/action-setup@…`. The walk
+# therefore finds each such `uses:`, backs up to the `- ` that opens its step,
+# and reads the `version:` key of that step's `with:` mapping, looking from
+# there to the next line indented no deeper than that dash — so it reads the
+# input whichever order the step's keys are written in, and in block
+# (`version: 11.22.0`) or flow (`with: { version: 11.22.0 }`) style. A
+# `version:` elsewhere in the step (under `env:`, say) is not the input.
+#
+# Renovate reads this pin with a REGEX, and that decides what counts as
+# unreadable here. Until issue #1319 it was read by the github-actions
+# known-actions registry (`known-actions/npm.ts`) as depType `uses-with` — a
+# YAML parser, so every valid spelling of the step was tracked and this walk
+# accepted them all. That lane is now disabled for pnpm, because it sourced
+# versions from npm that devbox could not follow yet. The pin is read instead by
+# renovate.json's pnpm customManager, from the devbox datasource, and its regex
+# matches ONE layout, on consecutive lines, with the version bare:
+#
+#   - uses: pnpm/action-setup@<ref>
+#     with:
+#       version: X.Y.Z
+#
+# So the walk still FINDS a pin in any layout — that is what turns a reformat
+# into an error instead of an absence — but it reports every site outside that
+# layout: a quoted version, a flow-style `with: { … }`, another input ahead of
+# `version:`, keys ahead of `uses:`, a comment on the `with:` line. Each is valid
+# YAML that Renovate would silently stop bumping, so its next grouped pnpm PR
+# would carry devbox.json's half alone and fail this very check. The one place
+# the guard is stricter than the regex is a blank line between those lines,
+# which the regex's `\s*` tolerates; stricter only ever fails early.
+# `renovate_reads_exactly_the_pnpm_sites_the_guard_finds` in
+# `xtask/linkage-check/src/pin_lockstep.rs` runs that regex over the real
+# workflows and requires the sites and versions this walk finds, so the two
+# cannot drift apart silently. One matching layer of quotes is still stripped
+# before the SEMVER test, so a quoted major is reported as inexact rather than
+# only as misformatted.
+#
+# What stays an error is anything that is not an exact X.Y.Z. That is the whole
+# of issue #1262: `version: 12` was accepted by the action and floated to every
+# 12.x the moment it shipped, and 12.6.0 hung `desktop-browser` with no commit
+# here to review or revert. A step with no `version:` at all is an error too.
+scan_workflow_pnpm() {
+  local f
+  while IFS= read -r f; do
+    awk -v file="${f#"$root"/}" -v scanerr="$SCAN_ERR" -v q="'" '
+      function indent(s) { match(s, /^ */); return RLENGTH }
+      function is_comment(s) { return s ~ /^[[:space:]]*(#.*)?$/ }
+      # Same token rule as the shell `pin_value` above: drop leading space, end
+      # at whitespace, `,` or `}`. Then peel one matching layer of quotes.
+      function value_of(s,   v) {
+        v = s
+        sub(/^[[:space:]]+/, "", v)
+        sub(/[[:space:],}].*$/, "", v)
+        if (length(v) >= 2 && (v ~ /^".*"$/ || (substr(v, 1, 1) == q && substr(v, length(v), 1) == q)))
+          v = substr(v, 2, length(v) - 2)
+        return v
+      }
+      # Each line is kept with any TRAILING comment removed — YAML starts one at
+      # a `#` preceded by whitespace — so `run_install: false # was version: 12`
+      # is not read as a `version:` input. Indentation is unaffected.
+      # Net `{` minus `}` in `s`, counting only braces OUTSIDE quoted scalars,
+      # so `package_json_file: "${{ matrix.file }}"` inside a multi-line flow
+      # mapping does not look like the mapping closing. The quote state is the
+      # global `instr`, reset when a flow mapping opens and carried across its
+      # lines, because a quoted scalar may itself span lines.
+      function brace_delta(s,   i, c, d) {
+        d = 0
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (instr != "") {
+            if (instr == "\"" && c == "\\") i++
+            else if (c == instr) instr = ""
+            continue
+          }
+          if (c == "\"" || c == q) instr = c
+          else if (c == "{") d++
+          else if (c == "}") d--
+        }
+        return d
+      }
+      # `raw` keeps the line as written, for the layout test against
+      # the regex in renovate.json, which sees trailing comments too.
+      { raw[NR] = $0; l = $0; sub(/[[:space:]]#.*$/, "", l); line[NR] = l }
+      END {
+        for (i = 1; i <= NR; i++) {
+          if (is_comment(line[i])) continue
+          # An optional quote before the action: the regex in renovate.json matches
+          # `pnpm/action-setup@` anywhere on the line, so
+          # `uses: "pnpm/action-setup@…"` is the same tracked step.
+          if (line[i] !~ /uses:[[:space:]]*["\047]?pnpm\/action-setup@/) continue
+
+          # The `- ` that opens this step: this line, or the nearest one above
+          # it indented LESS than this `uses:` key.
+          key_at = indent(line[i])
+          start = i
+          if (line[i] !~ /^ *- /) {
+            for (start = i - 1; start >= 1; start--) {
+              if (line[start] ~ /^ *- / && indent(line[start]) < key_at) break
+            }
+            if (start < 1) start = i
+          }
+          dash_at = indent(line[start])
+
+          # Only the `with:` mapping of the step is read. A `version:` elsewhere
+          # in the step (`env: { version: … }`, say) is not an input of the action,
+          # and reading it would let a step with no pin pass as pinned.
+          # `with_at` is the column of the `with:` key while inside its block
+          # form, or -1; the flow form is read on the `with:` line itself.
+          # `in_flow` is set while a flow mapping opened on the `with:` line
+          # (`with: {`) continues onto later lines, until its closing brace.
+          found = 0
+          with_at = -1
+          in_flow = 0
+          for (j = start; j <= NR; j++) {
+            # Applies inside a flow mapping too: YAML indents its continuation
+            # lines deeper than the step, so an unbalanced quote or brace can
+            # never carry the read into the next step.
+            if (j > start && !is_comment(line[j]) && indent(line[j]) <= dash_at) break
+            if (is_comment(line[j])) continue
+            if (with_at >= 0 && indent(line[j]) <= with_at) with_at = -1
+            cand = ""
+            if (in_flow) {
+              cand = line[j]
+              flow_depth += brace_delta(cand)
+              if (flow_depth <= 0) in_flow = 0
+            } else if (match(line[j], /^ *(- +)?with:/)) {
+              after = substr(line[j], RSTART + RLENGTH)
+              if (after ~ /^[[:space:]]*$/) {
+                with_at = RLENGTH - 5
+                continue
+              }
+              cand = after
+              if (after ~ /^[[:space:]]*\{/) {
+                instr = ""
+                flow_depth = brace_delta(after)
+                if (flow_depth > 0) in_flow = 1
+              }
+            } else if (with_at >= 0) {
+              cand = line[j]
+            }
+            if (cand == "") continue
+            if (!match(cand, /(^|[[:space:]{,])version:/)) continue
+            found = 1
+            rest = substr(cand, RSTART + RLENGTH)
+            v = value_of(rest)
+            # The SEMVER test written out rather than passed in with `-v`: awk
+            # processes escapes in a `-v` value, so `\.` would arrive as `.`
+            # and match any character.
+            if (v !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) {
+              printf "%s%s:%d has a pnpm/action-setup version that is not an exact X.Y.Z: %s%s%s. A major or a range floats to whatever pnpm ships next, with no commit here to review or revert (issue #1262).\n", scanerr, file, j, q, v, q
+              continue
+            }
+            # The layout the pnpm customManager in renovate.json can read (see the
+            # comment above this function): `with:` alone on the line after
+            # `uses:`, and a bare `version: X.Y.Z` on the line after that.
+            if (!(j == i + 2 && raw[i + 1] ~ /^[[:space:]]*with:[[:space:]]*$/ && raw[j] ~ /^[[:space:]]*version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+/)) {
+              printf "%s%s:%d has a pnpm/action-setup version renovate.json cannot read. Its pnpm customManager is a regex that wants exactly this layout, on consecutive lines: the `uses: pnpm/action-setup@...` line, then `with:` alone, then a bare `version: X.Y.Z`. Any other spelling (a quoted version, a flow-style `with: { ... }`, another input before `version:`, keys ahead of `uses:`, a comment on the `with:` line) is valid YAML that Renovate silently stops bumping, so its next pnpm PR would carry only the devbox.json half (issue #1319).\n", scanerr, file, j
+              continue
+            }
+            printf "%s:%d %s\n", file, j, v
+          }
+          if (!found) {
+            printf "%s%s:%d uses pnpm/action-setup with no version: input. Every workflow pin is explicit.\n", scanerr, file, i
+          }
+        }
+      }
+    ' "$f"
+  done < <(workflow_files)
+}
+
 # Every `<name><TAB><version>` pair in devbox.json's `packages`, in file order.
 #
 # `packages` HAS TWO SPELLINGS and devbox writes both, which is why this is a
@@ -381,6 +590,57 @@ devbox_pins() {
   ' "$root/devbox.json"
 }
 
+# The RWX configs: `.rwx/` top level, the same file set renovate.json's RWX
+# customManagers match (`/^\.rwx/[^/]+\.ya?ml$/`). No `.rwx/` directory, no
+# sites, which is what every fixture in pin_lockstep.rs that predates RWX is.
+rwx_files() {
+  local f
+  for f in "$root"/.rwx/*.yml "$root"/.rwx/*.yaml; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+}
+
+# Emits "<file>:<line> <version>" per RWX site of one pin. `$1` is an ERE for
+# what precedes the version, exactly what renovate.json's matching RWX
+# customManager puts before its `currentValue`, and `$2` names the pin in
+# errors. A line that carries the prefix without an exact X.Y.Z after it is an
+# error rather than a non-site: Renovate's regex would skip it, so the pin
+# would silently stop being bumped. Full-line comments are excluded, as
+# everywhere else here.
+scan_rwx() {
+  local prefix="$1" what="$2" f hit lineno rest token value
+  while IFS= read -r f; do
+    while IFS= read -r hit; do
+      lineno="${hit%%:*}"
+      rest="${hit#*:}"
+      while IFS= read -r token; do
+        # The whole token after the prefix, NOT its numeric head: the token
+        # already ends at the delimiter the pin is written with (a space, a
+        # quote or `/`), so anything left after an exact X.Y.Z, such as a
+        # pre-release `-beta.1`, is a different version and fails below.
+        value="$(printf '%s' "$token" | sed -E "s#^${prefix}##")"
+        if ! printf '%s' "$value" | grep -qE "$SEMVER"; then
+          printf '%s%s:%s has an unreadable %s pin: %s. renovate.json matches an exact X.Y.Z here; anything else silently stops being tracked.\n' \
+            "$SCAN_ERR" "${f#"$root"/}" "$lineno" "$what" "'$token'"
+          continue
+        fi
+        printf '%s:%s %s\n' "${f#"$root"/}" "$lineno" "$value"
+      # `-e`: a prefix can start with `--` (rustup's `--default-toolchain`).
+      done < <(printf '%s' "$rest" | grep -oE -e "${prefix}[^[:space:]\"'/]*" || true)
+    done < <(pin_lines "$prefix" "$f")
+  done < <(rwx_files)
+}
+
+# The RWX sites of each class. The Rust toolchain has two spellings there:
+# `rust-lang/install`'s `rust-version:` and rustup's `--default-toolchain`.
+scan_rwx_toolchain() {
+  scan_rwx 'rust-version:[[:space:]]*' 'Rust toolchain'
+  scan_rwx '--default-toolchain[[:space:]]+' 'Rust toolchain'
+}
+scan_rwx_nextest() { scan_rwx 'get\.nexte\.st/' 'cargo-nextest'; }
+scan_rwx_pnpm() { scan_rwx 'pnpm@' 'pnpm'; }
+scan_rwx_gotask() { scan_rwx 'go-task/task/releases/download/v' 'go-task'; }
+
 # Emits "devbox.json(<name>) <version>" per named package in devbox.json.
 scan_devbox() {
   local name value found pins
@@ -452,23 +712,63 @@ compare() {
     "$class" "$devbox_versions" "$(printf '%s\n' "$workflow_sites" | wc -l | tr -d ' ')"
 }
 
+if [ "${pnpm_sites_only:-0}" -eq 1 ]; then
+  scan_workflow_pnpm
+  exit 0
+fi
+if [ "${toolchain_sites_only:-0}" -eq 1 ]; then
+  scan_workflow_toolchain
+  exit 0
+fi
+if [ "${rwx_sites_only:-0}" -eq 1 ]; then
+  scan_rwx_toolchain
+  scan_rwx_nextest
+  scan_rwx_pnpm
+  scan_rwx_gotask
+  exit 0
+fi
+
 # `rustc`/`cargo`/`clippy`/`rustfmt` are four devbox packages carrying ONE
 # toolchain version, and the workflows express the same thing as a single
 # `toolchain:` input, so they are one class with four devbox sites.
 compare "Rust toolchain" \
   "$(scan_devbox rustc cargo clippy rustfmt)" \
-  "$(scan_workflow_toolchain)"
+  "$(scan_workflow_toolchain; scan_rwx_toolchain)"
 
 compare "cargo-nextest" \
   "$(scan_devbox cargo-nextest)" \
-  "$(scan_workflow_nextest)"
+  "$(scan_workflow_nextest; scan_rwx_nextest)"
+
+# pnpm is the desktop app's package manager: devbox.json's `pnpm` is what a
+# `devbox shell` runs `pnpm install` / `pnpm test` with, and
+# `pnpm/action-setup`'s `version:` is what `desktop-web`, `desktop-browser` and
+# the release's desktop bundle run them with (issue #1262).
+compare "pnpm" \
+  "$(scan_devbox pnpm)" \
+  "$(scan_workflow_pnpm; scan_rwx_pnpm)"
+
+# When the repository has RWX configs, each class must be pinned there too. The
+# RWX sites ride the workflow side of `compare`, so without this a `.rwx/` that
+# lost its pin (an unpinned installer, a reworded URL) would leave the class
+# agreeing on the workflows alone and nothing would say RWX now floats.
+if [ -n "$(rwx_files)" ]; then
+  for class in toolchain nextest pnpm gotask; do
+    if [ -z "$(sites_only "$(scan_rwx_$class)")" ]; then
+      err "$class: .rwx/ pins nothing for this class. The RWX configs install it, so they must pin the same exact version devbox.json does; an absent pin means RWX floats."
+    fi
+  done
+  # go-task runs the repository's Taskfile-based tests (`DAD_REQUIRE_GO_TASK`),
+  # and .rwx/ is the only CI side that pins it.
+  compare "go-task" "$(scan_devbox go-task)" "$(scan_rwx_gotask)"
+fi
 
 if [ "$fail" -ne 0 ]; then
   cat >&2 <<'EOF'
 
-The pins in devbox.json and .github/workflows/ must match exactly: `cargo
+The pins in devbox.json, .github/workflows/ and .rwx/ must match exactly: `cargo
 test-fast` / `cargo test-e2e` in a devbox shell and `cargo nextest run` in CI
-are supposed to be the same claim, and they are not while these disagree.
+are supposed to be the same claim, and so are `pnpm install` / `pnpm test` in
+desktop/, and they are not while these disagree.
 
 Both sides move together in ONE pull request. renovate.json holds the
 toolchain-class devbox packages for a human precisely so the two halves can be

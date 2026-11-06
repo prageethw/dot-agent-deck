@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2e", feature = "e2e-live"))]
+#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
 //! L2 end-to-end coverage for the command-entry lock on Orchestration tabs.
 //!
@@ -40,8 +40,8 @@ use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
 /// `orch-deck` / `orch-lock-*` fixtures. Mirrors
-/// `e2e_orchestration_pane_column.rs::open_orchestration` — with no
-/// `[[modes]]` defined the Mode chip row is `[No mode] [Orch: …] [schedule]`,
+/// `e2e_orchestration_pane_column.rs::open_orchestration` — the
+/// Mode chip row is `[No mode] [Orch: …] [schedule]`,
 /// so ONE Right selects the orchestration; selecting an orchestration hides
 /// the Command field, so a second Enter submits the form. Lands with the
 /// orchestrator (start) role focused in `PaneInput` mode.
@@ -57,15 +57,68 @@ fn open_orchestration(deck: &TuiDeck) {
     deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
 }
 
-/// Switch focus from the orchestrator role to the fixture's second role
-/// ("worker", `role_pane_ids` index 1): Ctrl+D back to Normal mode, then digit
-/// `2` (`Jump2` -> `Action::FocusCard(1)`) — the same mechanism
-/// `focus/orchestration/001` pins for "1-9 on an orchestration tab jumps to
-/// role pane N and focuses it". `focus_deck` re-enters `PaneInput` mode on
-/// success, so no separate Enter is needed.
+/// The bottom bar's mode chip (`src/ui.rs::mode_chip_label`), drawn in cell 0
+/// of the bar row in every mode but Filter/Rename — the same left-anchored
+/// read `e2e_mode_indication.rs` uses.
+fn typing_chip_shown(grid: &str) -> bool {
+    grid.lines().any(|line| line.starts_with(" TYPING "))
+}
+
+fn command_chip_shown(grid: &str) -> bool {
+    grid.lines().any(|line| line.starts_with(" COMMAND "))
+}
+
+/// Focus the fixture's second role ("worker", `role_pane_ids` index 1) in
+/// `PaneInput` mode, from either `PaneInput` or command mode, and panic unless
+/// it got there.
+///
+/// The jump itself is digit `2` from command mode (`Jump2` ->
+/// `Action::FocusCard(1)`) — the mechanism `focus/orchestration/001` pins for
+/// "1-9 on an orchestration tab jumps to role pane N and focuses it" — and
+/// `focus_deck` re-enters `PaneInput` on success. Reaching command mode first
+/// is the part that depends on where the caller starts: `Ctrl+d` is a TOGGLE
+/// (`Action::DetachToNormal`), so sending it unconditionally from command mode
+/// drops back INTO the focused pane and types the `2` there. For a lock test
+/// that pane is the orchestrator, which is never gated, so every sentinel after
+/// it echoed and the test passed without consulting the lock (issue #440). So
+/// the starting mode is read off the mode chip rather than assumed, and
+/// `Ctrl+d` is sent only from `PaneInput`.
+///
+/// The postcondition is what makes a wrong guess loud: the helper returns only
+/// once the TYPING chip is up and the worker — not the orchestrator — is the
+/// role drawn as the expanded pane box, which only the focused role gets
+/// (`e2e_orchestration_focus.rs::expanded_header`).
 fn focus_worker_role(deck: &TuiDeck) {
-    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            typing_chip_shown(grid) || command_chip_shown(grid)
+        }),
+        "focus_worker_role: neither the TYPING nor the COMMAND mode chip is on \
+         the bottom bar, so the starting mode is unknown and Ctrl+d (a toggle) \
+         could go either way.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    if typing_chip_shown(&deck.snapshot_grid()) {
+        deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+        assert!(
+            deck.wait_for_grid_predicate_within(Duration::from_secs(5), command_chip_shown),
+            "focus_worker_role: Ctrl+d from PaneInput never brought up the \
+             COMMAND mode chip.\nGrid:\n{}",
+            deck.snapshot_grid()
+        );
+    }
     deck.send_keys(b"2"); // Jump2 -> focus role index 1 ("worker")
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            typing_chip_shown(grid)
+                && common::role_pane_left_edge(grid, "worker").is_some()
+                && common::role_pane_left_edge(grid, "orchestrator").is_none()
+        }),
+        "focus_worker_role: after `2` from command mode the deck did not land in \
+         PaneInput with the worker role as the expanded (focused) pane — a \
+         keystroke sent now would not be aimed at the worker.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
 }
 
 /// Scenario: Open a real orchestration tab (default LOCKED) and confirm the
@@ -87,10 +140,10 @@ fn lock_008_forwarding_gated_by_lock_state() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
 
     // The orchestrator pane is NEVER gated: even though the deck starts LOCKED
     // by default, typing into the currently-focused orchestrator role must
@@ -163,10 +216,10 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
     deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode
 
     // --- Part 1: in PaneInput the chord must reach the PTY, observed in the
@@ -229,14 +282,13 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
         deck.snapshot_grid()
     );
 
-    // Jump straight to the worker from command mode. Deliberately NOT
-    // `focus_worker_role`, which opens with its own `Ctrl+d`: that helper
-    // assumes it is called from PaneInput, and `Ctrl+d` is a TOGGLE, so using
-    // it here would drop back INTO the pane and type the `2` at the
-    // orchestrator instead of jumping. The sentinel would then land in the
-    // orchestrator's own never-gated pane and this test would pass without the
-    // lock having been consulted at all.
-    deck.send_keys(b"2"); // Jump2 -> focus role index 1 ("worker")
+    // Jump to the worker from command mode. This is the call issue #440 was
+    // about: the old helper opened with an unconditional `Ctrl+d`, which from
+    // here dropped back INTO the orchestrator's never-gated pane, so the
+    // sentinel landed there and this test passed without the lock having been
+    // consulted at all. The helper now sends `Ctrl+d` only from PaneInput and
+    // asserts the worker is the focused pane before returning.
+    focus_worker_role(&deck);
     deck.send_keys(format!("{WORKER_UNLOCKED_SENTINEL}\r").as_bytes());
     assert!(
         deck.wait_for_grid_string_within(WORKER_UNLOCKED_SENTINEL, Duration::from_secs(3)),
@@ -260,10 +312,10 @@ fn lock_010_global_chord_unaffected_by_lock_state() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent");
+    deck.wait_for_absence("┌ New Agent");
 
     // Focus the non-orchestrator worker role — still LOCKED, the default.
     focus_worker_role(&deck);
@@ -348,6 +400,8 @@ fn inject_worker_status(
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
     common::write_hook_line(deck.hook_socket_path(), &line)
@@ -397,13 +451,14 @@ fn lock_011_waiting_carve_out_on_real_panes() {
     const WORKER_RELOCKED_SENTINEL: &str = "LOCK011_RELOCKED_e814";
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
 
     let socket = deck.attach_socket_path().to_path_buf();
     let worker_record = worker_agent_record(&socket);
@@ -490,16 +545,20 @@ fn lock_011_waiting_carve_out_on_real_panes() {
 const LIVE_LOCKED_SENTINEL: &str = "lock012_locked_9d3f.txt";
 const LIVE_UNLOCKED_SENTINEL: &str = "lock012_unlocked_5a71.txt";
 
-/// A directive typed straight into a pane's PTY (never `WriteAndSubmit`, which
-/// is a daemon RPC that bypasses the lock's keystroke-forwarding gate
-/// entirely) asking a real agent to create `sentinel`. Cheap and
+/// PRD #1666: an exact Bash command rather than "create a file in the current
+/// directory", which leaves the model to choose the path (and, measured, the
+/// Write tool, whose permission prompt this pane cannot answer).
+///
+/// A directive typed straight into a pane's PTY (never a daemon-side message,
+/// which bypasses the lock's keystroke-forwarding gate entirely) asking a real agent to create `sentinel`. Cheap and
 /// deterministic: the file's presence/absence on disk is proof the agent did
 /// or did not genuinely receive and act on the instruction, independent of
 /// terminal echo/redraw variance.
 fn create_sentinel_directive(sentinel: &str) -> String {
     format!(
-        "Use the Bash tool to create an empty file named {sentinel} in the \
-         current directory, then stop and say nothing else.\r"
+        "This is a local input-forwarding smoke test in a disposable directory. \
+         Use the Bash tool to run exactly: `pwd && touch {sentinel}`. \
+         Then briefly confirm completion.\r"
     )
 }
 
@@ -509,15 +568,7 @@ fn tail(text: &str) -> &str {
     &text[text.len().saturating_sub(2000)..]
 }
 
-/// Scenario: Open a real orchestration tab (`cat` orchestrator, a REAL
-/// interactive Claude Haiku worker) locked by default, focus the worker, and
-/// type a create-sentinel-file directive — confirm the file is never created
-/// since the keystrokes never reach the agent. Enter command mode (`Ctrl+d`)
-/// and send `Ctrl+e` to unlock, `Ctrl+d` back into `PaneInput`, then type a
-/// second directive with a different sentinel — confirm the real agent now
-/// receives it and creates that file, proving the lock gates a genuine agent's
-/// input, not just a `cat` stub's echo. Self-skips where the CLI or
-/// credentials are absent.
+/// Scenario: Open an orchestration with a cat orchestrator and real Claude Haiku worker, focus the locked worker, and type a sentinel directive that must not execute. Unlock with Ctrl+d, Ctrl+e, Ctrl+d and type a second directive: the worker must create only the unlocked sentinel.
 #[spec("orchestration/lock/012")]
 #[test]
 fn lock_012_real_agent_gated_by_lock_state() {
@@ -535,13 +586,13 @@ fn lock_012_real_agent_gated_by_lock_state() {
         // directives below aren't swallowed answering them.
         .with_claude_trust_workdir()
         .launch_with_fixture("orch-lock-live");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let cwd = deck.workdir().to_path_buf();
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
 
     let worker_id = worker_agent_record(&socket).id;
     if !common::wait_until_panes_settled(
@@ -655,7 +706,7 @@ fn lock_015_gate_holds_with_no_project_config_present() {
         .with_env("DOT_AGENT_DECK_FEATURES_CONFIG", ghost_config.as_str())
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
@@ -712,10 +763,10 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
         .with_env("DOT_AGENT_DECK_FEATURES_CONFIG", ghost_config.as_str())
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent");
+    deck.wait_for_absence("┌ New Agent");
 
     let locked_tail = wait_for_chip_tail(&deck, Duration::from_secs(2));
     assert!(
@@ -789,7 +840,7 @@ fn lock_017_paste_gated_by_lock_state() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
@@ -1004,7 +1055,7 @@ fn lock_018_persistent_chip_and_help_entry() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
@@ -1093,7 +1144,7 @@ fn lock_019_hint_visible_at_80_columns() {
     let deck = TuiDeck::builder()
         .with_pty_size(80, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused

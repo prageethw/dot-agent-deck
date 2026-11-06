@@ -47,9 +47,6 @@ import { sanitizeText } from "./displayText";
 
 export { ALL_ENDPOINT_SELECTION, DEFAULT_SSH_PORT, LOCAL_ENDPOINT_SELECTION };
 
-/** `EndpointId`'s bound — `MAX_ENDPOINT_ID_BYTES` in `settings.rs`. */
-export const MAX_ENDPOINT_ID_LENGTH = 64;
-
 /*
  * The five bounds below are `MAX_BYTES` on the five `SshArgumentRules` impls,
  * one constant each — there is deliberately no shared "fields are short"
@@ -341,9 +338,8 @@ export function mintEndpointId(): string {
 }
 
 /**
- * How a deck is named on screen, derived from its address exactly as
- * `RemoteEndpoint::describe()` derives it: `user@host`, with `:port` appended
- * when the port is not 22.
+ * A deck's ADDRESS as text, derived exactly as `RemoteEndpoint::describe()`
+ * derives it: `user@host`, with `:port` appended when the port is not 22.
  *
  * Sanitised on the way out even though every stored byte came through a charset
  * that excludes the bidi codepoints. The seam is here because this string is
@@ -351,9 +347,21 @@ export function mintEndpointId(): string {
  * only control characters is a label a reordering character walks through — the
  * same reason `dto::safe_display_text` exists on the other side.
  */
-export function describeEndpoint(row: RemoteEndpointDto): string {
+export function endpointAddress(row: RemoteEndpointDto): string {
   const userHost = row.user ? `${row.user}@${row.host}` : row.host;
   return sanitizeText(row.port === DEFAULT_SSH_PORT ? userHost : `${userHost}:${row.port}`);
+}
+
+/**
+ * How a deck is named on screen: its name in the shared deck list when it has
+ * one (issue #1426), otherwise its {@link endpointAddress}.
+ *
+ * The name is a validated slug on the Rust side (`DeckName`); it is sanitised
+ * here anyway, for the reason `endpointAddress` gives.
+ */
+export function describeEndpoint(row: RemoteEndpointDto): string {
+  const name = row.name ? sanitizeText(row.name) : "";
+  return name || endpointAddress(row);
 }
 
 /** A blank row, ready for the user to fill in. */
@@ -441,12 +449,35 @@ export function sameSelection(left: DeckSelection, right: DeckSelection): boolea
   return selectionToken(left) === selectionToken(right);
 }
 
+/**
+ * Whether the stored selection is **All Decks** (#1083).
+ *
+ * The screens that cannot merge across decks — the deck screen, whose tiles
+ * own terminals, and the Projects and Workflows sheets that launch there — read
+ * this to show "Select a deck" instead of rendering one deck. Under All Decks
+ * the crate still resolves "the selected deck" to the local one, because its
+ * plumbing needs an endpoint, so a screen that took that answer would be
+ * showing, and launching on, this machine's deck without saying so.
+ *
+ * It reads the same stored token the Deck selector does, so the body state and
+ * the selector's label cannot disagree.
+ */
+export function selectsAllDecks(section: EndpointSettingsDto | undefined): boolean {
+  return parseSelection(section?.selection ?? LOCAL_ENDPOINT_SELECTION).kind === "all";
+}
+
 /** One entry in the Deck selector: what it is, and how it is named on screen. */
 export interface DeckChoice {
   /** Stable per entry, and what the selector keys and test ids use. */
   token: string;
   selection: DeckSelection;
   label: string;
+  /**
+   * The deck's address, present exactly when {@link label} is its name rather
+   * than its address (issue #1426) — what Settings shows beside the name, so the
+   * user can still tell which machine a name points at.
+   */
+  address?: string;
 }
 
 /**
@@ -465,21 +496,25 @@ export interface DeckChoice {
  * paths — so this list is never empty and the selector is useful before
  * anything is stored.
  *
- * **Rendered text says Deck, never "daemon".** M15 swept the rest of the app
- * into the same vocabulary, so this is no longer the only surface written in it:
- * rendered text says Deck everywhere, while code, protocol, CLI, docs, CSS class
- * names and `data-testid`s deliberately keep `daemon`.
+ * **Rendered text says daemon, never "Deck"** (issue #1045, which reversed PRD
+ * #741 M15's "the UI says Deck"; `docs/develop/glossary.md` has the canonical
+ * words). Identifiers keep the `deck` spelling M15 left them in — `deckId`,
+ * `DeckChoice`, the `deck-*` testids — because renaming them changes nothing a
+ * user sees.
  */
 export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoice[] {
   const choices: DeckChoice[] = [
-    { token: ALL_ENDPOINT_SELECTION, selection: ALL_DECKS_SELECTION, label: "All Decks" },
+    { token: ALL_ENDPOINT_SELECTION, selection: ALL_DECKS_SELECTION, label: "All daemons" },
     { token: LOCAL_ENDPOINT_SELECTION, selection: LOCAL_DECK_SELECTION, label: "This machine" },
   ];
   for (const row of section?.remote ?? []) {
+    const label = describeEndpoint(row) || "New daemon";
+    const address = endpointAddress(row);
     choices.push({
       token: row.id,
       selection: { kind: "one", id: row.id },
-      label: describeEndpoint(row) || "New deck",
+      label,
+      ...(address && address !== label ? { address } : {}),
     });
   }
   return choices;
@@ -493,7 +528,7 @@ export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoic
  * the local deck and says so through `connection.selectionFallback`; this is
  * only the label on the trigger while that sentence is on screen.
  */
-export const UNKNOWN_DECK_LABEL = "Unknown deck";
+export const UNKNOWN_DECK_LABEL = "Unknown daemon";
 
 /** Whether two stored rows are the same deck described the same way. */
 function sameEndpointRow(left: RemoteEndpointDto, right: RemoteEndpointDto): boolean {
@@ -503,7 +538,8 @@ function sameEndpointRow(left: RemoteEndpointDto, right: RemoteEndpointDto): boo
     && left.user === right.user
     && left.identity === right.identity
     && left.jump === right.jump
-    && left.socket === right.socket;
+    && left.socket === right.socket
+    && (left.name ?? null) === (right.name ?? null);
 }
 
 /** Whether two endpoint sections say the same thing, row order included. */

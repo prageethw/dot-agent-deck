@@ -35,10 +35,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
-    DOT_AGENT_DECK_REGISTRATION_GENERATION, GuardedSend, SpawnOptions, TabMembership,
+    AgentPtyRegistry, CommissionArm, CommissionDispatchInFlight, DOT_AGENT_DECK_PANE_ID,
+    SpawnOptions, TabMembership,
 };
-use dot_agent_deck::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
+use dot_agent_deck::event::{AgentEvent, AgentType, DelegateResponse, DelegateSignal, EventType};
 use dot_agent_deck::state::OrchestrationIdentity;
 use spec::spec;
 
@@ -59,6 +59,10 @@ const ORCHESTRATION_ID: &str = "recovery-instance-1";
 /// from `ORCHESTRATION` on purpose: a fallback to the canonical name would read
 /// as a pass if the two were equal.
 const DISPLAY_TITLE: &str = "recovery-orchestration · issue-960";
+/// Issue #962: the file whose appearance makes `delegate/022`'s orchestrator
+/// stand-in exit, so the worker is re-created with no live sibling left.
+const ORCHESTRATOR_EXIT_MARKER: &str = "orchestrator-exit";
+const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
 /// Issue #709: what the SIGTERM-ignoring stand-in prints once — and only once —
 /// its `trap '' TERM` is installed, so `delegate/022` can wait for the state its
@@ -66,10 +70,11 @@ const DISPLAY_TITLE: &str = "recovery-orchestration · issue-960";
 const STUBBORN_WORKER_ARMED: &[u8] = b"STUBBORN-WORKER-ARMED";
 
 fn config(worker_command: &str) -> String {
+    let worker_command = common::capability_export_command(worker_command);
     format!(
         "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
          [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
-         [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = \"{worker_command}\"\nclear = true\n"
+         [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = {worker_command:?}\nclear = true\n"
     )
 }
 
@@ -87,6 +92,38 @@ fn membership(role_index: usize, role_name: &str, is_start_role: bool, cwd: &str
 
 fn snapshot_contains(snapshot: &[u8], needle: &[u8]) -> bool {
     snapshot.windows(needle.len()).any(|w| w == needle)
+}
+
+/// PRD #1666 S5: wait until a delegated task is in `pane_id`'s inbox, bound
+/// to the agent that holds the pane now — what a delegate posts instead of
+/// typing a pointer. Answers whether it arrived.
+async fn wait_for_pane_task(registry: &AgentPtyRegistry, pane_id: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let arrived = registry
+            .pane_current_agent_id(pane_id)
+            .is_some_and(|agent| {
+                registry.inbox().list(pane_id).into_iter().any(|message| {
+                    message.bind_agent.as_deref() == Some(agent.as_str())
+                        && message.subject.starts_with("task from the orchestrator")
+                })
+            });
+        if arrived || tokio::time::Instant::now() >= deadline {
+            return arrived;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// PRD #1666 S5: everything posted to `pane_id`'s inbox, rendered whole.
+fn inbox_text(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+    registry
+        .inbox()
+        .rendered(pane_id)
+        .into_iter()
+        .map(|delivery| delivery.text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn wait_for_pane_needle(
@@ -108,39 +145,238 @@ async fn wait_for_pane_needle(
     }
 }
 
-/// Issue #709: wait until `pane_id`'s close has OBSERVABLY entered its grace
-/// window, so a delegate aimed at that window lands inside it rather than at a
-/// guessed offset from when the close was asked for.
+/// Issue #954: how many times the close is asked for before the precondition
+/// gives up and reports every attempt.
 ///
-/// Bounded by [`common::child_boot_budget`] for the same reason the boot waits
-/// are: the quantity being waited on is a freshly scheduled task getting its
-/// turn, so the ceiling has to follow how contended the machine is. It returns
-/// the instant the window opens, so an idle box pays nothing for the headroom.
-async fn wait_for_close_in_flight<T>(
+/// More than one because a `StopAgent` that comes back WITHOUT the close ever
+/// beginning has established nothing — see
+/// [`close_pane_into_its_grace_window`]. Three rather than "until the budget
+/// runs out": each attempt re-asserts that the stand-in is still live and still
+/// owns its pane, so a genuine defect fails on the second pass rather than being
+/// retried at, and a small fixed count keeps the failure report short enough to
+/// read.
+const CLOSE_GRACE_ATTEMPTS: usize = 3;
+
+/// What [`wait_for_pane_record_to_clear`] established.
+enum RecordCleared {
+    /// The pane has no registry entry and its close is still in flight — a
+    /// delegate issued now reaches `respawn_or_recreate_agent_for_pane`'s
+    /// `NotFound` arm, which is #606's recovery.
+    WhileClosing,
+    /// The close completed before the entry cleared. Not a verdict: the attempt
+    /// simply did not reach the state it was aiming at.
+    WindowShutFirst,
+    /// Neither happened inside the budget.
+    BudgetExpired,
+}
+
+/// PR #1115 review (Greptile P1): wait until `pane_id` has no registry entry,
+/// while its close is still in flight.
+///
+/// See [`close_pane_into_its_grace_window`]'s doc for why the close having
+/// BEGUN is not enough, and for why polling for this particular state is sound
+/// when polling for the window was not.
+async fn wait_for_pane_record_to_clear(
     registry: &AgentPtyRegistry,
     pane_id: &str,
-    request: &tokio::task::JoinHandle<T>,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + common::child_boot_budget();
+    budget: Duration,
+) -> RecordCleared {
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if registry.pane_close_in_flight(pane_id) {
-            return true;
+        // `agent_id_for_pane_any`, not `pane_current_agent_id`: the respawn's
+        // own lookup carries no `exited` filter, so an entry whose child had
+        // died would still be found by it and still route away from the
+        // recovery. (The one difference left is `pane_handed_over`, which this
+        // helper skips and the respawn does not — no handover happens in this
+        // test, and a stricter reading would only make this wait end later.)
+        if registry.agent_id_for_pane_any(pane_id).is_none() {
+            // Re-read rather than trust the earlier signal: the entry could
+            // have cleared because the whole close finished, and a delegate
+            // aimed after that is an ordinary post-close delegate.
+            return if registry.pane_close_in_flight(pane_id) {
+                RecordCleared::WhileClosing
+            } else {
+                RecordCleared::WindowShutFirst
+            };
         }
-        // The `StopAgent` request returns only once the close has run to
-        // completion (measured: `is_finished` flips in the same 100 ms tick that
-        // `pane_close_in_flight` goes back to false), so a finished request with
-        // no window ever observed means there is nothing left to wait for — the
-        // request failed, or the pane was never closed at all. Ending here turns
-        // that into a prompt, legible failure instead of one that spends the
-        // whole budget and then reports the wrong cause.
-        if request.is_finished() {
-            return false;
+        if !registry.pane_close_in_flight(pane_id) {
+            return RecordCleared::WindowShutFirst;
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            return RecordCleared::BudgetExpired;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+/// Issue #709/#954: put `pane_id`'s close into its grace window and hand back
+/// the still-running request, so a delegate aimed at that window lands inside it
+/// rather than at a guessed offset from when the close was asked for.
+///
+/// **The window is OBSERVED, not sampled for.** The receiver comes from
+/// [`AgentPtyRegistry::pane_close_signal`] and is taken BEFORE the request is
+/// issued, so there is no interval in which the transition can happen unwitnessed:
+/// `begin_pane_close` resolves it by dropping the sender, and a resolved
+/// `oneshot` stays resolved, so the observation does not depend on when this
+/// function happens to look. That is the whole difference from issue #954's
+/// defect. The predecessor polled `pane_close_in_flight` on a 5 ms sleep and
+/// **read a finished request as proof that there had been no window**, which is
+/// exactly what it cannot prove: an attempt that never reached the daemon is
+/// silent about whether the pane would have closed. The reported failures carried
+/// `stop_agent finished = true` together with `stand-in still live = true`, and
+/// those two are only consistent with the handler never reaching `close_agent` —
+/// its first act is removing the registry entry, so a close that had begun could
+/// not leave the stand-in live. The test then blamed the window.
+///
+/// So a request that returns before the close begins is treated as INCONCLUSIVE
+/// and retried, and only a run of [`CLOSE_GRACE_ATTEMPTS`] failed attempts is a
+/// failure — reported with each attempt's own outcome, which is the fact the old
+/// `let _ = closing.await` discarded.
+///
+/// **The close BEGINNING is not enough, and waiting only for it silently loses
+/// the coverage** (PR #1115 review, Greptile P1). `begin_pane_close` — which is
+/// what resolves the signal — runs BEFORE `close_agent`, and `close_agent` is
+/// what removes the pane's registry entry. A delegate aimed at the gap between
+/// them finds a record and takes `respawn_agent_for_pane_declared`'s ORDINARY
+/// path, not the `NotFound` recreation path that is all #606 is about. What
+/// actually happens then is worse than a silent pass: that path removes the
+/// record itself and only then calls `spawn_agent`, which REFUSES a pane still
+/// in `cleanup_holds` with `DuplicatePaneId` — an error
+/// `respawn_or_recreate_agent_for_pane` returns untouched, since only `NotFound`
+/// routes to the recovery. The delegate fails, no replacement ever appears, and
+/// the test reports #606's own symptom for a scenario it never reached. The
+/// predecessor's gap was WIDER still: it returned on `pane_close_in_flight`,
+/// true from `hold_pane_for_cleanup`, a step earlier again.
+///
+/// So the second half of the precondition waits for the pane's entry to be
+/// GONE, with the close still in flight. That wait may poll, and the difference
+/// from the defect above is not a matter of degree: "no entry for this pane" is
+/// MONOTONIC for the rest of the close, because nothing can publish onto a pane
+/// in `cleanup_holds` — `spawn_agent` refuses it — so once true it stays true
+/// until the hold lifts, which is ~3 s of `AGENT_TERMINATE_GRACE` away. A poll
+/// cannot miss a state that cannot be left. It re-reads `pane_close_in_flight`
+/// on every turn as well, so it can never draw a conclusion from a window that
+/// has since shut; that, too, is an inconclusive attempt rather than a verdict.
+///
+/// Bounded by [`common::daemon_task_start_budget`], because the quantity being
+/// waited on is a freshly scheduled task getting its turn, so the ceiling has to
+/// follow how contended the machine is. It returns the instant the window opens,
+/// so an idle box pays nothing for the headroom. (Issue #1148 renamed this from
+/// [`common::child_boot_budget`], which this wait had borrowed while naming the
+/// right quantity in this very sentence. Same 8 s base and the same load
+/// scaling, so nothing here changed behaviour — but `delegate/034` bounded a
+/// dispatch task's start on that constant and nobody questioned the size,
+/// because the name said it was about a child.)
+///
+/// **The ~3 s this relies on is a property of `close_agent` specifically, not of
+/// the stand-in alone** (issue #1148). The close terminates the child while
+/// still holding its whole `RunningAgent` — PTY master included — so a
+/// `trap '' TERM` worker really does survive to the SIGKILL backstop here. The
+/// RESPAWN leg drops the master BEFORE terminating, which hands the same worker
+/// EOF on stdin and ends it in milliseconds; that asymmetry is what
+/// `delegate/034` was wrecked by, and it is why its stand-in reads nothing at
+/// all while `/022`'s is a `cat`.
+async fn close_pane_into_its_grace_window(
+    registry: &AgentPtyRegistry,
+    attach_path: &std::path::Path,
+    pane_id: &str,
+    agent_id: &str,
+) -> tokio::task::JoinHandle<Result<(), dot_agent_deck::daemon_client::ClientError>> {
+    let mut attempts: Vec<String> = Vec::new();
+    for attempt in 1..=CLOSE_GRACE_ATTEMPTS {
+        // Issue #709: the assertion below says "still alive" but only ever
+        // checked REGISTRATION, and the difference is the whole scenario.
+        // `close_agent` spends `AGENT_TERMINATE_GRACE` only while the child is
+        // still running — against an already-dead one it returns at once, the
+        // close transition opens and shuts inside a few milliseconds, and the
+        // grace window this test needs to deliver into never observably exists.
+        //
+        // Issue #954: re-checked on EVERY attempt, which is what keeps the retry
+        // below from papering over a real defect. A previous attempt that closed
+        // the pane without ever calling `begin_pane_close` leaves the stand-in
+        // dead, and that fails here — naming every attempt — instead of being
+        // asked again.
+        assert!(
+            registry.agent_is_live(agent_id)
+                && registry.pane_current_agent_id(pane_id).as_deref() == Some(agent_id),
+            "precondition: the worker stand-in must own its pane and still be running for the \
+             close to spend its termination grace (attempt {attempt} of {CLOSE_GRACE_ATTEMPTS}); \
+             earlier attempts = {attempts:?}, records = {:?}",
+            registry.agent_records()
+        );
+        // Taken BEFORE the request is issued: everything after this point is
+        // witnessed, whether the transition takes three seconds or one
+        // instruction. A pane already mid-close hands back a pre-resolved
+        // receiver, so even the register-after-`begin_pane_close` ordering is
+        // covered.
+        let close_began = registry.pane_close_signal(pane_id);
+        let client = dot_agent_deck::daemon_client::DaemonClient::new(attach_path.to_path_buf());
+        let closing_id = agent_id.to_string();
+        let mut request = tokio::spawn(async move { client.stop_agent(&closing_id).await });
+        // Captured, not re-read in the panic below: `daemon_task_start_budget`
+        // samples the machine's load each call, so reporting a second sample
+        // would name a duration this attempt never actually waited.
+        let ceiling = common::daemon_task_start_budget();
+        let budget = tokio::time::sleep(ceiling);
+        tokio::pin!(budget);
+        tokio::select! {
+            // `biased` so a close that begins in the same instant the request
+            // returns is read as the window it is, never as a failed attempt.
+            biased;
+            _ = close_began => {
+                // The close has begun. Now wait for the half that makes the
+                // delegate below reach #606's path at all: the pane's registry
+                // entry gone, with the window still open. The doc above has the
+                // ordering and why this poll is sound where the one it replaced
+                // was not.
+                match wait_for_pane_record_to_clear(registry, pane_id, ceiling).await {
+                    RecordCleared::WhileClosing => return request,
+                    RecordCleared::WindowShutFirst => attempts.push(format!(
+                        "attempt {attempt}: the close began and had already finished before the \
+                         pane's registry entry cleared, so the delegate could not be aimed \
+                         inside the window"
+                    )),
+                    RecordCleared::BudgetExpired => panic!(
+                        "precondition: {pane_id}'s close entered its grace window but its \
+                         registry entry was still there {ceiling:?} later, so a delegate now \
+                         would take the ordinary respawn path instead of #606's recreation \
+                         path; attempt {attempt} of {CLOSE_GRACE_ATTEMPTS}, earlier attempts \
+                         = {attempts:?}, stop_agent finished = {}, close still in flight = {}, \
+                         records = {:?}",
+                        request.is_finished(),
+                        registry.pane_close_in_flight(pane_id),
+                        registry.agent_records()
+                    ),
+                }
+            }
+            outcome = &mut request => {
+                attempts.push(format!(
+                    "attempt {attempt}: stop_agent returned {outcome:?} without the close ever \
+                     beginning"
+                ));
+            }
+            _ = &mut budget => {
+                panic!(
+                    "precondition: the close never entered its grace window within {:?} and the \
+                     `StopAgent` request is still in flight, so the delegate below would race a \
+                     teardown that has not started instead of landing in #606's window; \
+                     attempt {attempt} of {CLOSE_GRACE_ATTEMPTS}, earlier attempts = {attempts:?}, \
+                     stand-in still live = {}, records = {:?}",
+                    ceiling,
+                    registry.agent_is_live(agent_id),
+                    registry.agent_records()
+                );
+            }
+        }
+    }
+    panic!(
+        "precondition: {CLOSE_GRACE_ATTEMPTS} `StopAgent` requests each came back without the \
+         pane's close ever beginning, so the delegate below would be an ordinary post-close \
+         delegate instead of #606's race; attempts = {attempts:?}, stand-in still live = {}, \
+         records = {:?}",
+        registry.agent_is_live(agent_id),
+        registry.agent_records()
+    );
 }
 
 /// The pane's live agent id, once it is one this test has not seen before.
@@ -164,7 +400,7 @@ async fn wait_for_replacement_agent(
     }
 }
 
-fn session_start(pane_id: &str, agent_id: &str) -> String {
+async fn session_start(cwd: &std::path::Path, pane_id: &str, agent_id: &str) -> String {
     let event = AgentEvent {
         session_id: format!("session-{agent_id}"),
         agent_type: AgentType::None,
@@ -181,8 +417,16 @@ fn session_start(pane_id: &str, agent_id: &str) -> String {
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     };
-    serde_json::to_string(&event).expect("serialize synthetic SessionStart")
+    dot_agent_deck::event::agent_event_line(
+        &event,
+        common::recorded_hook_capability(cwd, agent_id)
+            .await
+            .as_deref(),
+    )
+    .expect("serialize synthetic SessionStart")
 }
 
 struct Fixture {
@@ -194,8 +438,35 @@ struct Fixture {
 }
 
 async fn fixture(worker_command_in_dir: impl FnOnce(&std::path::Path) -> String) -> Fixture {
+    fixture_with_orchestrator(|_| "cat".to_string(), worker_command_in_dir).await
+}
+
+/// Issue #708: the orchestrator stand-in `delegate/023` needs — a `cat` behind
+/// `stty -echo -icanon -icrnl -opost`, so every byte the daemon writes into the
+/// orchestrator's pane appears exactly once and untranslated. Under the cooked
+/// `cat` the other tests use, a submit CR and a notice LF both come back as the
+/// same echoed CRLF, and "was the notice submitted?" cannot be read at all. The
+/// `&&` means the readiness marker is printed only once `stty` has SUCCEEDED.
+const RAW_ORCHESTRATOR_COMMAND: &str =
+    "stty -echo -icanon -icrnl -opost min 1 time 0 && printf RAW-ORCH-READY && exec cat -u";
+
+/// What [`RAW_ORCHESTRATOR_COMMAND`] prints once its termios is in place.
+const RAW_ORCHESTRATOR_READY: &[u8] = b"RAW-ORCH-READY";
+
+/// Both roles are started through the daemon's real `StartAgent` handler over
+/// the attach socket — the path a `Ctrl+n` orchestration takes — rather than by
+/// spawning into the registry and registering the roles by hand. Issue #962:
+/// the handler is where the daemon learns the tab's run title, so a fixture that
+/// bypassed it would test a daemon that was never told the title at all.
+async fn fixture_with_orchestrator(
+    orchestrator_command_in_dir: impl FnOnce(&std::path::Path) -> String,
+    worker_command_in_dir: impl FnOnce(&std::path::Path) -> String,
+) -> Fixture {
+    use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+
     let daemon = common::spawn_inprocess_daemon().await;
     let dir = common::race_safe_tempdir();
+    let orchestrator_command = orchestrator_command_in_dir(dir.path());
     let worker_command = worker_command_in_dir(dir.path());
     std::fs::write(
         dir.path().join(".dot-agent-deck.toml"),
@@ -204,44 +475,31 @@ async fn fixture(worker_command_in_dir: impl FnOnce(&std::path::Path) -> String)
     .expect("write orchestration config");
     let cwd = dir.path().to_string_lossy().into_owned();
 
-    let orchestrator_agent_id = daemon
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some("cat"),
-            cwd: Some(&cwd),
-            display_name: Some("orchestrator"),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
-            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
-            ..SpawnOptions::default()
-        })
-        .expect("spawn orchestrator stand-in");
-    let worker_agent_id = daemon
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some(&worker_command),
-            cwd: Some(&cwd),
-            display_name: Some(WORKER_ROLE),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
-            tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
-            ..SpawnOptions::default()
-        })
-        .expect("spawn worker stand-in");
-
-    {
-        let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
-            id: ORCHESTRATION_ID.to_string(),
-            name: ORCHESTRATION.to_string(),
-        };
-        state.register_orchestration_role(
-            ORCH_PANE,
-            "orchestrator",
-            true,
-            identity.clone(),
-            Some(&cwd),
-        );
-        state.register_orchestration_role(WORKER_PANE, WORKER_ROLE, false, identity, Some(&cwd));
-    }
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    let start = |command: String, pane_id: &str, role_index: usize, role: &str, start: bool| {
+        StartAgentOptions {
+            command: Some(command),
+            cwd: Some(cwd.clone()),
+            display_name: Some(role.to_string()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+            tab_membership: Some(membership(role_index, role, start, &cwd)),
+            ..StartAgentOptions::default()
+        }
+    };
+    // Issue #708: the orchestrator stand-in runs under a fixed `SHELL`, so
+    // [`RAW_ORCHESTRATOR_COMMAND`]'s `stty` line behaves the same on every host.
+    let mut orchestrator_start = start(orchestrator_command, ORCH_PANE, 0, "orchestrator", true);
+    orchestrator_start
+        .env
+        .push(("SHELL".to_string(), "/bin/sh".to_string()));
+    let orchestrator_agent_id = client
+        .start_agent(orchestrator_start)
+        .await
+        .expect("start orchestrator stand-in");
+    let worker_agent_id = client
+        .start_agent(start(worker_command, WORKER_PANE, 1, WORKER_ROLE, false))
+        .await
+        .expect("start worker stand-in");
 
     Fixture {
         daemon,
@@ -253,19 +511,19 @@ async fn fixture(worker_command_in_dir: impl FnOnce(&std::path::Path) -> String)
 }
 
 async fn delegate(fx: &Fixture, task: &str) {
-    // Issue #567 (mirrors fork #358 M4's reasoning exactly): ORCH_PANE is
-    // registered exactly once per fixture via `register_orchestration_role`,
-    // which reserves generation `1` for a pane_id it has never seen before —
-    // read the daemon's own `daemon_boot_id` back rather than hand-rolling it.
-    let daemon_boot_id = fx.daemon.state.read().await.daemon_boot_id().to_string();
+    delegate_with(fx, task, false).await;
+}
+
+/// [`delegate`] with `--supersede` as the caller chose, answering the daemon's
+/// reply.
+async fn delegate_with(fx: &Fixture, task: &str, supersede: bool) -> DelegateResponse {
     let signal = DelegateSignal {
         pane_id: ORCH_PANE.to_string(),
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
+        supersede,
         timestamp: chrono::Utc::now(),
-        generation: 1,
-        daemon_boot_id,
-        subject: None,
+        token: None,
     };
     fx.daemon
         .state
@@ -277,7 +535,7 @@ async fn delegate(fx: &Fixture, task: &str) {
             &fx.daemon.event_tx,
             Some(&fx.daemon.state),
         )
-        .await;
+        .await
 }
 
 /// Scenario: start an orchestration whose `coder` role is `clear = true`, wait
@@ -299,25 +557,35 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // reproduce the race at all. `exec` keeps the ignore disposition (it is
     // inherited across `execve`) while still giving the pane something that
     // echoes what the daemon writes into it.
-    let fx = fixture(|dir| {
-        let script = dir.join("stubborn-worker.sh");
-        // Issue #709: the marker is printed AFTER the trap and BEFORE the exec,
-        // so seeing it is proof the disposition is already `SIG_IGN` — the one
-        // fact this scenario cannot proceed without. `exec` carries it across
-        // `execve`, so it still holds for the `cat` that replaces the shell.
-        let marker = String::from_utf8_lossy(STUBBORN_WORKER_ARMED).into_owned();
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\ntrap '' TERM\nprintf '{marker}'\nexec cat\n"),
-        )
-        .expect("write SIGTERM-ignoring worker stand-in");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod SIGTERM-ignoring worker stand-in");
-        script.to_string_lossy().into_owned()
-    })
+    // Issue #962: the orchestrator stand-in exits on demand, so the delegate can
+    // land after every OTHER pane of the tab is gone — the reachable shape being
+    // an orchestrator that sends its delegate and exits while the async dispatch
+    // is still running.
+    let fx = fixture_with_orchestrator(
+        |dir| {
+            format!(
+                "while [ ! -e {} ]; do sleep 0.05; done",
+                dir.join(ORCHESTRATOR_EXIT_MARKER).display()
+            )
+        },
+        |dir| {
+            let script = dir.join("stubborn-worker.sh");
+            // Issue #709: the marker is printed AFTER the trap and BEFORE the exec,
+            // so seeing it is proof the disposition is already `SIG_IGN` — the one
+            // fact this scenario cannot proceed without. `exec` carries it across
+            // `execve`, so it still holds for the `cat` that replaces the shell.
+            let marker = String::from_utf8_lossy(STUBBORN_WORKER_ARMED).into_owned();
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\ntrap '' TERM\nprintf '{marker}'\nexec cat\n"),
+            )
+            .expect("write SIGTERM-ignoring worker stand-in");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod SIGTERM-ignoring worker stand-in");
+            script.to_string_lossy().into_owned()
+        },
+    )
     .await;
-    let client = dot_agent_deck::daemon_client::DaemonClient::new(fx.daemon.attach_path.clone());
-
     // Issue #709: this was a flat 400 ms sleep, and it was the load-sensitive
     // seam of the whole test. What the scenario needs is not "400 ms have
     // passed" but "the stand-in has installed its `trap '' TERM`" — and on a
@@ -340,60 +608,47 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
          window #606 is about; snapshot = {:?}",
         String::from_utf8_lossy(&armed)
     );
-    assert_eq!(
-        fx.daemon
-            .registry
-            .pane_current_agent_id(WORKER_PANE)
-            .as_deref(),
-        Some(fx.worker_agent_id.as_str()),
-        "precondition: the worker stand-in must still own its pane before the close"
-    );
-    // Issue #709: the assertion above says "still alive" but only ever checked
-    // REGISTRATION, and the difference is the whole scenario. `close_agent`
-    // spends `AGENT_TERMINATE_GRACE` only while the child is still running —
-    // against an already-dead one it returns at once, the close transition opens
-    // and shuts inside a few milliseconds, and the grace window this test needs
-    // to deliver into never observably exists. That reads downstream as "the
-    // close was not in flight", which is true and useless. Check the fact the
-    // sentence always meant.
-    assert!(
-        fx.daemon.registry.agent_is_live(&fx.worker_agent_id),
-        "precondition: the worker stand-in is registered but no longer running, so the close \
-         below would finish instantly instead of spending its termination grace"
-    );
 
-    let closing_id = fx.worker_agent_id.clone();
-    let closing = tokio::spawn(async move { client.stop_agent(&closing_id).await });
-
-    // Issue #709: this was a flat `sleep(200 ms)` — the reporter's own interval
-    // — followed by the assertion below, and it was the SECOND fixed deadline in
-    // this test. The 200 ms was standing in for "the close has entered its grace
+    // Issue #709: this was a flat `sleep(200 ms)` — the reporter's own interval —
+    // followed by a bare assertion, and it was the SECOND fixed deadline in this
+    // test. The 200 ms was standing in for "the close has entered its grace
     // window", but `stop_agent` is driven by a spawned task and a socket round
-    // trip, so on a loaded box neither had necessarily reached
-    // `begin_pane_close` yet when the sleep expired. The assertion then fired
-    // saying the close was not in flight — and it was right, for the opposite of
-    // the reason it names: not "the close already finished" but "the close had
-    // not started". Measured on this branch at load 78 on 16 cores, in a
-    // full-tier run whose whole failing case took 0.98 s, so nothing had
-    // overshot anything.
+    // trip, so on a loaded box neither had necessarily reached `begin_pane_close`
+    // yet when the sleep expired. The assertion then fired saying the close was
+    // not in flight — and it was right, for the opposite of the reason it names:
+    // not "the close already finished" but "the close had not started".
     //
-    // `pane_close_in_flight` is exactly the state the 200 ms was approximating —
-    // it is true from the moment the cleanup hold and the closing mark go up,
-    // which is also the moment the pane's registry entry is gone and its role is
-    // still registered: the window a `clear = true` respawn used to fail
-    // `NotFound` in. Waiting for it puts the delegate inside that window by
-    // construction rather than by arithmetic, and it cannot report a window that
-    // has not opened as one that has closed.
-    let entered_grace = wait_for_close_in_flight(&fx.daemon.registry, WORKER_PANE, &closing).await;
-    assert!(
-        entered_grace,
-        "precondition: the close never entered its grace window, so the delegate below would be \
-         an ordinary post-close delegate instead of #606's race; stop_agent finished = {}, \
-         stand-in still live = {}, records = {:?}",
-        closing.is_finished(),
-        fx.daemon.registry.agent_is_live(&fx.worker_agent_id),
-        fx.daemon.registry.agent_records()
-    );
+    // Issue #954: its replacement, a 5 ms poll of `pane_close_in_flight` that
+    // bailed on `JoinHandle::is_finished`, kept the second half of that defect —
+    // it still reported a request that had failed as a window that had closed.
+    // `close_pane_into_its_grace_window` observes the transition through the
+    // registry's own close signal, taken before the request is issued, and
+    // retries an attempt that establishes nothing. Its doc carries the evidence.
+    let closing = close_pane_into_its_grace_window(
+        &fx.daemon.registry,
+        &fx.daemon.attach_path,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+    )
+    .await;
+    // Issue #962: no live sibling may carry the title when the worker is
+    // re-created. The orchestrator was the only other pane of the tab; once it
+    // has exited, `agent_records` (which filters exited agents out) holds no
+    // pane of this orchestration at all, so a title read off a live sibling —
+    // what #960 did — comes back `None`. The daemon has to know the title
+    // itself.
+    tokio::fs::write(fx._dir.path().join(ORCHESTRATOR_EXIT_MARKER), b"")
+        .await
+        .expect("tell the orchestrator stand-in to exit");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while fx.daemon.registry.has_live_pane(ORCH_PANE) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "precondition: the orchestrator stand-in never exited, so the delegate below would \
+             find a live sibling to borrow the title from and could not reproduce #962"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     delegate(&fx, "list the files in this directory").await;
 
     let replacement = wait_for_replacement_agent(
@@ -404,10 +659,27 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     )
     .await
     .unwrap_or_else(|| {
+        // Issue #954: the two extra values separate the verdicts this one
+        // sentence used to merge. A `clear = true` respawn that finds no record
+        // waits `PANE_CLOSE_SETTLE_TIMEOUT` (6 s, twice `AGENT_TERMINATE_GRACE`)
+        // for the pane's hold to lift and then spawns anyway — and
+        // `spawn_agent` REFUSES a pane that is still held, so a close that
+        // outruns that window leaves the pane empty for the session — issue
+        // #1114, which is a product-side residual of #606 rather than a
+        // regression in this test, and which reads identically to one because
+        // the pane is simply empty either way. `close still in flight` is what
+        // tells them apart: true means the teardown never released the pane in
+        // time (#1114), false means the recovery had its chance and did not take
+        // it, which is #606 proper. Measured by shortening that constant below
+        // the grace — deterministic — and no test-side budget recovers it: the
+        // wait above was temporarily widened to 120 s and expired with the pane
+        // still empty, so it was left at its flat 20 s.
         panic!(
             "delegating to a `clear = true` role while its pane was mid-close left the role with \
              no live agent at all — the pane is dead for the rest of the session (#606). \
-             records = {:?}",
+             close still in flight = {}, stop_agent finished = {}, records = {:?}",
+            fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+            closing.is_finished(),
             fx.daemon.registry.agent_records()
         )
     });
@@ -416,23 +688,14 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // agent's hook exactly as the rest of the fast delegate suite does.
     common::write_hook_line(
         &fx.daemon.hook_path,
-        &session_start(WORKER_PANE, &replacement),
+        &session_start(std::path::Path::new(&fx.cwd), WORKER_PANE, &replacement).await,
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
-    let pointer =
-        common::expected_delegate_pointer(std::path::Path::new(&fx.cwd), WORKER_ROLE, WORKER_PANE);
-    let snapshot = wait_for_pane_needle(
-        &fx.daemon.registry,
-        WORKER_PANE,
-        &pointer,
-        Duration::from_secs(20),
-    )
-    .await;
     assert!(
-        snapshot_contains(&snapshot, &pointer),
-        "the recovered worker never received the task pointer; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        wait_for_pane_task(&fx.daemon.registry, WORKER_PANE, Duration::from_secs(20)).await,
+        "the recovered worker never received its task; inbox = {:?}",
+        fx.daemon.registry.inbox().list(WORKER_PANE)
     );
 
     let _ = closing.await;
@@ -442,10 +705,14 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // `PaneRecreateIdentity` — which hardcoded `display_title: None`, silently
     // dropping the tab's run-identifying label from this pane. It is not
     // immediately visible, because `partition_hydrated_panes` keeps the first
-    // non-`None` title it finds and the orchestrator pane still has one; the
-    // label is lost once every title-carrying pane has exited or been re-created
-    // this way. Asserted on the RECREATED pane specifically, since that is the
-    // only one whose membership this path authors.
+    // non-`None` title it finds; the label is lost once every title-carrying
+    // pane has exited or been re-created this way. Asserted on the RECREATED
+    // pane specifically, since that is the only one whose membership this path
+    // authors.
+    //
+    // Issue #962: #960 fixed this by reading the title off a LIVE sibling, and
+    // here there is none — the orchestrator exited above. The title now comes
+    // from the daemon's own record of it, held beside the role maps.
     let recreated_membership = fx
         .daemon
         .registry
@@ -476,8 +743,8 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
         ),
         (Some(DISPLAY_TITLE), 1, Some(ORCHESTRATION_ID)),
         "the re-created worker must rejoin its tab with the tab's own title, index and instance \
-         token — a `None` title here is issue #960's secondary path, and it costs the tab its \
-         label as soon as the last pane that still carries one goes away"
+         token — a `None` title here, with no live sibling left, is issue #962, and it costs \
+         the tab its label as soon as the last pane that still carries one goes away"
     );
 
     let state = fx.daemon.state.read().await;
@@ -509,38 +776,45 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
 ///
 /// Five seconds is ~46x the slowest figure measured here — room for a CI runner
 /// an order of magnitude slower than this box and then some — while staying 6x
-/// under the 30 s `SESSION_START_WAIT_TIMEOUT` a reverted EOF-driven wait would
-/// cost. It is deliberately not tighter: this is an upper bound on a fast event,
-/// so unlike `orchestration/delegate/010`'s lower bound it IS the load-sensitive
+/// under the 30 s a reverted EOF-driven wait would cost. It is deliberately not
+/// tighter: this is an upper bound on a fast event, so it IS the load-sensitive
 /// direction, and headroom is the only mitigation available.
 const DEAD_REPLACEMENT_NOTICE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Scenario: start an orchestration whose `clear = true` worker refuses to start
 /// while a marker file sits beside it, drop that marker once the first worker is
 /// confirmed up, then delegate. The replacement dies before it can announce
-/// itself, and the orchestrator must be TOLD — in its own pane, and within five
-/// seconds rather than the thirty a readiness wait would cost — instead of being
-/// left to wait for a `work-done` that can never arrive.
+/// itself, and the orchestrator must be TOLD — as a daemon notice in its inbox
+/// naming what to do next, within five seconds — instead of being left to wait
+/// for a `work-done` that can never arrive. The daemon must not log that death as a readiness
+/// timeout either (issue #1243).
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/023")]
 async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() {
     use std::os::unix::fs::PermissionsExt;
 
+    // PRD #1666 S5: the delegate no longer waits for the replacement's
+    // readiness, so the issue #1243 log half — that a replacement which DIED is
+    // not logged as having waited out a readiness timeout — has no wait left to
+    // guard and was removed with it.
     // The stand-in refuses to start once a `die` marker exists beside it. The
     // TEST drops that marker, after confirming the first worker is up — so
     // "the replacement dies before it is ready" is a fact the test establishes,
     // not a race it hopes for.
-    let fx = fixture(|dir| {
-        let script = dir.join("one-shot-worker.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nif [ -e \"$(dirname \"$0\")/die\" ]; then exit 3; fi\nexec cat\n",
-        )
-        .expect("write one-shot worker stand-in");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod one-shot worker stand-in");
-        script.to_string_lossy().into_owned()
-    })
+    let fx = fixture_with_orchestrator(
+        |_| RAW_ORCHESTRATOR_COMMAND.to_string(),
+        |dir| {
+            let script = dir.join("one-shot-worker.sh");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nif [ -e \"$(dirname \"$0\")/die\" ]; then exit 3; fi\nexec cat\n",
+            )
+            .expect("write one-shot worker stand-in");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod one-shot worker stand-in");
+            script.to_string_lossy().into_owned()
+        },
+    )
     .await;
 
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -552,38 +826,42 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         Some(fx.worker_agent_id.as_str()),
         "precondition: the first worker must be up before we make the next one fail"
     );
+    let orchestrator_ready = wait_for_pane_needle(
+        &fx.daemon.registry,
+        ORCH_PANE,
+        RAW_ORCHESTRATOR_READY,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&orchestrator_ready, RAW_ORCHESTRATOR_READY),
+        "precondition: the orchestrator stand-in must have its raw termios in place before \
+         anything is written to it, or the terminator below is not readable; snapshot = {:?}",
+        String::from_utf8_lossy(&orchestrator_ready)
+    );
     std::fs::write(std::path::Path::new(&fx.cwd).join("die"), "")
         .expect("arm the stand-in's refusal to start again");
 
     delegate(&fx, "list the files in this directory").await;
 
-    // The user's altitude: something visible in the orchestrator's own pane.
+    // The user's altitude: a daemon notice in the orchestrator's inbox. PRD
+    // #1666 S5: the replacement can die before the task is posted ("never came
+    // up", naming the pane) or just after (the task turns undeliverable, naming
+    // the role); either way the orchestrator is told the task did not arrive.
     let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
-    let mut snapshot;
-    loop {
-        snapshot = fx
-            .daemon
-            .registry
-            .snapshot(&fx.orchestrator_agent_id)
-            .unwrap_or_default();
-        let text = String::from_utf8_lossy(&snapshot);
-        if text.contains("delegated worker never came up") && text.contains(WORKER_PANE) {
-            break;
+    let text = loop {
+        let text = inbox_text(&fx.daemon.registry, ORCH_PANE);
+        if dead_replacement_notices(&text) >= 1 {
+            break text;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "a `clear = true` delegate whose replacement worker died reported nothing to the \
-             orchestrator within {DEAD_REPLACEMENT_NOTICE_BUDGET:?} — either the notice is gone \
-             entirely, or the readiness wait no longer ends on the replacement's EOF and the \
-             orchestrator is sitting through it (#584; budget re-derived in #243 against a \
-             measured ~0.1 s). orchestrator pane = {:?}",
-            text
+             orchestrator within {DEAD_REPLACEMENT_NOTICE_BUDGET:?} (#584; budget re-derived in \
+             #243 against a measured ~0.1 s). orchestrator inbox = {text:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let pointer =
-        common::expected_delegate_pointer(std::path::Path::new(&fx.cwd), WORKER_ROLE, WORKER_PANE);
+    };
     let worker_snapshot = fx
         .daemon
         .registry
@@ -591,16 +869,639 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         .and_then(|id| fx.daemon.registry.snapshot(&id).ok())
         .unwrap_or_default();
     assert!(
-        !snapshot_contains(&worker_snapshot, &pointer),
+        !snapshot_contains(&worker_snapshot, POINTER),
         "nothing may be written into a pane whose agent is not live"
     );
-    // PRD #249 finding B3's precedent: this notice family interpolates the
-    // worker's scrubbed pane id and nothing else, so the role name — which is
-    // caller-supplied config text — must not appear.
+    // Issue #708: the orchestrator's `delegate` already exited 0, so in an
+    // unattended dispatched unit a notice that reaches nobody leaves the
+    // orchestrator waiting forever for a `work-done` that cannot arrive. The
+    // notice is a daemon notice in its inbox and names what to do next.
+    let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
+        .into_iter()
+        .filter(|option| !text.contains(option))
+        .collect();
     assert!(
-        !String::from_utf8_lossy(&snapshot).contains("'coder'"),
-        "the notice must not interpolate the role name; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        text.contains("from dot-agent-deck (daemon notice)]") && missing_options.is_empty(),
+        "the dead-replacement notice must be posted as a daemon notice and name the remediation \
+         options (notify the user, re-delegate, reassign); missing options = \
+         {missing_options:?}, orchestrator inbox = {text:?}"
+    );
+    assert!(
+        fx.daemon
+            .registry
+            .inbox()
+            .list(ORCH_PANE)
+            .iter()
+            .all(|message| message.bind_agent.as_deref() == Some(fx.orchestrator_agent_id.as_str())),
+        "the notice must be bound to the orchestrator that delegated; inbox = {:?}",
+        fx.daemon.registry.inbox().list(ORCH_PANE)
+    );
+    // PRD #249 finding B3's precedent: the role name is caller-supplied config
+    // text, so it may appear only fenced as untrusted metadata.
+    assert!(
+        !text.contains("'coder'"),
+        "the notice must not interpolate the role name bare; inbox = {text:?}"
+    );
+
+    // Issue #1423: the worker was given nothing, so the delegation's idle-worker
+    // watch must not stay armed to tell the orchestrator, hours later, that the
+    // worker went idle on this task. The release follows the notice's submit on
+    // the same dispatch task, so it is waited for rather than read once.
+    let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
+    while let Some(seq) = fx.daemon.registry.outstanding_delegation_seq(WORKER_PANE) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a delegation whose replacement worker died still holds its idle-worker record \
+             (seq {seq}) {DEAD_REPLACEMENT_NOTICE_BUDGET:?} after the orchestrator was told, so \
+             the orchestrator would later be told the worker went idle on a task it never \
+             received"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Issue #708 (Greptile P2 on PR #1338): the SAME failure a second time. The
+    // `die` marker is still there, so the next delegate's replacement dies too and
+    // the daemon composes byte-identical text for the same worker pane. The user
+    // has typed into the orchestrator meanwhile, which is the clock that arms the
+    // repeat-payload refusal — without it the guard abstains and this would pass
+    // for the wrong reason. The first report's payload record therefore has to be
+    // released, or the second failure is refused as a repeat of the user's draft
+    // and the orchestrator is left waiting after all.
+    fx.daemon.registry.note_user_input(ORCH_PANE);
+    delegate(&fx, "list the files in this directory").await;
+    let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
+    loop {
+        let text = inbox_text(&fx.daemon.registry, ORCH_PANE);
+        if dead_replacement_notices(&text) >= 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the SECOND dead-replacement report never reached the orchestrator within \
+             {DEAD_REPLACEMENT_NOTICE_BUDGET:?} of the user typing and a second delegate; \
+             orchestrator inbox = {text:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// PRD #1666 S5: how many notices in an orchestrator's inbox text say a
+/// delegated task did not reach a replacement worker that died — "never came
+/// up" when it died before the task was posted, "undeliverable" when it died
+/// just after.
+fn dead_replacement_notices(text: &str) -> usize {
+    text.matches("delegated worker never came up").count()
+        + text
+            .matches("is undeliverable: the worker it was addressed to exited")
+            .count()
+}
+
+/// Issue #1114: how long `delegate/032` keeps the worker pane in the window
+/// between `begin_pane_close` and `close_agent` before finishing the close.
+///
+/// Unlike the two fixed deadlines issue #709 took out of `delegate/022`, this
+/// one cannot expire early on the thing it is waiting for: anywhere inside the
+/// 6 s window it stays under, over-holding is safe in BOTH directions. A fixed
+/// build parks in the respawn's wait for as long as the hold is up and then
+/// re-creates the pane, and a broken one has already failed by then. All the
+/// value has to be is long enough that a delegate cannot still be on its way to
+/// `spawn_agent`, and short enough to stay inside the 6 s
+/// `PANE_CLOSE_SETTLE_TIMEOUT` the daemon allows a close before it stops waiting
+/// for one. One second is ~1000x the first and 6x under the second.
+///
+/// There is deliberately no early exit on "the record has gone", tempting as it
+/// is — the record going IS the defect, so ending the hold on it hands the
+/// broken build's `spawn_agent` a pane that is no longer held and lets it
+/// succeed. Measured: with a 25 ms poll on that condition the pre-fix build came
+/// back green in 1.18 s. The hold has to outlast the failure it is provoking,
+/// not race it.
+const CLOSE_WINDOW_HOLD: Duration = Duration::from_secs(1);
+
+/// Issue #1114: how long `delegate/033` keeps the pane's cleanup hold up AFTER
+/// `close_agent` has already removed the record — the starved tail of a close,
+/// which is what outrunning `PANE_CLOSE_SETTLE_TIMEOUT` means in production.
+///
+/// It has to EXCEED that 6 s constant, or the test is `delegate/022`'s ordinary
+/// in-flight close wearing a different fixture and says nothing about the
+/// give-up this scenario is named for. Eight seconds clears it by two, and a
+/// `sleep` can only overshoot, so load moves this in the safe direction. The
+/// other end is the recovery's own ceiling — `PANE_CLOSE_RECREATE_TIMEOUT`,
+/// 30 s — which this sits comfortably under.
+const STARVED_CLOSE_TAIL: Duration = Duration::from_secs(8);
+
+/// Finish a close the way `daemon_protocol.rs`'s `StopAgent` arm finishes one:
+/// `close_agent`, then `unregister_pane` under the state write guard, then
+/// `finish_pane_close`, and only then drop the cleanup hold.
+///
+/// The two tests below are ABOUT the interior of that sequence, so a faithful
+/// reproduction has to be able to stand between its statements — which is why
+/// they assemble it here rather than driving `StopAgent` over the socket the way
+/// `delegate/022` does. Everything else about them is the production path: a
+/// real `handle_delegate_with_state`, a real registry, real PTYs.
+async fn finish_the_close(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &dot_agent_deck::state::SharedState,
+    agent_id: &str,
+    hold: dot_agent_deck::agent_pty::PaneCleanupHold,
+) -> Result<(), dot_agent_deck::agent_pty::AgentPtyError> {
+    let closed = registry.close_agent(agent_id);
+    state.write().await.unregister_pane(WORKER_PANE);
+    registry.finish_pane_close(WORKER_PANE, closed.is_ok());
+    drop(hold);
+    closed
+}
+
+/// Scenario: put the worker's pane into the exact state the daemon's `StopAgent`
+/// handler is in between `begin_pane_close` and `close_agent` — cleanup hold
+/// taken, closing mark set, and the pane's registry record still there — then
+/// delegate to the `clear = true` role and let the close finish a moment later.
+/// The role must come back with a live agent that receives the task pointer, and
+/// the delegate must not have destroyed the pane's record on its way past, which
+/// the close itself reports by failing `NotFound` against an id that is gone.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/032")]
+async fn delegate_032_a_delegate_inside_the_pre_close_window_leaves_the_record_alone() {
+    let fx = fixture(|_| "cat".to_string()).await;
+
+    // The window. `begin_pane_close` runs first and `close_agent` — the step
+    // that removes the pane's entry — runs behind a `spawn_blocking` hop, so a
+    // delegate landing between them finds a RECORD and takes the ordinary
+    // respawn path instead of issue #606's recreation.
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("the stopping agent must be able to hold its own pane for cleanup");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+
+    assert!(
+        fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: the pane must read as mid-close, or the delegate below is an ordinary \
+         delegate to a healthy worker"
+    );
+    assert_eq!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .as_deref(),
+        Some(fx.worker_agent_id.as_str()),
+        "precondition: the pane's record must still be PRESENT — a pane with no record is \
+         `delegate/022`'s window, not this one, and it reaches the recovery by a different route"
+    );
+
+    // Finish the close the way the handler does, once the hold has been up long
+    // enough that no delegate can still be on its way to `spawn_agent`. See
+    // `CLOSE_WINDOW_HOLD` for why this does not end early on the defect it is
+    // provoking.
+    let registry = Arc::clone(&fx.daemon.registry);
+    let state = fx.daemon.state.clone();
+    let closing_id = fx.worker_agent_id.clone();
+    let closing = tokio::spawn(async move {
+        tokio::time::sleep(CLOSE_WINDOW_HOLD).await;
+        finish_the_close(&registry, &state, &closing_id, hold).await
+    });
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let closed = closing.await.expect("the close task must not panic");
+    assert!(
+        closed.is_ok(),
+        "the close could not find the agent it was already taking apart, so the delegate had \
+         lifted the pane's record out from under it — `respawn_agent_for_pane_declared` removes \
+         the entry and only THEN calls `spawn_agent`, which refuses a pane still held for \
+         cleanup (#1114). error = {:?}",
+        closed.unwrap_err()
+    );
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "delegating to a `clear = true` role in the window before its close removed the \
+             pane's record left the role with no live agent at all — the pane is dead for the \
+             rest of the session (#1114, #606). records = {:?}",
+            fx.daemon.registry.agent_records()
+        )
+    });
+
+    // A `cat` stand-in emits no readiness signal of its own, so stand in for the
+    // agent's hook exactly as the rest of the fast delegate suite does.
+    common::write_hook_line(
+        &fx.daemon.hook_path,
+        &session_start(std::path::Path::new(&fx.cwd), WORKER_PANE, &replacement).await,
+    )
+    .expect("deliver synthetic SessionStart for the replacement worker");
+
+    assert!(
+        wait_for_pane_task(&fx.daemon.registry, WORKER_PANE, Duration::from_secs(20)).await,
+        "the recovered worker never received its task; inbox = {:?}",
+        fx.daemon.registry.inbox().list(WORKER_PANE)
+    );
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route after the recovery, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+}
+
+/// Scenario: close the worker's pane for real but leave the close's pane-scoped
+/// cleanup running for longer than the six seconds the respawn allows it — a
+/// starved close tail — and delegate to the `clear = true` role while it runs.
+/// The role must still come back once the close finally lets go, instead of the
+/// delegate giving up at the settle timeout and leaving the pane dead for the
+/// rest of the session.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/033")]
+async fn delegate_033_a_close_that_outruns_the_settle_timeout_still_brings_the_role_back() {
+    let fx = fixture(|_| "cat".to_string()).await;
+
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("the stopping agent must be able to hold its own pane for cleanup");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+    fx.daemon
+        .registry
+        .close_agent(&fx.worker_agent_id)
+        .expect("close the worker stand-in");
+
+    assert!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .is_none(),
+        "precondition: `close_agent` must have removed the pane's record, or this is \
+         `delegate/032`'s window rather than the give-up this test is named for"
+    );
+    assert!(
+        fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: the close's cleanup hold must still be up — it is what `spawn_agent` \
+         refuses a fresh pane on, and without it the recovery has nothing to wait for"
+    );
+
+    // The starved tail: everything after `close_agent` in the `StopAgent` arm,
+    // stretched past `PANE_CLOSE_SETTLE_TIMEOUT`. Measured on a real box at 80
+    // concurrent copies, not invented — see issue #1114.
+    let registry = Arc::clone(&fx.daemon.registry);
+    let state = fx.daemon.state.clone();
+    let closing = tokio::spawn(async move {
+        tokio::time::sleep(STARVED_CLOSE_TAIL).await;
+        state.write().await.unregister_pane(WORKER_PANE);
+        registry.finish_pane_close(WORKER_PANE, true);
+        drop(hold);
+    });
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        STARVED_CLOSE_TAIL + Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the close outran the respawn's settle window, so the `clear = true` delegate gave \
+             up and left the role with no agent at all — the pane is dead for the rest of the \
+             session (#1114). close still in flight = {}, records = {:?}",
+            fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+            fx.daemon.registry.agent_records()
+        )
+    });
+    closing.await.expect("the close task must not panic");
+
+    common::write_hook_line(
+        &fx.daemon.hook_path,
+        &session_start(std::path::Path::new(&fx.cwd), WORKER_PANE, &replacement).await,
+    )
+    .expect("deliver synthetic SessionStart for the replacement worker");
+
+    assert!(
+        wait_for_pane_task(&fx.daemon.registry, WORKER_PANE, Duration::from_secs(20)).await,
+        "the recovered worker never received its task; inbox = {:?}",
+        fx.daemon.registry.inbox().list(WORKER_PANE)
+    );
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route after the recovery, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+}
+
+/// Issue #1148: what a `trap '' TERM HUP` stand-in that reads NOTHING prints
+/// once it is armed — `delegate/034`'s worker.
+///
+/// A separate marker from [`STUBBORN_WORKER_ARMED`] so the two stand-ins cannot
+/// be confused in a snapshot dump, and because they are armed against different
+/// things: `delegate/022`'s ignores SIGTERM and still reads its PTY, which is
+/// all `close_agent` needs; this one must additionally survive having its PTY
+/// taken away. See [`delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back`].
+const UNKILLABLE_WORKER_ARMED: &[u8] = b"UNKILLABLE-WORKER-ARMED";
+
+/// Issue #1148: what `delegate/034`'s precondition found when it looked for the
+/// respawn's gap.
+#[derive(Debug)]
+enum RespawnGap {
+    /// The pane has no record: the respawn has lifted it out and has not yet
+    /// published a replacement. This is the state the hold must be taken in.
+    Entered,
+    /// The pane has a record again, under an agent id that is not the one the
+    /// respawn lifted out. So the respawn DID run — it ran to completion,
+    /// gap included, before this poll could observe the gap at all.
+    ///
+    /// A verdict, not an inconclusive attempt: the gap is supposed to be
+    /// `AGENT_TERMINATE_GRACE` wide (~3 s) and a 5 ms poll cannot step over
+    /// something that lasts 3 s. Seeing a successor therefore means the
+    /// premise the whole scenario rests on has stopped holding, and retrying
+    /// would only find the same collapsed gap again.
+    Collapsed { successor: String },
+    /// The budget ran out with the pane still on the agent id the delegate was
+    /// aimed at, so nothing lifted anything: the dispatch task never got as far
+    /// as the respawn.
+    ///
+    /// `waited` is the ceiling this attempt ACTUALLY used, carried out rather
+    /// than re-sampled by the panic (PR #1149 review, Greptile P2).
+    /// [`common::daemon_task_start_budget`] reads `/proc/loadavg` on every
+    /// call, so a second call names a duration nobody waited — and misstating
+    /// the budget in a failure about the budget is the same class of defect as
+    /// the message this whole helper replaces. [`close_pane_into_its_grace_window`]
+    /// already captures its ceiling for exactly this reason.
+    NeverStarted { waited: Duration },
+}
+
+/// Issue #1148: wait for the respawn to lift `pane_id`'s record out, and say
+/// WHICH of the three things happened rather than only whether the record is
+/// gone.
+///
+/// **The three-way answer is the fix, not a nicety.** Its predecessor was a
+/// `while pane_current_agent_id(..).is_some()` poll whose failure message read
+/// "the respawn never lifted the pane's record out" — and in every failure
+/// measured for issue #1148 that sentence was FALSE. The respawn had lifted the
+/// record and published a replacement 2.57 ms later, and the poll, having
+/// missed a window that narrow, spent the rest of its budget looking at the
+/// SUCCESSOR's record and reporting it as the original's. A wrong diagnosis is
+/// worse than a bare failure: #1148 records a bisect built on that sentence
+/// which produced a nonsense culprit. `Collapsed` is the arm that says so, and
+/// it says it in milliseconds instead of burning the budget first.
+///
+/// **Polling is sound here, given a gap that is genuinely
+/// `AGENT_TERMINATE_GRACE` wide** — and the fixture is what makes it so; see
+/// the stand-in in
+/// [`delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back`].
+/// Two properties, both needed. "No record for this pane" is MONOTONIC for the
+/// rest of the gap: the respawn is parked in
+/// `terminate_child_with_grace_and_wait` and is the only thing that can publish
+/// onto the pane, so once true the state cannot be left until the respawn
+/// itself leaves it — the same argument [`wait_for_pane_record_to_clear`]
+/// makes for the close window. And it lasts ~3 s against a 5 ms poll, so a
+/// poller gets ~600 looks at it. A poll cannot miss a state that cannot be left
+/// and that outlasts its own cadence by three orders of magnitude.
+///
+/// **Which is why this does NOT take a registry signal for the lift edge, and
+/// that was a real choice rather than an omission** (issue #1148). A signal
+/// would make the edge unmissable, and unmissable is not what this test needs:
+/// it needs to *be inside* the gap when it places the hold, not to learn
+/// afterwards that the gap happened. Against the 2.57 ms gap that failed, a
+/// signal-woken test would still have lost the race — it would simply have
+/// failed somewhere else. The only signal that would fix it is one that HOLDS
+/// the respawn between the lift and the spawn, i.e. a test-only barrier in a
+/// hot product path, which is a large cost to pay for a premise the fixture can
+/// restore on its own. The width of the gap was the defect; the sampling was
+/// only how it surfaced.
+///
+/// Bounded by [`common::daemon_task_start_budget`] rather than
+/// [`common::child_boot_budget`]: what is waited on is a freshly
+/// `tokio::spawn`ed dispatch task getting its turn and reaching a synchronous
+/// record removal, which is not a child producing its first byte. Both are
+/// load-scaled and both are 8 s, so this is a naming fix and not a behaviour
+/// change — but the old name is how the mis-sized wait went unquestioned in the
+/// first place.
+async fn wait_for_respawn_to_lift_the_record(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    delegated_agent_id: &str,
+) -> RespawnGap {
+    let ceiling = common::daemon_task_start_budget();
+    let deadline = tokio::time::Instant::now() + ceiling;
+    loop {
+        match registry.pane_current_agent_id(pane_id) {
+            None => return RespawnGap::Entered,
+            Some(id) if id != delegated_agent_id => {
+                return RespawnGap::Collapsed { successor: id };
+            }
+            Some(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return RespawnGap::NeverStarted { waited: ceiling };
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Issue #1114 (Greptile P1 on PR #1119): how long `delegate/034` keeps the
+/// cleanup hold up once it has taken it — a `StopAgent` whose remaining steps
+/// are starved, modelled the same way `delegate/033` models a starved close
+/// tail.
+///
+/// It has to outlast the respawn's own `AGENT_TERMINATE_GRACE`, because that
+/// grace is what separates the record removal this test waits for from the
+/// `spawn_agent` the hold has to refuse. Hold for less and the spawn lands after
+/// the hold is down, succeeds, and the test proves nothing. Five seconds is 1.7x
+/// the 3 s grace, and a `sleep` can only overshoot, so load moves it in the safe
+/// direction — while staying far under the recovery's own 30 s ceiling, above
+/// which a FIXED build would fail too.
+const STARVED_STOPAGENT_HOLD: Duration = Duration::from_secs(5);
+
+/// Scenario: delegate to a `clear = true` role whose worker survives being
+/// terminated, so the respawn spends its full three-second termination grace
+/// between lifting the pane's record out and spawning the replacement. Take the
+/// pane's cleanup hold inside that gap — a `StopAgent` that read its record a
+/// moment before the respawn removed it, and whose own remaining steps are then
+/// starved — and keep it up past the grace, so the replacement spawn is
+/// refused. The role must still come back once the hold goes down.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/034")]
+async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Issue #1148: NOT `delegate/022`'s stand-in, and the difference is the
+    // whole of why that one could not hold this gap open.
+    //
+    // `/022`'s worker is `trap '' TERM` + `exec cat`, and against `close_agent`
+    // that is exactly right: the close terminates the child while still HOLDING
+    // its `RunningAgent`, PTY master included, so a SIGTERM-ignoring `cat` has
+    // nothing to end it and the close spends the full `AGENT_TERMINATE_GRACE`.
+    //
+    // The RESPAWN leg is not shaped like that. `respawn_agent_for_pane_declared`
+    // deliberately `drop`s the writer and the master BEFORE it terminates — so
+    // that any I/O blocked on the PTY unblocks first — and closing the master
+    // hands the child EOF on its stdin. A `cat` then exits **0**, of its own
+    // accord, with the SIGTERM it is ignoring never mattering at all. Measured:
+    // the old child's exit status on this path is `(success, 0)`, never a
+    // signal, and the terminate returns after ONE 50 ms `try_wait` tick rather
+    // than after 3 s. That made this test's gap ~50 ms instead of ~3 s, and
+    // when the child's exit happened to land before the terminate helper's
+    // immediate FIRST `try_wait` — a sub-millisecond scheduling race, which is
+    // why the failure was load-sensitive — the gap collapsed to **2.57 ms** and
+    // the 5 ms poll below stepped straight over it. That is issue #1148.
+    //
+    // So this worker reads nothing at all: it ignores TERM and HUP (a `trap ''`
+    // disposition is `SIG_IGN`, which `execve` preserves, so the `sleep` that
+    // replaces the shell inherits both) and then sleeps. Losing the PTY is not
+    // an event for it, no signal the grace phase sends can end it, and it
+    // survives to the SIGKILL backstop — which is what makes the gap
+    // `AGENT_TERMINATE_GRACE` wide BY CONSTRUCTION rather than by luck.
+    //
+    // `sleep 300` rather than an unbounded sleep or a busy `while :` loop: it is
+    // one process with no CPU cost, 50x the worst case this test can take, and a
+    // bounded leak if the SIGKILL ever failed to land. Nothing here needs the
+    // pane to echo — unlike `/022`, this test asserts no pointer delivery, only
+    // that a LIVE replacement takes the pane and the role still routes — so the
+    // `cat` that `/022` needs buys this test nothing and costs it the gap.
+    let fx = fixture(|dir| {
+        let script = dir.join("unkillable-worker.sh");
+        let marker = String::from_utf8_lossy(UNKILLABLE_WORKER_ARMED).into_owned();
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '' TERM HUP\nprintf '{marker}'\nexec sleep 300\n"),
+        )
+        .expect("write signal-ignoring, PTY-ignoring worker stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod signal-ignoring, PTY-ignoring worker stand-in");
+        script.to_string_lossy().into_owned()
+    })
+    .await;
+
+    // The marker is printed AFTER the trap and BEFORE the exec, so seeing it is
+    // proof the dispositions are already `SIG_IGN` — the one fact this scenario
+    // cannot proceed without. Issue #709's fix, borrowed.
+    let armed = common::wait_for_child_first_output(
+        &fx.daemon.registry,
+        &fx.worker_agent_id,
+        UNKILLABLE_WORKER_ARMED,
+    )
+    .await;
+    assert!(
+        snapshot_contains(&armed, UNKILLABLE_WORKER_ARMED),
+        "precondition: the worker stand-in never got as far as installing its `trap '' TERM HUP`, \
+         so the respawn below would terminate it promptly and leave no gap to place the hold in; \
+         snapshot = {:?}",
+        String::from_utf8_lossy(&armed)
+    );
+    assert!(
+        !fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: NOTHING is closing this pane when the delegate lands — that is what makes \
+         this the ordinary respawn leg rather than `delegate/032`'s window, and the whole point \
+         is that the ordinary leg can still meet a hold on its way to `spawn_agent`"
+    );
+
+    delegate(&fx, "list the files in this directory").await;
+
+    // The gap: the respawn has lifted the record out and is now inside
+    // `terminate_child_with_grace_and_wait`, which the stand-in makes spend the
+    // full three seconds. "The record has gone" is the observable edge of it, so
+    // the hold lands inside the gap by construction rather than by arithmetic.
+    //
+    // Issue #1148: the two ways this can fail are now told apart, because the
+    // predecessor merged them and named the wrong one. See
+    // [`wait_for_respawn_to_lift_the_record`].
+    match wait_for_respawn_to_lift_the_record(&fx.daemon.registry, WORKER_PANE, &fx.worker_agent_id)
+        .await
+    {
+        RespawnGap::Entered => {}
+        RespawnGap::Collapsed { successor } => panic!(
+            "precondition: the respawn lifted the pane's record out AND published a replacement \
+             ({successor}, where the delegate was aimed at {delegated}) before this poll could \
+             see the gap — so the gap is no longer the ~3 s of `AGENT_TERMINATE_GRACE` this \
+             scenario needs, and the hold below would be taken after the spawn it is supposed to \
+             refuse. The stand-in has stopped surviving the respawn's terminate: see the fixture \
+             above, and note that the respawn drops the PTY master before terminating, so a \
+             worker that READS its PTY exits on EOF at once however many signals it traps \
+             (issue #1148). records = {records:?}",
+            delegated = fx.worker_agent_id,
+            records = fx.daemon.registry.agent_records()
+        ),
+        RespawnGap::NeverStarted { waited } => panic!(
+            "precondition: the pane is still on the agent id the delegate was aimed at \
+             ({delegated}) after {waited:?}, so nothing lifted its record and the respawn never \
+             got going at all — there is no gap to take the hold in and the assertion below \
+             would pass for the wrong reason. Unlike the collapsed case above, this one says the \
+             dispatch task never reached the respawn. records = {records:?}",
+            delegated = fx.worker_agent_id,
+            records = fx.daemon.registry.agent_records()
+        ),
+    }
+
+    // The `StopAgent` that lost this race: it read the worker's record just
+    // before the respawn removed it, so `pane_claimed_by_other` sees nothing and
+    // the hold is granted. Its own `close_agent` then fails against an id that
+    // is gone — which is exactly what the real handler does here, and why it
+    // rolls the closing mark back rather than completing.
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("a pane nobody claims is grantable to the stopping agent");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+    let stale_close = fx.daemon.registry.close_agent(&fx.worker_agent_id);
+    assert!(
+        stale_close.is_err(),
+        "precondition: this models a `StopAgent` whose record the respawn already took, so its \
+         own close MUST fail — if it succeeded the respawn had not removed anything and the gap \
+         was never entered"
+    );
+
+    let registry = Arc::clone(&fx.daemon.registry);
+    let releasing = tokio::spawn(async move {
+        tokio::time::sleep(STARVED_STOPAGENT_HOLD).await;
+        registry.finish_pane_close(WORKER_PANE, false);
+        drop(hold);
+    });
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        STARVED_STOPAGENT_HOLD + Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "a cleanup hold taken AFTER the respawn lifted the pane's record out left the role \
+             with no agent at all — the ordinary respawn leg had already terminated the worker, \
+             and `spawn_agent`'s `DuplicatePaneId` was returned instead of entering the recovery \
+             that knows how to wait for the hold (#1114). records = {:?}",
+            fx.daemon.registry.agent_records()
+        )
+    });
+    releasing
+        .await
+        .expect("the hold-release task must not panic");
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route afterwards, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+    assert!(
+        fx.daemon.registry.agent_is_live(&replacement),
+        "and the replacement has to be a LIVE agent rather than a record: this pane's whole \
+         history in this test is a worker that was terminated and a spawn that was refused"
     );
 }
 
@@ -628,8 +1529,6 @@ const RESPAWN_FAILED_NEEDLE: &str = "respawn failed for role 'coder'";
 
 /// The daemon's dead-replacement notice (`orchestration/delegate/023`).
 const DEAD_REPLACEMENT_NEEDLE: &str = "delegated worker never came up";
-
-const READINESS_BUFFER_ENV: &str = "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS";
 
 /// Re-point the `coder` role at `worker_command` for every LATER delegate. The
 /// dispatch task re-reads `.dot-agent-deck.toml` on each delegate, so the
@@ -678,35 +1577,6 @@ fn write_one_shot_worker(dir: &std::path::Path) -> String {
     script.to_string_lossy().into_owned()
 }
 
-/// Pins `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` for one test and restores
-/// it afterwards. nextest runs each test in its own process, so nothing else
-/// reads the variable while it is set.
-struct ReadinessBufferGuard {
-    previous: Option<String>,
-}
-
-impl ReadinessBufferGuard {
-    fn set(millis: u64) -> Self {
-        let previous = std::env::var(READINESS_BUFFER_ENV).ok();
-        // SAFETY: set before the fixture starts any task that reads it, in a
-        // test process nextest gives this test alone.
-        unsafe { std::env::set_var(READINESS_BUFFER_ENV, millis.to_string()) };
-        Self { previous }
-    }
-}
-
-impl Drop for ReadinessBufferGuard {
-    fn drop(&mut self) {
-        // SAFETY: as in `set`.
-        unsafe {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(READINESS_BUFFER_ENV, value),
-                None => std::env::remove_var(READINESS_BUFFER_ENV),
-            }
-        }
-    }
-}
-
 /// Scenario: start an orchestration with a live `cat` worker, re-point its `clear = true` role at a binary that does not exist, and delegate, so the respawn disposes of the worker and then fails to replace it. Once the orchestrator has been told the respawn failed, the worker pane must owe nothing: its outstanding delegation is retired and the daemon has broadcast that retirement.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/048")]
@@ -735,8 +1605,8 @@ async fn delegate_048_a_failed_respawn_retires_the_delegation_it_armed() {
 
 /// Scenario: start an orchestration whose `clear = true` worker refuses to start once a marker file sits beside it, drop that marker after the first worker is up, and delegate, so the replacement dies before it can receive anything. Once the orchestrator has been told the worker never came up, the worker pane must owe nothing: its outstanding delegation is retired and the daemon has broadcast that retirement.
 #[tokio::test(flavor = "multi_thread")]
-#[spec("orchestration/delegate/049")]
-async fn delegate_049_a_replacement_that_never_becomes_live_retires_the_delegation() {
+#[spec("orchestration/delegate/059")]
+async fn delegate_059_a_replacement_that_never_becomes_live_retires_the_delegation() {
     let fx = fixture(write_one_shot_worker).await;
     // The stand-in prints nothing of its own, so there is no output to wait
     // for; the same settle `orchestration/delegate/023` gives it. A first
@@ -769,21 +1639,17 @@ async fn delegate_049_a_replacement_that_never_becomes_live_retires_the_delegati
     .await;
 }
 
-/// Scenario: delegate to a `clear = true` worker, announce the replacement so the dispatch enters its readiness buffer, and during that buffer close the replacement and let a different agent take the worker pane. The task pointer is bound to the replacement, so the identity gate refuses it and nothing is written into the successor; the delegation must then be retired and that retirement broadcast.
+/// Scenario: delegate to a `clear = true` worker, announce the replacement and let the task land in its inbox, then close the replacement before it acknowledges and let a different agent take the worker pane. The task is bound to the replacement, so the successor is never handed it; the delegation must then be retired and that retirement broadcast.
+///
+/// Re-expressed in the 2026-11-05 upstream sync: the fork's `delegate/050` held
+/// a typed pointer inside the readiness buffer and watched the identity gate
+/// refuse it as `WrongSession`. Neither the buffer nor the pointer exists now
+/// (PRD #1666): the same guarantee, that a task for one agent never reaches
+/// whoever inherits its pane, is a bound inbox message and the exit of its
+/// bound recipient before it acknowledged.
 #[tokio::test(flavor = "multi_thread")]
-#[spec("orchestration/delegate/050")]
-async fn delegate_050_a_pointer_refused_for_the_wrong_session_retires_the_delegation() {
-    // Long enough that the hand-over below lands well inside it: the swap
-    // starts a quarter of the way in and takes milliseconds. Both figures grow
-    // together with how contended the machine is — four seconds and one second
-    // on an idle box, up to 24 s and 6 s at the scaling's ceiling, which stays
-    // under the 30 s the daemon clamps this override to. Measured ONCE, so the
-    // two cannot be scaled by different load readings.
-    let readiness_buffer = common::load_scaled(Duration::from_millis(4000));
-    let hand_over_after = readiness_buffer / 4;
-    let _buffer = ReadinessBufferGuard::set(
-        u64::try_from(readiness_buffer.as_millis()).expect("readiness buffer fits in u64 ms"),
-    );
+#[spec("orchestration/delegate/060")]
+async fn delegate_060_a_task_bound_to_a_replacement_that_exited_retires_the_delegation() {
     let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
     let mut broadcasts = fx.daemon.event_tx.subscribe();
 
@@ -798,20 +1664,25 @@ async fn delegate_050_a_pointer_refused_for_the_wrong_session_retires_the_delega
     .expect("precondition: the clear=true delegate must respawn the worker");
     common::write_hook_line(
         &fx.daemon.hook_path,
-        &session_start(WORKER_PANE, &replacement),
+        &session_start(std::path::Path::new(&fx.cwd), WORKER_PANE, &replacement).await,
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
+    assert!(
+        wait_for_pane_task(
+            &fx.daemon.registry,
+            WORKER_PANE,
+            common::load_scaled(Duration::from_secs(20))
+        )
+        .await,
+        "precondition: the task must be waiting in the replacement's inbox before it is closed; \
+         inbox = {:?}",
+        fx.daemon.registry.inbox().list(WORKER_PANE)
+    );
 
-    // The dispatch re-checks that the replacement still owns the pane as soon
-    // as its readiness wait ends, and only then starts the buffer. Swapping
-    // before that check would take the dead-replacement exit instead, which
-    // `orchestration/delegate/049` covers; the precondition below tells the
-    // two apart.
-    tokio::time::sleep(hand_over_after).await;
     fx.daemon
         .registry
         .close_agent(&replacement)
-        .expect("close the replacement worker mid-buffer");
+        .expect("close the replacement worker before it acknowledges");
     let successor = fx
         .daemon
         .registry
@@ -829,41 +1700,33 @@ async fn delegate_050_a_pointer_refused_for_the_wrong_session_retires_the_delega
         "the hand-over must produce a NEW registry agent id"
     );
 
+    let handed_to_successor = fx
+        .daemon
+        .registry
+        .inbox()
+        .list(WORKER_PANE)
+        .into_iter()
+        .any(|message| message.bind_agent.as_deref() == Some(successor.as_str()));
     assert!(
-        common::wait_for_commission_release(&fx.daemon.registry, WORKER_PANE).await,
-        "precondition: the dispatch never reached a no-delivery exit; watches = {:?}",
-        fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
-    );
-    let orchestrator = wait_for_orchestrator_text(&fx, "").await;
-    assert!(
-        !orchestrator.contains(DEAD_REPLACEMENT_NEEDLE),
-        "precondition: the hand-over landed before the readiness buffer began, so the dispatch \
-         left through the dead-replacement exit rather than through the identity gate this test \
-         is about; orchestrator pane = {orchestrator:?}"
-    );
-    let pointer =
-        common::expected_delegate_pointer(std::path::Path::new(&fx.cwd), WORKER_ROLE, WORKER_PANE);
-    let successor_snapshot = fx.daemon.registry.snapshot(&successor).unwrap_or_default();
-    assert!(
-        !snapshot_contains(&successor_snapshot, &pointer),
-        "precondition: a pointer bound to the replacement must not be written into the agent \
-         that inherited its pane; successor pane = {:?}",
-        String::from_utf8_lossy(&successor_snapshot)
+        !handed_to_successor,
+        "a task bound to the replacement must not be handed to the agent that inherited its \
+         pane; inbox = {:?}",
+        fx.daemon.registry.inbox().list(WORKER_PANE)
     );
 
     common::assert_undelivered_delegation_is_retired(
         &fx.daemon.registry,
         &mut broadcasts,
         WORKER_PANE,
-        "the identity gate refused its task pointer as WrongSession",
+        "the bound recipient exited before acknowledging its task",
     )
     .await;
 }
 
 /// Scenario: hold the worker pane's dispatch lock so a delegate whose respawn is going to fail is armed but cannot run, arm a NEWER delegation on the same worker pane, then release the lock and let the older delegate fail. The older delegate's exit may retire only its own delegation: the newer one must still be armed afterwards, and no retirement may have been broadcast for the pane.
 #[tokio::test(flavor = "multi_thread")]
-#[spec("orchestration/delegate/051")]
-async fn delegate_051_an_undelivered_delegate_leaves_a_newer_delegation_armed() {
+#[spec("orchestration/delegate/061")]
+async fn delegate_061_an_undelivered_delegate_leaves_a_newer_delegation_armed() {
     let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
     point_worker_role_at(&fx, MISSING_WORKER_BINARY);
     let mut broadcasts = fx.daemon.event_tx.subscribe();
@@ -892,7 +1755,7 @@ async fn delegate_051_an_undelivered_delegate_leaves_a_newer_delegation_armed() 
             WORKER_ROLE,
             ORCH_PANE,
             &fx.orchestrator_agent_id,
-            Some(&OrchestrationIdentity::Instance {
+            Some(&OrchestrationIdentity {
                 id: ORCHESTRATION_ID.to_string(),
                 name: ORCHESTRATION.to_string(),
             }),
@@ -939,39 +1802,24 @@ async fn delegate_051_an_undelivered_delegate_leaves_a_newer_delegation_armed() 
     );
 }
 
-/// Report `work-done` from the worker pane, as the worker's own CLI call does.
+/// Report `work-done` from the worker pane, as the worker's own CLI call does:
+/// the same two steps the daemon's hook handler takes (PRD #1666 S5), a report
+/// built from the pane's own registry record and then completed against the
+/// shared state.
 async fn work_done(fx: &Fixture) {
-    // Read back rather than assumed, so the signal is the one the pane's
-    // current registration would produce and cannot be refused as stale.
-    let (generation, daemon_boot_id) = {
-        let state = fx.daemon.state.read().await;
-        (
-            state
-                .pane_registration_generation
-                .get(WORKER_PANE)
-                .copied()
-                .expect("precondition: the fixture registered the worker pane"),
-            state.daemon_boot_id().to_string(),
-        )
-    };
-    fx.daemon
-        .state
-        .read()
-        .await
-        .handle_work_done(
-            WorkDoneSignal {
-                pane_id: WORKER_PANE.to_string(),
-                task: "The delegated test task is complete.".to_string(),
-                done: false,
-                timestamp: chrono::Utc::now(),
-                generation,
-                daemon_boot_id,
-                subject: None,
-            },
-            &fx.daemon.registry,
-            Some(&fx.daemon.event_tx),
-        )
-        .await;
+    let (request, provenance) = dot_agent_deck::task_completion::worker_report(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        "The delegated test task is complete.",
+        false,
+    );
+    let _ = dot_agent_deck::task_completion::complete(
+        &fx.daemon.state,
+        &fx.daemon.registry,
+        request,
+        &provenance,
+    )
+    .await;
 }
 
 /// Wait until the commission ledger holds exactly `expected` entries for the
@@ -999,13 +1847,13 @@ async fn wait_for_outstanding_commissions(fx: &Fixture, expected: u32) -> bool {
 
 /// Scenario: hold the worker pane's dispatch lock so a delegate whose respawn is going to fail is armed but cannot run, arm a NEWER delegation and its commission on the same worker pane, then release the lock and let the older delegate fail. The older delegation no longer counts, so the first `work-done` from the pane answers the newer one: the record must be retired and that retirement broadcast.
 #[tokio::test(flavor = "multi_thread")]
-#[spec("orchestration/delegate/052")]
-async fn delegate_052_work_done_after_an_overtaken_undelivered_delegate_retires_the_newer_one() {
+#[spec("orchestration/delegate/062")]
+async fn delegate_062_work_done_after_an_overtaken_undelivered_delegate_retires_the_newer_one() {
     let fx = fixture(|_dir: &std::path::Path| "cat".to_string()).await;
     point_worker_role_at(&fx, MISSING_WORKER_BINARY);
     let mut broadcasts = fx.daemon.event_tx.subscribe();
 
-    // As in `orchestration/delegate/051`: the older delegate's task stays
+    // As in `orchestration/delegate/061`: the older delegate's task stays
     // parked at its first statement while the newer delegation is armed.
     let dispatch_lock = fx.daemon.registry.pane_dispatch_lock(WORKER_PANE);
     let parked = dispatch_lock.lock().await;
@@ -1028,16 +1876,24 @@ async fn delegate_052_work_done_after_an_overtaken_undelivered_delegate_retires_
             WORKER_ROLE,
             ORCH_PANE,
             &fx.orchestrator_agent_id,
-            Some(&OrchestrationIdentity::Instance {
+            Some(&OrchestrationIdentity {
                 id: ORCHESTRATION_ID.to_string(),
                 name: ORCHESTRATION.to_string(),
             }),
         )
         .expect("precondition: neither pane is closing, so the newer delegation must arm");
+    // The in-flight guard is dropped at once: this precondition only needs the
+    // commission owed; `supersede` is true because an earlier one is outstanding.
     assert!(
-        fx.daemon
-            .registry
-            .arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
+        matches!(
+            fx.daemon.registry.arm_delegation_commission(
+                WORKER_PANE,
+                ORCH_PANE,
+                Some(fx.orchestrator_agent_id.as_str()),
+                true,
+            ),
+            CommissionArm::Armed { .. }
+        ),
         "precondition: neither pane is closing, so the newer commission must arm"
     );
     drop(parked);
@@ -1072,7 +1928,7 @@ async fn delegate_052_work_done_after_an_overtaken_undelivered_delegate_retires_
                 .outstanding_delegation
                 .is_some(),
         "precondition: the older delegate's exit must leave the newer delegation armed and \
-         unannounced (`orchestration/delegate/051`); broadcasts = {seen:?}, watches = {:?}",
+         unannounced (`orchestration/delegate/061`); broadcasts = {seen:?}, watches = {:?}",
         fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
     );
 
@@ -1118,7 +1974,7 @@ fn arm_earlier_delivered_delegation(fx: &Fixture) -> u64 {
             WORKER_ROLE,
             ORCH_PANE,
             &fx.orchestrator_agent_id,
-            Some(&OrchestrationIdentity::Instance {
+            Some(&OrchestrationIdentity {
                 id: ORCHESTRATION_ID.to_string(),
                 name: ORCHESTRATION.to_string(),
             }),
@@ -1261,16 +2117,24 @@ async fn overtaken_after_an_earlier_delegation(
             WORKER_ROLE,
             ORCH_PANE,
             &fx.orchestrator_agent_id,
-            Some(&OrchestrationIdentity::Instance {
+            Some(&OrchestrationIdentity {
                 id: ORCHESTRATION_ID.to_string(),
                 name: ORCHESTRATION.to_string(),
             }),
         )
         .expect("precondition: neither pane is closing, so the newer delegation must arm");
+    // The in-flight guard is dropped at once: this precondition only needs the
+    // commission owed; `supersede` is true because an earlier one is outstanding.
     assert!(
-        fx.daemon
-            .registry
-            .arm_delegation_commission(WORKER_PANE, ORCH_PANE, None),
+        matches!(
+            fx.daemon.registry.arm_delegation_commission(
+                WORKER_PANE,
+                ORCH_PANE,
+                Some(fx.orchestrator_agent_id.as_str()),
+                true,
+            ),
+            CommissionArm::Armed { .. }
+        ),
         "precondition: neither pane is closing, so the newer commission must arm"
     );
     drop(parked);
@@ -1358,6 +2222,29 @@ async fn delegate_056_after_a_failed_respawn_the_first_work_done_answers_the_new
     );
 }
 
+/// Issue #812, re-pointed in the 2026-11-05 upstream sync (ruling 34): the fork's
+/// `mark_delegation_dispatch_pending` / `_started` pair is gone. Upstream's seam
+/// for "this commission's dispatch has not taken the pane's dispatch lock yet" is
+/// the guard [`CommissionDispatchInFlight`]: held while the dispatch is queued,
+/// dropped the moment it holds the lock, and carrying the idle record it armed
+/// ([`CommissionDispatchInFlight::bind_idle_record`]) so a replaced worker's
+/// sweep keeps that record. The test arms the older commission itself and holds
+/// the guard where the fork test marked the dispatch pending.
+fn hold_older_dispatch_in_flight(fx: &Fixture, idle_seq: u64) -> CommissionDispatchInFlight {
+    match fx.daemon.registry.arm_delegation_commission(
+        WORKER_PANE,
+        ORCH_PANE,
+        Some(fx.orchestrator_agent_id.as_str()),
+        true,
+    ) {
+        CommissionArm::Armed { in_flight, .. } => {
+            in_flight.bind_idle_record(Some(idle_seq));
+            in_flight
+        }
+        _ => panic!("precondition: neither pane is closing, so the older commission must arm"),
+    }
+}
+
 /// Scenario: an older delegate's dispatch is still queued behind the pane's dispatch lock (its task never handed to any worker) when a newer delegate whose respawn will fail is dispatched first. After the newer delegate fails, the older generation must still be owed and watched, because if the failure was transient its dispatch will still deliver; one `work-done` then retires it and the retirement is broadcast.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/057")]
@@ -1366,7 +2253,7 @@ async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_
     point_worker_role_at(&fx, MISSING_WORKER_BINARY);
     let mut broadcasts = fx.daemon.event_tx.subscribe();
     let queued = arm_earlier_delivered_delegation(&fx);
-    fx.daemon.registry.mark_delegation_dispatch_pending(queued);
+    let older_dispatch = hold_older_dispatch_in_flight(&fx, queued);
     let dispatch_lock = fx.daemon.registry.pane_dispatch_lock(WORKER_PANE);
     let parked = dispatch_lock.lock().await;
     delegate(&fx, "list the files in this directory").await;
@@ -1402,7 +2289,7 @@ async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_
          task, if delivered later, unwatched; watches = {:?}",
         fx.daemon.registry.delegation_watch_snapshot(WORKER_PANE)
     );
-    fx.daemon.registry.mark_delegation_dispatch_started(queued);
+    drop(older_dispatch); // the older dispatch now holds the lock: its task is handed over
     work_done(&fx).await;
     assert!(
         fx.daemon
@@ -1425,309 +2312,17 @@ async fn delegate_057_a_failed_respawn_keeps_an_older_delegation_whose_dispatch_
     );
 }
 
-/// Issue #706: an env-dumping worker stand-in — logs the vars that decide
-/// whether a recreated worker's `work-done` can pass the daemon's
-/// generation/boot-id staleness gate, then behaves like `cat`.
-#[cfg(unix)]
-fn write_env_dump_worker(path: &std::path::Path, log: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let script = format!(
-        "#!/bin/sh\n\
-         {{\n\
-         echo \"gen=$DOT_AGENT_DECK_REGISTRATION_GENERATION\"\n\
-         echo \"boot=$DOT_AGENT_DECK_DAEMON_BOOT_ID\"\n\
-         echo \"pane=$DOT_AGENT_DECK_PANE_ID\"\n\
-         echo \"---\"\n\
-         }} >> \"{log}\"\n\
-         exec cat\n",
-        log = log.display()
-    );
-    std::fs::write(path, script).expect("write env-dump worker stand-in");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod env-dump worker stand-in");
-}
-
-/// Scenario: issue #706 — `dispatch_one_owned`'s `clear = true` recreate leg
-/// (issue #606's recovery path) is driven by closing the worker's registry
-/// record directly, the same deterministic technique
-/// `agent_detection.rs`'s `spawn_010_declared_identity_wins_spawn_recreate_and_learning`
-/// fixture uses, rather than racing an in-flight close — so the next
-/// delegate's respawn attempt reliably reports `recreated: true`. The
-/// recreated worker's actual environment must carry the SAME registration
-/// generation and daemon boot id that `pane_registration_generation` ends up
-/// holding for its pane, not just `DOT_AGENT_DECK_PANE_ID`.
-#[tokio::test(flavor = "multi_thread")]
-#[spec("orchestration/delegate/046")]
-async fn delegate_046_recreate_leg_injects_matching_registration_generation() {
-    let script_dir = common::race_safe_tempdir();
-    let script_path = script_dir.path().join("env-dump-worker.sh");
-    let log_path = script_dir.path().join("env-dump.log");
-    write_env_dump_worker(&script_path, &log_path);
-    let worker_command = script_path.to_string_lossy().into_owned();
-
-    let fx = fixture(move |_dir: &std::path::Path| worker_command).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while recorded_launches(&log_path).is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the worker stand-in never recorded its initial launch"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(
-        fx.daemon
-            .registry
-            .pane_current_agent_id(WORKER_PANE)
-            .as_deref(),
-        Some(fx.worker_agent_id.as_str()),
-        "precondition: the worker stand-in must still own its pane before it is closed"
-    );
-
-    fx.daemon
-        .registry
-        .close_agent(&fx.worker_agent_id)
-        .expect("remove the worker's registry record to force the recreate leg (issue #606)");
-
-    delegate(&fx, "list the files in this directory").await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while recorded_launches(&log_path).len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "delegating to a role whose pane had no registry record left never recreated it \
-             (issue #606); blocks = {:?}",
-            recorded_launches(&log_path)
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    let blocks = recorded_launches(&log_path);
-    let recreated_block = blocks.last().expect("a second launch block exists");
-    let field = |name: &str| -> String {
-        recreated_block
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name}=")))
-            .unwrap_or_default()
-            .to_string()
-    };
-    let injected_gen = field("gen");
-    let injected_boot = field("boot");
-
-    // The `if recreated { ... }` re-registration in `dispatch_one_owned` runs
-    // inline, before any readiness wait — but poll rather than assume, since
-    // nothing here should depend on that ordering staying true.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !fx
-        .daemon
-        .state
-        .read()
-        .await
-        .pane_registration_generation
-        .contains_key(WORKER_PANE)
-        && tokio::time::Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let state = fx.daemon.state.read().await;
-    let map_generation = state.pane_registration_generation.get(WORKER_PANE).copied();
-    let daemon_boot_id = state.daemon_boot_id().to_string();
-    drop(state);
-
-    assert!(
-        !injected_gen.is_empty() && injected_gen != "0",
-        "the recreated worker's env carried no DOT_AGENT_DECK_REGISTRATION_GENERATION \
-         (issue #706); block = {recreated_block:?}"
-    );
-    assert_eq!(
-        injected_gen.parse::<u64>().ok(),
-        map_generation,
-        "the generation injected into the recreated worker's env must match what \
-         `pane_registration_generation` ends up holding for its pane, or the worker's own \
-         `work-done` fails the daemon's staleness gate (issue #706); block = \
-         {recreated_block:?}, map = {map_generation:?}"
-    );
-    assert_eq!(
-        injected_boot, daemon_boot_id,
-        "the recreated worker's env must carry this daemon's own boot id (issue #706); block = \
-         {recreated_block:?}"
-    );
-}
-
-/// Scenario: issue #706 fix-round (reviewer B1 / auditor A1) — the ORDINARY
-/// (non-recreate) respawn leg of a `clear = true` delegate, exercised against
-/// a worker pane whose registry record is left INTACT — the opposite of
-/// `delegate_046_recreate_leg_injects_matching_registration_generation`,
-/// which deliberately forces `recreated: true` by closing the record first.
-/// `respawn_or_recreate_agent_for_pane`'s own doc calls this the
-/// "overwhelmingly common" outcome: with a record present it never falls
-/// through to the recreate branch, so simply not closing the agent (as this
-/// test does) is what selects this leg deterministically. `dispatch_one_owned`
-/// reserves a fresh registration generation unconditionally before EVERY
-/// `clear = true` respawn attempt — and `reserve_registration_generation`
-/// writes that value into `pane_registration_generation` immediately, not
-/// only once confirmed — but `respawn_agent_for_pane_declared` replays the
-/// PREVIOUS child's `spawn_env` verbatim and never looks at
-/// `PaneRecreateIdentity::env`. On this leg (`recreated == false`),
-/// `dispatch_one_owned` restores the map to the pre-reservation value
-/// synchronously, under the same `pane_dispatch_lock` guard, instead of
-/// confirming — so the map stays in sync with what the live worker's own
-/// `work-done` will report, closing the same failure #706 fixed on the
-/// recreate leg, on the far more common ordinary path too.
-#[tokio::test(flavor = "multi_thread")]
-#[spec("orchestration/delegate/047")]
-async fn delegate_047_ordinary_respawn_leg_keeps_registration_generation_in_sync() {
-    let daemon = common::spawn_inprocess_daemon().await;
-    let initial_boot_id = daemon.state.read().await.daemon_boot_id().to_string();
-
-    let script_dir = common::race_safe_tempdir();
-    let script_path = script_dir.path().join("env-dump-worker.sh");
-    let log_path = script_dir.path().join("env-dump.log");
-    write_env_dump_worker(&script_path, &log_path);
-    let worker_command = script_path.to_string_lossy().into_owned();
-
-    let dir = common::race_safe_tempdir();
-    std::fs::write(
-        dir.path().join(".dot-agent-deck.toml"),
-        config(&worker_command),
-    )
-    .expect("write orchestration config");
-    let cwd = dir.path().to_string_lossy().into_owned();
-
-    let orchestrator_agent_id = daemon
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some("cat"),
-            cwd: Some(&cwd),
-            display_name: Some("orchestrator"),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
-            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
-            ..SpawnOptions::default()
-        })
-        .expect("spawn orchestrator stand-in");
-
-    // The initial worker's env already carries a registration generation and
-    // this daemon's boot id — the same as a REAL production spawn would
-    // (`crate::spawn::spawn`'s `pane_env`, `src/spawn.rs`), which this
-    // in-process fixture bypasses by calling `registry.spawn_agent` directly.
-    // `"1"` is not arbitrary: it is the exact value
-    // `reserve_registration_generation` computes for a pane_id it has never
-    // seen before (`.or_insert(0) += 1`), which is what `register_orchestration_role`
-    // below performs for `WORKER_PANE`. So the env and the map start out
-    // GENUINELY in sync — the precondition an ordinary respawn is supposed to
-    // preserve, and the state a real live pane is actually in before any
-    // `clear = true` delegate touches it.
-    let worker_agent_id = daemon
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some(&worker_command),
-            cwd: Some(&cwd),
-            display_name: Some(WORKER_ROLE),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
-                    "1".to_string(),
-                ),
-                (DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(), initial_boot_id),
-            ],
-            tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
-            ..SpawnOptions::default()
-        })
-        .expect("spawn worker stand-in");
-
-    {
-        let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
-            id: ORCHESTRATION_ID.to_string(),
-            name: ORCHESTRATION.to_string(),
-        };
-        state.register_orchestration_role(
-            ORCH_PANE,
-            "orchestrator",
-            true,
-            identity.clone(),
-            Some(&cwd),
-        );
-        state.register_orchestration_role(WORKER_PANE, WORKER_ROLE, false, identity, Some(&cwd));
-    }
-
-    let fx = Fixture {
-        daemon,
-        _dir: dir,
-        cwd,
-        orchestrator_agent_id,
-        worker_agent_id,
-    };
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while recorded_launches(&log_path).is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the worker stand-in never recorded its initial launch"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(
-        fx.daemon
-            .registry
-            .pane_current_agent_id(WORKER_PANE)
-            .as_deref(),
-        Some(fx.worker_agent_id.as_str()),
-        "precondition: the worker's registry record must stay INTACT through this test — never \
-         closed — which is what selects the ORDINARY respawn leg rather than delegate_046's \
-         forced recreate leg"
-    );
-
-    delegate(&fx, "list the files in this directory").await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while recorded_launches(&log_path).len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the `clear = true` delegate against an intact registry record never produced an \
-             ordinary respawn; blocks = {:?}",
-            recorded_launches(&log_path)
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    let blocks = recorded_launches(&log_path);
-    let respawned_block = blocks.last().expect("a second launch block exists");
-    let field = |name: &str| -> String {
-        respawned_block
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name}=")))
-            .unwrap_or_default()
-            .to_string()
-    };
-    let injected_gen = field("gen");
-
-    // Unlike `delegate_046`, no detached task confirms anything on this leg —
-    // `dispatch_one_owned`'s reservation is synchronous and its
-    // `confirm_orchestration_role` call only runs `if recreated`, which this
-    // is not — so there is nothing to poll for; the map is already whatever
-    // it is going to be by the time `delegate` above returns.
-    let state = fx.daemon.state.read().await;
-    let map_generation = state.pane_registration_generation.get(WORKER_PANE).copied();
-    drop(state);
-
-    assert_eq!(
-        map_generation,
-        injected_gen.parse::<u64>().ok(),
-        "on the ORDINARY (non-recreate) respawn leg, `pane_registration_generation` must still \
-         equal whatever generation the respawned child's actual (verbatim-replayed) env carries \
-         — the eager, unconditional reservation `dispatch_one_owned` performs before EVERY \
-         `clear = true` respawn attempt bumps the map regardless of which leg runs, but only the \
-         recreate leg's `confirm_orchestration_role` call keeps it in sync (issue #706 fix-round \
-         review B1 / audit A1); block = {respawned_block:?}, map = {map_generation:?}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // #584's control: the two spawn paths' respawns, side by side.
 // ---------------------------------------------------------------------------
+
+/// The base ceiling, before [`common::load_scaled`], on a recorder worker
+/// writing its launch block. A BOOT, not a behaviour, for
+/// [`common::CHILD_BOOT_BASE`]'s reason: each wait returns the instant the
+/// block is complete. Kept at the flat 10 s it replaced, so an idle box keeps
+/// the bound it had.
+#[cfg(unix)]
+const RECORDER_BOOT_BASE: Duration = Duration::from_secs(10);
 
 /// A recorder worker: appends everything that decides HOW it was launched to a
 /// log, then behaves like a `cat` pane so the delegate's pointer is observable.
@@ -1755,10 +2350,21 @@ fn write_recorder(path: &std::path::Path, log: &std::path::Path) {
 
 /// The recorder's per-invocation blocks, minus the agent id (which is expected
 /// to differ — it is the whole point of a respawn).
+///
+/// Only COMPLETE blocks, ended by the recorder's `---` line: it writes one line
+/// at a time, so a block still being written must not count as a launch. When
+/// it did, the wait for the initial launches passed on a lone `argv0=` line,
+/// the respawn then killed that worker before it wrote the rest, and its torn
+/// block merged with the replacement's, so the log never showed a second
+/// launch (seen in a `test-fast` run at `io full` 90.6%).
 fn recorded_launches(log: &std::path::Path) -> Vec<String> {
-    std::fs::read_to_string(log)
-        .unwrap_or_default()
-        .split("---\n")
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let mut blocks: Vec<&str> = text.split("---\n").collect();
+    // What follows the last terminator is a block still being written, or
+    // nothing.
+    blocks.pop();
+    blocks
+        .into_iter()
         .map(str::trim)
         .filter(|block| !block.is_empty())
         .map(str::to_string)
@@ -1808,6 +2414,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
                 dot_agent_deck::orchestrator_context::Attendance::Unattended,
             ),
             owner: None,
+            seed_reason: None,
         },
         &daemon.registry,
         &SilentNotifier,
@@ -1836,6 +2443,38 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
         .pane_current_agent_id(&dispatched_worker)
         .expect("the dispatched worker pane has a live agent");
 
+    // Issue #962: the dispatch path tells the daemon its run title too, so a
+    // `clear = true` worker it later re-creates reads it from the daemon rather
+    // than from whichever sibling is still alive. The title the daemon recorded
+    // must be the one stamped on the role panes.
+    let stamped_title = daemon
+        .registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(dispatched_orchestrator.as_str()))
+        .and_then(|r| match r.tab_membership {
+            Some(TabMembership::Orchestration { display_title, .. }) => display_title,
+            _ => None,
+        });
+    assert!(
+        stamped_title.is_some(),
+        "precondition: a dispatch into a directory named apart from its orchestration stamps a \
+         run title on its role panes"
+    );
+    {
+        let state = daemon.state.read().await;
+        let identity = state
+            .pane_orchestration_map
+            .get(&dispatched_orchestrator)
+            .expect("the dispatched orchestrator is registered")
+            .clone();
+        assert_eq!(
+            state.orchestration_display_title(&identity),
+            stamped_title,
+            "the daemon must hold the dispatched orchestration's run title beside its role maps"
+        );
+    }
+
     // --- the StartAgent path: the shape `AttachRequest::StartAgent` builds.
     let control = fixture(|dir| {
         let recorder = dir.join("recorder.sh");
@@ -1851,7 +2490,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
         ("dispatch", dispatch_log.as_path()),
         ("startagent", control_log.as_path()),
     ] {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + common::load_scaled(RECORDER_BOOT_BASE);
         while recorded_launches(log).is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1862,29 +2501,14 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     }
 
     // --- delegate on each path and let each replacement announce itself, so
-    // neither side pays the production readiness fallback.
-    //
-    // Issue #567: `dispatched_orchestrator` was registered by the REAL
-    // `dot_agent_deck::spawn::spawn` primitive, so read its genuine
-    // generation/boot-id back from `daemon.state` rather than hand-typing a
-    // literal that could silently drift from what that primitive actually
-    // reserved.
-    let (dispatched_generation, dispatched_boot_id) = {
-        let guard = daemon.state.read().await;
-        let generation = *guard
-            .pane_registration_generation
-            .get(&dispatched_orchestrator)
-            .expect("the dispatch spawn primitive must have reserved a generation");
-        (generation, guard.daemon_boot_id().to_string())
-    };
+    // neither side waits on the production fallback.
     let signal = DelegateSignal {
         pane_id: dispatched_orchestrator,
         task: "list the files in this directory".to_string(),
         to: vec![WORKER_ROLE.to_string()],
+        supersede: false,
         timestamp: chrono::Utc::now(),
-        generation: dispatched_generation,
-        daemon_boot_id: dispatched_boot_id,
-        subject: None,
+        token: None,
     };
     daemon
         .state
@@ -1907,7 +2531,12 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     .expect("the dispatched worker must be replaced by the clear=true delegate");
     common::write_hook_line(
         &daemon.hook_path,
-        &session_start(&dispatched_worker, &dispatched_replacement),
+        &session_start(
+            dispatch_dir.path(),
+            &dispatched_worker,
+            &dispatched_replacement,
+        )
+        .await,
     )
     .expect("deliver the dispatched replacement's SessionStart");
 
@@ -1922,48 +2551,42 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     .expect("the StartAgent-path worker must be replaced by the clear=true delegate");
     common::write_hook_line(
         &control.daemon.hook_path,
-        &session_start(WORKER_PANE, &control_replacement),
+        &session_start(
+            std::path::Path::new(&control.cwd),
+            WORKER_PANE,
+            &control_replacement,
+        )
+        .await,
     )
     .expect("deliver the control replacement's SessionStart");
 
-    // --- both workers actually receive the pointer.
-    let dispatched_pointer =
-        common::expected_delegate_pointer(dispatch_dir.path(), WORKER_ROLE, &dispatched_worker);
-    let dispatched_snapshot = wait_for_pane_needle(
-        &daemon.registry,
-        &dispatched_worker,
-        &dispatched_pointer,
-        Duration::from_secs(20),
-    )
-    .await;
+    // --- both workers actually receive the task.
     assert!(
-        snapshot_contains(&dispatched_snapshot, &dispatched_pointer),
-        "the DISPATCHED orchestration's respawned worker never received the task pointer — the \
-         user-visible half of #584; snapshot = {:?}",
-        String::from_utf8_lossy(&dispatched_snapshot)
+        wait_for_pane_task(
+            &daemon.registry,
+            &dispatched_worker,
+            Duration::from_secs(20)
+        )
+        .await,
+        "the DISPATCHED orchestration's respawned worker never received its task — the \
+         user-visible half of #584; inbox = {:?}",
+        daemon.registry.inbox().list(&dispatched_worker)
     );
-    let control_pointer = common::expected_delegate_pointer(
-        std::path::Path::new(&control.cwd),
-        WORKER_ROLE,
-        WORKER_PANE,
-    );
-    let control_snapshot = wait_for_pane_needle(
-        &control.daemon.registry,
-        WORKER_PANE,
-        &control_pointer,
-        Duration::from_secs(20),
-    )
-    .await;
     assert!(
-        snapshot_contains(&control_snapshot, &control_pointer),
-        "the CONTROL orchestration's respawned worker never received the task pointer — a broken \
+        wait_for_pane_task(
+            &control.daemon.registry,
+            WORKER_PANE,
+            Duration::from_secs(20)
+        )
+        .await,
+        "the CONTROL orchestration's respawned worker never received its task — a broken \
          control means the harness is wrong and the dispatched result above proves nothing; \
-         snapshot = {:?}",
-        String::from_utf8_lossy(&control_snapshot)
+         inbox = {:?}",
+        control.daemon.registry.inbox().list(WORKER_PANE)
     );
 
     // --- and the two paths' relaunch parameters agree.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + common::load_scaled(RECORDER_BOOT_BASE);
     while recorded_launches(&dispatch_log).len() < 2 || recorded_launches(&control_log).len() < 2 {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -2012,123 +2635,249 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     );
 }
 
-/// A raw, no-echo `cat` on `pane_id` that prints `marker` once its termios is
-/// already in raw mode. Every byte the daemon submits into the pane afterwards
-/// appears exactly once in the agent's snapshot and nothing else does, which is
-/// what makes "this text was NOT submitted" directly observable — the same stub
-/// `idle_worker_detector.rs` and `work_done_reporting.rs` use for the same
-/// reason.
-fn spawn_raw_cat_observer(
-    registry: &Arc<AgentPtyRegistry>,
-    pane_id: &str,
-    marker: &str,
-    cwd: &str,
-) -> String {
-    let command =
-        format!("stty -echo -icanon -icrnl -opost min 1 time 0 && printf {marker} && exec cat -u");
-    registry
-        .spawn_agent(SpawnOptions {
-            command: Some(&command),
-            cwd: Some(cwd),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
-                ("SHELL".to_string(), "/bin/sh".to_string()),
-            ],
-            ..SpawnOptions::default()
+/// Issue #1784: the task the worker is working on, and the addendum the
+/// orchestrator sends while it still owes the `work-done`. Each carries a token
+/// of its own, so an assertion can tell which one a worker generation was given.
+const ORIGINAL_TASK: &str = "Implement the change. original-task-body-1784";
+const ADDENDUM: &str = "Addendum to your current task: also cover the empty input. addendum-1784";
+
+/// PRD #1666 part 3 (H5): take and settle `agent`'s oldest waiting message in
+/// `pane` the way a model-run `inbox fetch` and its agent's `ack` do: a hook
+/// receiver ([`dot_agent_deck::inbox_hub::serve_hook`]) is handed what waits,
+/// the agent acknowledges the oldest by id, and the receiver reports the rest
+/// not handed over, which puts them back in the queue at once. Answers the
+/// text of the one it settled, or `None` when nothing waits.
+async fn take_acked(
+    hub: &Arc<dot_agent_deck::inbox_hub::InboxHub>,
+    pane: &str,
+    agent: &str,
+) -> Option<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (read, write) = tokio::io::split(server);
+    let serve = tokio::spawn(dot_agent_deck::inbox_hub::serve_hook(
+        Arc::clone(hub),
+        pane.to_string(),
+        agent.to_string(),
+        dot_agent_deck::event::InboxComponent::Other,
+        dot_agent_deck::inbox_hub::HookFetch {
+            named: None,
+            budget: None,
+            hook_integration: Some(dot_agent_deck::inbox_hub::HOOK_INTEGRATION),
+            consumer: dot_agent_deck::event::InboxFetchConsumer::Cli,
+        },
+        BufReader::new(read),
+        write,
+    ));
+    let (from, mut to) = tokio::io::split(client);
+    let mut lines = BufReader::new(from).lines();
+    let line = lines.next_line().await.ok().flatten();
+    let mut handed = line
+        .and_then(|line| serde_json::from_str::<dot_agent_deck::event::InboxWaitReply>(&line).ok())
+        .and_then(|reply| reply.messages)
+        .unwrap_or_default()
+        .into_iter();
+    let first = handed.next();
+    if let Some(delivery) = &first {
+        hub.ack(
+            &delivery.id,
+            pane,
+            agent,
+            dot_agent_deck::inbox::AckHow::Explicit,
+        );
+    }
+    let rest: Vec<serde_json::Value> = handed
+        .filter_map(|delivery| {
+            let at = delivery.attempt?;
+            Some(serde_json::json!({"id": delivery.id, "a": at.a, "e": at.e}))
         })
-        .unwrap_or_else(|error| panic!("spawn raw-cat observer on {pane_id}: {error}"))
+        .collect();
+    if !rest.is_empty() {
+        let control = format!("{}\n", serde_json::json!({"not_handed": rest}));
+        let _ = to.write_all(control.as_bytes()).await;
+    }
+    let _ = to.shutdown().await;
+    drop(lines);
+    let _ = serve.await;
+    first.map(|delivery| delivery.text)
 }
 
-/// Poll `agent_id`'s scrollback until `needle` appears, or the deadline passes.
-/// Returns whatever the last snapshot held so the caller can print it.
-async fn wait_for_snapshot(registry: &AgentPtyRegistry, agent_id: &str, needle: &str) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+/// Issue #1784: take the next task the worker pane holds the way an agent's
+/// component does — fetch and acknowledge it ([`take_acked`]) — for whichever
+/// agent holds the pane once a task is waiting for it. Answers that agent and the text it was
+/// handed.
+async fn take_worker_task(
+    registry: &AgentPtyRegistry,
+    timeout: Duration,
+) -> Option<(String, String)> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let snapshot =
-            String::from_utf8_lossy(&registry.snapshot(agent_id).unwrap_or_default()).into_owned();
-        if snapshot.contains(needle) || tokio::time::Instant::now() >= deadline {
-            return snapshot;
+        if let Some(agent) = registry.pane_current_agent_id(WORKER_PANE)
+            && let Some(text) = take_acked(registry.inbox(), WORKER_PANE, &agent).await
+        {
+            return Some((agent, text));
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
-/// Scenario: An agent asks the daemon to dispatch, and its pane changes hands
-/// while `handle_dispatch` does its worktree-and-spawn work — the caller is
-/// closed and an unrelated agent inherits the same `DOT_AGENT_DECK_PANE_ID`.
-/// Delivering the dispatch result must be refused as `WrongSession`, and none of
-/// the result text may appear in the successor's scrollback even after a later
-/// authorized write to that successor has demonstrably landed.
-#[spec("orchestration/dispatch/006")]
-#[tokio::test]
-async fn dispatch_006_a_dispatch_result_is_refused_when_the_caller_pane_changed_hands() {
-    common::init_test_env();
-    const PANE: &str = "dispatch-result-handover-pane";
-    const RESULT: &str = "DISPATCH-RESULT-MUST-NOT-REACH-THE-SUCCESSOR-2f7c";
-    const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-9b13";
+/// Issue #1784: what became of a worker that took [`ORIGINAL_TASK`] once the
+/// orchestrator sent it [`ADDENDUM`] with `--supersede`.
+struct SupersededWorker {
+    /// The agent that took the original task and was working on it.
+    working: String,
+    /// The agent the addendum was handed to.
+    addendum_taker: String,
+    /// What that agent was handed.
+    addendum_text: String,
+    /// Whether the agent that took the original task is still running.
+    working_still_live: bool,
+    /// `.dot-agent-deck/worker-task-coder.md` after the addendum.
+    task_file: String,
+    /// Whether, after one `work-done`, the next plain delegate was refused
+    /// because the worker still owed one.
+    busy_after_one_work_done: bool,
+}
 
-    let dir = common::race_safe_tempdir();
-    let cwd = dir.path().to_string_lossy().into_owned();
-    let registry = Arc::new(AgentPtyRegistry::new());
-
-    // The agent that asked for the dispatch, and whose registry id the daemon
-    // captures from ONE `AgentRecord` before the slow half runs.
-    let caller = spawn_raw_cat_observer(&registry, PANE, "CALLER-READY", &cwd);
-    let ready = wait_for_snapshot(&registry, &caller, "CALLER-READY").await;
-    assert!(
-        ready.contains("CALLER-READY"),
-        "precondition: the caller stub must be up before it is handed over; snapshot = {ready:?}"
-    );
-
-    // The hand-over: the caller goes away and an unrelated agent takes the pane
-    // id, exactly as a recycled `DOT_AGENT_DECK_PANE_ID` is reissued.
-    registry.close_agent(&caller).expect("close the caller");
-    let successor = spawn_raw_cat_observer(&registry, PANE, "SUCCESSOR-READY", &cwd);
-    assert_ne!(
-        caller, successor,
-        "the hand-over must produce a NEW registry agent id"
-    );
-    let ready = wait_for_snapshot(&registry, &successor, "SUCCESSOR-READY").await;
-    assert!(
-        ready.contains("SUCCESSOR-READY"),
-        "precondition: the successor must be up and echoing, or the absence asserted below \
-         proves only that its stub never started; snapshot = {ready:?}"
-    );
-
-    let outcome =
-        dot_agent_deck::daemon::deliver_dispatch_result(&registry, PANE, &caller, RESULT).await;
-    assert_eq!(
-        outcome,
-        GuardedSend::WrongSession,
-        "a dispatch result bound to the caller must be refused once the caller's pane belongs \
-         to somebody else"
-    );
-
-    // A barrier, not a sleep: an AUTHORIZED write to the successor that has
-    // demonstrably arrived proves the pane has drained past the point where a
-    // leaked result would have landed, so its absence below is a fact rather
-    // than a race the test happened to win.
-    let barrier = registry
-        .write_and_submit_guarded(PANE, BARRIER, &successor, || async { true })
+/// Issue #1784: delegate [`ORIGINAL_TASK`] to the `coder` role, let its worker
+/// take it, then send [`ADDENDUM`] the only way an orchestrator can while that
+/// worker still owes a `work-done`: a plain delegate is refused as busy, so
+/// `--supersede`.
+async fn send_addendum_with_supersede(clear: bool) -> SupersededWorker {
+    let fx = fixture(|_| "cat".to_string()).await;
+    if !clear {
+        // Read on every delegate, so rewriting it before the first one is enough.
+        tokio::fs::write(
+            fx._dir.path().join(".dot-agent-deck.toml"),
+            config("cat").replace("clear = true", "clear = false"),
+        )
         .await
-        .expect("the barrier write must reach the registry");
+        .expect("rewrite the orchestration config with a clear = false worker");
+    }
+    let budget = common::load_scaled(Duration::from_secs(20));
+
+    let first = delegate_with(&fx, ORIGINAL_TASK, false).await;
     assert_eq!(
-        barrier,
-        GuardedSend::Applied,
-        "the successor owns the pane, so a write bound to IT must be applied — otherwise this \
-         test proves nothing about the refusal above"
+        first.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "precondition: the original task must be dispatched; reply = {first:?}"
     );
-    let snapshot = wait_for_snapshot(&registry, &successor, BARRIER).await;
+    let (working, original_text) = take_worker_task(&fx.daemon.registry, budget)
+        .await
+        .expect("precondition: the worker never took the original task");
     assert!(
-        snapshot.contains(BARRIER),
-        "the barrier write never reached the successor's PTY, so the absence below is untested; \
-         snapshot = {snapshot:?}"
-    );
-    assert!(
-        !snapshot.contains(RESULT),
-        "the dispatch result reached a process that merely inherited the caller's pane id — the \
-         successor may act on it with its own tools; snapshot = {snapshot:?}"
+        original_text.contains(ORIGINAL_TASK),
+        "precondition: the worker must have been handed the original task; text = {original_text:?}"
     );
 
-    registry.shutdown_all();
+    // CONTROL: why an orchestrator reaches for `--supersede` at all. The worker
+    // still owes a work-done, so a plain delegate is refused.
+    let refused = delegate_with(&fx, ADDENDUM, false).await;
+    assert!(
+        refused.delivered.is_empty() && refused.busy.iter().any(|b| b.role == WORKER_ROLE),
+        "control — a plain delegate to a worker that owes a work-done must be refused as busy; \
+         reply = {refused:?}"
+    );
+
+    let superseding = delegate_with(&fx, ADDENDUM, true).await;
+    assert_eq!(
+        superseding.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "the --supersede addendum must be dispatched; reply = {superseding:?}"
+    );
+    let (addendum_taker, addendum_text) = take_worker_task(&fx.daemon.registry, budget)
+        .await
+        .expect("the addendum never reached the worker pane");
+    let working_still_live = fx.daemon.registry.agent_is_live(&working);
+    let task_file = tokio::fs::read_to_string(
+        std::path::Path::new(&fx.cwd).join(".dot-agent-deck/worker-task-coder.md"),
+    )
+    .await
+    .unwrap_or_default();
+
+    // The worker reports once, and the orchestrator delegates its next task.
+    let (request, provenance) = dot_agent_deck::task_completion::worker_report(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        "Finished the task and the addendum.",
+        false,
+    );
+    let _ = dot_agent_deck::task_completion::complete(
+        &fx.daemon.state,
+        &fx.daemon.registry,
+        request,
+        &provenance,
+    )
+    .await;
+    let next = delegate_with(&fx, "The next task.", false).await;
+    SupersededWorker {
+        working,
+        addendum_taker,
+        addendum_text,
+        working_still_live,
+        task_file,
+        busy_after_one_work_done: next.busy.iter().any(|b| b.role == WORKER_ROLE),
+    }
+}
+
+/// Scenario: Delegate a task to a `clear = true` `coder` and let its worker take it, then send an addendum with `--supersede`, since a plain delegate is refused as busy. A new agent takes the addendum alone, the one that was working is gone, and after one `work-done` the worker takes the next task. On a `clear = false` worker the agent that was working takes the addendum and keeps running, and the addendum replaces the original task, so one `work-done` leaves it free too.
+///
+/// Issue #1784 reproduced: what this pins is `--supersede`'s documented meaning,
+/// which the issue keeps and the orchestrator's instructions now warn about. An
+/// addendum that keeps a `clear = true` worker's agent needs a path of its own;
+/// until it exists, this is the restart the orchestrator is told to avoid.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/052")]
+async fn delegate_052_a_supersede_addendum_restarts_a_clear_true_worker() {
+    let restarted = send_addendum_with_supersede(true).await;
+    assert_ne!(
+        restarted.addendum_taker, restarted.working,
+        "a --supersede delegate to a clear = true worker must hand the addendum to a new agent"
+    );
+    assert!(
+        !restarted.working_still_live,
+        "the clear = true agent that was working on the original task must be gone"
+    );
+    assert!(
+        restarted.addendum_text.contains(ADDENDUM)
+            && !restarted.addendum_text.contains(ORIGINAL_TASK),
+        "the new agent must be handed the addendum alone, without the original task; text = {:?}",
+        restarted.addendum_text
+    );
+    assert!(
+        restarted.task_file.contains(ADDENDUM) && !restarted.task_file.contains(ORIGINAL_TASK),
+        "the worker's task file must hold the addendum alone; file = {:?}",
+        restarted.task_file
+    );
+    assert!(
+        !restarted.busy_after_one_work_done,
+        "the restart retires the original task, so one work-done must leave the worker free"
+    );
+
+    // CONTROL: the restart comes from `clear = true`, not from `--supersede`.
+    let kept = send_addendum_with_supersede(false).await;
+    assert_eq!(
+        kept.addendum_taker, kept.working,
+        "control — a clear = false worker must be handed the addendum by the agent that was working"
+    );
+    assert!(
+        kept.working_still_live,
+        "control — the clear = false agent that was working must still be running"
+    );
+    assert!(
+        kept.addendum_text.contains(ADDENDUM),
+        "control — the clear = false worker must be handed the addendum; text = {:?}",
+        kept.addendum_text
+    );
+    // PRD #1666 part 3, round 5 (plan D8): `--supersede` ends the task it
+    // replaces, its debt included, so the worker owes one work-done, for the
+    // addendum. Before round 5 it owed one for each task.
+    assert!(
+        !kept.busy_after_one_work_done,
+        "a --supersede addendum replaces the original task, so a clear = false worker that \
+         reported once must be free for the next task"
+    );
 }

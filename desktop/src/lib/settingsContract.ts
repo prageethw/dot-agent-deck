@@ -18,16 +18,36 @@
  * key/value widgets, and a renderer built to fit both would fit neither. A
  * panel is an ordinary React component and owns its own layout.
  *
- * Secrets never travel through here. A settings document may hold a non-secret
+ * Secrets never travel through here, and since PRD #802 M4 there is somewhere
+ * else for them to go: `useSettingsBridge()`'s `storeSecret`/`forgetSecret`,
+ * which reach the OS keychain through `src-tauri/src/secrets.rs` and never put
+ * a value in the document. A settings document may hold a non-secret
  * *reference* — which backend holds the key, or a boolean saying one is stored —
- * and nothing more. The Rust-side check that pins this is a **naming tripwire,
- * not a security boundary**: it reads key names in the serialised document and
- * nothing else, so a field called `endpoint` holding a token passes it, and
- * nothing on this side of the bridge is scanned at all. Issue #827 carries the
- * checks #802 needs before it stores a real key.
+ * and nothing more.
+ *
+ * Two checks watch that and they establish different things. The Rust-side
+ * key-name check is a **naming tripwire, not a security boundary**: it reads key
+ * names in the serialised document and nothing else, so a field called
+ * `endpoint` holding a token passes it. `xtask/linkage-check`'s
+ * `desktop_settings_secrets` is the structural one — it pins the field TYPES the
+ * Rust schema may use (`String` is deliberately absent), this side's DTO names,
+ * and the `localStorage` key set. It is what went red when #802 added its
+ * section, which is how the credential ended up in the keychain rather than in
+ * the document.
  */
 import type { ComponentType } from "react";
 import type { DesktopSettingsDto } from "./bridge";
+
+/**
+ * What became of one save, for a panel that has to act on it (issue #1426's add
+ * form). A save's own UI — the document applied at once, the failure sentence
+ * in `saveError` — happens whether or not anyone reads this.
+ *
+ * `disk` is set when the failure replaced the document on screen with the one
+ * on disk (the deck list changed outside the app, so what the window held was
+ * stale): a deck the save added is then not on screen unless it is on disk.
+ */
+export type SaveOutcome = { saved: true } | { saved: false; disk?: DesktopSettingsDto };
 
 /** What every settings panel is handed. */
 export interface SettingsPanelProps {
@@ -42,14 +62,30 @@ export interface SettingsPanelProps {
    *
    * Saves are serialised inside `useDesktopSettings` and a superseded response
    * is dropped, so two rapid calls reach the disk in the order they were made
-   * and a stale reply cannot overwrite newer state. Two *processes* racing on
-   * the same field is a different problem, not handled, tracked as #828.
+   * and a stale reply cannot overwrite newer state. Across *processes* — two
+   * app windows, or the app and a hand edit — only the fields this call changed
+   * are written, so another writer's edit to a field you did not touch survives
+   * (issue #828). Compute `next` from the `settings` you were handed: the
+   * difference between the two is what the hook treats as your edit. A write
+   * that builds on some OTHER snapshot — one kept across an `await` — passes it
+   * as `from`, so the difference is measured against what it actually edited.
+   *
+   * May return a promise of the {@link SaveOutcome}, which never rejects; most
+   * panels ignore it.
    */
-  onSave: (next: DesktopSettingsDto) => void;
+  onSave: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void | Promise<SaveOutcome>;
   /**
-   * Set when the last save failed. The choice is still applied for this
-   * session; what failed is persisting it, and a panel should say so rather
-   * than silently reverting.
+   * Why the settings document cannot be written right now, as a **complete
+   * sentence** — render it verbatim rather than composing around it.
+   *
+   * Two conditions reach this one prop and a panel cannot tell them apart,
+   * which is deliberate: the last save failed (the choice is still applied for
+   * this session; what failed is persisting it), or the document on disk cannot
+   * be read at all, in which case the app is on defaults and every save is
+   * refused so the user's file survives (issue #1072). `useDesktopSettings`
+   * composes the right sentence for each. A panel that prefixed its own
+   * "saving failed" lead-in would be wrong half the time — which is what they
+   * all did before #1072, back when only one of the two existed.
    */
   saveError?: string;
   /**

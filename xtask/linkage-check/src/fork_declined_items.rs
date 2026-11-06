@@ -1,4 +1,5 @@
-//! Check 16: the three upstream governance/infra changes the maintainer
+//! Rule 22 (`fork-declined-items`; numbered 16 before the net merge of upstream's
+//! rule registry): the three upstream governance/infra changes the maintainer
 //! reviewed and explicitly declined post-rebase during the 14th fork/upstream
 //! sync must not silently resurface.
 //!
@@ -115,7 +116,7 @@ pub fn run(root: &Path) -> Vec<String> {
                 ));
             }
         }
-        // Matches checks 14/15's own skip pattern (`main.rs`'s
+        // Matches rules 20/21's own skip pattern (`main.rs`'s
         // `resolve_base`/origin-main-not-resolvable handling): a synthetic
         // fixture repo (this rule's own self-tests, `duplicate_catalog_id.rs`
         // and `resurrected_changelog_fragment.rs`) has no `.dot-agent-deck.toml`
@@ -127,7 +128,7 @@ pub fn run(root: &Path) -> Vec<String> {
         // context" case this skip exists for.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                "linkage-check: [16] skipped ({CONFIG_PATH} not present — not this project's \
+                "linkage-check: fork-declined-items skipped ({CONFIG_PATH} not present — not this project's \
                  checkout, e.g. a synthetic fixture repo)"
             );
         }
@@ -273,7 +274,7 @@ mod tests {
     /// (a synthetic fixture repo, e.g. `duplicate_catalog_id.rs`'s and
     /// `resurrected_changelog_fragment.rs`'s own self-tests, which run the
     /// real `xtask-linkage-check` binary against a tempdir with no
-    /// `.dot-agent-deck.toml` at all) — matching checks 14/15's own
+    /// `.dot-agent-deck.toml` at all) — matching rules 20/21's own
     /// precondition-not-applicable skip, not a failure. A config file that
     /// DOES exist but is missing the gate sentence is still a failure —
     /// see `a_removed_gate_sentence_fails` above.

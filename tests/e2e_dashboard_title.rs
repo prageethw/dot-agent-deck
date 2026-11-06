@@ -30,7 +30,7 @@ use spec::spec;
 #[test]
 fn title_001_bar_shows_worker_deck_not_upstream_name() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let grid = deck.snapshot_grid();
     assert!(

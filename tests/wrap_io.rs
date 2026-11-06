@@ -6,7 +6,7 @@ mod common;
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::FromRawFd as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::net::UnixListener;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -23,8 +23,10 @@ use spec::spec;
 /// watches their own card flip through session_start/thinking/idle. Every site
 /// below that does not care about emitted events points here instead and drops
 /// the inherited ids; `hook::send_to_socket` treats an unreachable endpoint as a
-/// no-op. `codex_wrap_005` is the deliberate exception: it binds a real socket
-/// because the events are what it asserts on.
+/// no-op. The deliberate exceptions bind a real socket in their own fixture:
+/// `codex_wrap_005` and `codex_wrap_006` because the events are what they
+/// assert on, and `sigkilled_wrapper_case` because the fork-time event is its
+/// proof the child-group backstop was armed (issue #963).
 const UNREACHABLE_HOOK_SOCKET: &str = "/nonexistent/dot-agent-deck-wrap-tests.sock";
 
 fn run_wrap(script: &str, stdin: &[u8]) -> Output {
@@ -125,6 +127,32 @@ fn read_pty(mut master: File) -> Vec<u8> {
     observed
 }
 
+fn read_pty_line(master: &mut File) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = Vec::new();
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // SAFETY: `descriptor` points to one initialized pollfd containing a
+        // live descriptor owned by `master`, and poll does not retain it.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, remaining.as_millis() as i32) };
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        assert!(ready > 0, "waiting for PTY stderr line: {observed:?}");
+        let mut byte = [0];
+        master.read_exact(&mut byte).expect("read PTY stderr byte");
+        observed.push(byte[0]);
+        if byte[0] == b'\n' {
+            return observed;
+        }
+    }
+}
+
 fn run_with_stderr_redirected() -> (bool, Vec<u8>, Vec<u8>) {
     let fixture = common::harness_tempdir().expect("create stderr-only redirect fixture");
     let stderr_path = fixture.path().join("stderr.log");
@@ -201,6 +229,9 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// How long a read from an accepted wrapper event stream may wait for bytes.
+const WRAPPER_EVENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<AgentEvent> {
     listener
         .set_nonblocking(true)
@@ -210,6 +241,17 @@ fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<Agent
     while events.len() < expected && Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // On macOS the accepted stream inherits the listener's
+                // O_NONBLOCK (Linux's does not), so a read that beats the
+                // wrapper's write would fail with WouldBlock (issue #1700).
+                stream
+                    .set_nonblocking(false)
+                    .expect("make the accepted wrapper event stream blocking");
+                // Best-effort bound, so a wrapper that connects and stalls fails
+                // the read instead of hanging the test. XNU refuses it with
+                // EINVAL once the peer has closed, and a read from a closed peer
+                // cannot hang anyway, so a refusal is ignored.
+                let _ = stream.set_read_timeout(Some(WRAPPER_EVENT_READ_TIMEOUT));
                 let mut json = String::new();
                 stream
                     .read_to_string(&mut json)
@@ -227,9 +269,7 @@ fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<Agent
     events
 }
 
-/// Scenario: Run `dot-agent-deck wrap` with redirected non-interactive streams.
-/// Wholly non-interactive streams remain separate and byte-exact, while stderr-only
-/// and stdout-only redirects preserve each unaffected descriptor's TTY identity.
+/// Scenario: Run the real wrapper with independent redirected and terminal descriptors, then launch synthetic direct Codex on both pipe and PTY paths, reading its terminal stderr while it waits for input. Streams and input must retain their routing, Codex must receive its embedded pair once, and a non-Codex agent must keep its arguments unchanged.
 #[spec("codex/wrap/003")]
 #[test]
 fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
@@ -342,6 +382,155 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
         ),
         "wrapping must preserve every descriptor independently: non-interactive streams stay separate and byte-exact, stderr-only redirection reaches only stderr, and stdout-only redirection leaves stdin/stderr attached to their TTY"
     );
+    assert_embedded_streams();
+}
+
+fn assert_embedded_streams() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = common::harness_tempdir().expect("embedded stream fixture");
+    for name in ["codex", "plain-probe"] {
+        let program = fixture.path().join(name);
+        std::fs::write(&program, include_str!("fixtures/codex-embedded.py")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let home = fixture.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let mut failures = Vec::new();
+    for tty in [false, true] {
+        for (label, program, agent, original, expected_mode) in [
+            (
+                "direct Codex",
+                "codex",
+                "codex",
+                vec!["--model", "mini-fixture", "prompt with spaces"],
+                "EMBEDDED_SUCCESS",
+            ),
+            (
+                "already-prefixed control",
+                "codex",
+                "codex",
+                vec![
+                    "-c",
+                    "shell_environment_policy.set={}",
+                    "--model",
+                    "mini-fixture",
+                ],
+                "EMBEDDED_SUCCESS",
+            ),
+            (
+                "non-Codex control",
+                "plain-probe",
+                "opencode",
+                vec!["--model", "unchanged model", "prompt with spaces"],
+                "SHARED_SELECTION",
+            ),
+        ] {
+            let record = fixture.path().join("args.jsonl");
+            std::fs::write(&record, "").unwrap();
+            let (mut master, slave) = open_pty();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+            command
+                .args(["wrap", "--agent", agent, "--"])
+                .arg(fixture.path().join(program))
+                .args(&original)
+                .env_clear()
+                .envs(common::config_containment_env())
+                .env("HOME", &home)
+                .env("CODEX_HOME", home.join(".codex"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", fixture.path().display()),
+                )
+                .env("OTEL_SDK_DISABLED", "true")
+                .env("CODEX_ARGS_RECORD", &record)
+                .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+                .env(
+                    "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+                    common::WRAP_TEST_MAX_LIFETIME_SECS,
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            // One terminal descriptor selects the real PTY branch while
+            // stdout and stdin stay independently routed through pipes.
+            command.stderr(if tty {
+                Stdio::from(slave)
+            } else {
+                drop(slave);
+                Stdio::piped()
+            });
+            let mut child = command.spawn().expect("spawn embedded stream probe");
+            // Command retains its configured slave descriptor after spawn;
+            // close that copy before waiting for the outer master's EOF.
+            drop(command);
+            // Consume terminal stderr while the probe is still waiting for
+            // input. This avoids depending on unread PTY output surviving the
+            // final slave close, which made the macOS assertion see no bytes.
+            let mut terminal_stderr = if tty {
+                read_pty_line(&mut master)
+            } else {
+                Vec::new()
+            };
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"byte\0input\n")
+                .unwrap();
+            let output = child
+                .wait_with_output()
+                .expect("wait for embedded stream probe");
+            let stderr = if tty {
+                terminal_stderr.extend(read_pty(master));
+                // Terminal output passes through two line disciplines; CR
+                // expansion is terminal semantics, not a routing failure.
+                terminal_stderr
+                    .into_iter()
+                    .filter(|byte| *byte != b'\r')
+                    .collect()
+            } else {
+                drop(master);
+                output.stderr
+            };
+            assert!(output.status.success(), "{label}, tty={tty}: {stderr:?}");
+            assert_eq!(
+                stderr, b"STDERR_SENTINEL\n",
+                "{label}, tty={tty}: stderr routing"
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.ends_with("\nINPUT_SUCCESS:byte\0input\n"),
+                "{label}, tty={tty}: byte-exact input routing: {stdout:?}"
+            );
+            let args: Vec<Vec<String>> = std::fs::read_to_string(&record)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(args.len(), 1, "one child per wrapper");
+            let args = &args[0];
+            let want: Vec<String> = if label == "direct Codex" {
+                [
+                    vec!["-c", "shell_environment_policy.set={}"],
+                    original.clone(),
+                ]
+                .concat()
+                .into_iter()
+                .map(String::from)
+                .collect()
+            } else {
+                original.into_iter().map(String::from).collect()
+            };
+            if args != &want || stdout != format!("{expected_mode}\nINPUT_SUCCESS:byte\0input\n") {
+                failures.push(format!("{label}, tty={tty}: expected prepended embedded pair and preserved streams; argv={args:?}, want={want:?}, stdout={stdout:?}"));
+            } else {
+                eprintln!(
+                    "PASS {label}, tty={tty}: argv unchanged, input/stdout/stderr routed correctly"
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Scenario: Start two overlapping standalone wrappers with the same Codex identity and no pane environment ID. Their emitted lifecycle events must carry two distinct session IDs so one terminal cannot overwrite the other's card or status.
@@ -419,6 +608,11 @@ fn collect_wrapper_events_until(
     while Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // Blocking and bounded for the same reasons as in [`collect_wrapper_events`].
+                stream
+                    .set_nonblocking(false)
+                    .expect("make the accepted wrapper event stream blocking");
+                let _ = stream.set_read_timeout(Some(WRAPPER_EVENT_READ_TIMEOUT));
                 let mut json = String::new();
                 stream
                     .read_to_string(&mut json)
@@ -711,10 +905,10 @@ fn run_signal_case(
     );
 
     // The wrapper is our own child, so detect its exit by reaping it through the
-    // owned handle rather than probing by pid: common::process_running() cannot see
-    // a zombie on non-Linux (its kill(pid, 0) fallback treats an exited-but-unreaped
-    // pid as alive), so on macOS an exited-but-unreaped wrapper looks like it never
-    // exited. try_wait() reaps the wrapper and reports its exit portably.
+    // owned handle rather than probing by pid: try_wait() reaps the wrapper and
+    // reports its exit portably. Until issue #1565, common::process_running()
+    // could not see a zombie on macOS (its kill(pid, 0) fallback treated an
+    // exited-but-unreaped pid as alive), which is what this once misread.
     let wrapper_exited = {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -787,9 +981,9 @@ fn codex_wrap_004_termination_signals_reap_children_on_every_path() {
 fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     let fixture = common::harness_tempdir().expect("create lifetime backstop fixture");
     let pid_path = fixture.path().join("child.pid");
-    // Held for the whole test: the wrapper's descriptors must stay valid while it
-    // runs, and (see the KNOWN PLATFORM GAP note below) releasing it early made no
-    // difference to the macOS behaviour anyway.
+    // Held for the whole test, as a live terminal would be: the wrapper must exit
+    // on its own once the backstop has taken its child down, not because its
+    // outer terminal went away.
     let (_master, slave) = open_pty();
     let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args([
@@ -832,64 +1026,73 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     let child_pid = read_child_pid().expect("child pid recorded");
 
     // Two SEPARATE properties, waited on child-first so a failure says which one
-    // broke. The first draft used one 15 s budget and waited on the wrapper
-    // first; when that tripped on a macOS runner the message accused the backstop
-    // of never firing, while the child had in fact already been killed — the
-    // backstop HAD worked and only the wrapper's own teardown was still
-    // finishing. That is precisely the "one message for two unrelated causes"
-    // trap this branch fixes in `auto-reattach`; do not reintroduce it here.
+    // broke — one message for two unrelated causes is the trap #396 fixed in
+    // `auto-reattach`; do not reintroduce it here.
     //
     // 1. The child is dead — the backstop's actual contract: the watchdog fired,
     //    the reap loop forwarded SIGTERM and, since this child traps TERM,
     //    escalated to SIGKILL. Bounded by the 1 s cap + up to ~1 s of watchdog
     //    poll + the reap loop's 50 ms tick + WRAP_TERMINATE_GRACE (1.5 s).
-    // 2. KNOWN PLATFORM GAP — deliberately observed, not asserted. On macOS the
-    //    wrapper PROCESS does not exit after its child dies here: three CI runs
-    //    held on past 60 s with the child already reaped, both while this test
-    //    kept the outer PTY master open and after it was dropped between the two
-    //    waits. On Linux it exits in well under a second.
-    //
-    //    Not asserted because (a) no test asserted wrapper exit on ANY platform
-    //    before this one, so declining to gate on it removes no existing
-    //    coverage, and (b) the arithmetic teardown path is bounded — the stdin
-    //    pump is spawned detached and never joined, and the redirected-output
-    //    tees are `None` when all three descriptors are a tty — so the real cause
-    //    is something only reproducible on macOS, which no amount of adjusting
-    //    this test will establish.
-    //
-    //    Consequence to be honest about: on macOS the backstop removes the
-    //    expensive half of the leak (the child, which is what burned CPU in the
-    //    incident) but may leave the wrapper process itself behind. On Linux both
-    //    go. Worth a follow-up issue against the wrap teardown, NOT worth
-    //    blocking a Linux-verified leak fix.
     let child_gone = common::wait_until(Duration::from_secs(30), || {
         !common::process_running(child_pid)
     });
 
-    let wrapper_pid = wrapper.id() as libc::pid_t;
-
-    // Never leak this test's own probes, whatever the outcome above.
-    for pid in [child_pid, wrapper_pid] {
-        if common::process_running(pid) {
-            // SAFETY: best-effort cleanup of pids this test created. A
-            // `process_running` check followed by a signal is check-then-act:
-            // between the two the pid could in principle be reaped and reissued,
-            // so this is a bounded same-UID residual rather than a guarantee it
-            // only ever reaches its own probes. Unix permission checks rule out
-            // touching another user; closing the window entirely would need an
-            // OS-owned container (a cgroup), not a revalidated number.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
+    // 2. The wrapper then exits, so nothing is left at PID 1. Its teardown adds
+    //    the bounded post-exit drain (a 300 ms settle, then up to
+    //    AGENT_TERMINATE_GRACE, then a 500 ms final wait), so the arithmetic
+    //    worst case is a few seconds; the budget sits far above that because the
+    //    failure worth catching is "never exits".
+    //
+    //    Detected by reaping through the owned `Child` (issue #397). The wrapper
+    //    is this test's own child, so once it exits it stays a zombie until
+    //    reaped, and until issue #1565 `common::process_running(wrapper_pid)`
+    //    fell back off Linux to a `kill(pid, 0)` probe that reports a zombie as
+    //    alive. #396 asserted it that way, read the result on macOS as "the
+    //    wrapper never exits", and dropped the assertion; it was the same misread
+    //    `codex_wrap_004` had already been fixed for. Measured on a macOS runner
+    //    for #397: the wrapper had already exited by the time its child was seen
+    //    gone, while that probe still read it as running 15 s later.
+    let wrapper_exited = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match wrapper.try_wait() {
+                Ok(Some(_)) => break true,
+                Err(_) => break false,
+                Ok(None) if Instant::now() >= deadline => break false,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
+    };
+
+    // Never leak this test's own probes, whatever the outcome above.
+    if common::process_running(child_pid) {
+        // SAFETY: best-effort cleanup of the pid this test's wrapper recorded. A
+        // `process_running` check followed by a signal is check-then-act:
+        // between the two the pid could in principle be reaped and reissued,
+        // so this is a bounded same-UID residual rather than a guarantee it
+        // only ever reaches its own probe. Unix permission checks rule out
+        // touching another user; closing the window entirely would need an
+        // OS-owned container (a cgroup), not a revalidated number.
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+        }
     }
-    let _ = wrapper.wait();
+    // The wrapper is ended through its owned handle, which cannot reach a reissued
+    // pid: until `wait` reaps it, the number stays ours.
+    if !wrapper_exited {
+        terminate(&mut wrapper);
+    }
 
     assert!(
         child_gone,
         "the backstop never took the child down — either the watchdog did not \
          fire, or the reap loop never escalated past the SIGTERM this child \
          ignores. This is the three-day leak the backstop exists to prevent."
+    );
+    assert!(
+        wrapper_exited,
+        "the backstop killed the child but the WRAPPER never exited, so it would \
+         still be left behind at PID 1."
     );
 }
 
@@ -911,10 +1114,27 @@ struct StrandedChildOutcome {
 /// `setsid`'d into its own session at spawn, so from this moment nothing above
 /// it can signal its group. Only a bound the child owns independently can end
 /// it.
+///
+/// **The SIGKILL waits for proof the backstop was armed, not merely for the
+/// probe pids** (issue #963). The wrapper forks its reaper *after* `spawn`
+/// returns, and by then the child is already running, so it can record both
+/// pids before the wrapper has been scheduled to fork. A SIGKILL landing in that
+/// window tests nothing: there is no reaper yet, and none will ever come. On the
+/// pipe path that strands both probes for the whole budget, which is the exact
+/// CI signature (`pipe` false/false at 60.25 s), and holding the wrapper for
+/// 500 ms between `spawn` and the arm reproduced it on every run. The pty path
+/// passes regardless, because closing the inner master hangs the child up
+/// (issue #668) — which is also why the pipe path is the half that isolates the
+/// reaper. So the hook socket here is real: both wrap paths emit the fork-time
+/// `SessionStart` only after `arm_child_group_backstop` has returned, and that
+/// returns only after the forks that create the reaper have run — so a reaper
+/// missing past this point is a real defect, reported as one below.
 fn sigkilled_wrapper_case(interactive: bool) -> StrandedChildOutcome {
     let fixture = common::harness_tempdir().expect("create stranded-child fixture");
     let child_pid_path = fixture.path().join("child.pid");
     let grandchild_pid_path = fixture.path().join("grandchild.pid");
+    let socket = fixture.path().join("hook.sock");
+    let listener = UnixListener::bind(&socket).expect("bind stranded-child event socket");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
     command
@@ -938,11 +1158,15 @@ fn sigkilled_wrapper_case(interactive: bool) -> StrandedChildOutcome {
         ])
         .env("WRAP_CHILD_PID_FILE", &child_pid_path)
         .env("WRAP_GRANDCHILD_PID_FILE", &grandchild_pid_path)
-        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
-        // The behaviour under test: the shortest cap the parser accepts, so the
-        // whole probe finishes in cap + WRAP_TERMINATE_GRACE rather than the
-        // 300s the e2e harness pins.
-        .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "1")
+        .env("DOT_AGENT_DECK_SOCKET", &socket)
+        // The behaviour under test: a short cap, so the whole probe finishes in
+        // cap + WRAP_TERMINATE_GRACE rather than the 300s the e2e harness pins.
+        // Not the parser's 1 s floor: cap + WRAP_TERMINATE_GRACE also bounds how
+        // long the test may take between the arm and its SIGKILL before the
+        // reaper ends these TERM-ignoring probes on its own and the case proves
+        // nothing, so 3 s (4.5 s with the grace) buys a loaded host headroom
+        // there (see the liveness check before the SIGKILL).
+        .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "3")
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID");
 
@@ -986,6 +1210,52 @@ fn sigkilled_wrapper_case(interactive: bool) -> StrandedChildOutcome {
     let child_pid = read_pid(&child_pid_path).expect("child pid recorded");
     let grandchild_pid = read_pid(&grandchild_pid_path).expect("grandchild pid recorded");
 
+    // The backstop is armed once the fork-time `SessionStart` arrives; see the
+    // doc comment above for why the pids alone do not say so.
+    let events = collect_wrapper_events_until(&listener, Duration::from_secs(10), |event| {
+        event.is_wrapper_fork_session_start()
+    });
+    if !events.iter().any(|e| e.is_wrapper_fork_session_start()) {
+        terminate(&mut wrapper);
+        for pid in [child_pid, grandchild_pid] {
+            // SAFETY: best-effort cleanup of pids this test created.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        panic!(
+            "{} wrapper never emitted its fork-time SessionStart, so there is no \
+             evidence its child-group backstop was armed; events: {events:?}",
+            if interactive { "PTY" } else { "pipe" }
+        );
+    }
+
+    // The other precondition: both probes must still be alive when the wrapper
+    // dies. If the test stalled past cap + WRAP_TERMINATE_GRACE after the arm,
+    // the reaper (or the wrapper's own backstop) has already ended them, and
+    // the assertions below would pass without the wrapper ever having been
+    // killed out from under a live child. Checked here rather than inferred, so that case fails loudly
+    // instead of passing vacuously.
+    let probes_alive = [child_pid, grandchild_pid].map(common::process_running);
+    if probes_alive != [true, true] {
+        terminate(&mut wrapper);
+        for pid in [child_pid, grandchild_pid] {
+            // SAFETY: best-effort cleanup of pids this test created.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        panic!(
+            "{} probes were not both alive when the wrapper was about to be \
+             SIGKILLed (child, grandchild alive = {probes_alive:?}), so this run \
+             cannot tell a working backstop from a vacuous pass — the test took \
+             longer than the cap plus its TERM grace between arming and the kill",
+            if interactive { "PTY" } else { "pipe" }
+        );
+    }
+
     // SIGKILL, not SIGTERM: the point is that the wrapper gets NO chance to reap.
     // SAFETY: the wrapper pid came from this test's live `Child`; ending it
     // uncleanly is the behavior under test.
@@ -997,7 +1267,7 @@ fn sigkilled_wrapper_case(interactive: bool) -> StrandedChildOutcome {
     );
     let _ = wrapper.wait();
 
-    // Bounded by the 1 s cap + one 250 ms poll + WRAP_TERMINATE_GRACE (1.5 s).
+    // Bounded by the 3 s cap + one 250 ms poll + WRAP_TERMINATE_GRACE (1.5 s).
     // 30 s is loose headroom for a loaded host, not an expected duration.
     let deadline = Duration::from_secs(30);
     let child_gone = common::wait_until(deadline, || !common::process_running(child_pid));

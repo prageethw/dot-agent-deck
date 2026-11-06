@@ -1,10 +1,10 @@
 /**
- * The deck vocabulary on the webview's side — the field checks the Decks panel
+ * The daemon vocabulary on the webview's side — the field checks the Daemons panel
  * types against (PRD #741 M7) and the selection value the Deck selector carries
  * (M9).
  */
 import { describe, expect, it } from "vitest";
-import { ALL_ENDPOINT_SELECTION, LOCAL_ENDPOINT_SELECTION, type EndpointSettingsDto } from "./bridge";
+import { ALL_ENDPOINT_SELECTION, LOCAL_ENDPOINT_SELECTION, REMOTE_ADDRESS_FIELDS, type EndpointSettingsDto } from "./bridge";
 import {
   ALL_DECKS_SELECTION,
   deckChoices,
@@ -81,6 +81,7 @@ describe("the selection value", () => {
     expect(parseSelection(ID)).toEqual({ kind: "one", id: ID });
   });
 
+  /** Scenario: Reads the fleet token as its own variant and round-trips it. */
   it("reads the fleet token as its own variant and round-trips it", () => {
     /*
       PRD #742 M1. This assertion is the INVERSE of the one that stood here, and
@@ -95,7 +96,7 @@ describe("the selection value", () => {
     // And it is now a choice the selector offers, which is the other half of
     // the inversion: this used to assert that nothing matched it.
     const offered = deckChoices(section(LOCAL_ENDPOINT_SELECTION)).find((choice) => sameSelection(choice.selection, ALL_DECKS_SELECTION));
-    expect(offered?.label).toBe("All Decks");
+    expect(offered?.label).toBe("All daemons");
   });
 
   it("degrades a token this build does not know rather than throwing", () => {
@@ -128,34 +129,45 @@ describe("the selection value", () => {
 });
 
 describe("deckChoices", () => {
+  /** Scenario: Offers the fleet and then the local deck, even with nothing configured. */
   it("offers the fleet and then the local deck, even with nothing configured", () => {
     // Neither needs configuration — `Endpoint::local()` resolves the local deck
-    // from the platform paths, and All Decks resolves to it alone while nothing
+    // from the platform paths, and All daemons resolves to it alone while nothing
     // else is stored — so this list is never empty and the selector is useful
     // before anything is stored.
     expect(deckChoices(undefined)).toEqual([
-      { token: ALL_ENDPOINT_SELECTION, selection: ALL_DECKS_SELECTION, label: "All Decks" },
+      { token: ALL_ENDPOINT_SELECTION, selection: ALL_DECKS_SELECTION, label: "All daemons" },
       { token: LOCAL_ENDPOINT_SELECTION, selection: LOCAL_DECK_SELECTION, label: "This machine" },
     ]);
   });
 
+  /** Scenario: Names each remote deck the way Rust describes it. */
   it("names each remote deck the way Rust describes it", () => {
     const labels = deckChoices(section(LOCAL_ENDPOINT_SELECTION)).map((choice) => choice.label);
     // `user@host`, with `:port` appended only when the port is not 22 — the same
     // derivation `RemoteEndpoint::describe()` performs, because there is no
     // stored display name to use instead. The two unconfigured entries lead, in
     // the order the selector shows them.
-    expect(labels).toEqual(["All Decks", "This machine", "vf@build-box.example.com", "relay.example.com:2222"]);
+    expect(labels).toEqual(["All daemons", "This machine", "vf@build-box.example.com", "relay.example.com:2222"]);
   });
 
-  it("gives a deck with no host yet a label rather than an empty row", () => {
+  /** Scenario: Gives a daemon with no host yet a label rather than an empty row. */
+  it("gives a daemon with no host yet a label rather than an empty row", () => {
     const blank: EndpointSettingsDto = { remote: [{ host: "", id: ID, port: 22 }], selection: ID };
-    // Index 2: All Decks, then the local deck, then the stored rows.
-    expect(deckChoices(blank)[2].label).toBe("New deck");
+    // Index 2: All daemons, then the local deck, then the stored rows.
+    expect(deckChoices(blank)[2].label).toBe("New daemon");
   });
 });
 
 describe("describeEndpoint", () => {
+  /// Scenario: A named remote deck uses its CLI name on screen; a legacy name that cannot be shown falls back to its address.
+  it("uses a deck name when present and its address when the name is unavailable", () => {
+    const named = { host: "build-box", id: ID, port: 2222, user: "deploy", name: "build" };
+    const legacy = { ...named, name: null };
+    expect(describeEndpoint(named)).toBe("build");
+    expect(describeEndpoint(legacy)).toBe("deploy@build-box:2222");
+    expect(REMOTE_ADDRESS_FIELDS).not.toContain("name");
+  });
   it("drops the default port and keeps any other", () => {
     expect(describeEndpoint({ host: "h", id: ID, port: 22 })).toBe("h");
     expect(describeEndpoint({ host: "h", id: ID, port: 2222 })).toBe("h:2222");
@@ -247,7 +259,7 @@ describe("the placeholders the fields display", () => {
     exists to prevent: as shipped, `~/.ssh/id_ed25519` — the literal text the
     Key file input shows — went `aria-invalid` with a hint that contradicted it,
     and because `rowProblems` disables `Test connection`, the one path that
-    discovers a deck's socket went with it.
+    discovers a daemon's socket went with it.
   */
   it("accepts every placeholder that is a specimen value, and pins each in the shared table too", () => {
     for (const field of SPECIMEN_PLACEHOLDER_FIELDS) {

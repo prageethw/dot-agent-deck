@@ -60,9 +60,9 @@ pub enum Action {
     ToggleLayout,
     /// PRD #374 (#361 Item 3), moved deck-global by PRD #393: toggle the
     /// command-entry lock — whether keystrokes reach a focused
-    /// non-orchestrator role pane's PTY. Only ever reaches the handler from
-    /// an Orchestration tab in command mode — `scope_command_entry_lock`
-    /// un-resolves it everywhere else.
+    /// non-orchestrator role pane's PTY. Claimed only on an Orchestration tab
+    /// in command mode (see `scope_orchestration_chord`) and un-resolved
+    /// everywhere else.
     ToggleOrchestrationLock,
     /// PRD #336/#387: cycle the deck-global sidebar/pane-column split
     /// (`ui.split_stage`) through its three stages — Default, Narrow, and
@@ -74,9 +74,6 @@ pub enum Action {
     /// in command mode (see `scope_zoom`) — the default binding is a plain
     /// `z`, so off that one combination the character belongs to the agent.
     ToggleZoom,
-    /// Fork #339: toggle the deck-global agent-type badge on session cards
-    /// (`Ctrl+m` / a bare `m`, command mode only). Off by default.
-    ToggleAgentTypeBadge,
     Jump1,
     Jump2,
     Jump3,
@@ -100,8 +97,34 @@ pub enum Action {
     DenyPermission,
     GenerateConfig,
     OpenScheduledTasks,
+    /// PRD #1401: open the selected card's pull request in the system browser.
+    OpenPullRequest,
+    /// Issue #1635: open the upgrade dialog the footer's update badge names.
+    OpenUpgrade,
     ScrollPaneUp,
     ScrollPaneDown,
+    /// PRD #1258 M3: open the overlay showing the attached deck's host — disk
+    /// per watched role, load per core, memory and the sample's age.
+    HostMetrics,
+    /// PRD #1666 §6.4: open the picker of the selected card's deck messages
+    /// that wait on the user's Retry or Cancel.
+    InboxAttention,
+    /// PRD #1666 part 2 (G-fix7d): open the list of every agent the restart
+    /// notice names.
+    RestartNotice,
+    /// PRD #1666 part 2 (G-fix7d): dismiss the restart notice.
+    DismissRestartNotice,
+    /// Fork #339: toggle the deck-global agent-type badge on session cards.
+    /// Command mode only (see `global_action_for_mode`), off by default.
+    ///
+    /// Default `b` (ruling 87 of the 2026-11 upstream sync): `m` and `Ctrl+m`
+    /// belong to [`Action::HostMetrics`], so the fork's old `Ctrl+m` default is
+    /// gone. It stays in the `[global]` section so an existing
+    /// `toggle_agent_type_badge` entry in a user's file keeps working and so the
+    /// toggle works on any tab that shows cards, not only the dashboard; it is
+    /// last in canonical order so a plain letter a user already bound to
+    /// another action keeps it.
+    ToggleAgentTypeBadge,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -146,14 +169,14 @@ pub const ACTIONS: &[ActionSpec] = &[
         section: Section::Global,
         name: "new_pane",
         default: "Ctrl+n",
-        description: "New pane",
+        description: "New agent",
     },
     ActionSpec {
         action: Action::ClosePane,
         section: Section::Global,
         name: "close_pane",
         default: "Ctrl+w",
-        description: "Close pane",
+        description: "Close agent",
     },
     ActionSpec {
         action: Action::ToggleLayout,
@@ -182,13 +205,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_zoom",
         default: "Ctrl+z",
         description: "Zoom focused pane",
-    },
-    ActionSpec {
-        action: Action::ToggleAgentTypeBadge,
-        section: Section::Global,
-        name: "toggle_agent_type_badge",
-        default: "Ctrl+m",
-        description: "Toggle agent-type badge on cards",
     },
     ActionSpec {
         action: Action::Jump1,
@@ -338,7 +354,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         default: "g",
         description: "Generate config",
     },
-    // PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Default
+    // PRD #127 finding #4: open the "Schedules" manager dialog. Default
     // `s`; the dashboard handler also keeps the legacy uppercase `S` as a
     // non-configurable alias (mirroring the Down/Up aliases for j/k), so both
     // cases open it by default while the action itself stays remappable.
@@ -347,7 +363,26 @@ pub const ACTIONS: &[ActionSpec] = &[
         section: Section::Dashboard,
         name: "open_scheduled_tasks",
         default: "s",
-        description: "Scheduled Tasks manager",
+        description: "Schedules manager",
+    },
+    // PRD #1401: open the selected card's pull request in the system browser.
+    // Default `o`; a card without a pull request opens nothing.
+    ActionSpec {
+        action: Action::OpenPullRequest,
+        section: Section::Dashboard,
+        name: "open_pull_request",
+        default: "o",
+        description: "Open pull request",
+    },
+    // Issue #1635: open the upgrade dialog the footer's update badge names.
+    // Default `u`, free in command mode; the badge and the help overlay read
+    // the active binding, so a rebind shows there too.
+    ActionSpec {
+        action: Action::OpenUpgrade,
+        section: Section::Dashboard,
+        name: "open_upgrade",
+        default: "u",
+        description: "Upgrade",
     },
     // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused
     // agent pane. Command mode is the safe resting state, so reading back
@@ -367,6 +402,56 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "scroll_pane_down",
         default: "PageDown",
         description: "Scroll focused pane forward",
+    },
+    // PRD #1258 M3: the host-of-this-deck overlay. Last in canonical order, so
+    // an existing binding a user already put on `m` keeps it and this action is
+    // the one reported unbound.
+    ActionSpec {
+        action: Action::HostMetrics,
+        section: Section::Dashboard,
+        name: "host_metrics",
+        default: "m",
+        description: "Host of this deck",
+    },
+    // PRD #1666 §6.4: the selected card's deck messages waiting on Retry or
+    // Cancel. Last in canonical order, for the reason `host_metrics` is.
+    ActionSpec {
+        action: Action::InboxAttention,
+        section: Section::Dashboard,
+        name: "inbox_attention",
+        default: "i",
+        description: "Deck messages: Retry or Cancel",
+    },
+    // PRD #1666 part 2 (G-fix7d): the restart notice's two keys, which do
+    // something only while the footer shows the notice. Last in canonical
+    // order, for the reason `host_metrics` is; `a` and `c` are free in
+    // command mode.
+    ActionSpec {
+        action: Action::RestartNotice,
+        section: Section::Dashboard,
+        name: "restart_notice",
+        default: "a",
+        description: "Agents a deck restart stopped",
+    },
+    ActionSpec {
+        action: Action::DismissRestartNotice,
+        section: Section::Dashboard,
+        name: "dismiss_restart_notice",
+        default: "c",
+        description: "Dismiss the restart notice",
+    },
+    // Fork #339, ruling 87: the agent-type badge toggle, on `b`. Last in
+    // canonical order, for the reason `host_metrics` is: an existing binding a
+    // user already put on `b` keeps it and this action is the one reported
+    // unbound. `[global]` (not `[dashboard]`) so it resolves on every tab that
+    // shows cards; `global_action_for_mode` claims it in command mode only, so a
+    // `b` typed at an agent reaches the agent.
+    ActionSpec {
+        action: Action::ToggleAgentTypeBadge,
+        section: Section::Global,
+        name: "toggle_agent_type_badge",
+        default: "b",
+        description: "Toggle agent-type badge on cards",
     },
 ];
 
@@ -407,6 +492,59 @@ impl Action {
             .map(|s| s.action)
     }
 }
+
+/// The actions whose default `Ctrl+<letter>` chord also answers to the plain
+/// letter **in command mode** (PRD #1258): `d` (dashboard / back to the pane),
+/// `n` (new agent, unless the selected card is waiting for a permission answer,
+/// when `n` denies it as before), `w` (close, with its confirmation), `t`
+/// (layout), `e` (orchestration lock, gated exactly as `Ctrl+E`) and `z`
+/// (zoom). In a pane every letter still goes to the agent, and the chords keep
+/// working everywhere they did.
+///
+/// Left out on purpose: the split toggle (`Ctrl+L`), because `l` is already
+/// the next-tab key, and `Ctrl+C`, which is the quit trigger and not an
+/// action.
+///
+/// The rule ([`KeybindingConfig::plain_alias`]): an action has its alias only
+/// while it is still on its default chord — a remapped action gets none — and
+/// only while no other action is bound to that letter. Deny permission's `n`
+/// is the one binding that shares a letter instead of taking it.
+pub const PLAIN_LETTER_ALIASES: [Action; 6] = [
+    Action::Dashboard,
+    Action::NewPane,
+    Action::ClosePane,
+    Action::ToggleLayout,
+    Action::ToggleOrchestrationLock,
+    Action::ToggleZoom,
+];
+
+/// The mirror of [`PLAIN_LETTER_ALIASES`] (PR #1672): the actions whose default
+/// plain letter also answers to `Ctrl+<letter>` **in command mode** — `m`
+/// (host metrics), `s` (Schedules), `g` (generate config), `u` (upgrade) and
+/// `r` (rename). Command mode only, never global: in a pane `Ctrl+R`, `Ctrl+U`,
+/// `Ctrl+S`, `Ctrl+G` and `Ctrl+M` still reach the program byte for byte
+/// (reverse search, kill line, an agent's editor).
+///
+/// Left out on purpose: navigation (`j k h l`), the digits, `?`, `/`, `y`,
+/// `n`, `Enter` and `Esc`, which have no command a `Ctrl` form would name.
+/// `o` (open the pull request, PRD #1401) is a plain letter with no `Ctrl`
+/// form either.
+///
+/// `Ctrl+M` is the same byte as `Enter` in a terminal that does not
+/// disambiguate escape codes, so there it arrives as `Enter` and focuses the
+/// pane, as `Enter` always has; only a terminal that reports it as `Ctrl+M`
+/// (kitty's keyboard protocol, which the TUI asks for) reaches this alias.
+///
+/// Same rule as the plain letters ([`KeybindingConfig::command_mode_alias`]):
+/// only while the action is on its default letter, and only while no other
+/// action is bound to the `Ctrl` chord.
+pub const CTRL_LETTER_ALIASES: [Action; 5] = [
+    Action::HostMetrics,
+    Action::OpenScheduledTasks,
+    Action::GenerateConfig,
+    Action::OpenUpgrade,
+    Action::Rename,
+];
 
 /// A single parsed key binding.
 ///
@@ -645,6 +783,78 @@ impl KeybindingConfig {
     /// `true` iff `key` triggers `action` under this config.
     pub fn matches(&self, action: Action, key: &KeyEvent) -> bool {
         matches_binding(key, &self.binding(action))
+    }
+
+    /// The other form of `action`'s default key that it also answers to in
+    /// command mode, if it has one under this config: the plain letter of a
+    /// default `Ctrl+<letter>` chord ([`PLAIN_LETTER_ALIASES`]), or the
+    /// `Ctrl+<letter>` chord of a default plain letter
+    /// ([`CTRL_LETTER_ALIASES`]). One rule for both directions: the action is
+    /// still on its default key — a remapped action gets none, since the user
+    /// chose its key — and no other action is bound to the alias.
+    pub fn command_mode_alias(&self, action: Action) -> Option<Binding> {
+        let (from, to) = if PLAIN_LETTER_ALIASES.contains(&action) {
+            (KeyModifiers::CONTROL, KeyModifiers::NONE)
+        } else if CTRL_LETTER_ALIASES.contains(&action) {
+            (KeyModifiers::NONE, KeyModifiers::CONTROL)
+        } else {
+            return None;
+        };
+        let default = parse_binding(action.default_notation()).ok()?;
+        if self.binding(action) != default {
+            return None;
+        }
+        let (KeyCode::Char(letter), mods) = default.chord()? else {
+            return None;
+        };
+        if mods != from {
+            return None;
+        }
+        let alias = normalize_chord(KeyCode::Char(letter), to);
+        let taken = ACTIONS.iter().any(|spec| {
+            spec.action != action
+                // `n` denies a pending permission and makes a new agent
+                // otherwise, so deny's own binding of `n` shares the letter
+                // rather than taking it.
+                && !(action == Action::NewPane && spec.action == Action::DenyPermission)
+                && self
+                    .binding(spec.action)
+                    .chord()
+                    .is_some_and(|(code, mods)| normalize_chord(code, mods) == alias)
+        });
+        (!taken).then(|| Binding::bound(alias.0, alias.1))
+    }
+
+    /// The plain letter `action` also answers to in command mode, if it has
+    /// one under this config. See [`PLAIN_LETTER_ALIASES`] for the rule.
+    pub fn plain_alias(&self, action: Action) -> Option<char> {
+        match self.command_mode_alias(action)?.chord()? {
+            (KeyCode::Char(letter), KeyModifiers::NONE) => Some(letter),
+            _ => None,
+        }
+    }
+
+    /// The letter whose `Ctrl` chord `action` also answers to in command mode,
+    /// if it has one under this config. See [`CTRL_LETTER_ALIASES`].
+    pub fn ctrl_alias(&self, action: Action) -> Option<char> {
+        match self.command_mode_alias(action)?.chord()? {
+            (KeyCode::Char(letter), KeyModifiers::CONTROL) => Some(letter),
+            _ => None,
+        }
+    }
+
+    /// `true` iff `key` is `action`'s command-mode alias
+    /// ([`Self::command_mode_alias`]), in either direction. Only command mode
+    /// reads it.
+    pub fn matches_command_mode_alias(&self, action: Action, key: &KeyEvent) -> bool {
+        self.command_mode_alias(action)
+            .is_some_and(|alias| matches_binding(key, &alias))
+    }
+
+    /// `true` iff `key` is `action`'s plain-letter alias ([`Self::plain_alias`]).
+    /// Only command mode reads it; a key with any modifier never matches.
+    pub fn matches_plain_alias(&self, action: Action, key: &KeyEvent) -> bool {
+        self.plain_alias(action).is_some() && self.matches_command_mode_alias(action, key)
     }
 
     /// Find the (first, in canonical order) action triggered by `key`, if any.
@@ -900,6 +1110,19 @@ fn keybindings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: Read the labels exposed by the configured create, close, and
+    /// schedule shortcuts. Each description must use the same agent and
+    /// schedule terms that the TUI presents for those actions.
+    #[test]
+    fn action_descriptions_use_agent_and_schedule_words() {
+        assert_eq!(Action::NewPane.description(), "New agent");
+        assert_eq!(Action::ClosePane.description(), "Close agent");
+        assert_eq!(
+            Action::OpenScheduledTasks.description(),
+            "Schedules manager"
+        );
+    }
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)

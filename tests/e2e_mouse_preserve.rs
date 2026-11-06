@@ -42,16 +42,13 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
 /// away, the detach would not return us to the global bar. Should be GREEN
 /// (asserts existing behavior). DEFERRED, with reasons, in the body:
 /// explicit double-click-to-focus from the dashboard (covered by
-/// mouse/dashboard/001), mode-tab side/agent click-to-focus, text-selection
+/// mouse/dashboard/001), text-selection
 /// drag/multi-click, Ctrl+click hyperlink, and child-app mouse forwarding.
 #[spec("mouse/preserve/001")]
 #[test]
 fn preserve_001_existing_pane_mouse_behavior_intact() {
     // DEFERRED sub-behaviors (not asserted here) and why:
     //  - Explicit double-click-to-focus a card: covered by mouse/dashboard/001.
-    //  - Mode-tab side/agent pane click-to-focus: focus there is visual-only
-    //    (border highlight, no PaneInput status), not robustly readable via
-    //    vt100, and needs heavy mode-tab setup; same `pane.focus_pane` path.
     //  - Text selection (drag / double-click word / triple-click): the
     //    harness sends discrete clicks; driving a Drag sequence and reading
     //    the selection highlight from the grid is not robust. The
@@ -61,8 +58,8 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
     //  - Child-app mouse forwarding (mouse_mode_enabled): needs a child TUI
     //    that enables mouse mode; `sleep` does not.
     // PRD #127: 200 cols so the Normal-mode bar (reached after detach) renders
-    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
-    // always-shown Scheduled Tasks button is included.
+    // the FULL `[New Agent n/Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Schedules button is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .with_continue_session("realpane", "sleep 600")
@@ -81,7 +78,7 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
     deck.click(60, 5); // non-button click inside the focused-pane preview
     deck.scroll(60, 5, true); // scroll inside the pane region (not Down/Up → never hits buttons)
     deck.click(dcol, drow); // detach
-    deck.wait_for_string("[New Pane Ctrl+N]"); // cleanly back to Normal — events didn't navigate away
+    deck.wait_for_string("[New Agent n/Ctrl+N]"); // cleanly back to Normal — events didn't navigate away
     assert!(
         !deck.snapshot_grid().contains("Select Directory"),
         "a non-button click/scroll in the pane region must not open the New-Pane picker:\n{}",
@@ -93,7 +90,7 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
 /// fall through. With two dashboard cards (`alpha`, `bravo`): (1) clicking the
 /// `bravo` card (which misses every button) falls through to the existing
 /// card-selection path, moving the `▸` selection marker to `bravo`. (2)
-/// Clicking the global `[New Pane Ctrl+N]` bar button fires its action (the
+/// Clicking the global `[New Agent n/Ctrl+N]` bar button fires its action (the
 /// directory picker opens) AND short-circuits — after dismissing the picker
 /// the card selection is still on `bravo`, proving the button click did not
 /// also fall through to the card/pane layer underneath. Should be GREEN
@@ -101,13 +98,13 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
 #[spec("mouse/preserve/002")]
 #[test]
 fn preserve_002_button_short_circuits_miss_falls_through() {
-    // PRD #127: 200 cols so the bar renders the FULL `[New Pane Ctrl+N]` label;
-    // at 120 it collapses to chips once the always-shown Scheduled Tasks button
+    // PRD #127: 200 cols so the bar renders the FULL `[New Agent n/Ctrl+N]` label;
+    // at 120 it collapses to chips once the always-shown Schedules button
     // is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");
     send_session_start(&deck, "bravo", "pane-bravo", "/tmp");
@@ -169,9 +166,9 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
     };
     deck.wait_until_grid("bravo card selected", bravo_selected);
 
-    // (2) Short-circuit: clicking the [New Pane Ctrl+N] bar button fires its
+    // (2) Short-circuit: clicking the [New Agent n/Ctrl+N] bar button fires its
     // action (picker opens) and does NOT also act on the cards underneath.
-    let (bcol, brow) = deck.wait_for_in_grid("[New Pane Ctrl+N]");
+    let (bcol, brow) = deck.wait_for_in_grid("[New Agent n/Ctrl+N]");
     deck.click(bcol, brow);
     deck.wait_for_string("Select Directory");
 
@@ -194,8 +191,8 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
 #[test]
 fn preserve_modal_click_miss_is_consumed() {
     // PRD #127: 200 cols so the Normal-mode bar (reached after detach) renders
-    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
-    // always-shown Scheduled Tasks button is included.
+    // the FULL `[New Agent n/Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Schedules button is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .with_continue_session("realpane", "sleep 600")
@@ -205,7 +202,7 @@ fn preserve_modal_click_miss_is_consumed() {
     // unfocused) pane region behind the centered popup.
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
 
     // Open the quit-confirm modal over the dashboard.
     deck.send_bytes(b"\x03"); // Ctrl+C → quit-confirm
@@ -239,21 +236,41 @@ fn preserve_modal_click_miss_is_consumed() {
 /// so clicking it must be a no-op, exactly like pressing `g` with no cards.
 /// The config-gen prompt must NOT open, and the "no active agent session"
 /// status that the RequestConfigGen action would otherwise set must NOT appear
-/// — i.e. the disabled button records no clickable rect. (Build-checked here;
-/// not run in the fast tier.)
+/// — i.e. the disabled button records no clickable rect. Opening and closing
+/// the help overlay afterwards orders the check after the click. (Build-checked
+/// here; not run in the fast tier.)
 #[test]
 fn preserve_disabled_button_is_inert() {
     // PRD #127: 200 cols so the dashboard bar renders the FULL (dimmed)
     // `[Generate g]` label; at 120 the bar collapses to a `[g]` chip once the
-    // always-shown Scheduled Tasks button is included, and the labeled lookup
+    // always-shown Schedules button is included, and the labeled lookup
     // would miss.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The dashboard bar renders [Generate g] dimmed (no cards → disabled).
     let (col, row) = deck.wait_for_in_grid("Generate");
+
+    // What a dispatched click would put on screen: the status RequestConfigGen
+    // sets on an empty dashboard, matched verbatim, because a bare "No active
+    // agent" is also a prefix of the empty dashboard's own "No active agents.
+    // Press …" line. Every grid read from the click onward goes through this,
+    // not only the last one. The status lives 15s (`STATUS_MESSAGE_TTL`), so
+    // a check made only at the end could miss it on a machine that stalled
+    // that long; checked on every poll, the first frame that shows it fails
+    // the test.
+    let assert_no_side_effect = |grid: &str| {
+        assert!(
+            !grid.contains("No orchestration config found"),
+            "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
+        );
+        assert!(
+            !grid.contains("No active agent to send prompt to"),
+            "clicking the disabled Generate button must be a true no-op (no RequestConfigGen side effect):\n{grid}"
+        );
+    };
     deck.click(col, row);
 
     // Anchor: open the help overlay (?). It renders only from Normal mode, so
@@ -261,15 +278,21 @@ fn preserve_disabled_button_is_inert() {
     // order and (b) the disabled click did NOT open the config-gen prompt
     // (from which `?` would do nothing and this wait would time out).
     deck.send_bytes(b"?");
-    deck.wait_for_string("works from any pane");
+    deck.wait_until_grid("help overlay open", |g| {
+        assert_no_side_effect(g);
+        g.contains("chords work from any pane")
+    });
 
-    let grid = deck.snapshot_grid();
-    assert!(
-        !grid.contains("No workspace modes config found"),
-        "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
-    );
-    assert!(
-        !grid.contains("No active agent session"),
-        "clicking the disabled Generate button must be a true no-op (no RequestConfigGen side effect):\n{grid}"
-    );
+    // Close the overlay and wait for the dashboard's own empty-state line to
+    // be painted back over it. The deck writes one frame at a time, top row
+    // first, so seeing ANY cell of this later frame proves the whole help
+    // frame — bottom status row included — has already landed. A check made
+    // on the help frame alone is the race this test used to lose under load:
+    // a half-drawn overlay could leave rows unwritten, so nothing read from it
+    // was a complete picture of the state after the click.
+    deck.send_bytes(b"?");
+    deck.wait_until_grid("help closed and the empty dashboard repainted", |g| {
+        assert_no_side_effect(g);
+        !g.contains("chords work from any pane") && g.contains("No active agents. Press")
+    });
 }

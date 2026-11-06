@@ -33,6 +33,19 @@
 //! child filter from `module_path!()`, so they followed the move rather than
 //! naming a binary.
 //!
+//! **Environment writes.** A handful of tests below set or remove a process
+//! environment variable (`HOME`, an API key, a harness knob) and restore it
+//! before returning. `set_var` / `remove_var` race any thread concurrently
+//! reading the environment, so this states what can actually be running when
+//! they do, instead of the "single-threaded" their comments used to claim
+//! (issue #678): the test's own thread; libtest's runner thread, waiting for
+//! that test to finish; and, once anything has allocated a harness temp dir,
+//! the `load-context` heartbeat (`load_context::arm`), which sleeps and reads
+//! `/proc`, never the environment. None of those tests starts a runtime or a
+//! thread of its own. That is the argument under nextest, which every gate
+//! here uses; under plain `cargo test`, sibling tests share the process and
+//! these writes race them (issue #245).
+//!
 //! **Why so much of `mod.rs` is `pub(crate)`.** This module is a *sibling* of
 //! `common`, not a child of it, so `use super::*` no longer reaches the
 //! harness's private helpers. The helpers these tests cover therefore carry
@@ -50,6 +63,585 @@ use std::time::Duration;
 
 use crate::common::*;
 
+/// Scenario: A failed run leaves a cast, grid, fixture, logs and provenance.
+/// Starting and completing a passing rerun clears the current files but keeps
+/// the failed run's original artifacts together in a separate archive.
+#[test]
+fn recording_retention_preserves_failed_evidence_across_passing_reruns() {
+    let root = harness_tempdir().unwrap();
+    let dir = root.path();
+    let artifacts = [
+        "full-stream.cast",
+        "final-grid.txt",
+        "final-grid.svg",
+        "fixture.toml",
+        "daemon.log",
+        "deck.log",
+    ];
+    for name in artifacts {
+        std::fs::write(dir.join(name), format!("failed {name}")).unwrap();
+    }
+    let failed = serde_json::json!({"outcome":"failed", "recorded_at_unix": 1}).to_string();
+    std::fs::write(dir.join("provenance.json"), &failed).unwrap();
+    std::fs::write(dir.join("test.md"), "paired doc").unwrap();
+    discard_recording_dir(dir);
+    for name in artifacts {
+        assert!(!dir.join(name).exists(), "latest files must be invalidated");
+        std::fs::write(dir.join(name), format!("passed {name}")).unwrap();
+    }
+    std::fs::write(dir.join("provenance.json"), r#"{"outcome":"passed"}"#).unwrap();
+    discard_recording_dir(dir);
+    let archives: Vec<_> = std::fs::read_dir(dir.join("runs"))
+        .expect("a failed recording must survive a passing rerun under runs/")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let archive = archives
+        .iter()
+        .find(|path| std::fs::read_to_string(path.join("provenance.json")).unwrap() == failed)
+        .expect("the failed run's provenance must survive the passing rerun");
+    for name in artifacts {
+        assert_eq!(
+            std::fs::read_to_string(archive.join(name)).unwrap(),
+            format!("failed {name}")
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("test.md")).unwrap(),
+        "paired doc"
+    );
+}
+
+/// Scenario: Retain recent failures while trimming a mix of successful and
+/// expired failed recordings to the count cap, oldest first. Once their
+/// protection expires, those failures become eligible for the same pruning.
+#[test]
+fn recording_retention_prunes_oldest_runs_and_protects_recent_failures() {
+    let root = harness_tempdir().unwrap();
+    let runs = root.path().join("runs");
+    let plant = |time: u64, outcome: &str| {
+        let dir = runs.join(format!("run-{time:020}-fixture"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("provenance.json"),
+            serde_json::json!({
+                "outcome": outcome, "recorded_at_unix": time
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    };
+    let oldest_pass = plant(1, "passed");
+    let expired_failure = plant(2, "failed");
+    let newest_pass = plant(999, "passed");
+    let recent_failures = [
+        plant(990, "failed"),
+        plant(991, "failed"),
+        plant(992, "failed"),
+    ];
+    recording_evidence::prune_recordings(root.path(), 1000, 2, 100).unwrap();
+    assert!(!oldest_pass.exists());
+    assert!(!expired_failure.exists());
+    assert!(
+        !newest_pass.exists(),
+        "protected failures may exceed the soft cap"
+    );
+    assert!(recent_failures.iter().all(|path| path.exists()));
+    recording_evidence::prune_recordings(root.path(), 1090, 2, 100).unwrap();
+    assert!(
+        !recent_failures[0].exists(),
+        "failure expires exactly at the protection boundary"
+    );
+    assert!(recent_failures[1..].iter().all(|path| path.exists()));
+    recording_evidence::prune_recordings(root.path(), 2000, 1, 100).unwrap();
+    assert!(
+        !recent_failures[1].exists(),
+        "eligible runs are pruned oldest first"
+    );
+    assert!(recent_failures[2].exists());
+}
+
+/// Scenario: An interrupted recording has no usable provenance, and another
+/// failed recording has a timestamp ahead of the clock. Both stay protected
+/// rather than being mistaken for disposable successful runs.
+#[test]
+fn recording_retention_protects_incomplete_and_future_dated_failures() {
+    let root = harness_tempdir().unwrap();
+    for name in [
+        "run-00000000000000001000-incomplete",
+        "run-00000000000000002000-future",
+    ] {
+        std::fs::create_dir_all(root.path().join("runs").join(name)).unwrap();
+    }
+    recording_evidence::prune_recordings(root.path(), 1000, 0, 100).unwrap();
+    assert_eq!(
+        std::fs::read_dir(root.path().join("runs")).unwrap().count(),
+        2
+    );
+}
+
+/// Scenario: An archive directory or session transcript points outside its
+/// sandbox through a symlink. Pruning refuses that archive, and metadata
+/// collection ignores linked transcripts and linked ancestors without reading outside metadata.
+#[cfg(unix)]
+#[test]
+fn recording_evidence_does_not_follow_archive_or_transcript_symlinks() {
+    let root = harness_tempdir().unwrap();
+    let outside = harness_tempdir().unwrap();
+    let preserved = outside.path().join("run-00000000000000000001-old");
+    std::fs::create_dir(&preserved).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("runs")).unwrap();
+    assert!(recording_evidence::prune_recordings(root.path(), 1000, 0, 0).is_err());
+    assert!(preserved.exists());
+    let projects = root.path().join(".claude/projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let transcript = outside.path().join("host.jsonl");
+    std::fs::write(&transcript, "{\"permissionMode\":\"auto\"}\n").unwrap();
+    std::os::unix::fs::symlink(transcript, projects.join("linked.jsonl")).unwrap();
+    assert!(recording_evidence::claude_session_provenance(root.path()).is_empty());
+    std::fs::remove_dir_all(root.path().join(".claude")).unwrap();
+    let outside_projects = outside.path().join("projects");
+    std::fs::create_dir_all(&outside_projects).unwrap();
+    std::fs::write(
+        outside_projects.join("host.jsonl"),
+        "{\"sessionId\":\"outside-host-session\",\"permissionMode\":\"auto\"}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join(".claude")).unwrap();
+    assert!(
+        recording_evidence::claude_session_provenance(root.path()).is_empty(),
+        "a linked .claude ancestor must not import outside session metadata"
+    );
+    std::fs::remove_file(root.path().join(".claude")).unwrap();
+    std::fs::create_dir(root.path().join(".claude")).unwrap();
+    std::os::unix::fs::symlink(&outside_projects, &projects).unwrap();
+    assert!(recording_evidence::claude_session_provenance(root.path()).is_empty());
+}
+
+/// Scenario: A publisher holds the per-test recording lock while another launch tries to discard its files.
+/// The discard must wait until publication finishes, then preserve the complete evidence in one archive.
+#[test]
+fn recording_retention_waits_for_an_active_publisher() {
+    let root = harness_tempdir().unwrap();
+    let lock = std::fs::File::create(root.path().join(".recording.lock")).unwrap();
+    lock.lock().unwrap();
+    std::fs::write(root.path().join("final-grid.txt"), "failed grid").unwrap();
+    let dir = root.path().to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sender.send("started").unwrap();
+        discard_recording_dir(&dir);
+        sender.send("discarded").unwrap();
+    });
+    assert_eq!(receiver.recv().unwrap(), "started");
+    let completed_while_locked = receiver.recv_timeout(Duration::from_millis(100)).is_ok();
+    let grid_survived = root.path().join("final-grid.txt").exists();
+    lock.unlock().unwrap();
+    worker.join().unwrap();
+    assert!(
+        !completed_while_locked && grid_survived,
+        "discard cleared a recording while its publisher still held the per-test lock"
+    );
+    let runs: Vec<_> = std::fs::read_dir(root.path().join("runs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(runs[0].join("final-grid.txt")).unwrap(),
+        "failed grid"
+    );
+}
+
+/// Scenario: Retention encounters an abandoned old pending archive, a recent pending archive and an old one with a live writer lock.
+/// It reaps only the abandoned copy, then reaps the old live copy once its writer releases the lock.
+#[cfg(unix)]
+#[test]
+fn recording_retention_reaps_stale_pending_copies_without_touching_live_writers() {
+    let root = harness_tempdir().unwrap();
+    let runs = root.path().join("runs");
+    let old = runs.join(".pending-abandoned");
+    let live = runs.join(".pending-live");
+    let recent = runs.join(".pending-recent");
+    for path in [&old, &live, &recent] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let live_lock = std::fs::File::create(live.join(".writer.lock")).unwrap();
+    live_lock.lock().unwrap();
+    let epoch = std::time::SystemTime::UNIX_EPOCH;
+    for path in [&old, &live] {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(epoch))
+            .unwrap();
+    }
+    recording_evidence::prune_recordings(root.path(), 100_000, 0, 100).unwrap();
+    assert!(!old.exists(), "stale pending evidence was never reclaimed");
+    assert!(
+        live.exists(),
+        "a pending copy with a live writer must survive"
+    );
+    assert!(recent.exists());
+    live_lock.unlock().unwrap();
+    recording_evidence::prune_recordings(root.path(), 100_000, 0, 100).unwrap();
+    assert!(!live.exists());
+    assert!(recent.exists());
+}
+
+/// Scenario: Concurrent launch attempts archive the same completed failure while concurrent pruners trim old successful runs.
+/// Every operation succeeds and exactly one complete copy of the failure survives.
+#[test]
+fn recording_retention_concurrent_discards_and_pruners_preserve_one_complete_failure() {
+    let root = harness_tempdir().unwrap();
+    std::fs::write(root.path().join("final-grid.txt"), vec![b'x'; 1024 * 1024]).unwrap();
+    std::fs::write(
+        root.path().join("provenance.json"),
+        r#"{"outcome":"failed"}"#,
+    )
+    .unwrap();
+    for n in 0..20 {
+        let run = root.path().join("runs").join(format!("run-{n:020}-passed"));
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("provenance.json"), r#"{"outcome":"passed"}"#).unwrap();
+    }
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let workers: Vec<_> = (0..16)
+        .map(|n| {
+            let dir = root.path().to_owned();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                if n % 2 == 0 {
+                    discard_recording_dir(&dir);
+                } else {
+                    recording_evidence::prune_recordings(&dir, 1000, 1, u64::MAX).unwrap();
+                }
+            })
+        })
+        .collect();
+    let successes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().is_ok())
+        .collect();
+    assert!(
+        successes.iter().all(|ok| *ok),
+        "concurrent archive/clear/prune aborted a launch"
+    );
+    let failures: Vec<_> = std::fs::read_dir(root.path().join("runs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            std::fs::read_to_string(p.join("provenance.json")).is_ok_and(|s| s.contains("failed"))
+        })
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "one completed failure must be archived exactly once"
+    );
+    assert_eq!(
+        std::fs::metadata(failures[0].join("final-grid.txt"))
+            .unwrap()
+            .len(),
+        1024 * 1024
+    );
+}
+
+/// Scenario: An old archive cannot be removed, but the current failure can still be archived.
+/// Two launch attempts clear the current files after preserving them once, despite the retention error.
+#[cfg(unix)]
+#[test]
+fn recording_retention_prune_errors_do_not_republish_the_same_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = harness_tempdir().unwrap();
+    let runs = root.path().join("runs");
+    let mut old_dirs = Vec::new();
+    for n in 0..11 {
+        let run = runs.join(format!("run-{n:020}-passed"));
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("provenance.json"), r#"{"outcome":"passed"}"#).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o500)).unwrap();
+        old_dirs.push(run);
+    }
+    std::fs::write(root.path().join("final-grid.txt"), "original failure").unwrap();
+    std::fs::write(
+        root.path().join("provenance.json"),
+        r#"{"outcome":"failed"}"#,
+    )
+    .unwrap();
+    let attempts: Vec<_> = (0..2)
+        .map(|_| std::panic::catch_unwind(|| discard_recording_dir(root.path())).is_ok())
+        .collect();
+    for run in old_dirs {
+        if run.exists() {
+            std::fs::set_permissions(run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let failures = std::fs::read_dir(&runs)
+        .unwrap()
+        .filter(|entry| {
+            std::fs::read_to_string(entry.as_ref().unwrap().path().join("provenance.json"))
+                .is_ok_and(|s| s.contains("failed"))
+        })
+        .count();
+    assert!(
+        attempts.iter().all(|ok| *ok),
+        "retention cleanup errors must not abort an already archived launch"
+    );
+    assert_eq!(
+        failures, 1,
+        "retrying retention must not republish the same failure"
+    );
+    assert!(!root.path().join("provenance.json").exists());
+}
+
+/// Scenario: Claude's settings request auto mode, but the session transcript
+/// reports default and then acceptEdits, an actual model and a version, with or without a final newline.
+/// Provenance keeps the latest complete observation, marks a partial tail, and ignores settings.
+#[test]
+fn recording_provenance_carries_observed_claude_mode_version_and_model() {
+    let home = harness_tempdir().unwrap();
+    let project = home.path().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        r#"{"permissions":{"defaultMode":"auto"}}"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("session.jsonl"), concat!(
+        "{\"type\":\"user\",\"sessionId\":\"fixture-session\",\"permissionMode\":\"default\",\"version\":\"2.1.309\"}\n",
+        "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",\"content\":\"private transcript text\"}}\n",
+        "{\"type\":\"user\",\"permissionMode\":\"acceptEdits\"}\n",
+        "{partial final record"
+    )).unwrap();
+    let sessions = recording_evidence::claude_session_provenance(home.path());
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session["session_id"], "fixture-session");
+    assert_eq!(session["permissionMode"], "acceptEdits");
+    assert_eq!(
+        session["permission_modes"],
+        serde_json::json!(["default", "acceptEdits"])
+    );
+    assert_eq!(session["version"], "2.1.309");
+    assert_eq!(session["model"], "claude-haiku-4-5-20251001");
+    assert_eq!(
+        session["models"],
+        serde_json::json!(["claude-haiku-4-5-20251001"])
+    );
+    assert!(
+        !serde_json::to_string(&sessions)
+            .unwrap()
+            .contains("private transcript text")
+    );
+    for prefix in ["{\"permissionMode\":\"default\"}\n", ""] {
+        for ending in ["\n", ""] {
+            std::fs::write(
+                project.join("session.jsonl"),
+                format!(
+                    "{prefix}{{\"sessionId\":\"final-session\",\"permissionMode\":\"auto\",\"version\":\"final-version\",\"message\":{{\"model\":\"final-model\"}}}}{ending}"
+                ),
+            )
+            .unwrap();
+            let observed = recording_evidence::claude_session_provenance(home.path());
+            let final_session = &observed[0];
+            assert_eq!(
+                final_session["permissionMode"], "auto",
+                "latest complete record must survive EOF: prefix={prefix:?}, ending={ending:?}"
+            );
+            assert_eq!(final_session["session_id"], "final-session");
+            assert_eq!(final_session["version"], "final-version");
+            assert_eq!(final_session["model"], "final-model");
+            let modes = if prefix.is_empty() {
+                serde_json::json!(["auto"])
+            } else {
+                serde_json::json!(["default", "auto"])
+            };
+            assert_eq!(final_session["permission_modes"], modes);
+            assert_eq!(final_session["models"], serde_json::json!(["final-model"]));
+            assert_eq!(final_session["truncated"], false);
+        }
+    }
+    assert_eq!(
+        session["truncated"], true,
+        "a partial final record must mark the preserved observations incomplete"
+    );
+    std::fs::write(project.join("session.jsonl"), "{\"type\":\"system\"}\n").unwrap();
+    let unknown = recording_evidence::claude_session_provenance(home.path());
+    assert!(
+        unknown[0]["permissionMode"].is_null(),
+        "missing mode is unknown, not the configured auto default"
+    );
+    assert!(unknown[0]["version"].is_null());
+    assert_eq!(unknown[0]["models"], serde_json::json!([]));
+}
+
+/// Scenario: A sandbox has more transcripts than the collection cap, including one newest active session.
+/// Provenance keeps the newest session first and marks the omitted sessions explicitly.
+#[test]
+fn recording_provenance_selects_newest_sessions_and_reports_the_file_cap() {
+    let home = harness_tempdir().unwrap();
+    let project = home.path().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    for n in 0..257 {
+        let path = project.join(format!("session-{n:03}.jsonl"));
+        std::fs::write(&path, format!("{{\"sessionId\":\"session-{n}\"}}\n")).unwrap();
+        let modified = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(n);
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+    let sessions = recording_evidence::claude_session_provenance(home.path());
+    assert_eq!(sessions.len(), 256);
+    assert_eq!(
+        sessions[0]["session_id"], "session-256",
+        "the current session must survive the file cap"
+    );
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["collection_truncated"] == true)
+    );
+}
+
+/// Scenario: Transcript collection encounters an oversized JSONL record followed by a normal mode observation, then an I/O failure.
+/// It skips the oversized record, preserves the later observation and explicitly marks the incomplete read.
+#[test]
+fn recording_provenance_bounds_records_and_marks_partial_read_errors() {
+    use std::io::Read;
+    let mut bytes = format!(
+        "{{\"permissionMode\":\"auto\",\"content\":\"{}\"}}\n",
+        "x".repeat(128 * 1024)
+    )
+    .into_bytes();
+    bytes.extend_from_slice(b"{\"permissionMode\":\"default\"}\n");
+    struct FailsAtEnd(std::io::Cursor<Vec<u8>>);
+    impl Read for FailsAtEnd {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(output)?;
+            if n == 0 {
+                Err(std::io::Error::other("injected transcript read failure"))
+            } else {
+                Ok(n)
+            }
+        }
+    }
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_records(
+        std::io::BufReader::new(FailsAtEnd(std::io::Cursor::new(bytes))),
+        false,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!(["default"]));
+    assert_eq!(result["permissionMode"], "default");
+    assert_eq!(result["truncated"], true);
+    assert!(
+        result["read_error"].is_string(),
+        "read errors must not look like a complete transcript: {result}"
+    );
+}
+
+/// Scenario: A transcript grows after the collector snapshots its length.
+/// Collection stops at the original end offset and cannot observe a later mode appended to the file, or mistake a skipped first tail fragment for a complete record.
+#[test]
+fn recording_provenance_tail_stops_at_the_snapshot_even_if_the_file_grows() {
+    let snapshot = b"{\"permissionMode\":\"default\"}\n";
+    let mut growing = snapshot.to_vec();
+    growing.extend_from_slice(b"{\"permissionMode\":\"auto\"}\n");
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_tail(
+        std::io::Cursor::new(growing),
+        snapshot.len() as u64,
+        1024,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!(["default"]));
+    assert_eq!(result["permissionMode"], "default");
+    let snapshot = b"ignored-prefix{\"permissionMode\":\"auto\"}";
+    let mut result = serde_json::json!({"permission_modes": [], "models": []});
+    recording_evidence::collect_session_tail(
+        std::io::Cursor::new(snapshot),
+        snapshot.len() as u64,
+        b"{\"permissionMode\":\"auto\"}".len() as u64,
+        &mut result,
+    );
+    assert_eq!(result["permission_modes"], serde_json::json!([]));
+    assert!(result["permissionMode"].is_null());
+    assert_eq!(result["truncated"], true);
+}
+
+/// Scenario: A custom log points outside the sandbox, escapes with parent components or uses a symlink to an outside file.
+/// Collection rejects those sources while retaining an ordinary log from the sandbox.
+#[cfg(unix)]
+#[test]
+fn recording_evidence_confines_custom_logs_to_the_sandbox() {
+    let root = harness_tempdir().unwrap();
+    let normal = root.path().join("deck.log");
+    std::fs::write(&normal, "sandbox log").unwrap();
+    assert_eq!(
+        recording_evidence::sandbox_log(&normal).unwrap().unwrap(),
+        b"sandbox log"
+    );
+    let host = Path::new("/etc/hosts");
+    assert!(recording_evidence::sandbox_log(host).unwrap().is_none());
+    let link = root.path().join("linked.log");
+    std::os::unix::fs::symlink(host, &link).unwrap();
+    assert!(recording_evidence::sandbox_log(&link).unwrap().is_none());
+    let escape = root.path().join("../../../../etc/hosts");
+    assert!(recording_evidence::sandbox_log(&escape).unwrap().is_none());
+}
+
+/// Scenario: Concurrent publishers and discarders share a test's recording directory.
+/// Every archived failure keeps its own grid and provenance together, including the final flat recording.
+#[test]
+fn recording_retention_concurrent_publications_never_mix_or_lose_failures() {
+    let root = harness_tempdir().unwrap();
+    let workers: Vec<_> = (0..16)
+        .map(|n| {
+            let dir = root.path().to_owned();
+            std::thread::spawn(move || {
+                if n % 2 == 0 {
+                    discard_recording_dir(&dir);
+                }
+                recording_evidence::publish_recording(&dir, || {
+                    std::fs::write(dir.join("final-grid.txt"), n.to_string())?;
+                    std::thread::yield_now();
+                    std::fs::write(
+                        dir.join("provenance.json"),
+                        serde_json::json!({"outcome":"failed", "session":n}).to_string(),
+                    )
+                })
+                .unwrap();
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    discard_recording_dir(root.path());
+    let mut ids = Vec::new();
+    for run in std::fs::read_dir(root.path().join("runs")).unwrap() {
+        let run = run.unwrap().path();
+        let grid = std::fs::read_to_string(run.join("final-grid.txt")).unwrap();
+        let provenance: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run.join("provenance.json")).unwrap()).unwrap();
+        assert_eq!(
+            grid.parse::<u64>().unwrap(),
+            provenance["session"].as_u64().unwrap(),
+            "archive mixed two different runs"
+        );
+        ids.push(grid);
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        16,
+        "a concurrent publication lost failed evidence"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Issue #322 — harness temp-root containment and cleanup
 // -----------------------------------------------------------------------
@@ -62,8 +654,8 @@ const ROOT_MARKER: &str = "harness-temp-root=";
 #[test]
 fn claude_plugin_import_is_off_unless_explicitly_enabled() {
     let prev = std::env::var_os("DAD_E2E_IMPORT_CLAUDE_PLUGINS");
-    // SAFETY: nextest runs one test per process, so this is single-threaded;
-    // the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     unsafe { std::env::remove_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS") };
     let off_by_default = import_claude_plugins_enabled();
     unsafe { std::env::set_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS", "1") };
@@ -104,8 +696,8 @@ fn insufficient_space_message_names_the_cause_and_the_remedy() {
 #[cfg(unix)]
 #[test]
 fn zero_threshold_disables_the_preflight_check() {
-    // SAFETY: single-threaded test process (nextest runs one test per
-    // process); the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     let prev = std::env::var_os(MIN_FREE_ENV);
     unsafe { std::env::set_var(MIN_FREE_ENV, "0") };
     let verdict = temp_space_problem(Path::new("/"));
@@ -124,7 +716,8 @@ fn zero_threshold_disables_the_preflight_check() {
 #[test]
 fn an_unmeetable_threshold_trips_the_preflight_check() {
     let prev = std::env::var_os(MIN_FREE_ENV);
-    // SAFETY: as above — single-threaded, restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; restored before
+    // returning.
     unsafe { std::env::set_var(MIN_FREE_ENV, "1000000000") };
     let verdict = temp_space_problem(&std::env::temp_dir());
     match prev {
@@ -1527,7 +2120,7 @@ const FIRST_ALLOC_MARKER: &str = "harness-first-alloc=";
 #[test]
 fn the_tempfile_redirect_catches_a_bare_constructor_once_the_root_exists() {
     let root = harness_temp_root();
-    // The bare constructor IS the thing under test here, so rule 8 is opted
+    // The bare constructor IS the thing under test here, so linkage-check rule 8 is opted
     // out of on this one line: linkage-check:allow-bare-tempdir
     let stray = tempfile::tempdir().expect("bare tempdir"); // linkage-check:allow-bare-tempdir
     assert!(
@@ -2209,9 +2802,62 @@ fn match_prefix_then_terminal_reports_incomplete_prefix() {
     assert!(!terminal);
 }
 
+/// Scenario: Feed the version parser what OpenCode 2.x and 1.x print for
+/// `--version`, plus noise. Both real shapes parse to their numbers and
+/// anything that is not a version is refused.
+#[test]
+fn opencode_version_parser_reads_both_majors_and_refuses_noise() {
+    assert_eq!(parse_opencode_version("opencode v2.2.5\n"), Some((2, 2, 5)));
+    assert_eq!(parse_opencode_version("1.18.35\n"), Some((1, 18, 35)));
+    assert_eq!(
+        parse_opencode_version("\n v2.10.0-beta.1"),
+        Some((2, 10, 0))
+    );
+    assert_eq!(parse_opencode_version(""), None);
+    assert_eq!(parse_opencode_version("opencode"), None);
+    assert_eq!(parse_opencode_version("ERROR Unrecognized flag"), None);
+}
+
+/// Scenario: Resolve the OpenCode test-binary knob against a scratch home and
+/// PATH. `v1` names the pinned 1.x under the home only once that file exists,
+/// a path names itself, and a bare name is found on PATH; nothing else
+/// resolves.
+#[test]
+fn opencode_test_bin_resolves_v1_to_the_pinned_install() {
+    let home = race_safe_tempdir();
+    let bin_dir = race_safe_tempdir();
+    let path = std::ffi::OsString::from(bin_dir.path());
+    assert_eq!(
+        resolve_opencode_test_bin(OPENCODE_TEST_BIN_V1, home.path(), &path),
+        None,
+        "v1 resolves only once the pinned 1.x is installed"
+    );
+    let pinned = home.path().join(OPENCODE_PINNED_V1);
+    std::fs::create_dir_all(pinned.parent().unwrap()).expect("pinned dir");
+    std::fs::write(&pinned, "").expect("pinned binary");
+    assert_eq!(
+        resolve_opencode_test_bin(OPENCODE_TEST_BIN_V1, home.path(), &path),
+        Some(pinned.clone())
+    );
+    assert_eq!(
+        resolve_opencode_test_bin(&pinned.to_string_lossy(), home.path(), &path),
+        Some(pinned)
+    );
+    assert_eq!(
+        resolve_opencode_test_bin("opencode", home.path(), &path),
+        None
+    );
+    std::fs::write(bin_dir.path().join("opencode"), "").expect("PATH binary");
+    assert_eq!(
+        resolve_opencode_test_bin("opencode", home.path(), &path),
+        Some(bin_dir.path().join("opencode"))
+    );
+}
+
 /// Scenario: Import a synthetic OpenCode auth file while a hostile host config
-/// sits beside it. Only auth is copied, a minimal isolated config is created,
-/// and the imported token is registered for recording redaction.
+/// sits beside it. Only auth is copied, a minimal isolated config naming only
+/// the test model is created, and the imported token is registered for
+/// recording redaction.
 #[test]
 fn opencode_import_is_auth_only_and_synthesizes_minimal_config() {
     let source = race_safe_tempdir();
@@ -2240,7 +2886,7 @@ fn opencode_import_is_auth_only_and_synthesizes_minimal_config() {
     );
     assert_eq!(
         std::fs::read_to_string(target.path().join(".config/opencode/opencode.json")).unwrap(),
-        MINIMAL_OPENCODE_CONFIG
+        minimal_opencode_config()
     );
     assert!(
         !target
@@ -2481,8 +3127,7 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
     // and `install_credential_redaction` seeds the global store with an
     // ambient value, either of which would make the assertions below depend
     // on the machine.
-    // SAFETY: single-threaded test body, and nextest gives each test its own
-    // process, so nothing else in this process observes the change.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -2862,7 +3507,7 @@ fn a_credential_under_an_ordinary_env_variable_name_is_registered() {
 /// publishes. Three field names is cheaper than accepting that.
 #[test]
 fn the_seeded_claude_json_registers_its_account_identity_fields() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -2967,7 +3612,7 @@ fn the_seeded_claude_json_registers_its_account_identity_fields() {
 /// so never resolves itself — until the test's own timeout fired.
 #[test]
 fn a_second_trust_seeding_keeps_the_paths_the_first_one_trusted() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -3061,7 +3706,7 @@ fn a_second_trust_seeding_keeps_the_paths_the_first_one_trusted() {
 /// to cover the new one too.
 #[test]
 fn a_non_object_claude_json_in_the_test_home_falls_back_to_the_host() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -3140,7 +3785,7 @@ const GRID_COLS: u16 = 120;
 /// test was written.
 fn render_like_ratatui(cols: u16, rows: &[String]) -> String {
     let height = u16::try_from(rows.len().max(1)).expect("test grid height");
-    let mut parser = vt100::Parser::new(height, cols, 0);
+    let mut parser = dot_agent_deck::vt_grid::parser(height, cols, 0);
     for (index, row) in rows.iter().enumerate() {
         parser.process(format!("\x1b[{};1H{row}", index + 1).as_bytes());
     }
@@ -4715,8 +5360,8 @@ fn a_missing_or_malformed_response_block_is_rebuilt_rather_than_trusted() {
 #[test]
 fn an_empty_or_whitespace_only_api_key_counts_as_absent() {
     let prev = std::env::var_os(ANTHROPIC_API_KEY_ENV);
-    // SAFETY: nextest runs one test per process, so this is single-threaded;
-    // the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     unsafe { std::env::remove_var(ANTHROPIC_API_KEY_ENV) };
     assert!(anthropic_api_key().is_none(), "unset must read as absent");
     unsafe { std::env::set_var(ANTHROPIC_API_KEY_ENV, "") };
@@ -4777,6 +5422,52 @@ fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
     }
 }
 
+/// Scenario: Build the reason the OpenCode preflight gives when the test model
+/// does not answer its probe. A developer must be able to find a model their
+/// login accepts from that text alone: how to list candidates and how to try
+/// one with the probe the preflight runs. The message must not send them to a
+/// model id the provider has been seen rejecting.
+#[test]
+fn the_opencode_probe_failure_says_how_to_find_a_reachable_model() {
+    let message = opencode_probe_failure_message(
+        "anthropic/claude-haiku-4-5-20251001",
+        "exited unsuccessfully (exit status: 1)",
+        "Error: no credentials",
+    );
+
+    // Listing alone is not enough: `opencode models openai` (1.18.34) lists
+    // ids that a ChatGPT login then refuses, so the message must also give
+    // the probe itself. Its placeholder is a bare word: an `<id>` pasted into
+    // a shell is an input redirection, not an argument.
+    assert!(
+        message.contains("opencode models"),
+        "the message must say how to list candidate models:\n{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "opencode run --model MODEL_ID \"{OPENCODE_PROBE_PROMPT}\""
+        )),
+        "the message must give the probe command to try a candidate:\n{message}"
+    );
+    assert!(
+        message.contains("MODEL_ID replaced by an id from that listing"),
+        "the message must say what to put in place of the placeholder:\n{message}"
+    );
+    assert!(
+        message.contains(OPENCODE_TEST_MODEL_ENV),
+        "the message must name the override to set:\n{message}"
+    );
+
+    // Issue #1564: this id was the message's ChatGPT-login example, and on
+    // 2026-10-04 (OpenCode 1.18.34) such a login rejected it with "not
+    // supported when using Codex with a ChatGPT account". A developer who
+    // followed the hint failed the same preflight again.
+    assert!(
+        !message.contains("gpt-5.4-mini"),
+        "the message recommends a model ChatGPT logins reject:\n{message}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Issue #807/#395 — the grid lookup re-reads, the single-shot one cannot
 // -----------------------------------------------------------------------
@@ -4790,14 +5481,14 @@ fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
 /// `MID_REPAINT` is that instant: the title `New Schedule` is on screen and
 /// `[Submit]` is not. `SETTLED` is the same modal one flush later.
 const MID_REPAINT: &str = "\
- dot-agent-deck — 0 session(s)                 \n\
+ dot-agent-deck — 0 agent(s)                   \n\
     ┌─────────── New Schedule ───────────┐     \n\
     │ Command: cat                       │     \n\
     │                                    │     \n\
     └────────────────────────────────────┘     \n";
 
 const SETTLED: &str = "\
- dot-agent-deck — 0 session(s)                 \n\
+ dot-agent-deck — 0 agent(s)                   \n\
     ┌─────────── New Schedule ───────────┐     \n\
     │ Command: cat                       │     \n\
     │      [Submit]      [Cancel]        │     \n\
@@ -4931,8 +5622,8 @@ fn the_returned_column_counts_characters_not_bytes() {
 /// alone, not multiply it by [`MAX_LOAD_FACTOR`].
 ///
 /// This is the whole reason `load_factor` is split out of `load_scaled`. On
-/// Linux `machine_load_per_cpu` never returns `None`, so the branch that every
-/// macOS and Windows run takes is unreachable through the public entry point
+/// Linux and macOS `machine_load_per_cpu` does not return `None` in practice, so
+/// the branch that every Windows run takes is unreachable through the public entry point
 /// here — the case has to be driven directly or it is not covered at all,
 /// which is how a 6x-on-every-macOS-run regression sat unnoticed.
 #[test]
@@ -4950,6 +5641,26 @@ fn unmeasurable_load_leaves_the_base_unscaled() {
         base,
         "an unmeasurable load must return the base identically, so a macOS \
          contributor's 30s wait stays 30s rather than becoming 180s"
+    );
+}
+
+/// Issue #1244: on macOS the measurement must actually come back. It used to
+/// return `None` there on the false belief that `libc` did not expose
+/// `getloadavg`, which silently left every #709 ceiling unscaled on
+/// `build-macos` until `idle_worker_010` starved against a flat 8 s.
+/// `build-macos` runs this, so a regression is red there rather than a flake.
+///
+/// macOS only, deliberately. On Linux a `None` is legitimate — a container or
+/// chroot with no readable `/proc/loadavg` is exactly the unmeasurable case
+/// [`load_factor`] is written to tolerate — and `getloadavg` has no such
+/// dependency, so only here is `None` a defect rather than an environment.
+#[cfg(target_os = "macos")]
+#[test]
+fn load_is_measurable_on_macos() {
+    let load = machine_load_per_cpu();
+    assert!(
+        load.is_some_and(|l| l.is_finite() && l >= 0.0),
+        "machine_load_per_cpu() must measure the load on this platform, got {load:?}"
     );
 }
 
@@ -4989,10 +5700,888 @@ fn measured_load_still_widens_between_one_and_the_cap() {
         MAX_LOAD_FACTOR,
         "a runaway load average must clamp at the cap"
     );
+    assert!(
+        load_scaled(Duration::from_secs(8))
+            >= Duration::from_secs(8).mul_f64(load_factor(machine_load_per_cpu())),
+        "load_scaled must never scale by less than the measured load factor"
+    );
+}
+
+/// Scenario: An I/O or memory stall widens a ceiling by `1 / (1 - share)` — 1.0
+/// on a stall-free box, ~3.1 at the 68% `io full` that failed `delegate_012` at
+/// a load factor of 1.0, and the cap past it — while an unmeasurable or
+/// non-finite share leaves the base alone exactly as an unmeasurable load does.
+#[test]
+fn an_io_stall_widens_the_ceiling_the_load_average_left_alone() {
+    assert_eq!(stall_factor(None), 1.0);
+    assert_eq!(stall_factor(Some(0.0)), 1.0);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(stall_factor(Some(bad)), 1.0, "{bad} is not a stall share");
+    }
+    assert_eq!(stall_factor(Some(0.5)), 2.0);
+    assert_eq!(stall_factor(Some(1.0)), MAX_LOAD_FACTOR);
     assert_eq!(
-        load_scaled(Duration::from_secs(8)),
-        Duration::from_secs(8).mul_f64(load_factor(machine_load_per_cpu())),
-        "load_scaled must be exactly load_factor applied to the base"
+        stall_factor(Some(-0.5)),
+        1.0,
+        "a negative share never shrinks"
+    );
+
+    // `delegate_012`'s failing run: load 15.07 on 16 CPUs, `io full` 68.4%.
+    let starved = contention_factor(Some(15.07 / 16.0), Some(0.684));
+    assert!(
+        Duration::from_secs(8).mul_f64(starved) > Duration::from_secs(24),
+        "the measured starvation must widen the 8 s boot ceiling well past the \
+         ~10 s it took to fail, got factor {starved}"
+    );
+    // Either source alone can widen; neither can push past the cap.
+    assert_eq!(contention_factor(Some(44.0 / 16.0), Some(0.0)), 2.75);
+    assert_eq!(contention_factor(Some(1000.0), Some(1.0)), MAX_LOAD_FACTOR);
+    assert_eq!(contention_factor(None, None), 1.0);
+}
+
+// -----------------------------------------------------------------------
+// Issue #701 — a load-induced failure labels itself
+// -----------------------------------------------------------------------
+
+mod load_context_tests {
+    use std::time::Duration;
+
+    use crate::common::load_context::*;
+
+    const PSI_CPU: &str = "some avg10=7.21 avg60=19.87 avg300=16.87 total=31056709947\n\
+                           full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+
+    fn reading(cpu: u64, io: u64, mem: u64) -> Reading {
+        Reading {
+            cpu_some_us: Some(cpu),
+            io_full_us: Some(io),
+            memory_full_us: Some(mem),
+            load1: None,
+        }
+    }
+
+    /// Scenario: Parse the `total=` field out of a real `/proc/pressure/cpu`
+    /// capture for both the `some` and the `full` line, and get `None` for a
+    /// line that is absent or malformed rather than a wrong number.
+    #[test]
+    fn psi_total_is_read_from_the_named_line_only() {
+        assert_eq!(parse_psi_total(PSI_CPU, "some"), Some(31_056_709_947));
+        assert_eq!(parse_psi_total(PSI_CPU, "full"), Some(0));
+        assert_eq!(parse_psi_total("some avg10=1.00\n", "some"), None);
+        assert_eq!(parse_psi_total("some total=abc\n", "some"), None);
+        assert_eq!(parse_psi_total("", "full"), None);
+    }
+
+    /// Scenario: Read the `avg10=` field of a PSI line as a fraction — 7.21% is
+    /// 0.0721 — from the named line only, and get `None` for an absent line, a
+    /// missing field or a value that is not a non-negative number.
+    #[test]
+    fn psi_avg10_is_read_as_a_fraction_from_the_named_line_only() {
+        let io = "some avg10=70.00 avg60=1.00 avg300=1.00 total=1\n\
+                  full avg10=68.40 avg60=1.00 avg300=1.00 total=1\n";
+        let close = |got: Option<f64>, want: f64| got.is_some_and(|g| (g - want).abs() < 1e-9);
+        assert!(close(parse_psi_avg10(io, "full"), 0.684));
+        assert!(close(parse_psi_avg10(io, "some"), 0.70));
+        assert_eq!(parse_psi_avg10(PSI_CPU, "full"), Some(0.0));
+        assert_eq!(parse_psi_avg10("some total=1\n", "some"), None);
+        assert_eq!(parse_psi_avg10("full avg10=abc\n", "full"), None);
+        assert_eq!(parse_psi_avg10("full avg10=-1.00\n", "full"), None);
+        assert_eq!(parse_psi_avg10("", "full"), None);
+    }
+
+    /// Scenario: Read the `full` line of real `/proc/pressure/io` captures as a
+    /// fraction, taking the larger of `avg10` and `avg60`, and get `None` for a
+    /// file with no usable `full` line.
+    #[test]
+    fn psi_full_share_takes_the_larger_recent_average() {
+        let io = "some avg10=71.28 avg60=52.51 avg300=58.16 total=285448512127\n\
+                  full avg10=60.50 avg60=47.42 avg300=52.35 total=240720008324\n";
+        assert_eq!(parse_psi_recent_full_share(io), Some(0.605));
+        let lull = "full avg10=3.00 avg60=72.00 avg300=50.00 total=1\n";
+        assert_eq!(parse_psi_recent_full_share(lull), Some(0.72));
+        assert_eq!(
+            parse_psi_recent_full_share("some avg10=9.00 avg60=9.00\n"),
+            None
+        );
+        assert_eq!(parse_psi_recent_full_share("full avg10=x avg60=y\n"), None);
+        assert_eq!(parse_psi_recent_full_share(""), None);
+    }
+
+    /// Scenario: Two readings ten seconds apart whose stall counters grew by
+    /// 6 s, 0.5 s and nothing yield 60%, 5% and 0% of the window; a counter
+    /// that went backwards, a missing source and a zero-length window yield
+    /// no share at all rather than a fabricated one.
+    #[test]
+    fn stall_share_is_the_counter_delta_over_the_window() {
+        let start = reading(1_000_000, 2_000_000, 3_000_000);
+        let end = reading(7_000_000, 2_500_000, 3_000_000);
+        let stall = stall_between(&start, &end, Duration::from_secs(10));
+        assert_eq!(stall.cpu_some, Some(0.6));
+        assert_eq!(stall.io_full, Some(0.05));
+        assert_eq!(stall.memory_full, Some(0.0));
+
+        let backwards = stall_between(&end, &start, Duration::from_secs(10));
+        assert_eq!(backwards.cpu_some, None);
+        let zero = stall_between(&start, &end, Duration::ZERO);
+        assert_eq!(zero.cpu_some, None);
+        let absent = Reading {
+            cpu_some_us: None,
+            ..start
+        };
+        assert_eq!(
+            stall_between(&absent, &end, Duration::from_secs(10)).cpu_some,
+            None
+        );
+        // Clamped: a counter that ran ahead of wall time is at most 100%.
+        let over = stall_between(
+            &reading(0, 0, 0),
+            &reading(20_000_000, 0, 0),
+            Duration::from_secs(10),
+        );
+        assert_eq!(over.cpu_some, Some(1.0));
+    }
+
+    /// Scenario: Each PSI source on its own pushes the verdict over its
+    /// STARVED or CONTENDED threshold and the worst one wins; a high load
+    /// average does not override a complete, quiet PSI reading, but votes
+    /// whenever a PSI source is missing; and a host that measured nothing is
+    /// UNMEASURED rather than QUIET.
+    #[test]
+    fn psi_decides_the_verdict_and_load_is_only_the_fallback() {
+        let quiet = Stall {
+            cpu_some: Some(0.02),
+            io_full: Some(0.0),
+            memory_full: Some(0.0),
+        };
+        let with = |f: fn(&mut Stall)| {
+            let mut s = quiet;
+            f(&mut s);
+            s
+        };
+        assert_eq!(classify(&quiet, Some(0.3)), Verdict::Quiet);
+        assert_eq!(
+            classify(&with(|s| s.cpu_some = Some(STARVED_CPU_SOME)), None),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(&with(|s| s.io_full = Some(STARVED_FULL)), None),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(&with(|s| s.memory_full = Some(STARVED_FULL)), None),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(&with(|s| s.cpu_some = Some(CONTENDED_CPU_SOME)), None),
+            Verdict::Contended
+        );
+        assert_eq!(
+            classify(&with(|s| s.io_full = Some(CONTENDED_FULL)), None),
+            Verdict::Contended
+        );
+        // A quiet CPU does not mask a starved disk.
+        assert_eq!(
+            classify(
+                &with(|s| {
+                    s.cpu_some = Some(CONTENDED_CPU_SOME);
+                    s.io_full = Some(0.5);
+                }),
+                None
+            ),
+            Verdict::Starved
+        );
+        // The calibration case: load 1.5 per CPU with PSI at 12% is not
+        // contention the tests could feel, so the load average does not vote.
+        assert_eq!(
+            classify(&with(|s| s.cpu_some = Some(0.12)), Some(3.0)),
+            Verdict::Quiet
+        );
+        // A PARTIAL PSI reading lets the load average vote for what went
+        // unmeasured (PR #1408 review): CPU pressure hidden with I/O quiet, and
+        // CPU quiet with I/O and memory hidden, both still read as starved.
+        assert_eq!(
+            classify(&with(|s| s.cpu_some = None), Some(STARVED_LOAD_PER_CPU)),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(
+                &with(|s| {
+                    s.io_full = None;
+                    s.memory_full = None;
+                }),
+                Some(STARVED_LOAD_PER_CPU)
+            ),
+            Verdict::Starved
+        );
+        // …and PSI still wins when it is the worse of the two.
+        assert_eq!(
+            classify(
+                &with(|s| {
+                    s.memory_full = None;
+                    s.cpu_some = Some(STARVED_CPU_SOME);
+                }),
+                Some(0.1)
+            ),
+            Verdict::Starved
+        );
+        // Without PSI (macOS), the load average is the whole signal.
+        let none = Stall::default();
+        assert_eq!(
+            classify(&none, Some(STARVED_LOAD_PER_CPU)),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(&none, Some(CONTENDED_LOAD_PER_CPU)),
+            Verdict::Contended
+        );
+        assert_eq!(classify(&none, Some(0.1)), Verdict::Quiet);
+        assert_eq!(classify(&none, None), Verdict::Unmeasured);
+    }
+
+    /// Scenario: The load factor is the higher of the start and end readings
+    /// divided by the CPU count, and is absent only when neither reading
+    /// exists.
+    #[test]
+    fn peak_load_is_the_worse_of_the_two_readings_per_cpu() {
+        assert_eq!(peak_load_per_cpu(Some(8.0), Some(32.0), 16), Some(2.0));
+        assert_eq!(peak_load_per_cpu(Some(32.0), Some(8.0), 16), Some(2.0));
+        assert_eq!(peak_load_per_cpu(None, Some(16.0), 16), Some(1.0));
+        assert_eq!(peak_load_per_cpu(None, None, 16), None);
+        assert_eq!(peak_load_per_cpu(Some(f64::NAN), None, 16), None);
+    }
+
+    /// Scenario: Render the report for a starved, a quiet and an unmeasured
+    /// window. Each names its verdict first and says what to do about it —
+    /// a starved one points at a solo rerun, a quiet one at the code — and the
+    /// measured numbers and co-tenant counts appear under it.
+    #[test]
+    fn the_report_names_its_verdict_and_what_to_do_next() {
+        let starved = render_report(
+            Some(16),
+            Duration::from_millis(131_154),
+            Stall {
+                cpu_some: Some(0.641),
+                io_full: Some(0.03),
+                memory_full: Some(0.0),
+            },
+            Some(18.39),
+            Some(75.73),
+            &[("claude", 81), ("dot-agent-deck", 161)],
+        );
+        assert!(starved.contains("load context (issue #701)"), "{starved}");
+        assert!(starved.contains("verdict: STARVED"), "{starved}");
+        assert!(
+            starved.contains("NOT evidence of a regression"),
+            "{starved}"
+        );
+        assert!(starved.contains("rule 6"), "{starved}");
+        assert!(starved.contains("131.2s"), "{starved}");
+        assert!(starved.contains("cpu some 64.1%"), "{starved}");
+        assert!(starved.contains("75.73 now, on 16 CPUs"), "{starved}");
+        assert!(
+            starved.contains("81 claude, 161 dot-agent-deck"),
+            "{starved}"
+        );
+
+        let quiet = render_report(
+            Some(16),
+            Duration::from_secs(25),
+            Stall {
+                cpu_some: Some(0.01),
+                io_full: Some(0.0),
+                memory_full: Some(0.0),
+            },
+            Some(1.17),
+            Some(1.4),
+            &[],
+        );
+        assert!(quiet.contains("verdict: QUIET"), "{quiet}");
+        assert!(quiet.contains("real signal"), "{quiet}");
+        assert!(!quiet.contains("alive:"), "{quiet}");
+
+        let unarmed = render_report(None, Duration::ZERO, Stall::default(), None, None, &[]);
+        assert!(unarmed.contains("verdict: UNMEASURED"), "{unarmed}");
+    }
+
+    const LOAD_CHILD_ENV: &str = "DAD_TEST_LOAD_CONTEXT_CHILD";
+    const LOAD_CHILD_MARKER: &str = "load-context child reached its panic";
+
+    /// Scenario: Only when re-run by the test below — allocate a harness temp
+    /// dir, the one step every headless e2e test takes, and then panic, so
+    /// the parent can read what the panic hook printed.
+    #[test]
+    fn a_headless_harness_panic_carries_the_load_report() {
+        if std::env::var_os(LOAD_CHILD_ENV).is_none() {
+            return;
+        }
+        let _dir = crate::common::harness_tempdir().expect("harness tempdir");
+        panic!("{LOAD_CHILD_MARKER}");
+    }
+
+    /// Scenario: Re-run this binary against the child above and read its
+    /// captured stderr. A test that never touched a TUI grid — only a harness
+    /// temp dir — must still have its panic followed by the load report with
+    /// a verdict, which is the path `dispatch_005` and every other headless
+    /// test in #701's table fails through.
+    #[test]
+    fn the_panic_hook_appends_the_load_report_to_a_headless_failure() {
+        let exe = std::env::current_exe().expect("current exe");
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| module_path!());
+        let child = format!("{module}::a_headless_harness_panic_carries_the_load_report");
+        let out = std::process::Command::new(&exe)
+            .arg(&child)
+            .args(["--exact", "--test-threads=1", "--nocapture"])
+            .env(LOAD_CHILD_ENV, "1")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .expect("re-run this test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(LOAD_CHILD_MARKER),
+            "the child never reached its panic, so this proves nothing — did `{child}` match \
+             no test?\n{stderr}"
+        );
+        let report = stderr
+            .split_once("---- load context (issue #701) ----")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("no load report after the panic message:\n{stderr}"));
+        assert!(
+            ["STARVED", "CONTENDED", "QUIET", "UNMEASURED"]
+                .iter()
+                .any(|v| report.contains(&format!("verdict: {v}"))),
+            "the report carries no verdict:\n{stderr}"
+        );
+        // The baseline was taken, so the report measured a window rather than
+        // falling back to the unarmed wording.
+        assert!(report.contains("window:"), "{stderr}");
+    }
+}
+
+// -----------------------------------------------------------------------
+// Issue #244 — the async content waiters poll content, not existence
+// -----------------------------------------------------------------------
+
+/// Scenario: Create the sentinel EMPTY — the state a shell redirect leaves it
+/// in before its write lands — and fill it 400ms later. An existence wait
+/// would already have returned and read `""`; the async content waiter must
+/// keep polling and return `Ok` only once the expected text is there.
+#[tokio::test]
+async fn async_content_waiters_ride_out_an_empty_file_until_the_write_lands() {
+    let dir = harness_tempdir().expect("harness tempdir");
+    let trimmed = dir.path().join("trimmed.txt");
+    let containing = dir.path().join("containing.txt");
+    std::fs::write(&trimmed, "").expect("create empty sentinel");
+    std::fs::write(&containing, "").expect("create empty sentinel");
+    // Control: the race window is real — the file exists and reads empty.
+    assert!(wait_for_path_async(&trimmed, Duration::ZERO).await);
+    assert_eq!(std::fs::read_to_string(&trimmed).unwrap(), "");
+
+    let (t, c) = (trimmed.clone(), containing.clone());
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::fs::write(&t, "SENTINEL_OK\n")
+            .await
+            .expect("fill sentinel");
+        tokio::fs::write(&c, "prefix SENTINEL_OK suffix")
+            .await
+            .expect("fill sentinel");
+    });
+
+    // Both waiters start BEFORE the write, so each has to poll the empty file.
+    async fn timed(
+        started: std::time::Instant,
+        wait: impl std::future::Future<Output = Result<(), String>>,
+    ) -> (Result<(), String>, Duration) {
+        let result = wait.await;
+        (result, started.elapsed())
+    }
+    let started = std::time::Instant::now();
+    let ((trimmed_result, trimmed_at), (containing_result, containing_at)) = tokio::join!(
+        timed(
+            started,
+            wait_for_file_trimmed_eq_async(&trimmed, "SENTINEL_OK", Duration::from_secs(10)),
+        ),
+        timed(
+            started,
+            wait_for_file_containing_async(&containing, "SENTINEL_OK", Duration::from_secs(10)),
+        ),
+    );
+    trimmed_result.expect("trimmed waiter must see the late write");
+    containing_result.expect("containing waiter must see the late write");
+    for (name, at) in [("trimmed", trimmed_at), ("containing", containing_at)] {
+        assert!(
+            at >= Duration::from_millis(400),
+            "{name} waiter returned before the write landed: {at:?}"
+        );
+    }
+    writer.await.expect("writer task");
+}
+
+/// Scenario: The sentinel exists but its expected content never arrives —
+/// empty for one waiter, a partial prefix for the other. Each must give up at
+/// its timeout with an `Err` describing what the file actually held, not
+/// return `Ok` because the file exists.
+#[tokio::test]
+async fn async_content_waiters_time_out_when_the_content_never_arrives() {
+    let dir = harness_tempdir().expect("harness tempdir");
+    let empty = dir.path().join("empty.txt");
+    let partial = dir.path().join("partial.txt");
+    std::fs::write(&empty, "").expect("create empty sentinel");
+    std::fs::write(&partial, "SENTINEL").expect("create partial sentinel");
+    let timeout = Duration::from_millis(500);
+
+    let started = std::time::Instant::now();
+    let err = wait_for_file_trimmed_eq_async(&empty, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("an empty file must not satisfy the trimmed waiter");
+    assert!(
+        started.elapsed() >= timeout,
+        "gave up early: {:?}",
+        started.elapsed()
+    );
+    assert!(err.contains("contains \"\""), "{err}");
+
+    let err = wait_for_file_trimmed_eq_async(&partial, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a partial write must not satisfy the trimmed waiter");
+    assert!(err.contains("contains \"SENTINEL\""), "{err}");
+
+    let err = wait_for_file_containing_async(&partial, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a partial write must not satisfy the containing waiter");
+    assert!(err.contains("contains \"SENTINEL\""), "{err}");
+
+    let missing = dir.path().join("missing.txt");
+    let err = wait_for_file_containing_async(&missing, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a missing file must not satisfy the containing waiter");
+    assert!(err.contains("does not exist"), "{err}");
+}
+
+/// Issue #1516: `env_write::assert_no_tokio_runtime` refuses an environment
+/// write made from inside a runtime — the shape `EnvGuard::repoint` had inside
+/// `block_on` in `delegate_prompt_injection.rs`.
+#[test]
+fn env_write_refuses_inside_a_runtime() {
+    let refused = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build current-thread runtime")
+        .block_on(async {
+            std::panic::catch_unwind(|| env_write::assert_no_tokio_runtime("inside block_on"))
+        });
+    let message = refused.expect_err("a write from inside block_on must be refused");
+    let message = message
+        .downcast_ref::<String>()
+        .expect("the refusal is a formatted message");
+    assert!(
+        message.contains("inside block_on") && message.contains("#1516"),
+        "{message}"
+    );
+}
+
+/// Issue #1516: the refusal also sees a multi-thread runtime's workers from
+/// outside `block_on`, which is where `delegate/027`'s second arm wrote while
+/// the first arm's runtime was still alive, and it stops refusing once that
+/// runtime has dropped. The last half is the premise every guard's SAFETY
+/// comment rests on: dropping a runtime joins its threads. The first half is
+/// also what fails if a Tokio upgrade renames those threads, which would leave
+/// the `/proc` scan matching nothing (Tokio 1.53 calls them `tokio-rt-worker`,
+/// and this test caught the scan looking for `tokio-runtime-worker`).
+#[cfg(target_os = "linux")]
+#[test]
+fn env_write_refuses_while_runtime_threads_exist_and_not_after_the_runtime_drops() {
+    // Under plain `cargo test` a sibling test's runtime shares this process, so
+    // neither "no runtime threads yet" nor "none left after the drop" is this
+    // test's to assert, and the scan is off there anyway.
+    if !env_write::owns_the_process() {
+        eprintln!("SKIP: the runtime-thread scan needs nextest's process-per-test mode");
+        return;
+    }
+    env_write::assert_no_tokio_runtime("before any runtime");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .expect("build multi-thread runtime");
+    // A new thread carries its creator's name until it renames itself, so a
+    // worker that has not run yet is listed under this test's name. Wait
+    // (bounded) for the workers to take theirs before looking for them.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while env_write::tokio_runtime_threads().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !env_write::tokio_runtime_threads().is_empty(),
+        "a live multi-thread runtime must show up in /proc/self/task; threads: {:?}",
+        std::fs::read_dir("/proc/self/task")
+            .map(|tasks| tasks
+                .filter_map(Result::ok)
+                .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    let refused =
+        std::panic::catch_unwind(|| env_write::assert_no_tokio_runtime("beside a live runtime"));
+    assert!(
+        refused.is_err(),
+        "a write while runtime threads exist must be refused"
+    );
+    drop(runtime);
+    // Not `tokio_runtime_threads().is_empty()` directly: a joined thread can
+    // stay listed for a moment (see `assert_no_tokio_runtime`), and the
+    // assertion is what waits that out.
+    env_write::assert_no_tokio_runtime("after the runtime dropped");
+}
+
+// -----------------------------------------------------------------------
+// Issue #1565 — `process_running` on the caller's own exited child
+// -----------------------------------------------------------------------
+
+/// Blocks until `child` has exited WITHOUT reaping it, so it is left a
+/// zombie for as long as the caller holds off `Child::wait`. `WNOWAIT` is what
+/// leaves it unreaped; PR #1556 used the same call on the macOS runner.
+#[cfg(unix)]
+fn wait_for_exit_without_reaping(child: &std::process::Child) {
+    loop {
+        // SAFETY: a zeroed `siginfo_t` is a valid out-parameter, and the pid
+        // is this process's own child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "waitid(WNOWAIT) on our own child failed: {err}"
+        );
+    }
+}
+
+/// The #397 shape: a test probing its own child after the child has exited
+/// but before the test has reaped it. Off Linux the helper used to fall back to
+/// `kill(pid, 0)`, which succeeds on a zombie, so the exited child read as
+/// running for as long as it stayed unreaped.
+#[cfg(unix)]
+#[test]
+fn process_running_reads_an_exited_unreaped_child_as_gone() {
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn `true`");
+    let pid = child.id() as i32;
+    wait_for_exit_without_reaping(&child);
+
+    let running = process_running(pid);
+    let _ = child.wait();
+
+    assert!(
+        !running,
+        "pid {pid} has exited and is only waiting to be reaped by this test, \
+         yet process_running() reports it as running"
+    );
+}
+
+/// Control for the test above: the same helper on the same kind of pid, alive
+/// and then reaped. A zombie-aware probe that read every own child as gone
+/// would pass the test above and fail this one.
+#[cfg(unix)]
+#[test]
+fn process_running_reads_a_live_child_as_running_and_a_reaped_one_as_gone() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn `sleep 30`");
+    let pid = child.id() as i32;
+
+    let live = process_running(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(live, "a live child (pid {pid}) must read as running");
+    assert!(
+        !process_running(pid),
+        "a reaped child (pid {pid}) must read as gone"
+    );
+}
+
+/// Issue #656: the Codex test model follows the host's auth mode, so the most
+/// common login (ChatGPT) gets a model it can reach instead of skipping.
+#[test]
+fn codex_default_model_follows_the_auth_mode() {
+    assert_eq!(
+        codex_default_model_for(Some("chatgpt")),
+        CODEX_TEST_MODEL_CHATGPT_DEFAULT
+    );
+    assert_eq!(
+        codex_default_model_for(Some("ChatGPT")),
+        CODEX_TEST_MODEL_CHATGPT_DEFAULT
+    );
+    for other in [Some("apikey"), Some("api_key"), Some(""), None] {
+        assert_eq!(
+            codex_default_model_for(other),
+            CODEX_TEST_MODEL_API_KEY_DEFAULT,
+            "auth_mode {other:?} must take the API-key default"
+        );
+    }
+    assert_ne!(
+        CODEX_TEST_MODEL_CHATGPT_DEFAULT, CODEX_TEST_MODEL_API_KEY_DEFAULT,
+        "the two auth modes reach different model families"
+    );
+}
+
+/// Issue #656: a refused model is told apart from an auth, network or quota
+/// failure, because only the refusal turns the skip into a failure. The two
+/// refusal texts are the measured ones (lowercased, as the probe passes them).
+#[test]
+fn codex_probe_refusal_matches_only_a_refused_model() {
+    let chatgpt = r#"error: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"the 'gpt-5.1-codex-mini' model is not supported when using codex with a chatgpt account."}}"#;
+    let api_key = "unexpected status 404 not found: model not found";
+    assert!(codex_probe_refused_model(chatgpt));
+    assert!(codex_probe_refused_model(api_key));
+    for not_a_refusal in [
+        "unexpected status 401 unauthorized",
+        "error: not logged in",
+        "stream error: connection reset by peer",
+        "you've hit your usage limit",
+        "",
+    ] {
+        assert!(
+            !codex_probe_refused_model(not_a_refusal),
+            "{not_a_refusal:?} must stay a skip, not a refused model"
+        );
+    }
+}
+
+/// Scenario: Choose the Pi real-agent model with no override, with an empty
+/// one, and with several `<provider>/<model>` values, then with malformed ones.
+/// No override means the measured GPT default on the stored ChatGPT login
+/// (`openai-codex/gpt-5.6-luna`, PRD #1666) — never Anthropic, since the
+/// change is permanent rather than a fallback; an override is split at its
+/// first `/`; anything without both halves is refused rather than read as
+/// "skip"; and only the API-key providers name an env key.
+#[test]
+fn pi_test_model_selection_reads_provider_slash_model() {
+    let default = pi_test_model_from(None).expect("the default parses");
+    assert_eq!(default.provider, "openai-codex");
+    assert_eq!(default.model, "gpt-5.6-luna");
+    assert_eq!(default.to_string(), PI_TEST_MODEL_DEFAULT);
+    assert_eq!(
+        default.cli_args(),
+        "--provider openai-codex --model gpt-5.6-luna"
+    );
+    assert_eq!(default.env_key(), None, "the stored login authenticates it");
+    for blank in ["", "   "] {
+        assert_eq!(pi_test_model_from(Some(blank)).unwrap(), default);
+    }
+
+    let keyed = pi_test_model_from(Some(" openai/gpt-5-nano ")).unwrap();
+    assert_eq!(keyed.cli_args(), "--provider openai --model gpt-5-nano");
+    assert_eq!(keyed.env_key(), Some(OPENAI_API_KEY_ENV));
+    let routed = pi_test_model_from(Some("openrouter/openai/gpt-5.1-codex-mini")).unwrap();
+    assert_eq!(routed.provider, "openrouter");
+    assert_eq!(routed.model, "openai/gpt-5.1-codex-mini");
+
+    for bad in [
+        "gpt-5.6-luna",
+        "/gpt-5.6-luna",
+        "openai-codex/",
+        "openai codex/x",
+    ] {
+        let err = pi_test_model_from(Some(bad)).expect_err(bad);
+        assert!(err.contains(PI_TEST_MODEL_ENV), "{bad}: {err}");
+    }
+}
+
+/// Scenario: Turn the host's stored Pi login into the copy a scratch agent
+/// directory gets. An OAuth login with hours left loses its refresh token and
+/// keeps the rest; one about to expire, already expired, or carrying a refresh
+/// token with no expiry is refused with the remedy (log in again with `pi`)
+/// rather than copied; a login with no refresh token is copied as it is.
+#[test]
+fn a_scratch_pi_login_carries_no_refresh_token_and_a_run_margin() {
+    let now = std::time::SystemTime::now();
+    let ms = |offset: Duration, ahead: bool| {
+        let at = if ahead { now + offset } else { now - offset };
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let login = |expires: Option<u64>| {
+        let mut entry = serde_json::json!({
+            "type": "oauth",
+            "access": "ACCESS-TOKEN",
+            "refresh": "REFRESH-TOKEN",
+            "refreshToken": "REFRESH-TOKEN-2",
+            "accountId": "ACCOUNT",
+        });
+        if let Some(expires) = expires {
+            entry["expires"] = expires.into();
+        }
+        entry
+    };
+
+    let hours = ms(Duration::from_secs(3 * 3600), true);
+    let copied = pi_scratch_login(login(Some(hours)), now).expect("hours left is enough");
+    assert_eq!(
+        copied,
+        serde_json::json!({
+            "type": "oauth",
+            "access": "ACCESS-TOKEN",
+            "accountId": "ACCOUNT",
+            "expires": hours,
+        }),
+        "the copy keeps the access token and drops every refresh token"
+    );
+
+    for (expires, why) in [
+        (Some(ms(Duration::from_secs(600), true)), "ten minutes left"),
+        (Some(ms(Duration::from_secs(600), false)), "already expired"),
+        (None, "a refresh token with no expiry"),
+    ] {
+        let err = pi_scratch_login(login(expires), now).expect_err(why);
+        assert!(err.contains("/login"), "{why}: {err}");
+        assert!(
+            !err.contains("TOKEN"),
+            "{why}: the refusal must not quote a secret: {err}"
+        );
+    }
+
+    let keyed = serde_json::json!({ "type": "api_key", "key": "API-KEY" });
+    assert_eq!(
+        pi_scratch_login(keyed.clone(), now).expect("nothing to refresh"),
+        keyed
+    );
+}
+
+/// Scenario: Look for a missing sentinel's name around where it was expected.
+/// With nothing of that name nearby the note is empty; with a file of that name
+/// one level up — where a real agent once wrote it after inferring its working
+/// directory from the deck binary's path (PRD #1666) — or in an extra candidate
+/// directory, the note names that place as MISPLACED.
+#[test]
+fn a_missing_sentinel_found_elsewhere_is_reported_as_misplaced() {
+    let root = harness_tempdir().unwrap();
+    let work = root.path().join("project");
+    std::fs::create_dir_all(&work).unwrap();
+    let expected = work.join("sentinel-1666.txt");
+    let other = root.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    assert_eq!(
+        misplaced_note_among(&expected, std::slice::from_ref(&other)),
+        ""
+    );
+
+    std::fs::write(root.path().join("sentinel-1666.txt"), "DONE").unwrap();
+    let note = misplaced_note_among(&expected, std::slice::from_ref(&other));
+    assert!(note.contains("MISPLACED"), "{note}");
+    assert!(
+        note.contains(&root.path().join("sentinel-1666.txt").display().to_string()),
+        "{note}"
+    );
+
+    std::fs::remove_file(root.path().join("sentinel-1666.txt")).unwrap();
+    std::fs::write(other.join("sentinel-1666.txt"), "DONE").unwrap();
+    let note = misplaced_note_among(&expected, std::slice::from_ref(&other));
+    assert!(
+        note.contains(&other.join("sentinel-1666.txt").display().to_string()),
+        "{note}"
+    );
+    std::fs::write(&expected, "DONE").unwrap();
+    assert!(
+        !misplaced_note_among(&expected, std::slice::from_ref(&work))
+            .contains(&expected.display().to_string()),
+        "the expected path itself is never reported as misplaced"
+    );
+}
+
+/// Scenario: A `PATH` holding a deck's telemetry shim directory, as the deck
+/// installs one, loses that entry when the harness contains it. A directory
+/// holding a `codex` that is not a shim script, or a shim beside another
+/// program (a hidden one included), or an unreadable `codex`, is kept, and
+/// relative entries are dropped as before.
+#[cfg(unix)]
+#[test]
+fn contain_path_drops_a_deck_telemetry_shim_directory_and_nothing_like_it() {
+    use dot_agent_deck::telemetry::shim;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = harness_tempdir().expect("scratch root");
+    let executable = |path: &Path, body: &str| {
+        std::fs::write(path, body).expect("write a program");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+    };
+    let shim_dir = shim::install(&root.path().join("telemetry"), "/opt/deck/dot-agent-deck")
+        .expect("install a shim directory as the deck does");
+
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    executable(
+        &real.join("codex"),
+        "#!/bin/sh\nexec node codex.js \"$@\"\n",
+    );
+
+    let mixed = root.path().join("mixed");
+    std::fs::create_dir(&mixed).unwrap();
+    std::fs::copy(shim_dir.join("codex"), mixed.join("codex")).unwrap();
+    executable(&mixed.join("git"), "#!/bin/sh\n");
+
+    // A hidden program is reachable by name too; only the installer's own
+    // `.<program>.<pid>` staging files are not.
+    let hidden = root.path().join("hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    std::fs::copy(shim_dir.join("codex"), hidden.join("codex")).unwrap();
+    executable(&hidden.join(".helper"), "#!/bin/sh\n");
+    std::fs::write(shim_dir.join(".codex.4242"), "").unwrap();
+
+    let unreadable = root.path().join("unreadable");
+    std::fs::create_dir(&unreadable).unwrap();
+    std::fs::copy(shim_dir.join("codex"), unreadable.join("codex")).unwrap();
+    std::fs::set_permissions(
+        unreadable.join("codex"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let dangling = root.path().join("dangling");
+    std::fs::create_dir(&dangling).unwrap();
+    std::os::unix::fs::symlink(root.path().join("nowhere"), dangling.join("codex")).unwrap();
+
+    assert!(is_deck_telemetry_shim_dir(&shim_dir));
+    let path = std::env::join_paths([
+        shim_dir.as_path(),
+        real.as_path(),
+        mixed.as_path(),
+        hidden.as_path(),
+        Path::new(""),
+        Path::new("bin"),
+        unreadable.as_path(),
+        dangling.as_path(),
+    ])
+    .expect("join a PATH");
+    let rewritten = contain_path(&path.to_string_lossy());
+    // A process that can read any file (root) reads the unreadable script as
+    // a shim, so that one entry's fate depends on who runs the test.
+    let unreadable_kept = std::fs::read(unreadable.join("codex")).is_err();
+    let mut expected = vec![real, mixed, hidden];
+    if unreadable_kept {
+        expected.push(unreadable);
+    }
+    expected.push(dangling);
+    assert_eq!(
+        std::env::split_paths(&rewritten).collect::<Vec<_>>(),
+        expected,
+        "only the shim directory and the relative entries are dropped: {rewritten}"
     );
 }
 
@@ -5010,7 +6599,9 @@ fn measured_load_still_widens_between_one_and_the_cap() {
 /// `false` for a cell written after `\x1b[24m` turns it back off.
 #[test]
 fn grid_cell_style_reports_underline_when_present() {
-    let mut parser = vt100::Parser::new(1, 2, 0);
+    // vt100 0.18 (upstream #1322) takes `NonZeroU16` axes; the deck's `u16`
+    // boundary helper is the one place that converts.
+    let mut parser = dot_agent_deck::vt_grid::parser(1, 2, 0);
     parser.process(b"\x1b[4mU");
     parser.process(b"\x1b[24mN");
     let screen = parser.screen();

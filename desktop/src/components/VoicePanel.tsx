@@ -1,0 +1,882 @@
+/**
+ * The Voice section (PRD #802), and the settings surface's fourth tenant.
+ *
+ * It implements `SettingsPanelProps` and nothing else — the sheet does not know
+ * this is about voice, and this file does not know how the document is stored.
+ * Two stages, each with the same three controls plus a key row where one is
+ * needed.
+ *
+ * # Every stage is the same three questions
+ *
+ * **Which** backend, **where** it is, and **which** model — because a user who
+ * cannot answer the second cannot answer the first either. The build used to
+ * pick both coordinates: speech went to one hosted service and commands to
+ * another, which meant the key rows asked for a credential without naming whose
+ * it was, and a user with a provider we had not picked had no way in at all.
+ * The selects still carry a preset for the common cases, so the fields are an
+ * escape hatch rather than homework.
+ *
+ * **Picking a backend rewrites that stage's endpoint and model.** An endpoint
+ * belongs to the backend it names: leaving a loopback URL in place after a
+ * switch to a hosted service is a setting that cannot work and does not say so.
+ * A user who wants a different one types it afterwards, which is one edit
+ * rather than a trap.
+ *
+ * # What must never happen here, and how the code says so
+ *
+ * **No credential reaches `onSave`.** The settings document is written to
+ * `desktop.toml` and, in the browser preview, to `localStorage` — the two
+ * places PRD #803's rule forbids a secret. So the key never enters the
+ * document: it goes through `useSettingsBridge()`'s `storeSecret`, which is a
+ * Tauri command, and the document holds no reference to it at all. What this
+ * panel learns back is a boolean and, when something went wrong, a sentence —
+ * never a value. The endpoint fields are the new place that rule could have
+ * been broken, and the Rust `ServiceUrl` refuses a `user:password@` authority
+ * outright rather than trusting this side not to offer one.
+ *
+ * **The value is never read back.** There is no `loadSecret` on the bridge and
+ * there must not be: a stored key arriving here is one `JSON.stringify` from
+ * the `localStorage` half of the rule. So the input starts empty every time,
+ * even when a key is stored, and the panel says *A key is stored* rather than
+ * showing a masked preview of one. A preview would be an information channel
+ * out of the keychain whose only consumer is reassurance.
+ *
+ * **A failed save never looks like a saved key.** `storeSecret` rejects rather
+ * than resolving with `stored: false`, and this panel renders the rejection's
+ * sentence and leaves what the user typed in the field, so they can try again
+ * without retyping it. The outcome PRD #802 M4 is written against is *a user
+ * who thinks their key is stored and finds voice broken tomorrow*.
+ *
+ * # Rust validates the endpoint, and this file deliberately does not
+ *
+ * `ServiceUrl` and `ModelId` run their constructor's check inside their own
+ * `Deserialize`, so an endpoint this panel sends is refused at the IPC seam and
+ * the refusal arrives as `saveError`. A second copy of those rules here would
+ * be a second answer to *what is a valid endpoint*, with nothing keeping the
+ * two in step — the defect `normalizeVoiceSettings` avoids on the token side by
+ * folding rather than inventing. What this file owes the user instead is the
+ * rule in words, which is what the hint under each endpoint field is.
+ *
+ * # The Activation row is GONE
+ *
+ * It stated one mode nobody could change — `ActivationMode` has a single
+ * variant until PRD #802 D4 brings hold-to-talk and always-on-with-VAD. A row
+ * that reads as a control and answers nothing is worse than no row, and the
+ * stored field stays either way, so D4 adds a select here and loses nothing.
+ */
+import { useCallback, useEffect, useId, useState } from "react";
+import { AlertTriangle } from "lucide-react";
+import {
+  DEFAULT_VOICE_SETTINGS,
+  LOCAL_SPEECH_IMAGE,
+  MAX_TOKEN_CEILING,
+  MIN_TOKEN_CEILING,
+  VOICE_INTENT_BACKENDS,
+  VOICE_LABEL_SHARING,
+  VOICE_READING_CONSENT,
+  VOICE_SPEECH_SOURCES,
+  VOICE_STAGE_PRESETS,
+  VOICE_TRANSCRIPTION_BACKENDS,
+  type SecretStatusDto,
+  type VoiceIntentStageDto,
+  type VoiceSecretId,
+  type VoiceSettingsDto,
+  type VoiceStageDto,
+  type VoiceTranscriptionStageDto,
+} from "../lib/bridge";
+import {
+  AUTO_SPEECH_LANGUAGE,
+  DEFAULT_SPEECH_LANGUAGE,
+  SPEECH_LANGUAGES,
+  isEnglishOnlySpeechModel,
+} from "../lib/speechLanguages";
+import { useSettingsBridge } from "../lib/settingsBridge";
+import type { SettingsPanelProps } from "../lib/settingsContract";
+
+/**
+ * The visible label for each token, in the order the select offers them.
+ *
+ * **Named by provider, not by mechanism.** `Remote service` told a user holding
+ * three API keys nothing about which one to paste; the provider's name is the
+ * word they recognise, because it is the one on the key. The keyless options
+ * say so in the label rather than leaving it to be discovered by the absence of
+ * a key row.
+ */
+const TRANSCRIPTION_LABELS: Record<string, string> = {
+  local: "On this machine — speech container, no key",
+  remote: "OpenAI — needs an OpenAI API key",
+};
+
+const INTENT_LABELS: Record<string, string> = {
+  anthropic: "Anthropic API — needs an Anthropic API key",
+  openai_compatible: "OpenAI-compatible API — needs that provider's API key",
+};
+
+/**
+ * The Send on-screen names row's options (PRD #1223, audit finding A1; named
+ * by PRD #1497 R3-3): whether each command sends the names on screen to the
+ * Commands endpoint. The stored tokens are still `shared` and `withheld`.
+ */
+const LABEL_SHARING_LABELS: Record<string, string> = {
+  shared: "On",
+  withheld: "Off",
+};
+
+/**
+ * What the Send on-screen names row does, under it (PRD #1497 R3-3). Off is
+ * `LabelSharing::Withheld`: `prompt::state` sends no observed names, and every
+ * row that `needs_labels` is refused with `LABELS_WITHHELD_HINT`
+ * (`voice::schema::annotate_for`, `outcome::handle_utterance_with`) rather
+ * than resolved — so a command that needs one is refused, not answered from
+ * the name as the screen shows it.
+ */
+export const LABEL_SHARING_HINT = "Lets commands like \u201copen the tester\u201d find the agent, daemon or folder you name. Off keeps those names on this computer, and commands that need one are refused.";
+
+/**
+ * PRD #1497 — the Reading row's options: reading's only state (decision 1 of
+ * 2026-10-09), which "reading on" and "reading off" also flip.
+ */
+const READING_CONSENT_LABELS: Record<string, string> = {
+  off: "Off",
+  on: "On",
+};
+
+/**
+ * PRD #1497 D4 — what reading sends, shown under the switch, in one sentence
+ * (R3-1); `docs/desktop/voice.md`'s "What is sent where" has the full detail.
+ * Each clause is the code's: `voice::reading::read_turns` summarises a
+ * finished turn's final reply through the Commands connection
+ * (`voice::summary::summarise_turn`; an empty reply sends nothing, hence "A"
+ * rather than "Each"), and `desktop_voice_speech_audio` sends every spoken
+ * sentence to that connection's speech service when the Speech source picks
+ * it.
+ */
+export const READING_DISCLOSURE = "A finished turn's reply is sent to the Commands service to be summarised; with the provider's voice, the sentences the app speaks go to its speech service.";
+
+/** PRD #1497 D9 — the Speech source picker's options. */
+const SPEECH_SOURCE_LABELS: Record<string, string> = {
+  auto: "Auto",
+  provider: "Provider",
+  system: "System",
+};
+
+/** PRD #1497 D9 — what each Speech source does, shown under the picker. */
+const SPEECH_SOURCE_HINTS: Record<string, string> = {
+  auto: "The Commands connection's voice when it has one (OpenAI-compatible connections do, Anthropic does not), otherwise this computer's voice.",
+  provider: "The Commands connection's voice. Reading says so when the connection has none.",
+  system: "This computer's voice. Nothing is sent to be spoken.",
+};
+
+/**
+ * What every command sends, whatever the Send on-screen names row says (PRD
+ * #1223, closing audit F3), in one sentence (PRD #1497 R3-1). The full list —
+ * the transcript (`IntentRequest`'s `transcript`), the instructions and answer
+ * format, the model name and token limit, the command list
+ * (`prompt::commands_state`), the key for an endpoint off this machine
+ * (`RemoteResolver::run`), and what is decided on this machine
+ * (`outcome::local_intercept`, `dictation_intercept`, `voice::choice::answer`)
+ * — is `docs/desktop/voice.md`'s "What is sent where", and a change to any of
+ * those owes that page an update. "Not decided on this computer" is what keeps
+ * this sentence true of the utterances those intercepts answer, which send
+ * nothing.
+ */
+export const INTENT_DISCLOSURE = "Each command not decided on this computer sends what you said and this app's command list to the Commands service.";
+
+/**
+ * What Send on-screen names = On adds — `prompt::state`'s observed names (PRD
+ * #1223), in one sentence (PRD #1497 R3-1). The field-by-field list, and the
+ * point that a name is whatever it was set to and can itself be a path, are
+ * in `docs/desktop/voice.md`'s "What is sent where".
+ */
+export const INTENT_DISCLOSURE_SHARED = "It also sends the names on screen: agents, daemons, directories, modes and orchestrations.";
+
+/**
+ * What Send on-screen names = Off leaves out (PRD #1497 R3-1): the
+ * observed-names turn. It does not redact the transcript (PRD #1223, closing
+ * audit G2) — your words still go as heard, which the docs page says.
+ */
+export const INTENT_DISCLOSURE_WITHHELD = "It sends none of the names on screen.";
+
+/**
+ * PRD #1631 (ported from #1561's audit wording): while the agent on screen
+ * waits on a question, `voice::question` sends the utterance with that
+ * question's text, options and detail — for a permission prompt usually the
+ * command the agent wants to run, which is a tool's arguments — and it does
+ * so whatever the Send on-screen names row says. One sentence, as R3-1 asks;
+ * `docs/desktop/voice.md`'s "What is sent where" has the full list, including
+ * the answers decided on this machine that send nothing.
+ */
+export const INTENT_DISCLOSURE_QUESTION = "While the agent on screen waits on a question, what you say is sent with that question, usually including the command the agent wants to run, whether the names on screen are sent or not.";
+
+/**
+ * What the Language row says under it (issue #1458), or nothing while it is
+ * English, the default that costs nothing. Every command phrase the app
+ * recognises is English, so another language is a consequence the user acts
+ * on — commands may be misheard — and an English-only model (a `.en` Whisper
+ * build, such as the local default) is one that cannot do what was chosen.
+ */
+export const languageHint = (language: string, model: string): string | undefined => {
+  if (language === DEFAULT_SPEECH_LANGUAGE) return undefined;
+  const name = language === AUTO_SPEECH_LANGUAGE
+    ? undefined
+    : SPEECH_LANGUAGES.find((candidate) => candidate.code === language)?.name ?? language;
+  const choice = name === undefined
+    ? "The language is detected for each thing you say, so a short command may be misheard."
+    : `Commands are English, so with ${name} they may be misheard.`;
+  return isEnglishOnlySpeechModel(model)
+    ? `${choice} The model ${model} understands English only: choose a multilingual model, such as one without \u201c.en\u201d at the end.`
+    : choice;
+};
+
+/** The token the speech backend takes when it authenticates with a key. */
+const KEYED = "remote";
+
+/**
+ * Whether a stage will actually send a credential, which for Commands is a
+ * question about the ENDPOINT and not about the backend token.
+ *
+ * Both command protocols authenticate when there is somewhere to authenticate
+ * to, and neither does when the endpoint is on this machine —
+ * `RemoteResolver::run` never consults the keychain for a loopback address, so
+ * a key row there would ask for something nothing would read. Speech reaches
+ * the same rule from the other side: its keyless choice is a backend token, and
+ * the document refuses to pair that token with an off-machine endpoint.
+ */
+const needsKey = (stage: Stage, value: VoiceStageDto): boolean =>
+  stage === "transcription" ? value.backend === KEYED : !isLoopback(value.endpoint);
+
+/**
+ * A host that cannot leave this machine — `ServiceUrl::is_loopback`'s question,
+ * answered STRICTLY, which is deliberate rather than a near-miss.
+ *
+ * Rust parses the host as an `IpAddr` and asks `is_loopback()`, so it accepts
+ * the whole `127.0.0.0/8` and any spelling of `::1` including the expanded
+ * `0:0:0:0:0:0:0:1`. This accepts `localhost`, `127.*` and the short `::1`, and
+ * that is a narrower set on purpose: the two are not identical and the
+ * divergence only ever runs one way. Saying *not loopback* to something Rust
+ * calls loopback offers a key row nothing will read — a wasted field. Saying
+ * *loopback* to something Rust would authenticate to would hide the row a user
+ * needs, and that is the direction this must never err in. An unparseable
+ * endpoint gets the same treatment for the same reason.
+ *
+ * It is a display decision either way: `RemoteResolver::run` is what actually
+ * decides whether a credential is read, and it reads Rust's answer.
+ */
+const isLoopback = (endpoint: string): boolean => {
+  try {
+    const host = new URL(endpoint).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return host === "localhost" || host === "::1" || /^127\./.test(host);
+  } catch {
+    return false;
+  }
+};
+
+/** The stages, in the order the panel asks about them. */
+type Stage = "transcription" | "intent";
+
+/** The token a speech backend takes when it sends no credential at all. */
+const KEYLESS = "local";
+
+/**
+ * What the Endpoint field says the rule is, which is not the same rule for
+ * every backend.
+ *
+ * **The keyless speech backend may only reach this machine**, and that is a
+ * Rust rule (`settings::KEYLESS_OFF_MACHINE`) rather than a suggestion: it
+ * sends no `Authorization` header, so an endpoint on another host is a captured
+ * utterance uploaded to a third party with no credential on it. The document
+ * and the IPC seam both refuse the pairing, so typing one here comes back as a
+ * `saveError` — this is the field saying so before that happens.
+ *
+ * **The field stays offered**, which is deliberate rather than an omission the
+ * Rust rule has to cover for. A user who publishes the container on another
+ * port has to be able to say so, and `voice::transcribe::unreachable_detail`
+ * names *their* port in the docker command precisely because moving it is
+ * expected. Removing the field would break that, and would still not be the
+ * boundary — a hand-edited `desktop.toml` never passes through this panel.
+ */
+const endpointHint = (stage: Stage, backend: string): string =>
+  stage === "transcription" && backend === KEYLESS
+    ? "This machine only — http or https to a loopback address. The keyless backend sends no key, so it may not reach another host."
+    : "https to another machine, or http to this one.";
+
+export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) {
+  // Absence is `undefined`, not an empty section — see `DesktopSettingsDto`.
+  // Materialised here for display; a save writes the whole section, which is
+  // the first moment this build says anything about it.
+  const voice = settings.voice ?? DEFAULT_VOICE_SETTINGS;
+  // Per instance, for AppearancePanel's reason: two panels in one document
+  // must not share the id a radiogroup is named by.
+  const namesLabelId = useId();
+  const readingLabelId = useId();
+  const speechLabelId = useId();
+
+  const saveVoice = (next: VoiceSettingsDto) => onSave({ ...settings, voice: next });
+
+  const saveStage = (stage: Stage, next: Partial<VoiceIntentStageDto & VoiceTranscriptionStageDto>) =>
+    saveVoice({ ...voice, [stage]: { ...voice[stage], ...next } });
+
+  // A backend brings its own coordinates with it — see the file's header. A
+  // backend with no preset (one a newer build wrote) keeps what is stored
+  // rather than losing it to a fabricated default. The preset is laid over
+  // what is stored rather than replacing it, so a field no preset names —
+  // the speech language — stays the speaker's choice across the switch.
+  const chooseBackend = (stage: Stage, backend: string) =>
+    saveVoice({
+      ...voice,
+      [stage]: { ...voice[stage], ...(VOICE_STAGE_PRESETS[stage][backend] ?? { backend }) },
+    });
+  const speechLanguageHint = languageHint(voice.transcription.language, voice.transcription.model);
+
+  return (
+    <div className="settings-body" data-testid="voice-body">
+      <div className="settings-row">
+        <label htmlFor="voice-transcription">Speech</label>
+        <select
+          id="voice-transcription"
+          value={voice.transcription.backend}
+          onChange={(event) => chooseBackend("transcription", event.target.value)}
+        >
+          {VOICE_TRANSCRIPTION_BACKENDS.map((token) => (
+            <option key={token} value={token}>{TRANSCRIPTION_LABELS[token]}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* The one piece of panel prose here, and it clears
+          `docs/develop/desktop-gui.md`'s bar on the stated exception — "a
+          consequence the user has to act on". The keyless default is a
+          container the user has to be running, and somebody who does not know
+          that reads the first failed utterance as the feature being broken.
+          The wording tracks `voice::transcribe::unreachable_detail`, which is
+          what they meet if it is not running. */}
+      {voice.transcription.backend === "local" && (
+        <p className="settings-hint" data-testid="voice-speech-local">
+          Speech stays on this machine. Start the container with
+          {" "}<code>docker run -d -p {portOf(voice.transcription.endpoint)}:8000 {LOCAL_SPEECH_IMAGE}</code>
+          {" "}— the first utterance downloads the model.
+        </p>
+      )}
+
+      <StageFields stage="transcription" value={voice.transcription} onSave={saveStage} />
+
+      {/* Issue #1458: the language every request names. English by default,
+          which is what commands are spoken in; Auto names none. */}
+      <div className="settings-row">
+        <label htmlFor="voice-transcription-language">Language</label>
+        <select
+          id="voice-transcription-language"
+          value={voice.transcription.language}
+          onChange={(event) => saveStage("transcription", { language: event.target.value })}
+        >
+          <option value={AUTO_SPEECH_LANGUAGE}>Auto-detect</option>
+          {SPEECH_LANGUAGES.map((language) => (
+            <option key={language.code} value={language.code}>{language.name}</option>
+          ))}
+        </select>
+      </div>
+      {speechLanguageHint && (
+        <p className="settings-hint" data-testid="voice-language-hint">{speechLanguageHint}</p>
+      )}
+
+      {needsKey("transcription", voice.transcription) && (
+        <SecretRow id="voice-transcription" stage="transcription" endpoint={voice.transcription.endpoint} />
+      )}
+
+      <div className="settings-row">
+        <label htmlFor="voice-intent">Commands</label>
+        <select
+          id="voice-intent"
+          value={voice.intent.backend}
+          onChange={(event) => chooseBackend("intent", event.target.value)}
+        >
+          {VOICE_INTENT_BACKENDS.map((token) => (
+            <option key={token} value={token}>{INTENT_LABELS[token]}</option>
+          ))}
+        </select>
+      </div>
+
+      <StageFields stage="intent" value={voice.intent} onSave={saveStage} />
+
+      {/* PRD #1223, audit finding A1 — what leaves the machine on each
+          command, beside the endpoint it goes to. Panel prose clears
+          `docs/develop/desktop-gui.md`'s bar here for the reason the speech
+          hint does: the endpoint may be hosted, and what a user's own deck
+          labels and directory names are sent to is a consequence they act on
+          (the Send on-screen names row below). One short sentence each since
+          PRD #1497 R3-1; the clause-by-clause list, checked against
+          `voice::prompt::state`, `commands_state`, `outcome::local_intercept`
+          and `DIRECTORY_NAMES_SHOWN` (200), is `docs/desktop/voice.md`'s. */}
+      <p className="settings-hint" data-testid="voice-intent-disclosure">
+        {INTENT_DISCLOSURE}
+        {" "}{voice.labels === "withheld" ? INTENT_DISCLOSURE_WITHHELD : INTENT_DISCLOSURE_SHARED}
+        {" "}{INTENT_DISCLOSURE_QUESTION}
+      </p>
+
+      {/* Two short exclusive options, so a segmented control rather than a
+          select — `desktop-gui.md`'s cardinality rule, with AppearancePanel's
+          span + `aria-labelledby` radiogroup shape. The consequence of each is
+          the hint under it and the disclosure sentence above, which changes
+          with it. */}
+      <div className="settings-row">
+        <span className="settings-row-label" id={namesLabelId}>Send on-screen names</span>
+        <div className="segmented" role="radiogroup" aria-labelledby={namesLabelId}>
+          {VOICE_LABEL_SHARING.map((token) => (
+            <label key={token} className={token === voice.labels ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="voice-labels"
+                value={token}
+                checked={token === voice.labels}
+                onChange={() => saveVoice({ ...voice, labels: token })}
+              />
+              <span>{LABEL_SHARING_LABELS[token]}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <p className="settings-hint" data-testid="voice-labels-hint">{LABEL_SHARING_HINT}</p>
+
+      {/* Commands only. A transcription is as long as the audio was, so a
+          ceiling on the speech stage would bound nothing the user chose.
+          This one bounds an answer that includes a model's REASONING, which
+          is why it is here at all: the number was hardwired to 256, and any
+          model that thinks before it answers spent all of it thinking and
+          returned nothing. The failure sentence a truncated answer produces
+          names this row. */}
+      <NumberRow
+        id="voice-intent-max-tokens"
+        label="Max tokens"
+        value={voice.intent.max_tokens}
+        min={MIN_TOKEN_CEILING}
+        max={MAX_TOKEN_CEILING}
+        hint={`How much answer one command may cost, reasoning included — ${MIN_TOKEN_CEILING} to ${MAX_TOKEN_CEILING}. A ceiling, not a reservation: it costs nothing unless it is used. Raise it if answers come back cut off.`}
+        onCommit={(max_tokens) => saveStage("intent", { max_tokens })}
+      />
+
+      {/* One key row per backend that authenticates with a key of the app's
+          own, and none otherwise. Asking for a credential a user's chosen
+          backends do not need is how a feature becomes one most people never
+          try — the reason both stages default to a backend that needs none. */}
+      {needsKey("intent", voice.intent) && (
+        <SecretRow id="voice-intent" stage="intent" endpoint={voice.intent.endpoint} />
+      )}
+
+      {/* PRD #1497 D4 — Reading, off by default, with what it does and sends
+          beside it: an agent's replies leave the machine only once this is
+          on. The same segmented shape as Names. */}
+      <div className="settings-row">
+        <span className="settings-row-label" id={readingLabelId}>Reading</span>
+        <div className="segmented" role="radiogroup" aria-labelledby={readingLabelId}>
+          {VOICE_READING_CONSENT.map((token) => (
+            <label key={token} className={token === voice.reading ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="voice-reading"
+                value={token}
+                checked={token === voice.reading}
+                onChange={() => saveVoice({ ...voice, reading: token })}
+              />
+              <span>{READING_CONSENT_LABELS[token]}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <p className="settings-hint" data-testid="voice-reading-disclosure">{READING_DISCLOSURE}</p>
+
+      {/* PRD #1497 D9 — where reading's voice comes from. */}
+      <div className="settings-row">
+        <span className="settings-row-label" id={speechLabelId}>Speech source</span>
+        <div className="segmented" role="radiogroup" aria-labelledby={speechLabelId}>
+          {VOICE_SPEECH_SOURCES.map((token) => (
+            <label key={token} className={token === voice.speech ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="voice-speech"
+                value={token}
+                checked={token === voice.speech}
+                onChange={() => saveVoice({ ...voice, speech: token })}
+              />
+              <span>{SPEECH_SOURCE_LABELS[token]}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <p className="settings-hint" data-testid="voice-speech-hint">{SPEECH_SOURCE_HINTS[voice.speech] ?? SPEECH_SOURCE_HINTS.auto}</p>
+
+      {/* Rendered verbatim: `saveError` is a complete sentence composed by
+          `useDesktopSettings`, because the same prop also carries "your
+          settings file cannot be read" (issue #1072) — which must not acquire a
+          "saving it failed" preamble it has not earned. */}
+      {saveError && (
+        <p className="settings-error" role="alert">
+          <AlertTriangle size={13} />
+          <span>{saveError}</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One stage's endpoint and model.
+ *
+ * **Both stages always show both**, which they did not before: `intent:
+ * "claude"` spawned a CLI on this machine, so the panel hid two controls that
+ * would have changed nothing while that backend was chosen. Commands is
+ * API-only now, so every backend on this panel is an endpoint, a model and
+ * possibly a key — and the rows are unconditional.
+ *
+ * **Committed on blur and on Enter, not on every keystroke.** A URL is invalid
+ * for most of the time it is being typed, so saving per character would put a
+ * rejection under the field for `http`, `http:`, `http:/` and so on, and then
+ * write eight documents to reach one value. Escape restores what is stored,
+ * which is the undo a text field is expected to have.
+ */
+function StageFields({
+  stage,
+  value,
+  onSave,
+}: {
+  stage: Stage;
+  value: VoiceStageDto;
+  onSave: (stage: Stage, next: Partial<VoiceIntentStageDto>) => void;
+}) {
+  return (
+    <>
+      <TextRow
+        id={`voice-${stage}-endpoint`}
+        label="Endpoint"
+        value={value.endpoint}
+        hint={endpointHint(stage, value.backend)}
+        onCommit={(endpoint) => onSave(stage, { endpoint })}
+      />
+      <TextRow
+        id={`voice-${stage}-model`}
+        label="Model"
+        value={value.model}
+        onCommit={(model) => onSave(stage, { model })}
+      />
+    </>
+  );
+}
+
+/** One committed-on-blur text field, with the rule under it in words. */
+function TextRow({
+  id,
+  label,
+  value,
+  hint,
+  onCommit,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  hint?: string;
+  onCommit: (next: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  // The stored value wins whenever it changes underneath — a backend switch
+  // rewrites both fields, and a draft left over from the old backend would
+  // otherwise sit there looking current.
+  useEffect(() => { setDraft(value); }, [value]);
+
+  const commit = () => {
+    const next = draft.trim();
+    if (next && next !== value) onCommit(next);
+    else setDraft(value);
+  };
+
+  return (
+    <>
+      <div className="settings-row">
+        <label htmlFor={id}>{label}</label>
+        <input
+          id={id}
+          className="settings-input"
+          type="text"
+          spellCheck={false}
+          autoComplete="off"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") commit();
+            if (event.key === "Escape") setDraft(value);
+          }}
+        />
+      </div>
+      {hint && <p className="settings-hint" data-testid={`${id}-hint`}>{hint}</p>}
+    </>
+  );
+}
+
+/**
+ * One committed-on-blur integer field, with the rule under it in words.
+ *
+ * `TextRow`'s shape, and separate from it rather than a mode of it: the draft
+ * is text while it is being typed (`4` on the way to `4096` is out of range,
+ * and an empty field is not a number at all), and only a value that parses and
+ * sits inside the bounds is committed. Anything else restores what is stored on
+ * blur, which is the same undo the text fields have — Rust would refuse an
+ * out-of-range value at the document seam and cost the whole `[voice]` section,
+ * so declining to send one is cheaper than showing the user that error.
+ *
+ * `type="number"` is deliberately NOT used: its spinner and its browser-level
+ * coercion fight the commit-on-blur contract, and a field that silently rounds
+ * or blanks what was typed is the surprise this whole panel avoids.
+ */
+function NumberRow({
+  id,
+  label,
+  value,
+  min,
+  max,
+  hint,
+  onCommit,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  hint?: string;
+  onCommit: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => { setDraft(String(value)); }, [value]);
+
+  const commit = () => {
+    const next = Number(draft.trim());
+    if (draft.trim() && Number.isInteger(next) && next >= min && next <= max && next !== value) {
+      onCommit(next);
+    } else {
+      setDraft(String(value));
+    }
+  };
+
+  return (
+    <>
+      <div className="settings-row">
+        <label htmlFor={id}>{label}</label>
+        <input
+          id={id}
+          className="settings-input"
+          type="text"
+          inputMode="numeric"
+          spellCheck={false}
+          autoComplete="off"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") commit();
+            if (event.key === "Escape") setDraft(String(value));
+          }}
+        />
+      </div>
+      {hint && <p className="settings-hint" data-testid={`${id}-hint`}>{hint}</p>}
+    </>
+  );
+}
+
+/**
+ * One credential: type it, save it, forget it — and never read it back.
+ *
+ * Rendered only where `useSettingsBridge()` has a provider, the way
+ * `EndpointsPanel` hides Test connection: with no bridge there is nothing to
+ * press, and a panel rendered standalone in a test must not throw.
+ *
+ * Its own state is what the user is typing plus what the store last said. The
+ * settings document holds none of it, which is the point.
+ *
+ * **Labelled from the stage AND the endpoint.** `Speech key` named the stage
+ * and not the account the key came from, which is the one thing a user with
+ * several needs to know; the host is what they recognise, because they either
+ * typed it or picked the preset that carries it, and it stays true when they
+ * point the stage somewhere else — which a hardcoded provider name would not.
+ *
+ * **The stage half was dropped for a while and had to come back**, because the
+ * hosts stopped being distinct. Commands now defaults to OpenAI so that one key
+ * runs both stages, and OpenAI is also Speech's hosted option — so a user who
+ * picks hosted speech gets two key rows whose endpoint is the same host. Two
+ * fields labelled `Key for api.openai.com` is not a label, it is a coin toss:
+ * they are separate keychain entries under separate `SecretId`s, and a user has
+ * to be able to tell which one they are filling.
+ */
+function SecretRow({ id, stage, endpoint }: { id: VoiceSecretId; stage: Stage; endpoint: string }) {
+  const bridge = useSettingsBridge();
+  const label = `${stage === "intent" ? "Commands" : "Speech"} key for ${hostOf(endpoint)}`;
+  const [typed, setTyped] = useState("");
+  // Two pieces of state, not one, and the split is load-bearing: `status` is
+  // what the store last REPORTED and `failure` is what the last save or forget
+  // SAID. Folding them into one field looks tidier and is wrong — every
+  // operation refreshes the status afterwards, so a single field would have the
+  // refresh overwrite the failure sentence with `undefined` and a rejected save
+  // would render as if nothing had happened.
+  const [status, setStatus] = useState<SecretStatusDto>();
+  const [failure, setFailure] = useState<string>();
+  const [busy, setBusy] = useState(false);
+
+  const secretStatus = bridge?.secretStatus;
+  const refresh = useCallback(async () => {
+    if (!secretStatus) return;
+    try {
+      // `status.problem` is "I could not find out", which is NOT "nothing is
+      // stored" and must not render as it — otherwise an unreachable keychain
+      // invites the user to type their key again into a store that cannot hold
+      // it.
+      setStatus(await secretStatus(id));
+    } catch (error) {
+      setStatus({ stored: false, problem: messageOf(error) });
+    }
+  }, [id, secretStatus]);
+
+  // Asked on mount, which is the moment a machine with nowhere to put a key
+  // should say so — before the user types one rather than after.
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  if (!bridge) return null;
+
+  const run = async (work: () => Promise<unknown>) => {
+    setBusy(true);
+    try {
+      await work();
+      setFailure(undefined);
+      // The field is cleared only on success. A rejected save leaves what was
+      // typed where it is, so a retry after unlocking a keychain costs nothing.
+      setTyped("");
+    } catch (error) {
+      setFailure(messageOf(error));
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  };
+
+  const stored = status?.stored;
+  const problem = failure ?? status?.problem;
+
+  return (
+    <>
+      <div className="settings-row">
+        <label htmlFor={`secret-${id}`}>{label}</label>
+        <div className="voice-secret">
+          <input
+            id={`secret-${id}`}
+            className="settings-input"
+            // `password`, so the value is not on screen and a screenshot of a
+            // settings panel does not carry it. Autofill is off for the same
+            // reason `EndpointsPanel`'s fields turn it off: this is not a login
+            // form and a password manager offering to fill it would be wrong.
+            type="password"
+            spellCheck={false}
+            autoComplete="off"
+            value={typed}
+            placeholder={stored ? "A key is stored" : "Paste the key"}
+            onChange={(event) => setTyped(event.target.value)}
+          />
+          <button
+            className="button secondary compact"
+            data-testid={`save-${id}`}
+            disabled={busy || typed.trim().length === 0}
+            onClick={() => void run(() => bridge.storeSecret(id, typed))}
+          >
+            {stored ? "Replace" : "Save"}
+          </button>
+          {stored && (
+            <button
+              className="button secondary compact"
+              data-testid={`forget-${id}`}
+              disabled={busy}
+              onClick={() => void run(() => bridge.forgetSecret(id))}
+            >
+              Forget
+            </button>
+          )}
+        </div>
+      </div>
+      <SecretState id={id} stored={stored} problem={problem} />
+    </>
+  );
+}
+
+/**
+ * What the store last said, in one line.
+ *
+ * Three states and not two, because "I could not find out" is its own answer:
+ * a keychain that is locked, missing or refusing is a situation the user has to
+ * act on, and rendering it as *No key stored* would hide it behind an
+ * invitation to retype.
+ */
+function SecretState({
+  id,
+  stored,
+  problem,
+}: {
+  id: VoiceSecretId;
+  stored: boolean | undefined;
+  problem: string | undefined;
+}) {
+  if (problem) {
+    return (
+      <p className="settings-hint is-problem" role="alert" data-testid={`secret-problem-${id}`}>
+        {problem}
+      </p>
+    );
+  }
+  if (stored === undefined) return null;
+  return (
+    <p className="settings-hint" data-testid={`secret-state-${id}`}>
+      {stored ? "A key is stored in your OS keychain." : "No key stored yet."}
+    </p>
+  );
+}
+
+/**
+ * The port an endpoint would connect to, for the `docker run` the hint shows.
+ *
+ * Read from the endpoint rather than from the preset, so a user who moved it is
+ * told to publish the port they actually chose — `voice::transcribe::unreachable_detail`
+ * does the same on the Rust side, and the two sentences a user may meet in one
+ * session must not disagree about which port. `18000` only on a value neither
+ * side can parse, which is one Rust would refuse at the save anyway.
+ */
+function portOf(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    return url.port || (url.protocol === "https:" ? "443" : "80");
+  } catch {
+    return "18000";
+  }
+}
+
+/**
+ * The host an endpoint names, for the key row's label.
+ *
+ * Falls back to the whole value rather than to a generic word: a URL this
+ * cannot parse is one Rust will refuse at the save, and a label reading "Key
+ * for the remote service" would hide which of the two the user is looking at.
+ */
+function hostOf(endpoint: string): string {
+  try {
+    return new URL(endpoint).hostname || endpoint;
+  } catch {
+    return endpoint;
+  }
+}
+
+/**
+ * The sentence a rejected bridge call carries.
+ *
+ * The Rust side composes a complete sentence and the Tauri IPC rejects with it
+ * as a plain string, so an `Error` is what arrives in the browser preview and a
+ * string is what arrives from the command. Anything else is a bug rather than a
+ * message, and gets wording of this file's own rather than `String(error)` —
+ * which renders `[object Object]` at a user.
+ */
+function messageOf(error: unknown): string {
+  if (typeof error === "string" && error) return error;
+  if (error instanceof Error && error.message) return error.message;
+  return "The OS credential store could not be reached.";
+}

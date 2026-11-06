@@ -118,9 +118,11 @@ fi
 #
 # `/tag-release` Step 3 acts on this directly: tagging a `[skip ci]` HEAD
 # would stop `release.yml` running at all, so a `true` here means create an
-# empty preparation commit first. The usual cause is `docs-publish.yml`, which
-# ends every release by committing `chore: update docs chart to <tag> [skip
-# ci]` to `main`.
+# empty preparation commit first. Until #514 the usual cause was
+# `docs-publish.yml`, which ended every release by committing
+# `chore: update docs chart to <tag> [skip ci]` to `main`; nothing on the
+# release path writes a marker now, so a `true` here comes from a hand-written
+# commit message.
 head_message=$(git log -1 --format="%B" HEAD 2>/dev/null || echo "")
 skip_ci=false
 if echo "$head_message" | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'; then

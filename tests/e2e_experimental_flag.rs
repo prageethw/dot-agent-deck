@@ -18,7 +18,7 @@
 //!
 //! Decision 6: gated behind the `e2e` feature so CI's `cargo test-fast`
 //! never compiles it. Authored RED — the flag plumbing and the gated
-//! footer do not exist yet — and NOT run per-task (rule 5: the L2 suite is
+//! footer do not exist yet — and NOT run per-task (CLAUDE.md rule 5: the L2 suite is
 //! the pre-PR gate, not the per-task gate).
 
 mod common;
@@ -33,7 +33,7 @@ const EXPERIMENTAL_FOOTER_TEXT: &str = "experimental: on";
 
 /// Scenario: Launch the deck twice against the `minimal` fixture. The first
 /// launch sets `DOT_AGENT_DECK_EXPERIMENTAL=1` in the spawned binary's env;
-/// once the dashboard is up (`No active sessions`), the rendered grid must
+/// once the dashboard is up (`No active agents`), the rendered grid must
 /// show the `experimental: on` footer — proving the env override turns the
 /// gated surface on end-to-end with no config-file edit. The second
 /// (control) launch sets NO env var, so after the dashboard is up and
@@ -51,22 +51,23 @@ fn gating_003_env_var_toggles_footer_e2e() {
     let on = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("minimal");
-    on.wait_for_string("No active sessions");
+    on.wait_for_string("No active agents");
     on.wait_for_string(EXPERIMENTAL_FOOTER_TEXT);
 
     // OFF (control): no env var, default flag state -> surface hidden.
     // The gated footer is rendered in the SAME `render_dashboard` frame as
-    // the "No active sessions" message, so once that string is on the grid
+    // the "No active agents" message, so once that string is on the grid
     // the footer region for that frame has already been written — if the
     // flag were on, `experimental: on` would be present in the very same
     // frame. We therefore assert absence right after the positive sentinel.
     // (We must NOT use `wait_until_quiescent` here: the harness documents
     // quiescence as unreliable because the deck redraws often enough that a
     // 50ms idle window may never occur — so it times out on the always-
-    // redrawing dashboard. Rule 21 forbids sleeps, so a positive sentinel +
-    // same-frame absence check is the deterministic primitive.)
+    // redrawing dashboard. Linkage-check rule 5 (Decision 21) forbids sleeps,
+    // so a positive sentinel + same-frame absence check is the deterministic
+    // primitive.)
     let off = TuiDeck::launch_with_fixture("minimal");
-    off.wait_for_string("No active sessions");
+    off.wait_for_string("No active agents");
     assert!(
         !off.snapshot_grid().contains(EXPERIMENTAL_FOOTER_TEXT),
         "without DOT_AGENT_DECK_EXPERIMENTAL the gated footer must stay \
@@ -81,7 +82,7 @@ fn gating_003_env_var_toggles_footer_e2e() {
 /// first launch starts the deck from `nested/deep/`, two levels BELOW that
 /// root — the shape of issue #577, an operator running the deck from
 /// somewhere inside their project rather than at its top. Once the dashboard
-/// is up (`No active sessions`), the grid must show the `experimental: on`
+/// is up (`No active agents`), the grid must show the `experimental: on`
 /// footer: the flag is found by walking up to the project root. The second
 /// (control) launch is identical but starts at the project root, where the
 /// config sits in the launch directory itself, and must show the same footer
@@ -101,14 +102,14 @@ fn gating_004_flag_found_from_a_subdirectory_of_the_project() {
     let nested = TuiDeck::builder()
         .with_launch_subdir("nested/deep")
         .launch_with_fixture("features-experimental-on");
-    nested.wait_for_string("No active sessions");
+    nested.wait_for_string("No active agents");
     nested.wait_for_string(EXPERIMENTAL_FOOTER_TEXT);
 
     // Control: same fixture, same config file, launched AT the project root —
     // the case that always worked. If this one ever fails, the fixture or the
     // footer is broken and the assertion above proves nothing about the walk.
     let at_root = TuiDeck::launch_with_fixture("features-experimental-on");
-    at_root.wait_for_string("No active sessions");
+    at_root.wait_for_string("No active agents");
     at_root.wait_for_string(EXPERIMENTAL_FOOTER_TEXT);
 }
 
@@ -131,6 +132,6 @@ fn config_001_flag_resolves_from_project_dir_not_nested_launch_cwd() {
     let deck = TuiDeck::builder()
         .with_launch_subdir("nested/launch/dir")
         .launch_with_fixture("features-project-dir");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.wait_for_string(EXPERIMENTAL_FOOTER_TEXT);
 }

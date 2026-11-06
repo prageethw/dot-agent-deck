@@ -22,9 +22,126 @@ export const UNREPORTED = "Unavailable";
 
 export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
 export type RunHealth = "healthy" | "attention" | "failed" | "idle";
-export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped";
-export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting";
+/**
+ * The status an agent is shown in. `needs_input` and `idle` are the TUI's
+ * Needs Input and Idle (issue #1676): an agent waiting on the user and one that
+ * finished its turn are two states, never one.
+ */
+export type AgentStatus = "queued" | "running" | "needs_input" | "idle" | "passed" | "failed" | "stopped" | "blocked";
+
+/**
+ * The words a status is shown as. Each is its own id except Needs input, whose
+ * id cannot carry a space; the TUI's cards say Needs Input and Idle for the
+ * same two states.
+ */
+export function statusLabel(status: AgentStatus): string {
+  return status === "needs_input" ? "needs input" : status;
+}
+
+/** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
+export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
+
+/**
+ * Issue #714: why an agent is `blocked` — the agent reported that its provider
+ * refused it for an exhausted usage limit or credit pool. `detail` is the
+ * agent's own error message: agent-controlled text, scrubbed by the crate and
+ * rendered through `displayText` like every other such string. `resetsAtMs` is
+ * when the provider said the limit resets, when it said.
+ */
+export type AgentBlocked = {
+  kind: "usage_limit" | "credits_depleted" | "unknown";
+  detectedAtMs: number;
+  detail?: string;
+  resetsAtMs?: number;
+};
+/**
+ * PRD #1666: an agent's inbox as the daemon summarises it. `queued` and
+ * `fetched` are both still pending — the card counts them together — and
+ * `lastAckedAt` is when the agent last acknowledged a message, which is what
+ * "delivered" means.
+ */
+export type AgentInbox = {
+  queued: number;
+  fetched: number;
+  undeliverable: number;
+  lastAckedAt?: string;
+  /** How a new message would reach the agent: `native`, `turn_end`, `doorbell` or `none`. */
+  wake: string;
+  component?: string;
+  /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
+  wakeStalled?: boolean;
+  /** PRD #1666 §6.5: the deck messages waiting on the user's Retry or Cancel. */
+  attention?: InboxAttentionItem[];
+  /** PRD #1666 §11: why the agent's integration takes no deck messages yet. */
+  integration?: "cli_too_old" | "adapter_too_old" | "not_armed" | "refresh_failed" | "refresh_failed_pi" | "hooks_too_old";
+  /** PRD #1666 part 2 §2.7: the command that fixes `integration`, when the deck names one. */
+  integrationCommand?: string;
+  /** PRD #1666 §3: the deck's error recording receipts for this agent. */
+  receiptsDegraded?: string;
+  /** PRD #1666 §7: delivered messages whose evidence pauses hand-outs. */
+  evidencePaused?: number;
+  /** PRD #1666 part 3 (R-2): the refusal code the deck gave the agent's own request for its waiting messages. */
+  admissionRefused?: string;
+  /**
+   * PRD #2050: the daemon's sentence about a way the agent runs that the deck
+   * cannot fully support, and what to do about it — the same words the TUI's
+   * card prints.
+   */
+  agentNotice?: string;
+};
+/**
+ * PRD #1666 §6.4: one deck message an agent card lists for the user to decide
+ * on. `revision` is what Retry and Cancel compare on, so a second client
+ * acting on the same message is told it was too late.
+ */
+export type InboxAttentionItem = {
+  messageId: string;
+  revision: number;
+  kind: "uncertain" | "out_of_attempts" | "held_long" | "not_started";
+  fromLabel: string;
+  subject: string;
+  taskId?: string;
+};
+/** PRD #1666 §6.4: the two user actions on a listed deck message. */
+export type InboxActionVerb = "retry" | "cancel";
+/** PRD #1666 §2: the daemon's answer to Retry or Cancel. */
+export type InboxActionResult = { outcome: string };
+/**
+ * Issue #1678: the background work an agent left running after its turn ended,
+ * as the DAEMON counts it — commands still running in their own session and
+ * subagents started and not yet stopped. Present only with at least one count
+ * above zero; `sinceMs` is when the oldest counted item started on the daemon's
+ * clock, absent when the daemon has no start for any of them. The background
+ * aggregate carries counts and an instant, not subagent ids or command lines.
+ */
+export type AgentBackground = {
+  commands: number;
+  subagents: number;
+  sinceMs?: number;
+};
+export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
+
+/**
+ * Which of `AgentTile`'s two presentations to render (PRD #1105 M1).
+ *
+ * The grid tile and the agent-pane overlay are the SAME component at two
+ * sizes, and this is the one prop the differences are derived from — the whole
+ * point of the milestone that introduced it is that there is no
+ * `AgentTileOverlay`. A string union rather than an `isOverlay` boolean for
+ * three reasons a boolean cannot give: a third presentation (#745's deferred
+ * group view) arrives as a member rather than as a second boolean, whose four
+ * combinations include one that means nothing; `grep -rn '"overlay"'` finds
+ * every derivation; and where a derivation is written as a total map or a
+ * checked `switch`, an added member fails to compile instead of silently
+ * taking a `false` branch.
+ *
+ * The values name WHERE the pane appears, not how big it is, because not every
+ * difference is dimensional — the Reader launcher's fate is an affordance
+ * question, not a size one.
+ */
+export type AgentPanePresentation = "tile" | "overlay";
+
 export type Verdict = "PASS" | "FIX" | "HUMAN" | "ERROR" | "INFO";
 
 export interface ConnectionView {
@@ -51,6 +168,15 @@ export interface ConnectionView {
    * `deckId` above is what anything keying on a deck uses.
    */
   socketPath?: string;
+  /**
+   * A remote deck's NAME in the shared deck list (issue #1426) — what `deckName`
+   * shows in place of {@link socketPath}, which stays the deck's address.
+   *
+   * Carried by the bridge from the crate's `observed`/`unconfigured` lists, by
+   * `deckId`, because a deck's own snapshot does not state it. Absent for the
+   * local deck and for a remote deck with no usable name.
+   */
+  name?: string;
   /**
    * This deck is CONFIGURED but has no address yet (PRD #742 M12) — a stored
    * row whose socket path `Test connection` has not filled in.
@@ -86,6 +212,22 @@ export interface ConnectionView {
   pending?: boolean;
   message?: string;
   /**
+   * PRD #1666 part 2 (G-fix7c) — on a connected deck, the daemon process whose
+   * listing this snapshot carries; the same value its agents' `incarnation`
+   * holds, stated for the deck so that one listing nobody still names it.
+   * Another process than the last one seen means the deck restarted
+   * (`lib/restartDrop.ts`). Absent from a deck that names none, and from a
+   * snapshot that is not connected.
+   */
+  incarnation?: string;
+  /**
+   * The technical half of an incompatible daemon's `message`: the declared
+   * compatibility breaks by name, the protocol number on each side and the two
+   * builds. A user cannot act on any of it, so it is shown only behind a
+   * Technical details disclosure, never in the sentence.
+   */
+  detail?: string;
+  /**
    * Which kind of deck this connection is to (PRD #741 M7): `"local"` for a
    * daemon on this machine, `"remote"` for one reached over an ssh tunnel.
    *
@@ -115,7 +257,7 @@ export interface ConnectionView {
   selectionFallback?: string;
   /**
    * Why the project-aware surfaces — choosing a project, preparing and launching
-   * a workflow — are unavailable against this deck (PRD #741 M8).
+   * an orchestration — are unavailable against this deck (PRD #741 M8).
    *
    * The daemon's own sentence, derived from what it ADVERTISED in its `Hello`
    * reply rather than from a version number or a build stamp. Absent means
@@ -124,6 +266,20 @@ export interface ConnectionView {
    * the launch needs was advertised.
    */
   projectActionsReason?: string;
+  /**
+   * Why the New agent flow cannot start anything on this deck (PRD #1223) —
+   * the crate's sentence for a deck that does not advertise
+   * `list-directories`. Browsing is the only way the flow chooses a directory,
+   * so the deck step shows such a deck disabled with this reason. Absent means
+   * available.
+   */
+  newAgentReason?: string;
+  /**
+   * Issue #1240 — the deck honours the directory browser's listing options:
+   * Show hidden, symlinked directories and a filter the deck applies before its
+   * entry cap. Absent or false browses the deck exactly as PRD #1223 did.
+   */
+  listingOptions?: boolean;
   /** True when a daemon answered Hello but failed protocol/build compatibility. */
   daemonDetected?: boolean;
   /** Honest count reported by Hello; undefined when the daemon could not report it. */
@@ -149,13 +305,100 @@ export interface ConnectionView {
    */
   clientBuildVersion?: string;
   daemonBuildVersion?: string;
+  /**
+   * PRD #1487 D8 — whether to offer **Upgrade** for this deck, worked out by
+   * the desktop crate from the daemon's version (`daemon_upgrade::upgrade_offer`)
+   * so nothing here compares versions. Read it through `upgradeOffered`.
+   * Absent in fixture scenarios that do not play an older daemon.
+   */
+  upgradeOffer?: import("./lib/upgrade").UpgradeOffer;
+  /**
+   * Issue #1490 — why this deck is not connected, and the ONE control to offer
+   * for it, decided in Rust (`dot_agent_deck::daemon_start`): render
+   * **Start daemon** when `action` is `"start-daemon"` and **Reconnect** when it
+   * is `"reconnect"`, never both. Present on a live `"disconnected"` deck;
+   * absent otherwise, and in fixture scenarios that do not play one.
+   */
+  disconnectedReason?: DisconnectedReason;
+  /**
+   * Issue #1637 — agents whose hooks on this deck run an older
+   * `dot-agent-deck` (or, issue #1157, a deck that could not install hooks),
+   * each with the daemon's own remedy so this app and the TUI say the same
+   * thing. Absent when there is nothing to show.
+   */
+  hookBinaryNotices?: HookBinaryNotice[];
 }
+
+/**
+ * Issue #1637 — one hook-binary notice, as the daemon reports it.
+ *
+ * - `"older"`: the hooks run an older release (`version`).
+ * - `"unreported"`: the hooks run a copy so old it does not report a version.
+ * - `"unprobeable"`: the hooks' copy did not answer when asked its version.
+ * - `"ephemeral_location"`: this deck runs from a disk image or a translocated
+ *   location and found no installed copy to pin instead, so it installed no
+ *   hooks; `binary` is its own path.
+ * - `"unknown"`: a reason a newer daemon added.
+ */
+export interface HookBinaryNotice {
+  binary: string;
+  agents: string[];
+  version?: string;
+  daemonVersion: string;
+  reason: "older" | "unreported" | "unprobeable" | "ephemeral_location" | "unknown";
+  /** What to do, in the daemon's words. Never carries a path or a command. */
+  remedy: string;
+  /**
+   * The command that applies the fix, when there is one, shown after
+   * `remedy` and copied by the Copy button. The daemon composes it from
+   * trusted data only, and the bridge drops one that a display would alter.
+   */
+  command?: string;
+}
+
+/**
+ * Issue #1490 — why a deck the app is not connected to is not connected.
+ *
+ * - `"not-running"`: no daemon runs at the deck's socket → `action` is
+ *   `"start-daemon"`.
+ * - `"running-not-connected"`: a daemon runs there and the app is not
+ *   connected to it → `"reconnect"`.
+ * - `"unknown"`: the app cannot tell (the host is unreachable, ssh refused the
+ *   login, the deck is not installed there, or the first check has not
+ *   answered yet) → `"reconnect"`, and `message` says why.
+ *
+ * `message` is the sentence to show, `detail` the technical half for a
+ * disclosure, and `host` the machine the daemon runs on as the confirm dialog
+ * names it: `"this machine"` for a local deck, `user@host[:port]` for a remote
+ * one.
+ */
+export interface DisconnectedReason {
+  kind: "not-running" | "running-not-connected" | "unknown";
+  action: "start-daemon" | "reconnect";
+  message: string;
+  /** What kind of problem, when `kind` is `"unknown"`. */
+  failure?: StartDaemonFailure;
+  detail?: string;
+  host: string;
+}
+
+/** Issue #1490 — what stopped a start, or a check of whether a daemon runs. */
+export type StartDaemonFailure =
+  | "host-unreachable"
+  | "auth-failed"
+  | "host-key-not-trusted"
+  | "not-installed"
+  | "too-old"
+  | "did-not-answer"
+  | "start-failed"
+  | "check-failed"
+  | "not-checked-yet";
 
 /**
  * One project the DAEMON knows about (PRD #819 M6).
  *
  * It replaced `DeckProject`, which was a locally-invented record — a minted id,
- * a free-typed `cwd`, a workflow name, notes — persisted under
+ * a free-typed `cwd`, an orchestration name, notes — persisted under
  * `dot-agent-deck.desktop.projects.v1` and used as the source of truth for the
  * launch working directory. Nothing validated it against the daemon's world, so
  * against a remote daemon it named a directory on the wrong machine.
@@ -201,7 +444,7 @@ export interface DaemonOrchestrationRole {
 }
 
 export interface DaemonOrchestration {
-  /** Identity: this exact string goes back as the launch's workflow name. */
+  /** Identity: this exact string goes back as the launch's orchestration name. */
   name: string;
   /** `name`, escaped for rendering. */
   displayName: string;
@@ -210,9 +453,9 @@ export interface DaemonOrchestration {
 }
 
 /**
- * One resolved project: the canonical path, and the workflows that project
- * offers. The order is `daemon → project → workflow` and it is not
- * rearrangeable — the workflow list comes out of the project's own config, so
+ * One resolved project: the canonical path, and the orchestrations that project
+ * offers. The order is `daemon → project → orchestration` and it is not
+ * rearrangeable — the orchestration list comes out of the project's own config, so
  * there is nothing to offer before a project is chosen.
  */
 export interface DaemonResolvedProject {
@@ -230,6 +473,160 @@ export interface DaemonResolvedProject {
    */
   configRevision?: string;
 }
+
+/**
+ * PRD #1223 M4 — one subdirectory of a deck's filesystem, as that deck listed
+ * it for the New agent dialog.
+ */
+export interface DeckDirectoryEntry {
+  /**
+   * Identity: the canonical path the DAEMON joined, byte for byte — the string
+   * entering this directory sends back. Never built here from a parent and a
+   * name: the deck's filesystem need not be this machine's.
+   */
+  path: string;
+  /** The entry's name, escaped for rendering. Display-only. */
+  displayName: string;
+  /** It holds a `.dot-agent-deck.toml` the deck's project reader would open. */
+  isProject: boolean;
+  /**
+   * Issue #1240 — a symlink the deck listed by its target, so {@link path} is
+   * where it leads (and need not lie under the listing). Absent means a real
+   * directory.
+   */
+  isSymlink?: boolean;
+}
+
+/**
+ * Issue #1240 — what the directory browser asks a deck to widen or narrow
+ * about one listing. Sent only to a deck whose connection has
+ * `listingOptions`; omitted, the listing is PRD #1223's.
+ */
+export interface DeckListingOptions {
+  /** List `.`-named directories too. */
+  includeHidden?: boolean;
+  /** List symlinks to directories too, by their targets. */
+  includeSymlinks?: boolean;
+  /** Keep only directories whose name contains this, case-insensitively — applied by the deck before its entry cap. */
+  filter?: string;
+}
+
+/**
+ * One directory on a named deck (PRD #1223 M4), or the deck's answer that it
+ * has no listing verb — a deck older than the PRD, which the dialog does not
+ * offer at its deck step (`ConnectionView.newAgentReason`). `unsupported` is an
+ * outcome, not an error.
+ */
+export type DeckDirectoryListing =
+  | {
+    kind: "listing";
+    /** Identity: the deck's canonical spelling — what the flow carries from here on. */
+    path: string;
+    /** `path`, escaped for rendering. Never sent anywhere. */
+    displayPath: string;
+    /** The parent as the DECK computed it, which is what "up" sends. Absent at the root. */
+    parent?: string;
+    entries: DeckDirectoryEntry[];
+    /** The deck's entry cap or time budget cut the listing short. */
+    truncated: boolean;
+  }
+  | { kind: "unsupported" };
+
+/** One agent registry entry, for the New agent form's agent list (PRD #1223 M4). */
+export interface NewAgentOption {
+  /** The registry's stable key (`claude`, `opencode`, …). */
+  id: string;
+  /** The registry's label, escaped for rendering. */
+  displayName: string;
+  /** What choosing this agent writes into Command. */
+  defaultCommand?: string;
+}
+
+/**
+ * The authoring agents a deck can start (PRD #1223 M7) — the TUI's
+ * `schedule`, `schedule: issues` and `dispatcher` Mode options, spelled as the
+ * wire spells them. A closed set: the crate refuses any other value rather
+ * than starting a plain agent with no seed.
+ */
+export type AuthoringKind = "schedule" | "schedule-issues" | "dispatcher";
+
+/**
+ * What the New agent form needs to know about one deck (PRD #1223 M4).
+ *
+ * `deck` is the deck's own answer. `unsupported` is a deck older than the PRD:
+ * nothing in it comes from the deck, and `desktopAgents` is the registry
+ * compiled into THIS app, which the form labels as such. `lastCommand` is that
+ * deck's last New agent command, either way: the deck's own, shared with the
+ * TUI, when the deck keeps one (issue #1540), else the one this app last
+ * started there.
+ */
+export type NewAgentOptions =
+  | {
+    kind: "deck";
+    /** The deck host's configured `default_command` — Command's first prefill. */
+    defaultCommand?: string;
+    /**
+     * The deck host's configured `default_dir` (PRD #1223), canonical and
+     * vetted by the deck; the directory browser opens here instead of home.
+     * Absent when unset or unusable.
+     */
+    defaultDir?: string;
+    agents: NewAgentOption[];
+    experimental: boolean;
+    authoringKinds: string[];
+    lastCommand?: string;
+  }
+  | { kind: "unsupported"; desktopAgents: NewAgentOption[]; lastCommand?: string };
+
+/**
+ * Which of the app's experimental surfaces to show (issue #1198) — the Tauri
+ * `desktop_features` reply, one field per `features::show_desktop_*` wrapper in
+ * the root crate.
+ *
+ * It is the DESKTOP process's flag and belongs to the app, not to a deck — do
+ * not confuse it with {@link NewAgentOptions}' per-deck `experimental`. All
+ * `false` is the shipped default. The agent overview, the agent overlay and
+ * Settings have no field because they are never gated.
+ */
+export interface DesktopFeatures {
+  showDeck: boolean;
+  showProjects: boolean;
+  showPrompts: boolean;
+  showOrchestrations: boolean;
+  showAgentProfiles: boolean;
+  /**
+   * Issue #1400 — the agent screen's Diff, Checks, Delegations and Artifacts
+   * tabs and its ATT, MODEL and USAGE fields, which a live daemon supplies
+   * nothing for today. Off leaves Terminal as the only tab.
+   */
+  showAgentDetails: boolean;
+}
+
+/** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
+export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
+  showDeck: false,
+  showProjects: false,
+  showPrompts: false,
+  showOrchestrations: false,
+  showAgentProfiles: false,
+  showAgentDetails: false,
+};
+
+/**
+ * The orchestrations the New agent form can offer for one directory on one deck
+ * (PRD #1223 M6) — that deck's `ResolveProject` answer.
+ *
+ * `project` carries the deck's canonical path, which is what the launch sends.
+ * `not_project` is an ordinary directory: the deck's generic `unresolved`
+ * refusal, which is an answer here and not an error. `unsupported` is a deck
+ * that cannot launch from this flow — it lacks the project verbs, or cannot
+ * start a role with its configured command — and `reason` says which; the form
+ * withholds the orchestration chips and shows it.
+ */
+export type NewAgentOrchestrations =
+  | ({ kind: "project" } & DaemonResolvedProject)
+  | { kind: "not_project" }
+  | { kind: "unsupported"; reason: string };
 
 export interface DeckPrompt {
   id: string;
@@ -269,13 +666,44 @@ export interface Artifact {
 
 /**
  * Which top-level surface is mounted. A discriminated union from the start even
- * though it carries only two variants today, so PRD #745 iteration 3's group
- * and single-agent views arrive as added variants rather than as a refactor of
- * a boolean. No router library is warranted for this.
+ * though it carried only two variants for its first two PRDs, so PRD #745
+ * iteration 3's group and single-agent views arrive as added variants rather
+ * than as a refactor of a boolean. No router library is warranted for this.
  */
 export type DeckView =
   | { kind: "deck" }
-  | { kind: "overview" };
+  | { kind: "overview" }
+  /**
+   * PRD #1105 M2 — one agent's pane, OVER the screen it was opened from.
+   *
+   * The first two variants REPLACE the mounted screen, and `DeckShell` says so
+   * in its own doc comment. This one deliberately does not: an overlay that
+   * unmounted the screen beneath it would re-declare that screen's shown
+   * terminal set, and a nine-tile deck coming back costs five re-attaches and
+   * five scrollback replays. So `from` names the base screen to keep mounted
+   * underneath, and closing is `setView({ kind: from })`.
+   *
+   * `from` is also the ONLY record of where back goes. There is no history
+   * stack and none is wanted: a view reachable from two screens has to carry
+   * which one it came from anyway, and carrying it in the value makes a direct
+   * initial agent view — one with no prior navigation at all — close to the
+   * right place by construction.
+   *
+   * `deckId` is here even though nothing in M2/M3/M5 reads it, because the
+   * overview merges every observed deck's agents and an agent id is per-daemon
+   * monotonic: `agentId` alone names an agent on the selected deck and a
+   * DIFFERENT agent on any other. M6's cross-deck switch is what consumes it.
+   *
+   * `incarnation` is PRD #1666 part 2 (G-fix6): the daemon process that listed
+   * the agent when the view was opened, because a restarted deck reuses agent
+   * ids too. The view resolves its record only under that incarnation, so a
+   * newer snapshot that lists an unrelated agent under the same id is the open
+   * agent GONE, never the open agent. The key is absent only on a view nothing
+   * has bound yet; `DeckShell` binds every view it is handed
+   * (`bindViewIncarnation`), and a key holding `undefined` is a deck that named
+   * no process, on which the backend sends no action.
+   */
+  | { kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview"; incarnation?: string };
 
 /**
  * An agent's tab membership exactly as the daemon reports it, mirroring
@@ -310,6 +738,76 @@ export type AgentTab =
  * daemon. See `OverviewAgent` in `components/AgentOverview.tsx`, which is the
  * compiler-enforced honest projection.
  */
+/**
+ * PRD #1541 — the daemon's agent-type identity (`DesktopAgent.agent_type`):
+ * snake_case wire values, not names anybody reads. `none` covers an
+ * unrecognised command and any type a newer daemon names that this app does
+ * not know.
+ */
+export type AgentTypeId = "claude_code" | "open_code" | "pi" | "codex" | "devin" | "none";
+
+/**
+ * PRD #1541 — whether the agent is in the middle of a turn, from the daemon's
+ * status: `working` while it reports thinking, working or compacting, `idle`
+ * while it reports idle or waiting for input. Absent when the status says
+ * neither (no hook state yet, an error, a block, an unknown status) — the deck
+ * did not say, and voice's interrupt treats that as "not working".
+ */
+export type AgentTurn = "working" | "idle";
+
+/**
+ * PRD #1541 — the keys the DECK says interrupt this agent's turn and edit its
+ * prompt (`DesktopPromptKeys`, served by the daemon from its own agent
+ * registry and bounded by the desktop crate). Each `bytes` is written to the
+ * agent's terminal unchanged.
+ */
+export interface PromptKeys {
+  /** Write each step in order, waiting `pauseAfterMs` after each. */
+  interrupt: { bytes: string; pauseAfterMs: number }[];
+  /**
+   * The key that clears the prompt. `per_wrapped_row`: one press per wrapped
+   * screen row (Claude Code); `per_line`: one per logical line. Extra presses
+   * are harmless, so round up. Never more than `maxPressesPerWrite` in one
+   * write, when present, and `pauseBetweenWritesMs` between two writes of
+   * one clear, when present (Claude Code reads two writes sent back to back
+   * as one, and ignores a read that large).
+   */
+  clear: {
+    bytes: string;
+    presses: "per_wrapped_row" | "per_line";
+    maxPressesPerWrite?: number;
+    pauseBetweenWritesMs?: number;
+  };
+  /**
+   * The key that deletes one character, and the longest single write (in
+   * characters) the agent keeps as typed text — absent where no limit was
+   * observed. Voice applies its own 800-character ceiling on top (PRD #1541).
+   */
+  deleteChar: { bytes: string; maxLiteralWriteChars?: number };
+}
+
+/**
+ * PRD #1401 — what the badge shows and opens. `url` is present only when it is
+ * a github.com pull request page (`pullRequestFromDto`), so a badge without it
+ * opens nothing.
+ */
+export interface AgentPullRequest {
+  number: number;
+  url?: string;
+  state: import("./lib/bridge").PullRequestState;
+  review?: import("./lib/bridge").PullRequestReview;
+  /** Issue #1781 — the PR's CI result and how many checks are in each bucket. */
+  checks?: AgentPullRequestChecks;
+}
+
+export interface AgentPullRequestChecks {
+  state: import("./lib/bridge").PullRequestChecksState;
+  passing: number;
+  failing: number;
+  pending: number;
+  skipped: number;
+}
+
 export interface AgentSession {
   /** HONEST. Per-daemon monotonic integer, so it is unique only within a daemon. */
   id: string;
@@ -330,17 +828,38 @@ export interface AgentSession {
    * and `spawnedAtMs`.
    */
   cli?: string;
+  /**
+   * HONEST. PRD #1541 — the agent type the daemon reports for this agent.
+   * Optional so a surface built without it reads "the deck did not say".
+   */
+  agentType?: AgentTypeId;
+  /** HONEST. PRD #1541 — mid-turn or idle, from the daemon's status; see {@link AgentTurn}. */
+  turn?: AgentTurn;
+  /**
+   * HONEST. PRD #1541 — the prompt keys the daemon served for this agent.
+   * Absent when the deck has none for it (Devin, an unrecognised agent), is
+   * too old to send them, or sent a set the desktop refused — and never filled
+   * from a table of this app's own (the issue #856 principle).
+   */
+  promptKeys?: PromptKeys;
   /** FIXTURE-ONLY — the daemon tracks no model per agent (PRD #745, #633). */
   model: string;
   /** HONEST. */
   status: AgentStatus;
+  /**
+   * HONEST. The daemon's own status word, before `status` merges Working
+   * with Thinking — which the dashboard
+   * filter keeps apart (issue #1496). Absent in fixture mode, whose agents
+   * have only `status`.
+   */
+  daemonStatus?: DaemonAgentStatus;
   /**
    * HONEST — the daemon's `lastUserPrompt`, else a restatement of `activeTool`,
    * else a placeholder saying the daemon reported neither.
    *
    * A DISPLAY COPY, sanitised and clamped to `DISPLAY_LIMITS.prompt` by
    * `agentFromDto`'s `taskLine`, because `AgentTile` prints it straight into a
-   * DOM text node and the deck is the screen the app opens on. Bounding it at
+   * DOM text node on the deck, one of the app's two screens. Bounding it at
    * the projection rather than at that one tile is deliberate: nothing sorts,
    * groups or keys on this field, so making it a display copy costs nothing and
    * makes every consumer of it safe by construction rather than by memory.
@@ -442,6 +961,47 @@ export interface AgentSession {
    * rule and forks only the wording.
    */
   spawnedAtMs?: number;
+  /**
+   * HONEST. Issue #1496 — the authoring kind the daemon recorded for this
+   * agent (`AgentRecord.authoring_kind`): a dispatcher, a schedule or a
+   * schedule-issues agent, which is otherwise an ordinary dashboard pane.
+   * Absent for every other agent and from a daemon predating the field.
+   */
+  authoringKind?: AuthoringKind;
+  /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
+  blocked?: AgentBlocked;
+  /**
+   * HONEST. PRD #1666: the agent's inbox as the daemon summarises it
+   * (`AgentRecord.inbox`). Absent from a daemon predating the inbox and in
+   * fixture mode.
+   */
+  inbox?: AgentInbox;
+  /**
+   * HONEST. PRD #1666: the deck's notice explaining an `error` status — today a
+   * message the deck could not deliver to this agent. A display copy, present
+   * only while the daemon reports the agent in error.
+   */
+  deliveryNotice?: string;
+  /**
+   * HONEST. PRD #1631: the question the agent is waiting on, from the daemon's
+   * snapshot. Every text field is the agent's own words, scrubbed by the
+   * crate; render it through `displayText` like any other free-form string.
+   */
+  pendingQuestion?: import("./lib/voiceQuestion").PendingQuestionDto;
+  /**
+   * HONEST. PRD #1401 — the pull request the daemon found for the branch this
+   * agent works on (`SessionSnapshot.pull_request`), shown as the tile's badge.
+   * Absent when the daemon knows of none, has no `gh` login, or predates the
+   * field; never filled in by this app.
+   */
+  pullRequest?: AgentPullRequest;
+  /**
+   * HONEST. Issue #1678: background work still running after the agent's turn
+   * ended, copied from the daemon's aggregate and validated at the bridge.
+   * Rendering goes through `displayBackgroundWork`, which words it exactly as
+   * the TUI card does.
+   */
+  background?: AgentBackground;
   /** HONEST. */
   rows: number;
   /** HONEST. */
@@ -477,6 +1037,15 @@ export interface AgentSession {
   inOrchestration?: boolean;
   /** HONEST. True for the orchestration's start role — the coordinator an operator should message. */
   isStartRole?: boolean;
+  /**
+   * HONEST. The daemon process that listed this agent (PRD #1666 part 2). A
+   * restarted deck numbers its agents from 1 again, so an action on this agent
+   * carries this value, captured when the action was offered, and the desktop
+   * sends the action only to that process — opening its terminal included.
+   * Absent from a deck that names none, and then the desktop sends no action
+   * on the agent at all.
+   */
+  incarnation?: string;
 }
 
 export interface EvidenceItem {
@@ -515,6 +1084,48 @@ export interface AgentProfile {
   savedToProject: boolean;
 }
 
+/**
+ * PRD #1258 M4 — one watched role's filesystem on a deck's host, as its daemon
+ * reports it. A figure the daemon could not read is absent, never zero.
+ */
+export interface HostDiskUsage {
+  role: string;
+  freeBytes?: number;
+  totalBytes?: number;
+  /** PRD #1258 — the daemon's level for this filesystem's free space. */
+  level?: HostLevel;
+}
+
+/**
+ * PRD #1258 — how healthy one host reading is, as the deck's daemon judged it
+ * against its own thresholds. The app colours from it and never recomputes it;
+ * a reading without one (an older daemon, or an absent number) is shown
+ * uncoloured, not as `ok`.
+ */
+export type HostLevel = "ok" | "warn" | "critical";
+
+/** PRD #1258 M4 — a deck's host sample; every reading but the age may be absent. */
+export interface HostMetrics {
+  disks: HostDiskUsage[];
+  loadPerCpu?: number;
+  cpuCount?: number;
+  memoryUsedBytes?: number;
+  memoryAvailableBytes?: number;
+  /** PRD #1258 — the daemon's level for {@link loadPerCpu}. */
+  loadLevel?: HostLevel;
+  /** PRD #1258 — the daemon's level for available memory as a share of the total. */
+  memoryLevel?: HostLevel;
+  sampledAtMs: number;
+  sampleAgeMs: number;
+}
+
+/**
+ * PRD #1258 M4 — what a deck says about its host: its sample, or that its
+ * daemon does not report one (an older build), which the card states as "not
+ * available from this deck" rather than as zeros.
+ */
+export type HostMetricsReport = { status: "available"; metrics: HostMetrics } | { status: "not-available" };
+
 export interface DeckSnapshot {
   runId: string;
   repo: string;
@@ -546,6 +1157,18 @@ export interface DeckSnapshot {
    * be compared.
    */
   scheduleRevision?: number;
+  /**
+   * The crate's applied selection is All Decks (#1083), so this snapshot is the
+   * local deck's only because the plumbing needs one. The deck screen reads it
+   * to show "Select a deck" instead. Absent in fixture mode.
+   */
+  allDecks?: boolean;
+  /**
+   * PRD #1258 M4 — this deck's host, from its own daemon. Absent until the
+   * deck has answered, and for a deck that is not connected. Absent in fixture
+   * mode.
+   */
+  hostMetrics?: HostMetricsReport;
   stages: WorkflowStage[];
   agents: AgentSession[];
   evidence: EvidenceItem[];
@@ -592,19 +1215,21 @@ export type DeckFleet = DeckSnapshot[];
 
 /** One delegation's lifecycle, driven by the daemon's handoff events. */
 export interface HandoffEdge {
-  /** The daemon's delegation id (`dlg-<millis>-<seq>`). */
+  /** The delegated message's inbox id (`m-…`), PRD #1666. */
   id: string;
   toRole: string;
   orchestration?: string;
   taskPreview?: string;
   /**
-   * dispatched → delivered → done is the healthy path; failed is terminal and
-   * carries `reason`. `respawned` marks that the worker was restarted for this
-   * delegation (expected for clear=true roles).
+   * delegated → delivered → done is the healthy path; failed (the message was
+   * not delivered) is terminal and carries `reason`. `respawned` marks that the
+   * worker was restarted for this delegation (expected for clear=true roles).
    */
-  status: "dispatched" | "delivered" | "failed" | "done";
+  status: "delegated" | "delivered" | "failed" | "done";
   respawned: boolean;
   reason?: string;
+  /** The worker report that marked this edge done, so a redelivered report marks nothing else. */
+  reportId?: string;
   /** Wall-clock of the newest event applied to this edge (HH:MM:SS). */
   at: string;
 }
@@ -614,22 +1239,79 @@ export type DeckAction =
   | { type: "resume_run" }
   | { type: "approve_run" }
   | { type: "advance_fixture" }
-  | { type: "start_daemon" }
+  /**
+   * Start the daemon of deck `deckId` (issue #1490), on this machine or on a
+   * remote deck's host over ssh, then connect to it. Absent means the selected
+   * deck. Resolves once the deck is connected; rejects with the sentence to
+   * show otherwise.
+   */
+  | { type: "start_daemon"; deckId?: string }
   | { type: "stop_daemon"; force?: boolean }
-  | { type: "restart_daemon" }
-  | { type: "allow_build_mismatch" }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  /**
+   * Connect anyway (issue #801). `deckId` names the deck whose refusal the
+   * user pressed it on (issue #1472); the crate connects to THAT deck and
+   * rejects with the reason when it still cannot. Absent means the selected
+   * deck.
+   */
+  | { type: "allow_build_mismatch"; deckId?: string }
+  /**
+   * The Runs screen's launch. `taskPrompt` may be empty (issue #1044): the deck
+   * then composes a coordinator context with no task section and the
+   * coordinator waits for instructions, as under the TUI's `Ctrl+n`.
+   * `displayTitle` is the run's name — absent when the form's Name is empty, so
+   * the run takes the orchestration's name, as `start_orchestration`'s does.
+   */
+  | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  /**
+   * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
+   * wire `connection.deckId` of the target, captured once when the user picks
+   * the deck. Required, and never defaulted to the selected deck: under All
+   * Decks the selection resolves to the local deck (#1083), which is exactly
+   * the wrong answer on the overview. A deck the app is not observing is
+   * refused and nothing starts anywhere. The new agent's id comes back as
+   * `DeckActionResult.agentId`.
+   *
+   * `authoringKind` (PRD #1223 M7) starts an authoring agent instead, whose
+   * seed the deck composes and delivers once the agent is ready. It needs a
+   * `cwd` and a resolved `command` — a blank one would start the deck's
+   * default shell, which cannot act on a seed — and a deck that cannot compose
+   * the seed refuses it and starts nothing.
+   */
+  | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: AuthoringKind }
+  /**
+   * Launch one of a project's orchestrations on the deck `deckId` names, the
+   * TUI's way (PRD #1223 M6): no task prompt, `displayTitle` (the form's Name)
+   * as the run's title — absent when the Name is empty, so the run takes the
+   * orchestration's name — and every role started with the command its config
+   * gives it, on the deck. `path` and `orchestration` are the deck's own
+   * spellings from `newAgentOrchestrations`. The START role's id comes back as
+   * `DeckActionResult.agentId`.
+   *
+   * Not `activate_orchestration`, which is the Runs screen's launch and keeps its own
+   * form rules.
+   */
+  | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
   | { type: "retry_stage"; stageId: string }
-  | { type: "stop_agent"; agentId: string }
-  | { type: "rename_agent"; agentId: string; displayName: string }
-  | { type: "submit_text"; agentId: string; text: string };
+  /**
+   * PRD #1223 U4 — stop one agent on the deck `deckId` names, which the crate
+   * resolves as it resolves a start's: never from the selection, so an agent on
+   * another deck can be stopped from the overview under All Decks.
+   */
+  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string }
+  /**
+   * PRD #1223 U4 — close a whole orchestration: stop every one of `roles` on the
+   * deck `deckId` names, concurrently. There is no orchestration-wide daemon
+   * verb; this is `stop_agent` fanned out, as the TUI's Ctrl+W closes a tab's
+   * panes. A role whose stop the deck refused or did not answer is named in the
+   * rejection, which arrives as a `LaunchCleanupError`; `name` is what it is
+   * named as.
+   */
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[] }
+  | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string };
 
 /**
- * The daemon's honest delivery outcome for submitted input, mirroring the Rust
- * `SendResult` (kebab-case on the wire). Only `applied` and `queued` mean the
- * text reached the agent; every other value — including an unrecognised future
- * one decoded as `unknown` — is a non-delivery the UI must not dress up as
- * success.
+ * Whether an agent's pane takes input. The terminal reads `history-only` and
+ * `no-live-target` off the agent's write lease (`lib/terminalInput.ts`).
  */
 export type SendResult =
   | "applied"
@@ -641,43 +1323,49 @@ export type SendResult =
   | "ambiguous"
   | "unknown";
 
-/**
- * What `desktop_run_action` reports back. The Rust command returns `ok: false`
- * with a non-delivered `sendResult` instead of raising, so a caller that only
- * awaits the promise cannot tell delivery from silent loss — every consumer of
- * `submit_text` must read this.
- */
+/** What `desktop_run_action` reports back. */
 export interface DeckActionResult {
   ok: boolean;
-  sendResult?: SendResult;
   message?: string;
-}
-
-/** True only for the two outcomes that actually reached the agent. */
-export function isDelivered(result: DeckActionResult): boolean {
-  return result.ok && (result.sendResult === undefined || result.sendResult === "applied" || result.sendResult === "queued");
+  /**
+   * The id of the agent the action acted on — for `start_agent`, the one the
+   * target deck just minted (PRD #1223 M3). Unique only within that deck, so
+   * it means nothing without the `deckId` the action was sent with: a
+   * consumer keys it as `(deckId, agentId)`, never alone.
+   */
+  agentId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7): for a start, the daemon process that answered
+   * it — the one that minted {@link agentId}. The key is present on every
+   * start's result (holding `undefined` for a deck that named no process) and
+   * absent on every other action's. A consumer waiting for the started agent
+   * to be listed, or opening it, matches `(deckId, agentId, agentIncarnation)`:
+   * a restarted deck lists an unrelated agent under the same id, and that one
+   * is not the agent this start made.
+   */
+  agentIncarnation?: string;
 }
 
 /** Operator-facing explanation of a non-delivered outcome. */
 export function sendResultReason(result: SendResult | undefined): string {
   switch (result) {
-    case "stale": return "the deck's view of that pane had already moved on";
+    case "stale": return "the daemon's view of that pane had already moved on";
     case "wrong-session": return "the pane handle no longer maps to that agent's session";
     case "history-only": return "the agent has no live pane — only its history remains";
     case "no-live-target": return "there is nothing live to write to";
     case "ambiguous": return "the write started but did not complete; some of it may already have landed, so it was not retried";
-    case "unknown": return "the deck reported an outcome this build does not recognise";
-    default: return "the deck did not confirm delivery";
+    case "unknown": return "the daemon reported an outcome this build does not recognise";
+    default: return "the daemon did not confirm delivery";
   }
 }
 
-export interface WorkflowLaunchRole {
+export interface OrchestrationLaunchRole {
   role: string;
   command: string;
   start: boolean;
 }
 
-export interface WorkflowLaunchConfig {
+export interface OrchestrationLaunchConfig {
   /** The daemon's own spelling of the orchestration name, submitted verbatim. */
   name: string;
   /**
@@ -702,8 +1390,16 @@ export interface WorkflowLaunchConfig {
    */
   displayName: string;
   displayPath: string;
+  /**
+   * The run's name (issue #1044), submitted as the daemon's run title. Absent
+   * when the form's Name is empty — the TUI's rule — so the run takes the
+   * orchestration's name. Unlike the two display twins above it DOES reach the
+   * daemon, and is kept off the text nodes the same way any title is.
+   */
+  displayTitle?: string;
+  /** May be empty: the coordinator then waits for instructions (issue #1044). */
   taskPrompt: string;
-  roles: WorkflowLaunchRole[];
+  roles: OrchestrationLaunchRole[];
   rows: number;
   cols: number;
   customCommandCount: number;
@@ -714,6 +1410,27 @@ export interface WorkflowLaunchConfig {
 
 export interface TerminalChunk {
   agentId: string;
+  /**
+   * PRD #1105 security audit — the deck whose daemon produced these bytes, as
+   * the bridge knew it at delivery time.
+   *
+   * Stamped by the producer rather than inferred by the consumer, because the
+   * bridge learns the selected deck off `DesktopSnapshotDto.fleet[0]`
+   * synchronously while React state is a commit behind it. Optional so a
+   * producer that cannot name a deck stays valid; the runtime then falls back
+   * to the deck it currently believes is selected, which is what a bare-id
+   * producer implicitly meant.
+   */
+  deckId?: string;
+  /**
+   * PRD #1666 part 2 (G-fix7): the daemon process whose attach produced these
+   * bytes — the incarnation of the session's target, stamped by the bridge
+   * with the deck. A restarted deck reuses agent ids, so the runtime files
+   * the chunk under the bound pair, and a viewport for a successor with the
+   * same id never reads the previous process's output. Absent is a deck that
+   * named no process, which is its own key.
+   */
+  incarnation?: string;
   data: Uint8Array;
   stream: "output" | "end" | "error";
   operation: "append" | "replace";
@@ -727,9 +1444,76 @@ export interface TerminalBuffer {
   generation?: number;
 }
 
+/**
+ * The direct PTY-byte path, addressed by the COMPOSITE `(deckId, agentId)`.
+ *
+ * PRD #1105's security audit is why the deck travels here. Buffers used to be
+ * keyed by bare agent id, and nothing cleared them when the selected deck moved
+ * — so mounting a viewport for deck B's `planner` read deck A's retained
+ * buffer and wrote up to a megabyte of another machine's output into the new
+ * xterm, under B's correctly resolved heading. See {@link agentKey}.
+ */
 export interface TerminalFeed {
-  get(agentId: string): TerminalBuffer | undefined;
-  subscribe(agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
+  /**
+   * `incarnation` (PRD #1666 part 2, G-fix7) is the daemon process the agent
+   * was listed by: buffers are keyed by `boundAgentKey`, so a restarted deck's
+   * agent with the same id has a backlog of its own and never the previous
+   * process's. Required, so every reader says which process it is reading.
+   */
+  get(deckId: string | undefined, agentId: string, incarnation: string | undefined): TerminalBuffer | undefined;
+  subscribe(deckId: string | undefined, agentId: string, incarnation: string | undefined, listener: (buffer: TerminalBuffer) => void): () => void;
+}
+
+/**
+ * One agent on one deck — the whole identity of a terminal seam, passed as a
+ * value rather than assembled from a bare id and whatever deck happens to be
+ * selected when the call lands.
+ *
+ * # Why this is a parameter and not something the bridge can look up
+ *
+ * Every terminal verb used to take a bare `agentId` and resolve the daemon
+ * through the process-global selected endpoint. Agent ids are per-daemon
+ * monotonic integers, so `"planner"` names an agent on every deck: with the
+ * agent pane able to attach a terminal on a deck that is NOT the selected one,
+ * a bare id routes this client's keystrokes to whichever machine happens to be
+ * selected at the instant the write lands. Issue
+ * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116) is two audit
+ * rounds of that one shape — identity read from mutable current selection at
+ * use time rather than captured at creation.
+ *
+ * # It is compared BY VALUE, never by reference
+ *
+ * Nothing may key a `Map` on a `AgentTarget` object. The same target is
+ * re-allocated on every render — `{ deckId: agent.daemonId, agentId: agent.id }`
+ * is a fresh object each time — so an identity-keyed lookup passes a test that
+ * happens to reuse one object and fails in production. {@link agentKey} is the
+ * one way to turn a target into a key.
+ */
+export interface AgentTarget {
+  deckId: string;
+  agentId: string;
+  /**
+   * PRD #1666 part 2: the daemon process the agent was listed by, for an
+   * action that must not reach a restarted deck's agent with the same id.
+   */
+  incarnation: string | undefined;
+}
+
+/**
+ * Issue #1234 — one failed action's roles whose stop could not be confirmed.
+ * `id` is minted by the runtime per rejection, so two warnings naming the same
+ * roles are still two warnings, dismissed separately.
+ */
+export interface CleanupWarningEntry {
+  id: number;
+  stops: readonly string[];
+  /**
+   * The deck the failed action was sent to, as a display label (`deckName`),
+   * resolved when it failed. The warning outlives the screen and the selection
+   * it was raised under, so "this deck" would name whichever deck is selected
+   * when it is read. Absent only when that deck was not in the fleet.
+   */
+  deck?: string;
 }
 
 export interface DeckRuntimeState {
@@ -757,7 +1541,23 @@ export interface DeckRuntimeState {
   terminalFeed?: TerminalFeed;
   error?: string;
   /**
-   * Drop the last action's error (issue #1046).
+   * Issue #1234 — every unconfirmed-stop warning not yet dismissed, oldest
+   * first: one per action that rejected with a `LaunchCleanupError`.
+   *
+   * Deliberately NOT part of `error`. That is the single latest failure, and
+   * the next failure, the next action and `reconnect()` all replace or clear
+   * it — so a warning that roles may still be running, carried beside it,
+   * could be replaced in the same React batch it was set in and never reach
+   * a frame. An entry here is removed by {@link dismissCleanupWarning} and by
+   * nothing else. Optional so render-only test runtimes need not carry it; the
+   * real runtime always does.
+   */
+  cleanupWarnings?: readonly CleanupWarningEntry[];
+  /** Remove one entry of {@link cleanupWarnings} — the user's explicit dismissal. */
+  dismissCleanupWarning?: (id: number) => void;
+  /**
+   * Drop the last action's error (issue #1046). The cleanup warnings are
+   * untouched — see {@link cleanupWarnings}.
    *
    * Required rather than optional: the toast in `App.tsx` renders on
    * `notice || error`, so a runtime that cannot clear `error` produces a toast
@@ -766,10 +1566,35 @@ export interface DeckRuntimeState {
    */
   clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
-  sendTerminalInput: (agentId: string, data: string) => Promise<void>;
-  resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;
   /**
-   * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by agent id.
+   * PRD #1487 M5 — upgrade the daemon of the deck `deckId` names: **Upgrade**
+   * on a remote deck, **Replace daemon** on the local one. `onEvent` hears the
+   * stages and the live-agent question for THIS run; the promise resolves with
+   * the outcome (including "kept running" and "failed while …", which are
+   * answers, not errors) and rejects only when the upgrade could not start.
+   *
+   * Optional, and absence is a real state: a render-only test runtime offers
+   * no upgrade rather than a button that does nothing.
+   */
+  upgradeDaemon?: (deckId: string, onEvent: (event: import("./lib/upgrade").UpgradeEvent) => void) => Promise<import("./lib/upgrade").UpgradeOutcome>;
+  /** Answer question `questionId` of the upgrade `upgradeId`. */
+  decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
+  /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
+  inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
+  sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
+  resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
+  /**
+   * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by
+   * `boundAgentKey({ deckId, agentId, incarnation })`: the deck since PRD
+   * #1105's security audit, and the daemon process since PRD #1666 part 2
+   * (G-fix7), so a restarted deck's agent under the same id never inherits the
+   * previous process's grid.
+   *
+   * **The deck is part of that key since PRD #1105's security audit.** Nothing
+   * evicts an entry per agent, so a pane opened for deck B's `planner` applied
+   * deck A's grid, and an attach that won the race against the pane's first fit
+   * submitted A's cached dimensions to B — transiently reflowing B's PTY, and
+   * every other viewer attached to it, from a viewport on another machine.
    *
    * A terminal must render at this, not at the size of its own tile: a PTY has
    * one window size, so the daemon sizes each agent to the smallest pane among
@@ -784,10 +1609,15 @@ export interface DeckRuntimeState {
   /**
    * States the whole set of agents whose terminal is on screen (PRD #745 M7).
    * A screen that mounts terminals calls this once per render commit with every
-   * shown id; a screen that mounts none calls it with `[]`. Attach follows this
-   * and nothing else, so a screen that renders no output opens no PTYs either.
+   * shown target; a screen that mounts none calls it with `[]`. Attach follows
+   * this and nothing else, so a screen that renders no output opens no PTYs
+   * either.
+   *
+   * A target rather than a bare id since PRD #1105's cross-deck pane: the
+   * overview can show one deck's agents while a pane holds a terminal on
+   * another, and both declarations travel in the same array.
    */
-  setShownTerminals: (agentIds: string[]) => Promise<void>;
+  setShownTerminals: (targets: AgentTarget[]) => Promise<void>;
   reconnect: () => Promise<void>;
   /**
    * PRD #819 M6: the projects the connected daemon knows about. There is no
@@ -801,10 +1631,36 @@ export interface DeckRuntimeState {
    * request uses.
    */
   resolveProject: (path: string) => Promise<DaemonResolvedProject>;
+  /**
+   * PRD #1223 M4 — list one directory on the deck `deckId` names: a path that
+   * deck listed, one the user typed, or its home directory when `path` is
+   * absent. Resolves `unsupported` for a deck without the verb; rejects with
+   * the deck's or the app's own refusal otherwise.
+   *
+   * **Optional, and absence is a real state**, for the voice members' reason:
+   * several render-only test runtimes have no deck to ask, and a runtime
+   * without these two offers no New agent flow rather than a dialog that
+   * cannot load.
+   */
+  listDirectories?: (deckId: string, path?: string, options?: DeckListingOptions) => Promise<DeckDirectoryListing>;
+  /** PRD #1223 M4 — what the New agent form needs to know about the deck `deckId` names. */
+  newAgentOptions?: (deckId: string) => Promise<NewAgentOptions>;
+  /**
+   * PRD #1223 M6 — the orchestrations the New agent form can offer for `path`
+   * on the deck `deckId` names. Optional for the reason the two above are; a
+   * runtime without it offers no orchestration chips.
+   */
+  newAgentOrchestrations?: (deckId: string, path: string) => Promise<NewAgentOrchestrations>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
-  /** Persist the whole document; resolves to what was written. */
-  saveSettings: (settings: import("./lib/bridge").DesktopSettingsDto) => Promise<import("./lib/bridge").DesktopSettingsDto>;
+  /**
+   * Persist the whole document; resolves to what was written. `base` is the
+   * document the edit was made against, so only the edit is written (#828).
+   */
+  saveSettings: (
+    settings: import("./lib/bridge").DesktopSettingsDto,
+    base?: import("./lib/bridge").DesktopSettingsDto,
+  ) => Promise<import("./lib/bridge").DesktopSettingsDto>;
   /**
    * Test one deck end to end and resolve with a named state (PRD #741 M10).
    *
@@ -818,6 +1674,134 @@ export interface DeckRuntimeState {
     selection: string,
   ) => Promise<import("./lib/bridge").EndpointTestReportDto>;
   /**
+   * Whether a credential is stored, without reading it (PRD #802 M4).
+   *
+   * There is deliberately no counterpart that READS one: PRD #803's rule is
+   * that a secret goes in neither `desktop.toml` nor `localStorage`, and a
+   * value reaching this side is one `JSON.stringify` from the second half of
+   * that. The backends that need the value make their call Rust-side, which is
+   * where the CSP already forces every network hop.
+   *
+   * Never rejects for "I could not find out" — that arrives as `problem`,
+   * which is a different answer from "nothing is stored".
+   */
+  secretStatus: (
+    id: import("./lib/bridge").VoiceSecretId,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /**
+   * Replace a stored credential, resolving with the new status.
+   *
+   * **Rejects when the store failed**, so a failure can never render as a
+   * saved key — which is the outcome PRD #802 M4 is written against.
+   */
+  storeSecret: (
+    id: import("./lib/bridge").VoiceSecretId,
+    secret: string,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /** Forget a stored credential. Rejects when the store failed. */
+  forgetSecret: (
+    id: import("./lib/bridge").VoiceSecretId,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /**
+   * Deck naming (issue #1426): rename a stored deck, derive the name an added
+   * one would get, and check a name against the shared library's rule.
+   *
+   * Optional, like the voice seam below: a runtime without them renders the
+   * Daemons settings with no name field and no rename, and an added deck takes
+   * the name the library derives when it is saved.
+   */
+  renameDeck?: (deck: import("./lib/bridge").RemoteEndpointDto, name: string) => Promise<import("./lib/bridge").DesktopSettingsDto>;
+  defaultDeckName?: (host: string, user?: string) => Promise<string>;
+  checkDeckName?: (name: string, id?: string) => Promise<string | null>;
+  /**
+   * Voice control (PRD #802 M6): resolve one utterance into an outcome carrying
+   * the sentence to show, and drive the microphone that can produce one.
+   *
+   * **All six are optional, and absence is a real state rather than an
+   * oversight.** A runtime with no `resolveVoice` cannot run a voice command at
+   * all, so the surface offers no Voice control for it — the same reasoning the
+   * microphone gets one layer down, where `available: false` renders no mic
+   * rather than a broken-looking one. A control that opened onto a panel with
+   * nothing behind it would be worse than its absence, and several of this app's
+   * render-only test runtimes are exactly that shape.
+   *
+   * `declareVoiceScreen` states which screen a command would run against. It is
+   * a declaration rather than a parameter of `resolveVoice` because the mounted
+   * screen is the one piece of live state that exists ONLY in the webview; see
+   * `DeckBridge.declareVoiceScreen` for the whole of that seam.
+   */
+  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto, reading?: import("./lib/bridge").VoiceReadingStateDto) => void;
+  resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
+  /**
+   * PRD #1261 — answer a pending numbered choice, locally
+   * (`DeckBridge.answerVoiceChoice`). Optional like the rest: a panel on a
+   * runtime without it answers with `answerChoiceLocally`, the webview's port
+   * of the same rule.
+   */
+  answerVoiceChoice?: (utterance: string, action: string, offered: import("./lib/bridge").VoiceResolvedParamDto[]) => Promise<import("./lib/voiceChoice").VoiceChoiceAnswerDto>;
+  /**
+   * PR #1451 round 3, change 3 — answer a bare number against the numbered
+   * list on screen, locally (`DeckBridge.answerVoiceNumber`). Optional like
+   * the rest: a panel on a runtime without it answers with
+   * `answerNumberLocally`, the webview's port of the same rule.
+   */
+  answerVoiceNumber?: (utterance: string, heard: import("./lib/voiceNumbers").VoiceNumberedListDto, generation: number) => Promise<import("./lib/voiceNumbers").VoiceNumberAnswerDto>;
+  /**
+   * PRD #1631 — an utterance said while the agent on screen waits on a
+   * question (`DeckBridge.resolveVoiceQuestion`), and the send of a whole
+   * answered form (`DeckBridge.sendVoiceAnswer`). Optional like the rest: a
+   * panel on a runtime without them treats nothing as an answer.
+   */
+  resolveVoiceQuestion?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, utterance: string, form: import("./lib/voiceQuestion").QuestionSelectionDto[], awaitingText?: import("./lib/voiceQuestion").QuestionTextSlotDto, localOnly?: boolean) => Promise<import("./lib/voiceQuestion").QuestionResultDto>;
+  sendVoiceAnswer?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, form: import("./lib/voiceQuestion").QuestionSelectionDto[], confirmedAlways: boolean, lease: string) => Promise<import("./lib/voiceQuestion").AnswerOutcomeDto>;
+  /** PRD #1631 (audit A8): cancel the lease an answer is being sent under (`DeckBridge.cancelVoiceAnswer`). */
+  cancelVoiceAnswer?: (lease: string) => Promise<void>;
+  /**
+   * Every command in the table, annotated for one screen (PRD #802 D7) — what
+   * the discovery overlay lists.
+   *
+   * Optional alongside the rest of the voice members and for the same reason:
+   * a runtime that cannot resolve an utterance has no vocabulary worth showing,
+   * and several render-only test runtimes are exactly that shape. A dispatch of
+   * `list_commands` against such a runtime is refused before it runs, and the
+   * surface says the command is not wired to anything in this build — which is
+   * literally what is true.
+   */
+  voiceCommands?: (
+    screen: import("./lib/bridge").VoiceScreen,
+    directories?: import("./lib/bridge").VoiceDirectoriesDto,
+    newAgent?: import("./lib/bridge").VoiceNewAgentDto,
+  ) => Promise<import("./lib/bridge").VoiceCommandDto[]>;
+  /** Open the microphone. Rejects with the not-configured sentence when transcription is off. */
+  voiceStart?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
+  /**
+   * Close the microphone and transcribe what it heard. No audio crosses the
+   * boundary. `onSplit` is called once the backend has split the recording,
+   * before it transcribes (PRD #1631).
+   */
+  voiceStop?: (onSplit?: () => void) => Promise<import("./lib/bridge").VoiceTranscriptionDto>;
+  /**
+   * What the microphone is doing, and whether one is offered at all.
+   *
+   * Polled between a start and a stop, because it is the only way the surface
+   * learns the length cap ended the recording on its own.
+   */
+  voiceStatus?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
+  /** Abandon a recording without transcribing it. Idempotent and never refused. */
+  voiceCancel?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
+  /** PRD #1497 D9 — how the next spoken sentence is to be said. */
+  voiceSpeechPlan?: () => Promise<import("./lib/bridge").SpeechPlanDto>;
+  /** PRD #1497 D9 — the Commands connection's speech audio for `text`. */
+  voiceSpeechAudio?: (text: string) => Promise<ArrayBuffer>;
+  /** PRD #1497 M5 — start reading one agent; see `DeckBridge.voiceReadingStart`. */
+  voiceReadingStart?: (target: import("./lib/reading").ReadingTarget, onSentence: (sentence: import("./lib/reading").ReadingSentenceDto) => void) => Promise<import("./lib/reading").ReadingStartDto>;
+  /** PRD #1497 M5 — end a reading session. */
+  voiceReadingStop?: (session: number) => Promise<void>;
+  /** PRD #1497 — a save from any window turned reading's switch off; see `DeckBridge.onVoiceReadingConsentOff`. */
+  onVoiceReadingConsentOff?: (listener: () => void) => Promise<() => void>;
+  /** PRD #1497 — a save left reading's switch on; see `DeckBridge.onVoiceReadingConsentOn`. */
+  onVoiceReadingConsentOn?: (listener: () => void) => Promise<() => void>;
+  /**
    * Scale the whole window, terminals included (PRD #744).
    *
    * Applying only — the level is persisted through `saveSettings`, behind a
@@ -829,4 +1813,22 @@ export interface DeckRuntimeState {
    * no webview to scale.
    */
   setZoom: (level: number) => Promise<number>;
+  /**
+   * Issue #1198 — which of the app's experimental surfaces this window shows,
+   * read ONCE when the runtime starts (see {@link desktopFeaturesOf}).
+   *
+   * Optional, and `undefined` reads as every surface hidden: before the answer
+   * arrives, when the bridge has no such method, and when the call is refused.
+   * The flag defaults OFF, and an unanswered question must not show a surface.
+   */
+  desktopFeatures?: DesktopFeatures;
+}
+
+/**
+ * The features a runtime carries, with a missing answer read as the shipped
+ * default (issue #1198). Every gated call site reads through this, so it reads
+ * `features.showDeck` rather than guarding `undefined` itself.
+ */
+export function desktopFeaturesOf(runtime: Pick<DeckRuntimeState, "desktopFeatures">): DesktopFeatures {
+  return runtime.desktopFeatures ?? DEFAULT_DESKTOP_FEATURES;
 }

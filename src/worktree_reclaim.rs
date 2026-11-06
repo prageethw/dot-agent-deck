@@ -29,12 +29,19 @@
 //!
 //! No daemon/protocol involvement: this is a CLI verb that shells out to
 //! `git` and `gh` directly, synchronously — no `PROTOCOL_VERSION` bump.
+//!
+//! Every `git` in this module's production code is built by
+//! [`crate::git_env::git_at`], so the directory this module chose is the
+//! repository git acts on — not whatever an ambient `GIT_DIR` names (issue
+//! #1181). `xtask/linkage-check`'s rule 13 keeps that true for the next call
+//! site; `tests::ambient_location` proves it of the ones that exist.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Serialize;
 
+use crate::git_env::git_at;
 use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_terminal_display};
 use crate::worktree_owner::{OWNER_MARKER_FILENAME, path_from_bytes, trim_trailing_newline};
 
@@ -806,8 +813,7 @@ pub fn format_excluded_unknown_owner_warning(path: &Path) -> String {
 /// says nothing either way; fails silent rather than fails loud, matching a
 /// plain repo.
 fn is_shallow_repo(repo_dir: &Path) -> bool {
-    let out = Command::new("git")
-        .current_dir(repo_dir)
+    let out = git_at(repo_dir)
         .args(["rev-parse", "--is-shallow-repository"])
         .output();
     match out {
@@ -945,8 +951,7 @@ fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<RawWorktree> {
 /// Enumerate linked worktrees (excludes the main working tree) for the repo
 /// rooted at or above `repo_dir`.
 fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
-    let out = Command::new("git")
-        .current_dir(repo_dir)
+    let out = git_at(repo_dir)
         .args(["worktree", "list", "--porcelain", "-z"])
         .output()
         .map_err(|e| format!("failed to spawn `git worktree list`: {e}"))?;
@@ -1019,8 +1024,7 @@ fn check_cleanliness(worktree_path: &Path) -> Cleanliness {
 /// present) rather than `false`: the failure mode of an over-cautious `Ask`
 /// is an extra `--yes`, never a silent deletion.
 fn has_ignored_content(worktree_path: &Path) -> bool {
-    let out = Command::new("git")
-        .current_dir(worktree_path)
+    let out = git_at(worktree_path)
         .args(["status", "--porcelain", "--ignored=matching"])
         .output();
     match out {
@@ -1045,8 +1049,7 @@ fn has_ignored_content(worktree_path: &Path) -> bool {
 /// common dir (see [`resolve_common_dir`]) — a bare call to this function is
 /// not, by itself, safe to use for an ownership decision.
 fn resolve_git_dir(worktree_path: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .current_dir(worktree_path)
+    let out = git_at(worktree_path)
         .args(["rev-parse", "--git-dir"])
         .output();
     let out = match out {
@@ -1073,8 +1076,7 @@ fn resolve_git_dir(worktree_path: &Path) -> Option<PathBuf> {
 /// `None` on any failure to spawn, a non-zero exit, or empty output — callers
 /// fail closed on `None`.
 fn resolve_common_dir(repo_dir: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .current_dir(repo_dir)
+    let out = git_at(repo_dir)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output();
     let out = match out {
@@ -1532,7 +1534,7 @@ pub(crate) fn derive_repo_slug_for_remote(repo_dir: &Path, remote: &str) -> Opti
 /// `owner/name` slug. Returns `None` for anything else, including a
 /// non-GitHub host, a URL with no path, or a path with more than two
 /// segments — fail closed rather than guess.
-fn parse_github_owner_repo(url: &str) -> Option<String> {
+pub(crate) fn parse_github_owner_repo(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("git@github.com:")
         .or_else(|| url.strip_prefix("ssh://git@github.com/"))
@@ -1544,6 +1546,91 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{owner}/{name}"))
+}
+
+/// The `git` arguments that print, for every branch `branch_ref`
+/// (`refs/heads/<branch>`) selects, `<refname>NUL<push remote name>`.
+/// `for-each-ref` matches a pattern up to a `/` as well as exactly, so
+/// `refs/heads/feat` also selects `refs/heads/feat/x`: [`parse_push_remote`]
+/// keeps only the exact one.
+pub(crate) fn push_remote_args(branch_ref: &str) -> [&str; 3] {
+    [
+        "for-each-ref",
+        "--format=%(refname)%00%(push:remotename)",
+        branch_ref,
+    ]
+}
+
+/// The push remote [`push_remote_args`] printed for exactly `branch_ref`, or
+/// `None` when it names none.
+pub(crate) fn parse_push_remote(output: &str, branch_ref: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (refname, remote) = line.split_once('\0')?;
+        (refname == branch_ref && !remote.is_empty()).then(|| remote.to_string())
+    })
+}
+
+/// The `owner/name` of every GitHub repository among the URLs `git remote
+/// get-url --push --all` printed, one per line; other URLs are skipped. A
+/// remote with several push URLs pushes to each of them.
+pub(crate) fn push_repos_from_urls(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|url| parse_github_owner_repo(url.trim()))
+        .collect()
+}
+
+/// `owner/name` of each GitHub repository `branch` is pushed to: the remote
+/// `git push` picks (`branch.<name>.pushRemote`, then `remote.pushDefault`,
+/// then the branch's upstream remote), read through its push URLs. A
+/// contributor whose `origin` is the upstream repository and who pushes the
+/// branch to their fork gets the fork's slug, which is what tells their own
+/// pull request from that fork apart from a stranger's (issue #1779). Empty
+/// when no push remote is configured, its URLs are not GitHub repositories',
+/// or `git` fails, which leaves every fork's pull request someone else's.
+fn derive_push_repo_slugs(repo_dir: &Path, branch: &str) -> Vec<String> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let stdout = |args: &[&str]| {
+        let out = git_at(repo_dir).args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    stdout(&push_remote_args(&branch_ref))
+        .and_then(|refs| parse_push_remote(&refs, &branch_ref))
+        .and_then(|remote| stdout(&["remote", "get-url", "--push", "--all", &remote]))
+        .map(|urls| push_repos_from_urls(&urls))
+        .unwrap_or_default()
+}
+
+/// The `--json` fields the PR lookup needs. `isCrossRepository` and the head
+/// repository for the reason [`crate::pull_request::GH_PR_FIELDS`] carries
+/// them: `--head` matches a branch NAME, so a fork's pull request from a
+/// branch named like ours is listed too (issue #1687), and only the fork the
+/// branch is pushed to is ours (issue #1779). `headRefOid` is the fork's
+/// binding of a verdict to the exact commit it was reached for.
+const GH_PR_FIELDS: &str =
+    "state,headRefName,isCrossRepository,headRepository,headRepositoryOwner,headRefOid";
+
+/// What admitted the pull request a [`parse_pr_state`] verdict rests on.
+///
+/// Merge of two guards that each cover a case the other rejects: the fork's
+/// owner allowlist (issue #144, widened by #191) admits the PRs of the
+/// repositories this checkout is attached to through its own remotes; upstream's
+/// push-repository rule (issues #1687, #1779) additionally admits a fork's PR
+/// from the repository the branch is PUSHED to, which is a contributor's own
+/// pull request whenever `origin` is the upstream repository. The second is
+/// recorded separately because a verdict reached only through it is never
+/// trusted on repository identity alone: [`resolve_pr_state_for_linked_worktree`]
+/// requires its `headRefOid` to equal the worktree's own branch tip, the same
+/// binding an `upstream`-sourced verdict already needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrAdmission {
+    /// The head repository's owner is on the allowlist (the fork's original
+    /// rule, unchanged).
+    OwnerAllowlist,
+    /// Admitted ONLY as a fork PR from a repository the branch is pushed to.
+    PushRepo,
 }
 
 /// `gh pr list --head <branch> --state all --repo <owner/name> --json
@@ -1585,92 +1672,162 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 /// matches at all resolve to `NoPr` (genuinely no PR exists on THIS remote);
 /// more than one surviving owner match resolves to `Unresolvable`
 /// (ambiguous), never guessing.
+///
+/// When `accept_push_repo` is set (the ordinary linked-worktree path only, never
+/// the untrusted isolated-clone paths), a fork's pull request from a repository
+/// this branch is pushed to ([`derive_push_repo_slugs`], issue #1779) is also
+/// admitted, and the verdict says so ([`PrAdmission::PushRepo`]).
 fn query_pr_state(
     repo_dir: &Path,
     branch: &str,
     repo_slug: &str,
     acceptable_owners: &[&str],
-) -> PrState {
+    accept_push_repo: bool,
+) -> (PrState, PrAdmission) {
     let out = Command::new("gh")
         .current_dir(repo_dir)
-        .args([
-            "pr",
-            "list",
-            "--head",
+        .args(crate::pull_request::gh_pr_list_args(
             branch,
-            "--state",
-            "all",
-            "--repo",
             repo_slug,
-            "--json",
-            "state,headRefName,headRepositoryOwner,headRefOid",
-        ])
+            GH_PR_FIELDS,
+        ))
         .output();
     let out = match out {
         Ok(o) => o,
-        Err(e) => return PrState::Unresolvable(format!("gh unavailable: {e}")),
+        Err(e) => {
+            return (
+                PrState::Unresolvable(format!("gh unavailable: {e}")),
+                PrAdmission::OwnerAllowlist,
+            );
+        }
     };
     if !out.status.success() {
-        return PrState::Unresolvable(format!(
-            "gh pr list failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return (
+            PrState::Unresolvable(format!(
+                "gh pr list failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            PrAdmission::OwnerAllowlist,
+        );
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let entries: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+    let push_repos = if accept_push_repo {
+        derive_push_repo_slugs(repo_dir, branch)
+    } else {
+        Vec::new()
+    };
+    parse_pr_state(
+        &String::from_utf8_lossy(&out.stdout),
+        branch,
+        acceptable_owners,
+        &push_repos,
+    )
+}
+
+/// The PR state `gh pr list --json` output reports for exactly `branch`, and
+/// what admitted the pull request it rests on ([`PrAdmission`]).
+///
+/// Matches results on `headRefName` exactly (mitigates "a PR is matched to
+/// the wrong branch" from the PRD's risk list) and then admits an entry in
+/// exactly two ways, each fail-closed. (1) The fork's owner allowlist: the
+/// head repository's owner, compared ASCII-case-insensitively, is one of
+/// `acceptable_owners` (issue #144, widened by #191); a reply missing
+/// `headRepositoryOwner` is no match. (2) Upstream's push-repository rule
+/// (issues #1687 and #1779, the same filter
+/// [`crate::pull_request::parse_pr_list`] applies to the badge): a fork's
+/// entry (`isCrossRepository` true) whose head repository is one of
+/// `push_repos`, the repositories the branch is pushed to; a fork's entry
+/// that does not name its head repository, or a branch with no `push_repos`,
+/// cannot be admitted this way. Any other fork's pull request from a branch
+/// with the same name is someone else's, and its merge says nothing about
+/// this worktree.
+///
+/// A name match that nothing admitted is `Unresolvable`, never `NoPr` — `NoPr`
+/// ("no pull request found for this branch") would be false when a PR with
+/// that head ref genuinely exists and was found (NEW-2) — and this verdict can
+/// delete a directory. Zero name matches is `NoPr`; more than one admitted
+/// match is `Unresolvable` (ambiguous), never guessing.
+fn parse_pr_state(
+    json: &str,
+    branch: &str,
+    acceptable_owners: &[&str],
+    push_repos: &[String],
+) -> (PrState, PrAdmission) {
+    let entries: Vec<serde_json::Value> = match serde_json::from_str(json) {
         Ok(v) => v,
-        Err(e) => return PrState::Unresolvable(format!("could not parse gh output: {e}")),
+        Err(e) => {
+            return (
+                PrState::Unresolvable(format!("could not parse gh output: {e}")),
+                PrAdmission::OwnerAllowlist,
+            );
+        }
     };
     let name_matches: Vec<&serde_json::Value> = entries
         .iter()
         .filter(|v| v.get("headRefName").and_then(|h| h.as_str()) == Some(branch))
         .collect();
-    let owner_matches: Vec<&serde_json::Value> = name_matches
+    let owner_matches: Vec<(&serde_json::Value, PrAdmission)> = name_matches
         .iter()
         .copied()
-        .filter(|v| {
-            v.get("headRepositoryOwner")
-                .and_then(|o| o.get("login"))
-                .and_then(|l| l.as_str())
-                .is_some_and(|login| {
-                    acceptable_owners
-                        .iter()
-                        .any(|owner| login.eq_ignore_ascii_case(owner))
-                })
+        .filter_map(|v| {
+            let head_owner = v
+                .pointer("/headRepositoryOwner/login")
+                .and_then(|l| l.as_str());
+            if head_owner.is_some_and(|login| {
+                acceptable_owners
+                    .iter()
+                    .any(|owner| login.eq_ignore_ascii_case(owner))
+            }) {
+                return Some((v, PrAdmission::OwnerAllowlist));
+            }
+            // Issue #1779: a fork's pull request from a repository the branch
+            // is pushed to. Needs `isCrossRepository` to say so explicitly and
+            // a head repository `gh` names; anything missing is no match.
+            let cross_repository =
+                v.get("isCrossRepository").and_then(|c| c.as_bool()) == Some(true);
+            let head_name = v.pointer("/headRepository/name").and_then(|n| n.as_str());
+            (cross_repository
+                && crate::pull_request::is_push_repo(head_owner, head_name, push_repos))
+            .then_some((v, PrAdmission::PushRepo))
         })
         .collect();
     match (owner_matches.as_slice(), name_matches.as_slice()) {
-        ([], []) => PrState::NoPr,
-        ([], _) => PrState::Unresolvable(format!(
-            "{} pull request(s) match branch {branch:?} but none has a headRepositoryOwner \
-             matching any of {acceptable_owners:?} — the head repository owner could not be \
-             confirmed",
-            name_matches.len()
-        )),
-        ([one], _) => match one.get("state").and_then(|s| s.as_str()) {
-            Some("MERGED") => {
-                let head_ref_oid = one
-                    .get("headRefOid")
+        ([], []) => (PrState::NoPr, PrAdmission::OwnerAllowlist),
+        ([], _) => (
+            PrState::Unresolvable(format!(
+                "{} pull request(s) match branch {branch:?} but none has a headRepositoryOwner \
+                 matching any of {acceptable_owners:?} — the head repository owner could not be \
+                 confirmed",
+                name_matches.len()
+            )),
+            PrAdmission::OwnerAllowlist,
+        ),
+        ([(one, admission)], _) => {
+            let head_ref_oid = || {
+                one.get("headRefOid")
                     .and_then(|o| o.as_str())
-                    .map(|s| s.to_string());
-                PrState::Merged { head_ref_oid }
-            }
-            Some("OPEN") => {
-                let head_ref_oid = one
-                    .get("headRefOid")
-                    .and_then(|o| o.as_str())
-                    .map(|s| s.to_string());
-                PrState::Open { head_ref_oid }
-            }
-            Some("CLOSED") => PrState::ClosedUnmerged,
-            Some(other) => PrState::Unresolvable(format!("unrecognized PR state {other:?}")),
-            None => PrState::Unresolvable("PR entry has no `state` field".to_string()),
-        },
-        _ => PrState::Unresolvable(format!(
-            "{} pull requests matched branch {branch:?} and an acceptable owner in \
-             {acceptable_owners:?}",
-            owner_matches.len()
-        )),
+                    .map(|s| s.to_string())
+            };
+            let state = match one.get("state").and_then(|s| s.as_str()) {
+                Some("MERGED") => PrState::Merged {
+                    head_ref_oid: head_ref_oid(),
+                },
+                Some("OPEN") => PrState::Open {
+                    head_ref_oid: head_ref_oid(),
+                },
+                Some("CLOSED") => PrState::ClosedUnmerged,
+                Some(other) => PrState::Unresolvable(format!("unrecognized PR state {other:?}")),
+                None => PrState::Unresolvable("PR entry has no `state` field".to_string()),
+            };
+            (state, *admission)
+        }
+        _ => (
+            PrState::Unresolvable(format!(
+                "{} pull requests matched branch {branch:?} and an acceptable owner in \
+                 {acceptable_owners:?}",
+                owner_matches.len()
+            )),
+            PrAdmission::OwnerAllowlist,
+        ),
     }
 }
 
@@ -1688,11 +1845,16 @@ fn slug_owner(repo_slug: &str) -> &str {
 /// provenance [`resolve_pr_state_for_linked_worktree`] needs to tell an
 /// `origin`-sourced result (trusted, same-uid, unchanged behavior) apart
 /// from an `upstream`-sourced one (a third party's repository, issue #191
-/// A2) so it knows which results need the extra `headRefOid` binding and
-/// which don't.
+/// A2) or one admitted only through a push repository (issue #1779) so it
+/// knows which results need the extra `headRefOid` binding and which don't.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrStateSource {
     Origin,
+    /// `origin`'s answer, but admitted ONLY as a fork PR from a repository the
+    /// branch is pushed to ([`PrAdmission::PushRepo`], issue #1779) rather than
+    /// by the owner allowlist: repository identity alone, so it needs the same
+    /// `headRefOid` binding an `upstream`-sourced verdict does.
+    OriginPushRepo,
     Upstream,
 }
 
@@ -1703,11 +1865,26 @@ enum PrStateSource {
 /// without re-deriving `origin`'s slug a second time; a caller that has no
 /// use for the slug (isolated clones, which must never touch `upstream` at
 /// all — issue #191 F2/A1) just discards it.
-fn resolve_origin_pr_state(repo_dir: &Path, branch: &str) -> (PrState, Option<String>) {
+///
+/// `accept_push_repo` is set only by the ordinary linked-worktree path (see
+/// [`query_pr_state`]); the untrusted isolated-clone paths pass `false`, so
+/// their admission is exactly the owner allowlist and no extra `git` is run in
+/// a candidate's own directory.
+fn resolve_origin_pr_state(
+    repo_dir: &Path,
+    branch: &str,
+    accept_push_repo: bool,
+) -> (PrState, Option<String>, PrAdmission) {
     match derive_repo_slug_for_remote(repo_dir, "origin") {
         Some(slug) => {
-            let state = query_pr_state(repo_dir, branch, &slug, &[slug_owner(&slug)]);
-            (state, Some(slug))
+            let (state, admission) = query_pr_state(
+                repo_dir,
+                branch,
+                &slug,
+                &[slug_owner(&slug)],
+                accept_push_repo,
+            );
+            (state, Some(slug), admission)
         }
         None => (
             PrState::Unresolvable(
@@ -1716,6 +1893,7 @@ fn resolve_origin_pr_state(repo_dir: &Path, branch: &str) -> (PrState, Option<St
                     .to_string(),
             ),
             None,
+            PrAdmission::OwnerAllowlist,
         ),
     }
 }
@@ -1771,9 +1949,13 @@ fn resolve_origin_pr_state(repo_dir: &Path, branch: &str) -> (PrState, Option<St
 /// - When there is no `upstream` remote, or its URL doesn't parse, behavior
 ///   is identical to today: `origin`'s `NoPr` stands.
 fn resolve_pr_state_with_source(repo_dir: &Path, branch: &str) -> (PrState, PrStateSource) {
-    let (origin_state, origin_slug) = resolve_origin_pr_state(repo_dir, branch);
+    let (origin_state, origin_slug, admission) = resolve_origin_pr_state(repo_dir, branch, true);
     if !matches!(origin_state, PrState::NoPr) {
-        return (origin_state, PrStateSource::Origin);
+        let source = match admission {
+            PrAdmission::OwnerAllowlist => PrStateSource::Origin,
+            PrAdmission::PushRepo => PrStateSource::OriginPushRepo,
+        };
+        return (origin_state, source);
     }
     // `query_pr_state` only ever returns `PrState::NoPr` when it was given a
     // slug to query in the first place, so `origin_state == NoPr` proves
@@ -1782,7 +1964,8 @@ fn resolve_pr_state_with_source(repo_dir: &Path, branch: &str) -> (PrState, PrSt
     match derive_repo_slug_for_remote(repo_dir, "upstream") {
         Some(upstream_slug) => {
             let acceptable_owners = [slug_owner(&origin_slug), slug_owner(&upstream_slug)];
-            let state = query_pr_state(repo_dir, branch, &upstream_slug, &acceptable_owners);
+            let (state, _) =
+                query_pr_state(repo_dir, branch, &upstream_slug, &acceptable_owners, false);
             (state, PrStateSource::Upstream)
         }
         None => (origin_state, PrStateSource::Origin),
@@ -1819,7 +2002,7 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
 /// it — means `gh` is never spawned against whatever repository a forged
 /// `upstream` names, not merely that its answer would be discarded.
 fn resolve_pr_state_for_isolated_clone(repo_dir: &Path, branch: &str) -> PrState {
-    resolve_origin_pr_state(repo_dir, branch).0
+    resolve_origin_pr_state(repo_dir, branch, false).0
 }
 
 /// [`resolve_pr_state`] for the ordinary linked-worktree path — a strictly
@@ -1830,6 +2013,12 @@ fn resolve_pr_state_for_isolated_clone(repo_dir: &Path, branch: &str) -> PrState
 /// not touch (linked worktrees share the root checkout's own trusted
 /// `.git/config`, so `origin` there is same-uid-trusted the way it always
 /// has been).
+///
+/// A result admitted ONLY through a push repository (issue #1779: a fork's PR
+/// from a repository the branch is pushed to, see [`PrAdmission::PushRepo`]) is
+/// bound exactly like an `upstream`-sourced one, below: repository identity
+/// alone never permits a removal, the PR's `headRefOid` must equal the local
+/// branch tip as well (PRD sync ruling 42).
 ///
 /// An `upstream`-sourced result is different: `upstream` is a third party's
 /// repository, and this fork's branch names are shared and predictable
@@ -1855,9 +2044,30 @@ fn resolve_pr_state_for_linked_worktree(
     local_head_sha: Option<&str>,
 ) -> PrState {
     let (state, source) = resolve_pr_state_with_source(repo_dir, branch);
+    bind_verdict_to_local_tip(state, source, local_head_sha)
+}
+
+/// The pure half of [`resolve_pr_state_for_linked_worktree`]: bind a verdict to
+/// the local branch tip according to where it came from. An `Origin` verdict
+/// (admitted by the owner allowlist) is returned unchanged; an `upstream`-sourced
+/// or push-repository-admitted `Merged`/`Open` verdict stands only when
+/// `local_head_sha` is `Some` and equals the reply's own `headRefOid`.
+fn bind_verdict_to_local_tip(
+    state: PrState,
+    source: PrStateSource,
+    local_head_sha: Option<&str>,
+) -> PrState {
     if source == PrStateSource::Origin {
         return state;
     }
+    // Both non-`Origin` sources are bound to the local branch tip: an
+    // `upstream` verdict is a third party's repository (issue #191 A2), and a
+    // push-repository verdict (issue #1779) rests on repository identity alone
+    // (PRD sync ruling 42: never accept on repo match alone).
+    let provenance = match source {
+        PrStateSource::OriginPushRepo => "push-repository-admitted",
+        _ => "upstream-sourced",
+    };
     match state {
         PrState::Merged { ref head_ref_oid } => {
             let confirmed = matches!(
@@ -1867,13 +2077,12 @@ fn resolve_pr_state_for_linked_worktree(
             if confirmed {
                 state
             } else {
-                PrState::Unresolvable(
-                    "an upstream-sourced MERGED verdict's headRefOid does not match this \
+                PrState::Unresolvable(format!(
+                    "a {provenance} MERGED verdict's headRefOid does not match this \
                      worktree's own local branch tip -- refusing to trust what may be a \
                      same-named-branch collision on a third party's repository rather than \
                      this worktree's own PR"
-                        .to_string(),
-                )
+                ))
             }
         }
         PrState::Open { ref head_ref_oid } => {
@@ -1884,13 +2093,12 @@ fn resolve_pr_state_for_linked_worktree(
             if confirmed {
                 state
             } else {
-                PrState::Unresolvable(
-                    "an upstream-sourced OPEN verdict's headRefOid does not match this \
+                PrState::Unresolvable(format!(
+                    "a {provenance} OPEN verdict's headRefOid does not match this \
                      worktree's own local branch tip -- refusing to trust what may be a \
                      same-named-branch collision on a third party's repository rather than \
                      this worktree's own PR"
-                        .to_string(),
-                )
+                ))
             }
         }
         other => other,
@@ -2103,9 +2311,14 @@ struct IsolatedCloneCandidate {
 /// overrides or refusing to run `git status` in an untrusted directory at
 /// all, both rejected as disproportionate for now).
 fn git_in_untrusted_dir(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(dir).args(["-c", "core.fsmonitor="]);
-    cmd
+    // Upstream's `git_at` (issue #1181) is a strict superset of the guard this
+    // helper used to apply by hand (`-c core.fsmonitor=`): it also scrubs the
+    // ambient `GIT_DIR`-family location variables, turns hooks off
+    // (`core.hooksPath=/dev/null`) and sets `core.fsmonitor=false`. The accepted
+    // residual described above is unchanged (it is reachable through config
+    // surfaces neither guard names), and linkage-check rule 13 forbids a bare
+    // `git` literal in this file's production code.
+    git_at(dir)
 }
 
 /// Whether a persistent provenance artifact exists for `candidate`
@@ -2933,9 +3146,15 @@ pub fn format_list_error_for_cli(e: &str) -> String {
 /// its source instead of defending against it downstream. [`WorktreeReport`]
 /// still carries a lossy `path: String` for the report/JSON document; only
 /// this call site needs the exact bytes.
+///
+/// Both defenses above (the cleanliness gate and git's own refusal) are only
+/// worth what the repository they resolve is worth, which is why this goes through [`git_at`] (issue #1181): with an
+/// ambient `GIT_DIR` set, the `-z` enumeration above, the cleanliness gate and
+/// this removal each resolved whatever repository that variable named, so the
+/// gate protected one repository while the removal deleted a worktree from
+/// another — measured, and git reported success.
 fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> Result<(), String> {
-    let out = Command::new("git")
-        .current_dir(repo_dir)
+    let out = git_at(repo_dir)
         .args(["worktree", "remove", "--"])
         .arg(worktree_path)
         .output()
@@ -3766,6 +3985,187 @@ mod tests {
             Ownership::Ours,
         );
         assert!(matches!(v, Verdict::Keep(_)));
+    }
+
+    /// Re-pointed from upstream's `parse_pr_state_ignores_a_fork_pull_request_...`
+    /// at the merged fork shape (`parse_pr_state` also takes the owner allowlist
+    /// and returns what admitted the PR): a stranger's fork PR from a same-named
+    /// branch is never attributed to this worktree. Upstream reports `NoPr` for
+    /// it; the fork's fail-closed rule reports `Unresolvable` (a PR with that
+    /// head ref exists and was found, it just isn't ours), and both keep.
+    #[test]
+    fn parse_pr_state_ignores_a_fork_pull_request_from_a_same_named_branch() {
+        assert!(
+            GH_PR_FIELDS
+                .split(',')
+                .any(|field| field == "isCrossRepository"),
+            "gh must be asked where each PR's branch lives"
+        );
+        let fork = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true,
+            "headRepositoryOwner":{"login":"stranger"}}"#;
+        let own = r#"{"state":"OPEN","headRefName":"feat/x","isCrossRepository":false,
+            "headRepositoryOwner":{"login":"me"}}"#;
+        let (state, _) = parse_pr_state(&format!("[{fork}]"), "feat/x", &["me"], &[]);
+        assert!(matches!(state, PrState::Unresolvable(_)), "got {state:?}");
+        assert_eq!(
+            parse_pr_state(&format!("[{fork},{own}]"), "feat/x", &["me"], &[]),
+            (
+                PrState::Open { head_ref_oid: None },
+                PrAdmission::OwnerAllowlist
+            )
+        );
+    }
+
+    /// Issue #1779 (upstream), merged with the fork's owner allowlist: a
+    /// contributor's own pull request from the fork the branch is pushed to is
+    /// the branch's, and is reported as admitted ONLY through the push
+    /// repository; a stranger's fork is not, and neither is any fork when the
+    /// push repository is unknown or `gh` does not name the head repository.
+    #[test]
+    fn parse_pr_state_matches_a_fork_pull_request_only_from_the_push_repository() {
+        assert!(
+            ["headRepository", "headRepositoryOwner", "headRefOid"]
+                .iter()
+                .all(|wanted| GH_PR_FIELDS.split(',').any(|field| field == *wanted)),
+            "gh must be asked which repository each PR's branch lives in, and its head commit"
+        );
+        let mine = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true,
+            "headRefOid":"abc","headRepository":{"name":"r"},"headRepositoryOwner":{"login":"me"}}"#;
+        let stranger = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true,
+            "headRepository":{"name":"r"},"headRepositoryOwner":{"login":"stranger"}}"#;
+        let me = ["me/r".to_string()];
+        let unnamed = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true,
+            "headRepository":null,"headRepositoryOwner":{"login":"me"}}"#;
+        // `origin` is the upstream repository: only its own owner is on the allowlist.
+        let origin_owner = ["upstream-org"];
+        assert_eq!(
+            parse_pr_state(
+                &format!("[{mine},{stranger}]"),
+                "feat/x",
+                &origin_owner,
+                &me
+            ),
+            (
+                PrState::Merged {
+                    head_ref_oid: Some("abc".to_string())
+                },
+                PrAdmission::PushRepo
+            )
+        );
+        for (json, push_repos) in [
+            (format!("[{stranger}]"), &me[..]),
+            (format!("[{mine}]"), &[][..]),
+            (format!("[{unnamed}]"), &me[..]),
+        ] {
+            let (state, _) = parse_pr_state(&json, "feat/x", &origin_owner, push_repos);
+            assert!(
+                matches!(state, PrState::Unresolvable(_)),
+                "a fork PR nothing admitted must never resolve as merged/open/none; got {state:?} for {json}"
+            );
+        }
+        let own = r#"{"state":"OPEN","headRefName":"feat/x","isCrossRepository":false,
+            "headRepositoryOwner":{"login":"upstream-org"}}"#;
+        let (state, _) = parse_pr_state(&format!("[{mine},{own}]"), "feat/x", &origin_owner, &me);
+        assert!(matches!(state, PrState::Unresolvable(_)), "got {state:?}");
+    }
+
+    /// PRD sync ruling 42 (a destructive path): a verdict admitted by repository
+    /// identity alone (`upstream`-sourced, or a push-repository-admitted fork PR)
+    /// stands only when its `headRefOid` equals the local branch tip; a verdict
+    /// the owner allowlist admitted is unchanged. Repo match alone never removes.
+    #[test]
+    fn repository_identity_alone_never_binds_a_verdict_without_the_local_tip() {
+        let merged = |oid: Option<&str>| PrState::Merged {
+            head_ref_oid: oid.map(str::to_string),
+        };
+        for source in [PrStateSource::OriginPushRepo, PrStateSource::Upstream] {
+            assert_eq!(
+                bind_verdict_to_local_tip(merged(Some("abc")), source, Some("abc")),
+                merged(Some("abc")),
+                "{source:?}: the matching tip binds the verdict"
+            );
+            for (remote, local) in [
+                (Some("abc"), Some("def")),
+                (Some("abc"), None),
+                (None, Some("abc")),
+                (None, None),
+            ] {
+                let bound = bind_verdict_to_local_tip(merged(remote), source, local);
+                assert!(
+                    matches!(bound, PrState::Unresolvable(_)),
+                    "{source:?} remote {remote:?} local {local:?}: got {bound:?}"
+                );
+            }
+            let open = PrState::Open {
+                head_ref_oid: Some("abc".to_string()),
+            };
+            assert!(matches!(
+                bind_verdict_to_local_tip(open, source, Some("zzz")),
+                PrState::Unresolvable(_)
+            ));
+            assert_eq!(
+                bind_verdict_to_local_tip(PrState::NoPr, source, None),
+                PrState::NoPr
+            );
+        }
+        assert_eq!(
+            bind_verdict_to_local_tip(merged(Some("abc")), PrStateSource::Origin, None),
+            merged(Some("abc")),
+            "an owner-allowlist verdict keeps the fork's existing, unchanged behaviour"
+        );
+    }
+
+    #[test]
+    fn push_repos_from_urls_keeps_every_github_repository() {
+        assert_eq!(
+            push_repos_from_urls(
+                "git@github.com:me/r.git\nhttps://gitlab.com/me/r.git\nhttps://github.com/me/m\n"
+            ),
+            vec!["me/r".to_string(), "me/m".to_string()]
+        );
+        assert!(push_repos_from_urls("").is_empty());
+    }
+
+    #[test]
+    fn parse_push_remote_keeps_only_the_exact_branch() {
+        let out = "refs/heads/feat\0origin\nrefs/heads/feat/x\0fork\n";
+        assert_eq!(
+            parse_push_remote(out, "refs/heads/feat/x").as_deref(),
+            Some("fork")
+        );
+        assert_eq!(
+            parse_push_remote(out, "refs/heads/feat").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            parse_push_remote("refs/heads/feat\0\n", "refs/heads/feat"),
+            None
+        );
+        assert_eq!(parse_push_remote(out, "refs/heads/fea"), None);
+    }
+
+    #[test]
+    fn parse_pr_state_without_is_cross_repository_is_unresolvable() {
+        let json = r#"[{"state":"MERGED","headRefName":"feat/x"}]"#;
+        let (state, _) = parse_pr_state(json, "feat/x", &["me"], &[]);
+        assert!(matches!(state, PrState::Unresolvable(_)), "got {state:?}");
+    }
+
+    #[test]
+    fn parse_pr_state_two_own_pull_requests_are_unresolvable() {
+        let one = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":false,
+            "headRepositoryOwner":{"login":"me"}}"#;
+        let two = r#"{"state":"CLOSED","headRefName":"feat/x","isCrossRepository":false,
+            "headRepositoryOwner":{"login":"me"}}"#;
+        let (state, _) = parse_pr_state(&format!("[{one},{two}]"), "feat/x", &["me"], &[]);
+        assert!(matches!(state, PrState::Unresolvable(_)), "got {state:?}");
+        assert_eq!(
+            parse_pr_state(&format!("[{one}]"), "feat/x", &["me"], &[]),
+            (
+                PrState::Merged { head_ref_oid: None },
+                PrAdmission::OwnerAllowlist
+            )
+        );
     }
 
     #[test]
@@ -9755,5 +10155,426 @@ mod tests {
              correctly `owner_filter` resolves an identity (issue #300 blocker 2); got: {}",
             is_mine(&report, "human:alice@laptop")
         );
+    }
+
+    /// Issue #1181: the ambient git *location* environment must not be able to
+    /// steer this module's removals, or the dispatch paths' creations, into a
+    /// repository the code never chose.
+    ///
+    /// Unix-gated, like `xtask/linkage-check`'s `mod real_git` and this crate's
+    /// other real-fixture suites. **The defect is not Unix-specific and neither is
+    /// the fix** — [`crate::git_env`] carries no `cfg` — but the fixture is: it
+    /// re-execs the test binary and drives `git worktree add`/`remove` against
+    /// paths it then asserts are gone from disk, and neither of those has been
+    /// exercised on Windows here. `build-windows` still type-checks and lints
+    /// every module this touches.
+    #[cfg(unix)]
+    mod ambient_location {
+        use std::path::{Path, PathBuf};
+
+        use crate::git_env::fixture_git;
+        use crate::worktree_reclaim::{
+            Cleanliness, check_cleanliness, list_linked_worktrees, remove_worktree_dir,
+        };
+
+        /// Marker in the child's environment: this process is the re-exec'd half
+        /// of [`reclaim_and_dispatch_git_ignore_the_ambient_location_env`].
+        const AMBIENT_CHILD: &str = "DOT_AGENT_DECK_AMBIENT_GIT_CHILD";
+
+        /// Where the parent built the two repositories, handed to the child.
+        const AMBIENT_SANDBOX: &str = "DOT_AGENT_DECK_AMBIENT_GIT_SANDBOX";
+
+        /// That test's own name, used as the child's libtest filter. A rename
+        /// that misses this makes the child match zero tests — which libtest
+        /// exits 0 for, so the parent asserts on `1 passed` rather than on the
+        /// status alone.
+        const AMBIENT_TEST: &str = "reclaim_and_dispatch_git_ignore_the_ambient_location_env";
+
+        /// A branch name that exists in BOTH repositories, so the `branch -D` the
+        /// child runs against the clone has something to destroy in the decoy if
+        /// it is steered there.
+        const SHARED_BRANCH: &str = "shared";
+
+        /// The variable names this test expects the neutralization to cover,
+        /// held independently of [`crate::git_env::AMBIENT_LOCATION_VARS`] so
+        /// that list cannot drift silently.
+        ///
+        /// **A deliberate second copy, and the one place a second copy is
+        /// right.** Everywhere else in this change a second list is the
+        /// defect, because production behaviour reads one of them and a
+        /// missing entry is silent. Here nothing reads it but an equality
+        /// assertion, and what it buys is the failure direction the shared
+        /// list cannot give: DELETING an entry makes production stop clearing
+        /// that variable *and* makes this test stop setting it, so the run
+        /// stays green while the hole reopens. Adding one is already caught,
+        /// by [`ambient_value`]'s `panic!` on a name it does not know — so
+        /// with both, a change in either direction has to be made here too, on
+        /// purpose.
+        const EXPECTED_VARS: [&str; 8] = [
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_DIR",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_WORK_TREE",
+        ];
+
+        /// What each variable in [`crate::git_env::AMBIENT_LOCATION_VARS`] is set
+        /// to in the child, all aimed at the decoy.
+        ///
+        /// Derived from that list rather than written out beside it, and
+        /// panicking on a name it does not know: adding a variable to the
+        /// neutralization without staging it here fails loudly instead of leaving
+        /// this test silently not covering it.
+        fn ambient_value(var: &str, decoy: &Path) -> std::ffi::OsString {
+            match var {
+                "GIT_DIR" | "GIT_COMMON_DIR" => decoy.join(".git").into_os_string(),
+                "GIT_WORK_TREE" => decoy.as_os_str().to_os_string(),
+                "GIT_INDEX_FILE" => decoy.join(".git").join("index").into_os_string(),
+                "GIT_OBJECT_DIRECTORY" | "GIT_ALTERNATE_OBJECT_DIRECTORIES" => {
+                    decoy.join(".git").join("objects").into_os_string()
+                }
+                "GIT_NAMESPACE" => "escape".into(),
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM" => "1".into(),
+                other => panic!(
+                    "{other} was added to AMBIENT_LOCATION_VARS without being \
+                 staged here, so this test would silently stop covering it"
+                ),
+            }
+        }
+
+        /// A repository with one empty commit on `main`, built by
+        /// [`fixture_git`] so no developer `~/.gitconfig` and no ambient git
+        /// environment reaches it.
+        fn init_repo(sandbox: &Path, name: &str) -> PathBuf {
+            let repo = sandbox.join(name);
+            std::fs::create_dir_all(&repo).expect("create the fixture repo dir");
+            run_fixture(sandbox, &repo, &["init", "--quiet", "-b", "main"]);
+            run_fixture(
+                sandbox,
+                &repo,
+                &["commit", "--quiet", "--allow-empty", "-m", "base"],
+            );
+            repo
+        }
+
+        fn run_fixture(sandbox: &Path, repo: &Path, args: &[&str]) {
+            fixture_stdout(sandbox, repo, args);
+        }
+
+        fn fixture_stdout(sandbox: &Path, repo: &Path, args: &[&str]) -> String {
+            let out = fixture_git(repo, sandbox)
+                .args(args)
+                .output()
+                .expect("run a fixture git");
+            assert!(
+                out.status.success(),
+                "fixture precondition: `git {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// The production-side twin of `xtask/linkage-check`'s
+        /// `sandbox_git_ignores_ambient_location_env` (issue #834), against the
+        /// paths issue #1181 measured: `git`'s location discovery is steerable
+        /// from the environment, and `GIT_DIR` and its siblings outrank both the
+        /// `current_dir` this module passes and the `-C <dir>`
+        /// `issue_dispatch_run` and `dispatch` pass.
+        ///
+        /// Real `git` and real repositories rather than a stub, for the reason
+        /// `docs/develop/e2e-lanes.md` ("`--workspace` on all three aliases, and the
+        /// fast-tier exceptions") records for that file's `mod real_git` and for
+        /// `clean_tmp.rs`: what is being asserted is which repository
+        /// a deletion lands in, and no fixture short of a real one can answer
+        /// that. Two empty-commit repositories in a `test_temp::tempdir()`, no
+        /// network, no sleeps, ~1s wall.
+        ///
+        /// **The re-exec is what keeps it honest.** The variables have to be in
+        /// the environment *before* the process starts to reproduce the real
+        /// condition — a daemon lazy-spawned from inside a `rebase --exec`, a
+        /// pre-commit hook or a `bisect run` — and setting them in-process would
+        /// be `unsafe` and would race every other test sharing the process under
+        /// a threaded runner.
+        ///
+        /// **The child's control is what stops it passing vacuously.** An
+        /// un-neutralized `git` from inside the clone must resolve the DECOY, or
+        /// the staging failed and every assertion after it proves nothing.
+        #[tokio::test]
+        async fn reclaim_and_dispatch_git_ignore_the_ambient_location_env() {
+            if std::env::var_os(AMBIENT_CHILD).is_some() {
+                ambient_location_child().await;
+                return;
+            }
+
+            // Before anything else: the neutralization must still cover the
+            // variables this test was written against. A deletion from
+            // `AMBIENT_LOCATION_VARS` would otherwise take the coverage with
+            // it and leave the run green — see `EXPECTED_VARS`.
+            // Compared as SLICES, not arrays: a removal changes the array's
+            // length, and array `assert_eq!` against a different length is a
+            // type error whose message is rustc's rather than the one below —
+            // which is the message that says what to do about it.
+            let mut covered: Vec<&str> = crate::git_env::AMBIENT_LOCATION_VARS.to_vec();
+            covered.sort_unstable();
+            assert_eq!(
+                covered.as_slice(),
+                EXPECTED_VARS.as_slice(),
+                "AMBIENT_LOCATION_VARS changed. Production neutralizes exactly \
+                 what is in it, and this test stages exactly what is in it, so \
+                 a removal would silently narrow both. Update EXPECTED_VARS and \
+                 `ambient_value` deliberately, or put the variable back"
+            );
+            let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+            let sandbox = scratch.path();
+            // The victim: the repository the ambient variables name. Nothing the
+            // child runs is ever pointed at it.
+            let decoy = init_repo(sandbox, "decoy");
+            let clone = init_repo(sandbox, "clone");
+            // A branch of the same name in BOTH, so the `branch -D` the child runs
+            // against the clone has something to destroy here if it is steered.
+            for repo in [&decoy, &clone] {
+                run_fixture(sandbox, repo, &["branch", SHARED_BRANCH]);
+            }
+            // A linked worktree of the decoy's own, so the enumeration the removal
+            // decision is made from has a wrong answer available to give.
+            let decoy_wt = sandbox.join("decoy-wt");
+            run_fixture(
+                sandbox,
+                &decoy,
+                &[
+                    "worktree",
+                    "add",
+                    &decoy_wt.to_string_lossy(),
+                    "-b",
+                    "decoy/own",
+                ],
+            );
+            // …and make the decoy dirty, so the cleanliness gate — the check that
+            // protects an unexpectedly dirty tree from removal — has a wrong
+            // answer available too.
+            std::fs::write(decoy.join("untracked"), b"x").expect("dirty the decoy");
+
+            let head_before = fixture_stdout(sandbox, &decoy, &["rev-parse", "HEAD"]);
+            let branches_before = fixture_stdout(
+                sandbox,
+                &decoy,
+                &["branch", "--list", "--format=%(refname:short)"],
+            );
+            let worktrees_before =
+                fixture_stdout(sandbox, &decoy, &["worktree", "list", "--porcelain"]);
+
+            let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+            let mut child = std::process::Command::new(&exe);
+            child
+                .args([AMBIENT_TEST, "--nocapture", "--test-threads=1"])
+                .env(AMBIENT_CHILD, "1")
+                .env(AMBIENT_SANDBOX, sandbox)
+                // Configuration, not location: keeps a developer's `~/.gitconfig`
+                // out of the child without touching the thing under test.
+                .env("GIT_CONFIG_GLOBAL", sandbox.join("no-such-gitconfig"))
+                .env("GIT_CONFIG_SYSTEM", sandbox.join("no-such-gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            for var in crate::git_env::AMBIENT_LOCATION_VARS {
+                child.env(var, ambient_value(var, &decoy));
+            }
+            let out = child.output().expect("re-exec this test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+
+            // The write half, which is where the data loss is, and it is
+            // checked BEFORE the child's own verdict: a write that landed here
+            // must be reported as that, rather than masked by whichever
+            // assertion the child happened to trip over first. Unfixed, the
+            // child's `create_worktree` registers its branch and its worktree
+            // HERE, its `branch -D` deletes this repository's branch, and its
+            // `worktree remove` deletes a directory out of this repository.
+            assert_eq!(
+                fixture_stdout(sandbox, &decoy, &["rev-parse", "HEAD"]),
+                head_before,
+                "the child moved the decoy's HEAD"
+            );
+            assert_eq!(
+                fixture_stdout(
+                    sandbox,
+                    &decoy,
+                    &["branch", "--list", "--format=%(refname:short)"]
+                ),
+                branches_before,
+                "the decoy's branches changed: the child either created one here \
+             (`worktree add`) or deleted one here (`branch -D`) — issue #1181"
+            );
+            assert_eq!(
+                fixture_stdout(sandbox, &decoy, &["worktree", "list", "--porcelain"]),
+                worktrees_before,
+                "the decoy's worktree registry changed — a `worktree add` or a \
+             `worktree remove` landed in the repository the ambient `GIT_DIR` \
+             named rather than the one the code chose"
+            );
+            assert!(
+                decoy_wt.is_dir(),
+                "the decoy's own worktree was DELETED FROM DISK by a removal aimed \
+             at the clone — the outcome issue #1181 measured"
+            );
+
+            // …and only then the child's own verdict, which covers the other
+            // half: that the calls still did what they were asked to do, against
+            // the clone.
+            assert!(
+                out.status.success(),
+                "the production git calls must ignore every ambient location \
+             variable\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "the child must have run exactly the test named by AMBIENT_TEST \
+             ({AMBIENT_TEST}); zero matches exit 0 too, which is the \
+             fail-green this asserts away\n{stdout}"
+            );
+        }
+
+        /// The re-exec'd half: every variable in
+        /// [`crate::git_env::AMBIENT_LOCATION_VARS`] is set in this process's own
+        /// environment, aimed at the decoy, and every call below is made against
+        /// the clone.
+        async fn ambient_location_child() {
+            // Vacuity guard first: if the parent failed to hand these down, every
+            // assertion below passes while proving nothing.
+            for var in crate::git_env::AMBIENT_LOCATION_VARS {
+                assert!(
+                    std::env::var_os(var).is_some(),
+                    "the parent must set {var} in this child, or this test proves \
+                 nothing at all"
+                );
+            }
+            let sandbox = PathBuf::from(
+                std::env::var_os(AMBIENT_SANDBOX).expect("the parent must name its sandbox"),
+            );
+            let clone = sandbox.join("clone");
+            let decoy = sandbox.join("decoy");
+
+            // The control. An un-neutralized `git` from inside the clone must
+            // resolve the DECOY — otherwise the ambient environment is not
+            // actually in force here and nothing below is a test.
+            let raw = std::process::Command::new("git")
+                .current_dir(&clone)
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .expect("run git rev-parse");
+            assert!(
+                raw.status.success(),
+                "control: `git rev-parse` must succeed"
+            );
+            let raw_git_dir =
+                PathBuf::from(String::from_utf8_lossy(&raw.stdout).trim().to_string());
+            assert_eq!(
+                std::fs::canonicalize(&raw_git_dir).expect("canonicalize the control's answer"),
+                std::fs::canonicalize(decoy.join(".git")).expect("canonicalize the decoy"),
+                "control: an un-neutralized `git` run from inside the clone must \
+             resolve the DECOY, or this test stages nothing"
+            );
+
+            // 1. CREATE — `issue_dispatch_run::create_worktree`, the only `git
+            //    worktree add` in `src/`.
+            let wt = sandbox.join("wt");
+            let created = crate::issue_dispatch_run::create_worktree(
+                &clone,
+                &wt,
+                "agent/ambient-probe",
+                false,
+                crate::worktree_owner::Creator::dispatch("ambient"),
+            )
+            .await
+            .expect("create_worktree must succeed against the clone");
+            assert!(
+                matches!(
+                    created,
+                    crate::issue_dispatch_run::WorktreeCreation::Created { .. }
+                ),
+                "the worktree must have been created, not claimed or refused: {created:?}"
+            );
+            assert!(wt.is_dir(), "the worktree directory must exist");
+
+            // 2. READ — the enumeration `examine_worktrees` makes its removal
+            //    decision from. The decoy has a linked worktree of its own, so a
+            //    steered answer is available and wrong.
+            let listed = list_linked_worktrees(&clone).expect("list the clone's linked worktrees");
+            let paths: Vec<PathBuf> = listed
+                .iter()
+                .map(|w| std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()))
+                .collect();
+            assert_eq!(
+                paths,
+                vec![std::fs::canonicalize(&wt).expect("canonicalize the worktree")],
+                "the enumeration must list the CLONE's worktrees; listing the \
+             decoy's steers every removal decision made from it"
+            );
+
+            // 3. The cleanliness gate, on the same steering. The decoy is dirty
+            //    and the clone's worktree is clean, so a steered probe reports
+            //    `Dirty` for a tree that is not.
+            assert_eq!(
+                check_cleanliness(&wt),
+                Cleanliness::Clean,
+                "the cleanliness gate must probe the worktree it was handed"
+            );
+
+            // 4. DELETE a branch — `dispatch.rs`'s rollback shape, through the
+            //    helper it now goes through. `SHARED_BRANCH` exists in both
+            //    repositories; the parent asserts the decoy's survived.
+            crate::issue_dispatch_run::run_git_status(&[
+                "-C",
+                &clone.to_string_lossy(),
+                "branch",
+                "-D",
+                SHARED_BRANCH,
+            ])
+            .await
+            .expect("deleting the clone's own branch must succeed");
+
+            // 5. DELETE a worktree — `worktree_reclaim`'s own removal, the one
+            //    that runs unattended once the three gates hold.
+            remove_worktree_dir(&clone, &wt, "ambient-probe")
+                .expect("removing the clone's worktree must succeed");
+            assert!(!wt.exists(), "the clone's worktree must be gone from disk");
+
+            // 6. DELETE a worktree — `issue_dispatch_run::remove_worktree`, the
+            //    tab-close and rollback path, which is a different call site.
+            let wt2 = sandbox.join("wt2");
+            let created2 = crate::issue_dispatch_run::create_worktree(
+                &clone,
+                &wt2,
+                "agent/ambient-probe-2",
+                false,
+                crate::worktree_owner::Creator::dispatch("ambient"),
+            )
+            .await
+            .expect("create_worktree must succeed the second time too");
+            assert!(
+                matches!(
+                    created2,
+                    crate::issue_dispatch_run::WorktreeCreation::Created { .. }
+                ),
+                "the second worktree must be created too: {created2:?}"
+            );
+            let removed = crate::issue_dispatch_run::remove_worktree(
+                &wt2,
+                &clone,
+                crate::issue_dispatch_run::RemovalPolicy::Force,
+                "ambient-probe",
+            )
+            .await;
+            assert!(
+                matches!(
+                    removed,
+                    crate::issue_dispatch_run::RemoveOutcome::Removed(_)
+                ),
+                "the removal must report nothing left behind: {removed:?}"
+            );
+            assert!(!wt2.exists(), "the second worktree must be gone from disk");
+        }
     }
 }

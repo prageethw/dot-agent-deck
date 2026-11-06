@@ -170,9 +170,11 @@ fn try_run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .parent()
         .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
         .unwrap_or_else(|| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
-    let out = Command::new("git")
+    // Linkage-check rule 15: the one bare `git` constructor is `common::fixture_git`.
+    // The overrides below keep this fixture's own identity, `/dev/null` global
+    // config and parent-directory ceiling on top of it.
+    let out = common::fixture_git(dir, &ceiling)
         .args(args)
-        .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Fixture")
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "Fixture")

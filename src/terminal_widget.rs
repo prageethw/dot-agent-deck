@@ -114,27 +114,15 @@ pub struct TerminalWidget {
     /// so a caller that never sets it renders exactly as before. Set it via
     /// [`TerminalWidget::with_input_active`].
     input_active: bool,
-    /// PRD #84 M5 (invariant 3): when `true`, the caller attests that the
-    /// upstream layout/resize contract held for this pane — i.e. its PTY was
-    /// sized to this widget's inner area by `resize_panes_to_layout` earlier in
-    /// the same frame — so the widget enforces `screen == inner area` with a
-    /// `debug_assert!` (debug) / log-once + min fallback (release). Defaults to
-    /// `false` for [`TerminalWidget::new`], so a caller that constructs the
-    /// widget directly without that guarantee (e.g. a unit test feeding a
-    /// deliberate size mismatch) renders the 1:1 min-from-top fallback without
-    /// tripping the contract assert. The production render path opts in via
-    /// [`TerminalWidget::contract_guaranteed`].
-    contract_guaranteed: bool,
     /// PRD #313 M3: does this pane fill a ZOOMED frame — i.e. is it the one
     /// pane a zoom left on screen? When `true` the border title gains the
     /// [`ZOOM_TITLE_MARKER`], rendered as a separate span in
     /// [`zoom_marker_style`] so it cannot be forged by a display name that
     /// merely contains the same three characters.
     ///
-    /// Kept OUT of `title` on purpose. `title` is the pane's name and is what
-    /// the PRD #84 contract diagnostic reports; the marker is deck chrome, so
-    /// concatenating the two would both style the marker like a name and put
-    /// deck state into a diagnostic that is meant to identify a pane.
+    /// Kept OUT of `title` on purpose. `title` is the pane's name; the marker
+    /// is deck chrome, so concatenating the two would style the marker like a
+    /// name.
     ///
     /// Defaults to `false` in [`TerminalWidget::new`]. Set it via
     /// [`TerminalWidget::with_zoom_marker`].
@@ -149,7 +137,6 @@ impl TerminalWidget {
             focused,
             status: None,
             input_active: true,
-            contract_guaranteed: false,
             zoom_marker: false,
         }
     }
@@ -190,19 +177,15 @@ impl TerminalWidget {
         self
     }
 
-    /// Opt into the PRD #84 invariant-3 contract check (see the field doc).
+    /// A no-op, kept so existing callers and tests still compile.
     ///
-    /// HONOR SYSTEM — pass `true` ONLY from a caller that guarantees this pane's
-    /// PTY was already sized to this widget's inner area **this frame** (in
-    /// practice: the render path, which runs after `resize_panes_to_layout` has
-    /// sized every pane it draws from the same `compute_frame_layout`). Passing
-    /// `true` anywhere else arms a `debug_assert!` that will spuriously panic in
-    /// debug builds whenever the screen size and the area legitimately differ
-    /// (e.g. a pane that was not put through the layout/resize pass, or a unit
-    /// test feeding a deliberate mismatch). When in doubt, leave it `false`:
-    /// the widget still renders correctly via the 1:1 min-from-top fallback.
-    pub fn contract_guaranteed(mut self, guaranteed: bool) -> Self {
-        self.contract_guaranteed = guaranteed;
+    /// It used to opt into PRD #84's invariant-3 check, a `debug_assert!` that
+    /// the PTY screen equals this widget's inner area. PRD #882 removed that
+    /// check because the daemon now owns the PTY size and the two legitimately
+    /// differ (see the comment in `render` and
+    /// `docs/develop/rendering-contract.md`, invariant 3), so the argument is
+    /// ignored and `true` and `false` render identically.
+    pub fn contract_guaranteed(self, _guaranteed: bool) -> Self {
         self
     }
 }
@@ -249,10 +232,6 @@ impl Widget for TerminalWidget {
             .borders(Borders::ALL)
             .border_type(border_type)
             .border_style(border_style)
-            // Borrow the title (no per-frame clone): the block is consumed by
-            // `block.render` below, releasing the borrow, so `self.title` stays
-            // available for the contract-violation diagnostic (PRD #84 M5).
-            //
             // PRD #313 M3: while this pane fills a zoomed frame the marker rides
             // after the name as its OWN span, so it is drawn in
             // `zoom_marker_style` and a display name that merely spells `[Z]`
@@ -282,7 +261,7 @@ impl Widget for TerminalWidget {
         // layout/PTY-size mismatch that `resize_panes_to_layout` (M4) now
         // prevents, and the row window was the direct cause of the "scramble /
         // stale content near the bottom rows" symptom.
-        let (screen_rows, screen_cols) = screen.size();
+        let (screen_rows, screen_cols) = crate::vt_grid::size(screen);
 
         // PRD #882 — the invariant-3 equality guard is GONE, and its removal is
         // a design change rather than a relaxation.
@@ -291,11 +270,11 @@ impl Widget for TerminalWidget {
         // the geometry: `resize_pane_pty` set the parser synchronously, so the
         // two were the same number by construction and any difference was a bug.
         // Under PRD #882 the DAEMON owns it. The parser holds the geometry the
-        // daemon applied — the smallest viewport among everyone attached — and
-        // the inner area holds what this client would like to draw. Those two
-        // legitimately differ whenever another client's view of the agent is
-        // smaller,
-        // which is the entire point of the policy.
+        // daemon applied — the last-focused client's viewer size, or the
+        // smallest viewport among everyone attached when no client claimed
+        // focus (PRD #1105) — and the inner area holds what this client would
+        // like to draw. Those two legitimately differ whenever another client
+        // decides the size, which is the entire point of the policy.
         //
         // Nor can the guard be kept for one direction only. Every request is a
         // round trip now, so during a shrink the parser is briefly LARGER than
@@ -306,19 +285,18 @@ impl Widget for TerminalWidget {
         //
         // The invariant did not disappear; it MOVED to the side that can
         // actually state it. The daemon computes the applied geometry from the
-        // registered viewers and is where "the PTY is never larger than any
-        // viewer's pane" is enforced and tested. What remains here is the
-        // rendering rule that follows from it, and it is now the designed path
-        // rather than a defense against an upstream failure: draw the screen
-        // 1:1 from the top-left and leave anything past it blank. A pane
-        // narrower or shorter than its box is what a correctly applied policy
-        // looks like from inside a client that is not the smallest one.
-        let _ = self.contract_guaranteed;
+        // registered viewers and is where the policy is enforced and tested.
+        // What remains here is the rendering rule that follows from it, and it
+        // is now the designed path rather than a defense against an upstream
+        // failure: draw the screen 1:1 from the top-left and leave anything past
+        // it blank. A pane narrower or shorter than its box is what a correctly
+        // applied policy looks like from inside a client that is not the
+        // smallest one; since PRD #1105, a screen LARGER than the box, clipped
+        // at its right and bottom edges, is what it looks like from inside a
+        // client that is not the last-focused one.
 
-        // Fall back to `min(area, screen)` from the top-left so an over- or
-        // under-sized screen never reads out of bounds. With the contract held
-        // these are exactly the inner dims; the `min` only matters when the
-        // contract is violated (release) or for a caller that never attested it.
+        // `min(area, screen)` from the top-left, so an over- or under-sized
+        // screen never reads out of bounds.
         let rows = (inner.height as usize).min(screen_rows as usize);
         let cols = (inner.width as usize).min(screen_cols as usize);
 

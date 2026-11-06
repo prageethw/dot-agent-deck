@@ -5,20 +5,18 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use dot_agent_deck::agent_pty::{
-    DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
-    DOT_AGENT_DECK_REGISTRATION_GENERATION,
-};
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use dot_agent_deck::bounded_read::read_task_input;
 use dot_agent_deck::build_version_handshake;
-use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path, state_dir};
+use dot_agent_deck::config::{DashboardConfig, state_dir};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::{DaemonClient, LocalEndpoint};
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
+use dot_agent_deck::endpoint_resolve::client_attach_socket_path;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::pane::PaneController;
-use dot_agent_deck::reconnect::{HydrationGate, spawn_event_subscriber};
+use dot_agent_deck::reconnect::HydrationGate;
 use dot_agent_deck::state::AppState;
 use dot_agent_deck::ui::run_tui;
 
@@ -130,15 +128,38 @@ enum Commands {
         /// Role name(s) to delegate to (repeatable)
         #[arg(long)]
         to: Vec<String>,
-        /// Subject tag (issue/PR number, or a short opaque token) this delegation
-        /// is for — issue #586 M4. Optional; when both this and the worker's own
-        /// `work-done --subject` are supplied and they don't match, the daemon
-        /// flags it visibly rather than silently trusting a wrong-content report.
+        /// Dispatch even to a worker that still owes a work-done for an
+        /// earlier delegation. Without it the daemon refuses that worker and
+        /// says how many delegations it still owes. Use it when the earlier
+        /// task is abandoned and this one replaces it.
         #[arg(long)]
-        subject: Option<String>,
+        supersede: bool,
     },
     /// Create a git worktree and start an isolated line of work inside it.
     /// Agent-callable, one step (PRD #220).
+    ///
+    /// Exit status when starting a unit: 0 means the daemon admitted the
+    /// request, or gave no answer this build can check (an older daemon, or
+    /// none within 5 seconds). It does not mean the worktree was created, that
+    /// the unit started, or that its task reached the agent: the daemon answers
+    /// before it does any of that work. Non-zero means the request did not get
+    /// that far: no daemon was reachable, the daemon refused it (the reason is
+    /// printed), or the command line itself was unusable.
+    ///
+    /// What happened arrives afterwards as messages in this agent's inbox: first the
+    /// daemon's reply to the dispatch, beginning `dispatch:`. A reply beginning
+    /// `dispatch: spawned isolated` names what was started and where; a reply
+    /// with any other opening is a failure and says why. A spawned unit has
+    /// still not been confirmed to have received its task. The report it sends
+    /// later, when it finishes, beginning `dispatch: a unit you dispatched has
+    /// completed`, is the first message that indicates it
+    /// did — an indication, not proof, since the deck does not tie that report
+    /// to the task's delivery.
+    ///
+    /// With --list-targets the exit status means something else: 0 means the
+    /// listing was printed, and non-zero means no listing could be trusted —
+    /// the daemon did not answer, or could not read this repo's config or this
+    /// pane's directory. The reason is printed.
     Dispatch {
         /// Short name for the dispatch unit (used for worktree naming).
         /// Omit it only with --list-targets.
@@ -196,34 +217,193 @@ enum Commands {
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Signal that the entire orchestration is complete (orchestrator only)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "task_id")]
         done: bool,
-        /// Subject tag (issue/PR number, or a short opaque token) this report is
-        /// for — issue #586 M4, echoing back the delegation's own `--subject`.
-        /// Optional; when both this and the delegation's `--subject` are
-        /// supplied and they don't match, the daemon flags it visibly rather
-        /// than silently trusting a wrong-content report.
-        #[arg(long)]
-        subject: Option<String>,
+        /// The id of the delegated task this report completes, as your task
+        /// names it. Without it, the report is a note to your orchestrator
+        /// that completes no task.
+        #[arg(long = "task-id", value_name = "ID")]
+        task_id: Option<String>,
     },
-    /// Report an agent lifecycle state so the pane's card status updates
-    /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
-    /// extension) to drive status with NO hook installed: it rides the
-    /// existing raw-`AgentEvent` socket path.
+    /// Close dispatched units, one agent, or one orchestration.
+    ///
+    /// Name units by the name they were dispatched under, or by the unit id a
+    /// listing printed with --unit-id, or close one pane with --pane, or every
+    /// role of an orchestration with --orchestration-of. --all lists every
+    /// unit you may close and closes nothing; --all --yes lists them, then
+    /// closes exactly those.
+    ///
+    /// Refused unless --force: a dispatched unit that has not reported
+    /// `work-done --done`, an agent that is mid-turn, and one role of a live
+    /// orchestration closed on its own. Run from an agent's pane, `close` acts
+    /// only on units that agent dispatched, never on its own pane or
+    /// orchestration, and --force does not change that.
+    ///
+    /// Exit status: 0 everything named was closed (or listed); 1 something was
+    /// refused or failed; 2 the running daemon is too old for `close`; 3 no
+    /// daemon is running.
+    Close {
+        /// Dispatched units to close, by the name given to `dispatch`.
+        #[arg(conflicts_with_all = ["unit_ids", "pane", "orchestration_of", "all"])]
+        units: Vec<String>,
+        /// Dispatched units to close, by the unit id `close --all` (or an
+        /// `ambiguous` refusal) printed. Repeat it, or give several ids.
+        #[arg(
+            long = "unit-id",
+            value_name = "ID",
+            num_args = 1..,
+            conflicts_with_all = ["pane", "orchestration_of", "all"]
+        )]
+        unit_ids: Vec<String>,
+        /// Close the one agent in this pane.
+        #[arg(long, value_name = "PANE_ID", conflicts_with_all = ["orchestration_of", "all"])]
+        pane: Option<String>,
+        /// Close every role of the orchestration this pane belongs to.
+        #[arg(
+            long = "orchestration-of",
+            value_name = "PANE_ID",
+            conflicts_with = "all"
+        )]
+        orchestration_of: Option<String>,
+        /// List every unit you may close. Closes nothing unless --yes.
+        #[arg(long)]
+        all: bool,
+        /// With --all: close the units it listed.
+        #[arg(long, requires = "all")]
+        yes: bool,
+        /// Show what would be closed, and what would be refused, without
+        /// closing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Close even a unit that has not reported, an agent that is mid-turn,
+        /// or one role of a live orchestration.
+        #[arg(long)]
+        force: bool,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the live agents with their folder, orchestration and role, and
+    /// which one is each orchestration's orchestrator — the agent to message
+    /// with `inbox send`.
+    ///
+    /// --folder, --orchestration, --name and --pane select what `inbox send`
+    /// would address with the same flags (all the agents of each matching
+    /// orchestration) when run on the same machine as the deck, which is how
+    /// agents in deck panes run it, and combine as an intersection.
+    Roles {
+        /// Print a JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Only the orchestrations in this folder or, when none is, its
+        /// nearest parent folder that has one.
+        #[arg(long, value_name = "PATH")]
+        folder: Option<String>,
+        /// Only the orchestrations with this config name or title.
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
+        orchestration: Option<String>,
+        /// Only the standalone agents with this name (the NAME column).
+        #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
+        name: Option<String>,
+        /// Only the standalone agent or orchestrator in this pane (the PANE
+        /// column).
+        #[arg(long, value_name = "PANE", allow_hyphen_values = true)]
+        pane: Option<String>,
+    },
+    /// Acknowledge a message the deck delivered to you (`m-…`). Exits non-zero
+    /// only when the deck says it holds no such message for you; any other
+    /// failure to acknowledge is harmless, and the task goes on.
+    Ack {
+        /// The message id (`m-…`).
+        delivery_id: String,
+        /// Print the deck's answer as one JSON line, for the agent-side
+        /// components that confirm their acknowledgements.
+        #[arg(long, hide = true)]
+        json: bool,
+    },
+    /// Read and manage this agent's dot-agent-deck inbox.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
+    /// Report an agent lifecycle state, a submitted prompt or a tool call so
+    /// the pane's card updates (PRD #201 M1.2, issue #622). Used by an agent's
+    /// extension (e.g. the bundled Pi extension) to drive its card with NO
+    /// hook installed: it rides the existing raw-`AgentEvent` socket path.
     AgentEvent {
-        /// Lifecycle state: one of `running`, `waiting`, `finished`.
+        /// One of `running`, `waiting`, `finished` (lifecycle), `prompt`,
+        /// `tool-start`, `tool-end` (card detail).
         #[arg(long = "type")]
         r#type: String,
+        /// The agent's working directory, shown as the card's `Dir:`.
+        #[arg(long, allow_hyphen_values = true)]
+        cwd: Option<String>,
+        /// The prompt being submitted (with `--type prompt`).
+        #[arg(long, allow_hyphen_values = true)]
+        prompt: Option<String>,
+        /// The tool starting or finishing (with `--type tool-start|tool-end`).
+        #[arg(long = "tool-name", allow_hyphen_values = true)]
+        tool_name: Option<String>,
+        /// A short description of the tool call, e.g. its command or path.
+        #[arg(long = "tool-detail", allow_hyphen_values = true)]
+        tool_detail: Option<String>,
+        /// Accepted and ignored. Pi extensions from before PRD #1666 pass it on
+        /// every report to declare that they report every prompt; nothing reads
+        /// that any more, so the flag does nothing.
+        #[arg(long = "reports-prompts", hide = true)]
+        _reports_prompts: bool,
+        /// Read the final reply of the turn that just settled (with `--type
+        /// finished`) from stdin, for the deck's reading mode (PRD #1497). Sent
+        /// by the bundled Pi extension, which writes the reply to stdin so it
+        /// never appears on a command line; the daemon passes it only to
+        /// clients reading this agent, and never shows or stores it.
+        #[arg(long = "turn-reply-stdin")]
+        turn_reply_stdin: bool,
+        /// The turn whose reply `--turn-reply-stdin` reads ended in an error.
+        #[arg(long = "turn-reply-failed")]
+        turn_reply_failed: bool,
     },
-    /// Print the seed/prompt the daemon prepared for this pane, then clear it
-    /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
-    /// the hook socket for the pane's pending seed and prints it to stdout
-    /// (empty output = no seed). The bundled Pi extension shells this on
-    /// `session_start` and, if the output is non-empty, delivers it natively
-    /// via `pi.sendUserMessage` — so a Pi pane's first prompt no longer needs
-    /// PTY keystroke injection. Uses `DOT_AGENT_DECK_PANE_ID` to scope the
-    /// request, exactly like `agent-event`.
-    GetSeed,
+    /// Report a question an agent is asking and wait for the deck's answer
+    /// (PRD #1631). Run by the deck's OpenCode plugin and Pi extension, not by
+    /// hand: prints one line — what the producer should answer the agent with —
+    /// or nothing, and always exits 0.
+    #[command(hide = true)]
+    AwaitAnswer {
+        /// The producer: `opencode` (the question on stdin) or `pi`.
+        #[arg(long)]
+        agent: String,
+        /// The question, for a producer that cannot write stdin (Pi).
+        #[arg(long)]
+        question: Option<String>,
+        /// After printing the answer, read one line from stdin — whether the
+        /// agent took it — and pass it to the deck (the OpenCode plugin). The
+        /// question is then the first line of stdin rather than all of it.
+        #[arg(long)]
+        ack: bool,
+    },
+    /// Print the user documentation for this version, embedded in the binary
+    /// (no network, no daemon). With no topic, list the topics; with a topic
+    /// (e.g. `orchestration`, `desktop/voice`), print that page's Markdown;
+    /// with `--all`, print every page in reading order.
+    Docs {
+        /// The page to print: its path under the docs without `.md`, as
+        /// listed by `dot-agent-deck docs`.
+        topic: Option<String>,
+        /// Print every page in reading order.
+        #[arg(long, conflicts_with = "topic")]
+        all: bool,
+    },
+    /// Check for a newer release and upgrade this machine's dot-agent-deck
+    /// and Agent Deck desktop app, each through the way it was installed.
+    /// Prints what it would do and asks before each upgrade (issue #1635).
+    Upgrade {
+        /// Only report what is installed and what an upgrade would do.
+        #[arg(long)]
+        check: bool,
+        /// Upgrade without asking for confirmation.
+        #[arg(long, conflicts_with = "check")]
+        yes: bool,
+    },
     /// Set up the Pi orchestrator integration (PRD #201). Detects `pi` on
     /// PATH, materializes the bundled orchestrator extension into Pi's global
     /// extension dir, and enables it (Pi auto-discovers the dir). Prints the
@@ -325,7 +505,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ScheduleAction {
-    /// Add a new scheduled task.
+    /// Add a new schedule.
     Add {
         #[arg(long)]
         name: String,
@@ -371,8 +551,8 @@ enum ScheduleAction {
         #[arg(long)]
         triage: bool,
     },
-    /// Update fields of an existing task. Rename is forbidden — there is no
-    /// name-change flag; `name` selects the task to edit.
+    /// Update fields of an existing schedule. Rename is forbidden — there is no
+    /// name-change flag; `name` selects the schedule to edit.
     Update {
         #[arg(long)]
         name: String,
@@ -395,24 +575,24 @@ enum ScheduleAction {
         #[arg(long)]
         shape: Option<String>,
     },
-    /// Remove a task definition (does not kill an open tab for it).
+    /// Remove a schedule (does not kill an open tab for it).
     Remove {
         #[arg(long)]
         name: String,
     },
-    /// List scheduled tasks with their enabled/disabled state and next-fire.
+    /// List schedules with their enabled/disabled state and next-fire.
     List,
-    /// Enable a task.
+    /// Enable a schedule.
     Enable {
         #[arg(long)]
         name: String,
     },
-    /// Disable a task (keeps the definition; stops it firing).
+    /// Disable a schedule (keeps the definition; stops it firing).
     Disable {
         #[arg(long)]
         name: String,
     },
-    /// Fire a task now via the running daemon.
+    /// Fire a schedule now via the running daemon.
     RunNow {
         #[arg(long)]
         name: String,
@@ -485,6 +665,33 @@ enum DaemonCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Run the daemon as a user service (systemd on Linux, launchd on
+    /// macOS), so it starts at login and comes back after a crash or an
+    /// upgrade. Starts it now unless a daemon is already running; never stops
+    /// one (PRD #143).
+    Install,
+    /// Remove the service `install` set up, so the daemon no longer starts at
+    /// login. A daemon it started keeps running until `daemon stop`.
+    Uninstall,
+    /// Print the attach endpoint this host's daemon is listening on, and
+    /// print it **only** when a live daemon answered there.
+    ///
+    /// The remote half of endpoint discovery (issue #1174). The desktop runs
+    /// this over ssh on the far host so that the answer comes from a build of
+    /// this program running as that user, rather than from a shell snippet
+    /// restating the rules from outside — see
+    /// [`dot_agent_deck::remote_tunnel::REMOTE_SOCKET_PROBE`].
+    ///
+    /// Three things have to hold before anything is printed: the path resolves
+    /// the same way the daemon's own `bind(2)` resolves it, it passes
+    /// `verify_endpoint_trusted` (not a symlink, a socket, owned by this uid,
+    /// mode `0o600`), and a bounded attach-protocol `Hello` round trip
+    /// succeeds against it. Otherwise nothing goes to stdout and the exit
+    /// status is non-zero.
+    ///
+    /// Read-only, and it never lazy-spawns: "no daemon here" is the answer, not
+    /// a reason to start one.
+    Endpoint,
     /// Print a read-only snapshot of the daemon's managed agents: pane id,
     /// label, cwd, orchestration role, live status, and active tool. Fork
     /// #47: a CLI consumer of the existing `AttachRequest::ListAgents` — it
@@ -496,6 +703,37 @@ enum DaemonCmd {
         /// instead of the human table.
         #[arg(long)]
         json: bool,
+    },
+    /// Plumbing (PRD #1487): report whether a daemon is running at this host's
+    /// endpoint, and its `Hello` reply when one is. Never lazy-spawns. Run over
+    /// ssh by the laptop's `remote upgrade`, because `daemon hello` prints this
+    /// binary's own static hello rather than the running daemon's.
+    #[command(hide = true)]
+    Probe {
+        /// Print one JSON line (`{running, hello}`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plumbing (PRD #1487): ask the running daemon at this host's endpoint to
+    /// restart onto the build installed at its own path. Run over ssh by the
+    /// laptop's `remote upgrade`, through the freshly installed binary.
+    #[command(hide = true)]
+    RestartInstalled {
+        /// Print one JSON line (`{running, reply, unsupported}`).
+        #[arg(long)]
+        json: bool,
+        /// The version the caller just installed; the daemon refuses if the
+        /// installed build reports anything else.
+        #[arg(long)]
+        expect_version: Option<String>,
+        /// The confirmed stop set, as hex-encoded JSON.
+        #[arg(long, conflicts_with = "confirm_stdin")]
+        confirm_hex: Option<String>,
+        /// Read the confirmed stop set's JSON from stdin, to EOF: for a set
+        /// too large for the command line (issue #1619). `daemon probe --json`
+        /// reports `confirm_stdin: true` for a build that accepts it.
+        #[arg(long)]
+        confirm_stdin: bool,
     },
 }
 
@@ -756,8 +994,12 @@ enum RemoteCmd {
         /// Friendly name of the registry entry to diagnose.
         name: String,
     },
-    /// Re-run the binary install flow against an existing entry, then bump
-    /// the registry's version field.
+    /// Install a new build on a remote and restart its daemon onto it. On a
+    /// host whose deck Homebrew installed, runs `brew upgrade dot-agent-deck`
+    /// there instead of downloading a copy. An idle daemon restarts without a
+    /// question; when agents or orchestration roles would stop, it asks first
+    /// on a terminal and, with no terminal to ask on, installs and keeps the
+    /// running daemon. Exits non-zero only when a stage fails.
     Upgrade {
         /// Friendly name of the registry entry to upgrade.
         name: String,
@@ -769,6 +1011,10 @@ enum RemoteCmd {
         /// updated.
         #[arg(long = "no-install")]
         no_install: bool,
+        /// Print the outcome as one JSON object on stdout (progress goes to
+        /// stderr).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -780,6 +1026,147 @@ enum SnapshotCmd {
     /// dashboard instead of restoring the previous workspace. Registry-only
     /// `remote remove` intentionally does NOT touch this global snapshot.
     Clear,
+}
+
+#[derive(Subcommand)]
+enum InboxAction {
+    /// Print every message waiting for you, framed as from the deck, and
+    /// acknowledge them.
+    Fetch {
+        /// Print the deck's JSON answer instead.
+        #[arg(long)]
+        json: bool,
+        /// For an agent-side component that caught the doorbell naming this
+        /// message: fetch without acknowledging, and only while that message
+        /// is still waiting. Implies `--json`.
+        #[arg(long, hide = true, value_name = "ID")]
+        doorbell: Option<String>,
+        /// The integration the component running a doorbell fetch declares
+        /// (PRD #1666 §11). Run by that component, not by hand.
+        #[arg(long, hide = true, value_name = "N")]
+        adapter_integration: Option<u32>,
+        /// The receiver incarnation a doorbell fetch's attempts are bound to:
+        /// the component's own stream (PRD #1666 §4).
+        #[arg(long, hide = true, value_name = "RX")]
+        rx: Option<u64>,
+    },
+    /// List your messages and their delivery states.
+    List {
+        /// Print the deck's JSON answer instead.
+        #[arg(long)]
+        json: bool,
+        /// From an orchestrator pane: every inbox in its orchestration.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Wait for messages on behalf of an agent's hook, plugin or extension.
+    /// Run by those components, not by hand.
+    Wait {
+        /// The agent the component belongs to (`claude-code`, `opencode`,
+        /// `pi`, `codex`, `devin`).
+        #[arg(long)]
+        agent: String,
+        /// Stay connected and print each message as a JSON line, reading the
+        /// component's receipt controls from stdin.
+        #[arg(long)]
+        stream: bool,
+        /// The deck integration the component that runs this watcher
+        /// declares; with it the stream carries deck message receipts.
+        #[arg(long, value_name = "N")]
+        adapter_integration: Option<u32>,
+        /// Register a receiver that only carries the component's doorbell
+        /// substitutions.
+        #[arg(long, hide = true)]
+        doorbell_only: bool,
+        /// The component's callbacks survived since its previous watcher.
+        #[arg(long, hide = true)]
+        resumed: bool,
+    },
+    /// Tell the deck an agent's native inbox component is about to arm. Run
+    /// by those components, not by hand.
+    #[command(hide = true)]
+    Announce {
+        /// The agent the component belongs to.
+        #[arg(long)]
+        agent: String,
+    },
+    /// Announce something to every agent in your orchestration (or dispatch
+    /// tree) subscribed to TOPIC. They see it as another agent's text, to
+    /// use as information.
+    Publish {
+        /// The topic: lowercase letters, digits and hyphens.
+        topic: String,
+        #[command(flatten)]
+        body: InboxBody,
+    },
+    /// From an orchestrator pane: offer a job to the first free worker whose
+    /// role takes jobs from POOL. One worker gets it; you are told when it is
+    /// claimed, completed, or its claim expires.
+    Offer {
+        /// The pool: lowercase letters, digits and hyphens.
+        pool: String,
+        #[command(flatten)]
+        body: InboxBody,
+        /// How long the worker that takes the job may hold it before it is
+        /// offered to another, e.g. `30m`, `1h30m`, `90s`.
+        #[arg(long, value_name = "DURATION")]
+        claim_ttl: Option<String>,
+    },
+    /// Message an orchestration's orchestrator from outside it, by folder,
+    /// orchestration name, or both. With a folder alone that holds no
+    /// orchestration, the one standalone agent there is messaged instead,
+    /// which is how an orchestrator answers a standalone agent. --name and
+    /// --pane reach one standalone agent (or, by pane, an orchestrator) as
+    /// `dot-agent-deck roles` lists it, combined with --folder. Your text
+    /// arrives as UNTRUSTED data, with the deck naming your pane and how to
+    /// reply. A worker reports to its own orchestrator with `work-done`.
+    ///
+    /// Exit status: 0 sent; 1 refused (nothing matched, the address was
+    /// ambiguous, or the orchestrator is not live); 2 the running daemon is
+    /// too old for `inbox send`; 3 no daemon is running.
+    #[command(group(clap::ArgGroup::new("address").required(true).multiple(true).args(["folder", "orchestration", "name", "pane"])))]
+    Send {
+        /// The orchestration in this folder or, when none is, in its nearest
+        /// parent folder that has one.
+        #[arg(long, value_name = "PATH")]
+        folder: Option<String>,
+        /// The orchestration with this config name or title.
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
+        orchestration: Option<String>,
+        /// The standalone agent with this name (the NAME column of
+        /// `dot-agent-deck roles`), such as one of two in the same folder.
+        /// A name may start with `-`.
+        #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
+        name: Option<String>,
+        /// The standalone agent, or orchestration's orchestrator, in this pane
+        /// (the PANE column of `dot-agent-deck roles`). Never a worker.
+        #[arg(long, value_name = "PANE", allow_hyphen_values = true)]
+        pane: Option<String>,
+        #[command(flatten)]
+        body: InboxBody,
+    },
+    /// Report a job you were offered as done.
+    Complete {
+        /// The job's message id.
+        id: String,
+    },
+    /// Hand a job you were offered back, so another worker can take it.
+    Release {
+        /// The job's message id.
+        id: String,
+    },
+}
+
+/// The text of an `inbox publish` or `inbox offer`.
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct InboxBody {
+    /// The text.
+    #[arg(long)]
+    text: Option<String>,
+    /// Read the text from this file (`-` reads stdin).
+    #[arg(long, value_name = "PATH")]
+    file: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -795,6 +1182,14 @@ enum HooksAction {
         /// Agent type
         #[arg(long, value_enum, default_value_t = CliAgent::ClaudeCode)]
         agent: CliAgent,
+    },
+    /// Update every installed agent's hooks to this copy, as the deck does
+    /// when it starts, and say what they run now. Another live install the
+    /// hooks run is left in place, and the command to replace it is shown.
+    Refresh {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -954,39 +1349,6 @@ fn resolve_work_done_candidate(path: &std::path::Path) -> (std::path::PathBuf, b
     (path.to_path_buf(), false)
 }
 
-/// Read the registration generation and daemon boot id THIS WORKER WAS
-/// SPAWNED UNDER from its own environment — injected at spawn time, sibling
-/// to `DOT_AGENT_DECK_PANE_ID` — rather than asking the live daemon what the
-/// pane's generation/boot currently are.
-///
-/// Fork #358 (M2 redesign, M4): asking the daemon at send time answers "what
-/// generation does this pane currently hold", which is the SAME question
-/// `handle_work_done` asks again microseconds later at delivery — a signal
-/// produced that way can never disagree with itself, so a worker that
-/// outlives its own orchestration's teardown (the actual #358 repro) would
-/// ask the *new* tenant's daemon state and get delivered into the *new*
-/// tenant's worktree unchanged. Reading it from the env instead means the
-/// value genuinely travels with the worker process from spawn, so a mismatch
-/// at delivery means what it's supposed to mean: the pane was re-registered
-/// since THIS worker began.
-///
-/// Missing or unparseable (an old CLI predating these variables, or a caller
-/// that didn't go through a dot-agent-deck-managed spawn) degrades to
-/// `(0, String::new())` — `0` never matches a real registration (those start
-/// at `1`), and `""` is never a real `daemon_boot_id` (see
-/// `DaemonBootId::default`) — so a report built from a defaulted context is
-/// refused at delivery rather than silently delivered unchecked. See
-/// `WorkDoneSignal::generation`'s doc for the cross-version cost of that
-/// choice.
-fn read_registration_context() -> (u64, String) {
-    let generation: u64 = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let daemon_boot_id: String = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).unwrap_or_default();
-    (generation, daemon_boot_id)
-}
-
 /// What `dot-agent-deck delegate` should print and exit with, for one daemon
 /// reply. See [`delegate_verdict`].
 #[derive(Debug, PartialEq, Eq)]
@@ -1030,6 +1392,300 @@ fn parse_delegate_reply(line: &str) -> Option<dot_agent_deck::event::DelegateRes
         .filter(|r| r.is_delegate_reply())
 }
 
+/// Parse one line of daemon reply into a [`dot_agent_deck::event::SignalAck`],
+/// or `None` when the line is not an ack this build understands.
+///
+/// Same marker discipline as [`parse_delegate_reply`], and the same direction of
+/// failure matters more here: `SignalAck`'s fields are all `#[serde(default)]`
+/// over an `accepted: bool`, so `{}` and another verb's reply both parse into
+/// `accepted: false` — a refusal invented out of a line that is not an ack.
+/// Filtering on the marker is what keeps an unrecognised daemon reported as
+/// success rather than as a failure the sender did not have.
+fn parse_signal_ack(line: &str) -> Option<dot_agent_deck::event::SignalAck> {
+    serde_json::from_str::<dot_agent_deck::event::SignalAck>(line)
+        .ok()
+        .filter(|a| a.is_signal_ack())
+}
+
+/// Issue #1383: what `ack` got back, including the two cases it decides without
+/// asking the daemon.
+enum AckReply {
+    /// The argument is not shaped like a delivery id.
+    Malformed,
+    /// No `DOT_AGENT_DECK_PANE_ID`: not run from a deck-managed pane.
+    NoPane,
+    Socket(dot_agent_deck::hook::SocketReply),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AckStream {
+    Stdout,
+    Stderr,
+}
+
+/// Issue #1383: what `ack` prints, and where. Its exit code is 0 for every
+/// reply, which is the one deliberate divergence from
+/// [`send_signal_and_report_ack`]: a worker told to acknowledge before anything
+/// else must never be derailed from its task by a failed acknowledgement. The
+/// daemon keeps re-sending the pointer in that case, which the task file tells
+/// the worker to expect.
+///
+/// Only a recognisable ack with `accepted: true` whose `delivery` says the id
+/// named the pane's current delivery prints "Acknowledged" (PR #1414 review:
+/// admission alone is not a match). An id the deck does not know — mistyped, or
+/// an earlier task's — is said so on stderr, still with exit 0. `NoReply` —
+/// which is how a daemon older than `ack` answers, because it predates the verb
+/// — an admission that carries no `delivery`, and a line that is not an ack
+/// this build understands are all reported on stderr as "could not confirm",
+/// still with exit 0: nothing proves the deck matched the ack, so the worker
+/// must not be told it did, and nothing proves it failed either, so the worker
+/// carries on.
+/// PRD #1666: whether the deck positively said it holds no message under the
+/// id for this agent — the one `ack` outcome that exits non-zero, so an agent
+/// that acknowledged the wrong id learns it. Every other failure to confirm
+/// stays a success, for the reason [`ack_report`] gives.
+fn ack_was_refused_by_id(reply: &AckReply) -> bool {
+    use dot_agent_deck::event::AckDelivery;
+    use dot_agent_deck::hook::SocketReply;
+    let AckReply::Socket(SocketReply::Line(line)) = reply else {
+        return false;
+    };
+    parse_signal_ack(line).is_some_and(|ack| {
+        ack.accepted
+            && matches!(
+                ack.delivery,
+                Some(AckDelivery::Unknown | AckDelivery::WrongAgent | AckDelivery::Undeliverable)
+            )
+    })
+}
+
+/// PR #1735 second review: `ack --json`'s one line, for an agent-side
+/// component that must know whether the deck recorded its acknowledgement (the
+/// Pi extension confirms each one it sends over its watcher, which answers
+/// nothing). `final` is true when the deck refused the id itself, so asking
+/// again changes nothing; every other unrecorded answer may be asked again.
+fn ack_json(reply: &AckReply) -> serde_json::Value {
+    use dot_agent_deck::hook::{AckConfirmation, ack_confirmation};
+    if let AckReply::Socket(socket) = reply {
+        match ack_confirmation(socket) {
+            AckConfirmation::Recorded => return serde_json::json!({"acknowledged": true}),
+            AckConfirmation::Refused(reason) => {
+                return serde_json::json!({"acknowledged": false, "final": true, "reason": reason});
+            }
+            AckConfirmation::Unconfirmed => {}
+        }
+    }
+    let (_, message) = ack_report(reply);
+    serde_json::json!({"acknowledged": false, "final": false, "reason": message})
+}
+
+fn ack_report(reply: &AckReply) -> (AckStream, String) {
+    use dot_agent_deck::event::AckDelivery;
+    use dot_agent_deck::hook::SocketReply;
+    const CARRY_ON: &str = "this is harmless — carry on with your task.";
+    let not_confirmed = |why: &str| {
+        (
+            AckStream::Stderr,
+            format!("Could not confirm receipt with the deck ({why}); {CARRY_ON}"),
+        )
+    };
+    match reply {
+        AckReply::Malformed => not_confirmed("that is not a message id"),
+        AckReply::NoPane => not_confirmed("not running inside a dot-agent-deck managed pane"),
+        AckReply::Socket(SocketReply::Unreachable) => not_confirmed("the deck is not reachable"),
+        AckReply::Socket(SocketReply::NoReply) => {
+            not_confirmed("the deck did not answer; it may predate acknowledgements")
+        }
+        AckReply::Socket(SocketReply::Line(line)) => match parse_signal_ack(line) {
+            Some(ack) if ack.accepted => match ack.delivery {
+                Some(delivery) if delivery.recorded() => (
+                    AckStream::Stdout,
+                    "Acknowledged. Carry on with your task.".to_string(),
+                ),
+                Some(AckDelivery::Unknown) => (
+                    AckStream::Stderr,
+                    format!(
+                        "Unknown id: the deck has no delivery under that id for this pane \
+                         (mistyped, or from an earlier task), so it may send the task pointer \
+                         again; {CARRY_ON}"
+                    ),
+                ),
+                Some(AckDelivery::WrongAgent) => (
+                    AckStream::Stderr,
+                    "That message is addressed to another agent (wrong_agent); it was not \
+                     acknowledged."
+                        .to_string(),
+                ),
+                Some(AckDelivery::Undeliverable) => (
+                    AckStream::Stderr,
+                    "That message is no longer deliverable (undeliverable); it was not \
+                     acknowledged."
+                        .to_string(),
+                ),
+                Some(_) => not_confirmed("the deck's reply was not one this build understands"),
+                None => not_confirmed("the deck did not say whether the delivery id matched"),
+            },
+            Some(ack) => not_confirmed(&format!(
+                "the deck refused it{}",
+                ack.reason
+                    .as_deref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            )),
+            None => not_confirmed("the deck's reply was not one this build understands"),
+        },
+    }
+}
+
+/// Send one fire-and-forget hook-socket signal — `work-done` or `dispatch` —
+/// and turn the daemon's acknowledgement into this process's exit code.
+///
+/// Issue #1129. Before this, both verbs went through
+/// `dot_agent_deck::hook::send_to_socket` and exited 0 on any successful write,
+/// so a message the provenance gate refused looked identical to one the daemon
+/// acted on. The legitimate sender that trips that gate is a `dot-agent-deck`
+/// binary in the pane older than the daemon that spawned it: it forwards no
+/// token, is refused as `missing_token`, and used to report a completion that
+/// went nowhere as a clean success.
+///
+/// `verb` names the signal in the two messages below; `subject` is how a message
+/// refers to it in prose ("work-done report", "dispatch").
+///
+/// The four outcomes, and why only one of them is a failure the caller did not
+/// already have:
+///
+/// * [`SocketReply::Unreachable`] — never sent, and since issue #434 that is
+///   established by the byte count rather than assumed. Exactly what a `None`
+///   from `send_to_socket` meant, reported the same way.
+/// * [`SocketReply::NoReply`] — usually a daemon that does not write an ack,
+///   i.e. one predating issue #1129; since issue #434 also a request write
+///   that broke with bytes already gone. **Success** in both cases, for the
+///   reason `delegate`'s own `NoReply` arm is: the verb was fire-and-forget
+///   before the daemon answered it, so a daemon that does not answer must not
+///   become a phantom failure on every mixed-version pair — and a broken write
+///   may still have handed the daemon a complete line, so reporting a failure
+///   the sender would then retry is the one outcome that can double-send it.
+/// * a line that is not a recognisable ack — treated as `NoReply`, per
+///   [`parse_signal_ack`].
+/// * an ack with `accepted: false` — the one new failure. The daemon refused
+///   the signal and said why.
+///
+/// An `accepted: true` ack says the gate admitted the message, **not** that the
+/// handler behind it succeeded — for `dispatch` the daemon writes it before the
+/// handler runs, and for `work-done` once the report is queued, before it is
+/// written into any pane. See `dot_agent_deck::event::SignalAck` for what
+/// stays invisible.
+/// PRD #1666 part 3, round 5 (plan D1, D10): `work-done`, sent only once the
+/// daemon confirms on the same connection that it serves task-scoped
+/// completion, and answered in the words of `work_done_text`.
+fn run_work_done(pane_id: String, report: String, done: bool, task_id: Option<String>) -> ExitCode {
+    use dot_agent_deck::event::{
+        DaemonMessage, HookCapabilitiesRequest, WorkDoneMode, WorkDoneTaskReply,
+        WorkDoneTaskRequest,
+    };
+    use dot_agent_deck::hook::Gated;
+    use dot_agent_deck::work_done_text as text;
+    let token = dot_agent_deck::hook_provenance::token_from_env();
+    let mode = match (&task_id, done) {
+        (Some(task_id), _) => WorkDoneMode::Task {
+            task_id: task_id.clone(),
+        },
+        (None, true) => WorkDoneMode::Terminal,
+        (None, false) => WorkDoneMode::Uncorrelated,
+    };
+    let question = DaemonMessage::HookCapabilities(HookCapabilitiesRequest {
+        pane_id: pane_id.clone(),
+        token: token.clone(),
+    });
+    let mutation = DaemonMessage::WorkDoneTask(WorkDoneTaskRequest {
+        pane_id,
+        token,
+        mode,
+        report,
+        timestamp: chrono::Utc::now(),
+    });
+    let (Ok(question), Ok(mutation)) = (
+        serde_json::to_string(&question),
+        serde_json::to_string(&mutation),
+    ) else {
+        eprintln!("Failed to serialize work-done signal");
+        return ExitCode::FAILURE;
+    };
+    let reply = match dot_agent_deck::hook::send_gated(
+        &question,
+        &mutation,
+        dot_agent_deck::hook::confirms_task_scoped_completion,
+    ) {
+        Gated::NotConfirmed {
+            refusal: Some((code, message)),
+            ..
+        } => {
+            // The code is the word the daemon also put in its own `warn!`
+            // line, as `dispatch`'s refusal carries it.
+            eprintln!("Error: the daemon did not accept this work-done report: {message} [{code}]");
+            return ExitCode::FAILURE;
+        }
+        Gated::NotConfirmed { why, .. } => {
+            eprintln!("{}", text::NOT_CONFIRMED);
+            eprintln!("({why})");
+            return ExitCode::FAILURE;
+        }
+        Gated::Unconfirmed(why) => {
+            eprintln!("{}", text::unconfirmed(task_id.as_deref(), done));
+            eprintln!("({why})");
+            return ExitCode::FAILURE;
+        }
+        Gated::Reply(line) => line,
+    };
+    let Ok(reply) = serde_json::from_str::<WorkDoneTaskReply>(reply.trim()) else {
+        eprintln!("{}", text::unconfirmed(task_id.as_deref(), done));
+        eprintln!("(the daemon's answer could not be read)");
+        return ExitCode::FAILURE;
+    };
+    let answer = text::cli_answer(&reply, task_id.as_deref(), done);
+    if let Some(line) = answer.stdout {
+        println!("{line}");
+    }
+    if let Some(line) = answer.stderr {
+        eprintln!("{line}");
+    }
+    if answer.success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode {
+    use dot_agent_deck::hook::SocketReply;
+    match dot_agent_deck::hook::send_and_await_signal_ack(json) {
+        SocketReply::Unreachable => {
+            eprintln!("Failed to send {verb} signal to daemon socket.");
+            ExitCode::FAILURE
+        }
+        SocketReply::NoReply => ExitCode::SUCCESS,
+        SocketReply::Line(line) => match parse_signal_ack(&line) {
+            Some(ack) if !ack.accepted => {
+                // The daemon's sentence carries the remedy; the code is the word
+                // it also put in its own `warn!` line, so an operator reading
+                // both has one string to grep for.
+                eprintln!(
+                    "Error: the daemon did not accept this {subject}: {}{}",
+                    ack.error.as_deref().unwrap_or(
+                        "refused, and the daemon gave no reason this build understands."
+                    ),
+                    ack.reason
+                        .as_deref()
+                        .map(|r| format!(" [{r}]"))
+                        .unwrap_or_default()
+                );
+                ExitCode::FAILURE
+            }
+            _ => ExitCode::SUCCESS,
+        },
+    }
+}
+
 /// Decide what `delegate` reports for a daemon reply it does understand.
 ///
 /// Pure, and separate from the `Delegate` arm, so the contract below is pinned
@@ -1058,19 +1714,55 @@ fn parse_delegate_reply(line: &str) -> Option<dot_agent_deck::event::DelegateRes
 /// `AppState::delegate_targets` de-duplicates it — needed only for
 /// [`DelegateVerdict::info`]'s fork #92 P2 case below; every other branch
 /// ignores it.
+///
+/// Issue #580 adds `busy` — roles refused because their worker still owes a
+/// `work-done` — under the same contract. When NOTHING was dispatched the daemon
+/// also sets `error`, so the first arm above reports it and fails. When some role
+/// WAS dispatched, a busy role is a partial miss exactly like an unresolved one:
+/// a warning, exit 0. And `superseded` — a `--supersede` that did replace an
+/// unanswered delegation — is reported rather than silent, but is not a miss.
 fn delegate_verdict(
     pane_id: &str,
     requested_roles: &[String],
     resp: &dot_agent_deck::event::DelegateResponse,
 ) -> DelegateVerdict {
+    let blocked_note = blocked_workers_note(resp);
     if let Some(error) = resp.error.as_deref() {
+        let mut message = format!("Error: delegate from pane {pane_id} failed: {error}");
+        if let Some(note) = blocked_note {
+            message.push('\n');
+            message.push_str(&note);
+        }
         return DelegateVerdict {
             failed: true,
-            message: Some(format!(
-                "Error: delegate from pane {pane_id} failed: {error}"
-            )),
+            message: Some(message),
             info: None,
         };
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(note) = blocked_note {
+        notes.push(note);
+    }
+    if !resp.superseded.is_empty() {
+        notes.push(format!(
+            "Note: dispatched to worker(s) that still owed a work-done for an earlier \
+             delegation: {}. That earlier task is not cancelled — its work-done, if it comes, is \
+             credited like any other.",
+            dot_agent_deck::state::describe_busy_workers(&resp.superseded)
+        ));
+    }
+    if !resp.busy.is_empty() {
+        let delivered = if resp.delivered.is_empty() {
+            String::new()
+        } else {
+            format!(" It WAS delivered to: {}.", resp.delivered.join(", "))
+        };
+        notes.push(format!(
+            "Warning: delegate from pane {pane_id} was NOT sent to worker(s) that still owe a \
+             work-done for an earlier delegation: {}.{delivered} {}",
+            dot_agent_deck::state::describe_busy_workers(&resp.busy),
+            dot_agent_deck::state::busy_worker_remedy()
+        ));
     }
     if resp.unresolved_roles.is_empty() {
         // fork #92 P2: a role named more than once in `requested_roles` but
@@ -1091,8 +1783,10 @@ fn delegate_verdict(
             .map(|role| role.as_str())
             .collect();
         return DelegateVerdict {
-            failed: false,
-            message: None,
+            // A reply with `busy` and an empty `delivered` but no `error` is not
+            // one this daemon writes; if one arrives, nothing landed.
+            failed: resp.delivered.is_empty() && !resp.busy.is_empty(),
+            message: (!notes.is_empty()).then(|| notes.join("\n")),
             info: if collapsed.is_empty() {
                 None
             } else {
@@ -1106,36 +1800,108 @@ fn delegate_verdict(
         };
     }
     let unresolved = resp.unresolved_roles.join(", ");
-    // The three causes, stated as the three causes rather than as the one that
-    // happens to be most common.
+    // The five causes, stated as the five causes rather than as the one that
+    // happens to be most common. Issue #554 added the fourth: the daemon routes
+    // by the role name a pane was started with, so a role renamed in the toml
+    // after the orchestration started is present in the file and still reaches
+    // nobody — the first cause alone sent the user to a file that looked right.
+    // Issue #524 added the fifth: a worker that exited on its own is still in
+    // the role maps, and only a `clear = true` role is respawned by a delegate.
     let causes = "(A role reaches no worker when it is absent from \
                   .dot-agent-deck.toml, when it is the delegating orchestrator \
-                  itself — an orchestrator cannot delegate to itself — or when \
-                  its worker pane has been closed.)";
+                  itself — an orchestrator cannot delegate to itself — when \
+                  its worker pane has been closed, when its worker has exited \
+                  and the role is not `clear = true` — `dot-agent-deck pane \
+                  restart <role>` starts it again — or when the role was renamed \
+                  or added in .dot-agent-deck.toml after this orchestration \
+                  started — running panes keep the role names they were started \
+                  with until the orchestration is restarted.)";
     if resp.delivered.is_empty() {
-        return DelegateVerdict {
-            failed: true,
-            message: Some(format!(
+        notes.insert(
+            0,
+            format!(
                 "Error: delegate from pane {pane_id} reached no worker for role(s): \
                  {unresolved}. No role in this orchestration received it. {causes}"
-            )),
+            ),
+        );
+        return DelegateVerdict {
+            failed: true,
+            message: Some(notes.join("\n")),
             info: None,
         };
     }
-    DelegateVerdict {
-        failed: false,
-        message: Some(format!(
+    notes.insert(
+        0,
+        format!(
             "Warning: delegate from pane {pane_id} reached no worker for role(s): \
              {unresolved}. It WAS delivered to: {}. Retry only the roles that \
              missed — re-sending the whole delegate would dispatch the delivered \
              roles a second time. {causes}",
             resp.delivered.join(", ")
-        )),
+        ),
+    );
+    DelegateVerdict {
+        failed: false,
+        message: Some(notes.join("\n")),
         info: None,
     }
 }
 
+/// Issue #714: the warning `delegate` prints for
+/// [`dot_agent_deck::event::DelegateResponse::blocked`], split by what happened
+/// to each blocked role. Never a failure on its own: a blocked worker that was
+/// delivered to really has the task (a windowed limit may even have reset), so
+/// the exit code stays governed by the rules above. Fixed text plus role labels,
+/// ages and resets only — no error text, which is agent-controlled.
+fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Option<String> {
+    if resp.blocked.is_empty() {
+        return None;
+    }
+    let (busy, delivered): (Vec<_>, Vec<_>) = resp
+        .blocked
+        .iter()
+        .cloned()
+        .partition(|b| resp.busy.iter().any(|w| w.role == b.role));
+    let mut lines = Vec::new();
+    if !delivered.is_empty() {
+        lines.push(format!(
+            "Warning: worker(s) {} appear BLOCKED by a provider usage limit or credit pool. The task WAS \
+             delivered but will likely not be worked on while that lasts — if the worker's card \
+             still shows Blocked, reassign it to a role backed by a different provider or \
+             account, or restore the quota and re-delegate.",
+            dot_agent_deck::state::describe_blocked_workers(&delivered)
+        ));
+    }
+    if !busy.is_empty() {
+        lines.push(format!(
+            "Warning: busy worker(s) {} also appear BLOCKED by a provider usage limit or credit pool, so \
+             --supersede will likely not get the task worked on while that lasts — if the \
+             worker's card still shows Blocked, reassign it to a role backed by a different \
+             provider or account.",
+            dot_agent_deck::state::describe_blocked_workers(&busy)
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+/// A delegated-task delivery id from before PRD #1666 (`d-` and eight lowercase
+/// hex digits). Still sent, so the deck can answer that it holds no such
+/// message instead of the CLI calling a task file's id malformed.
+fn is_retired_delivery_id(id: &str) -> bool {
+    id.strip_prefix("d-").is_some_and(|hex| {
+        hex.len() == 8
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 fn main() -> ExitCode {
+    // PRD #1741: the telemetry PATH shim, first, so the agent's arguments it
+    // carries are never read as the deck's.
+    if let Some(code) = dot_agent_deck::telemetry::shim::run_if_invoked() {
+        return code;
+    }
     // PRD #89 M3.4: the `--continue` flag was removed — auto-restore is now the
     // default. Intercept a stale invocation before clap parsing so the user
     // gets a guiding message ("auto-restore is the default; just run
@@ -1214,6 +1980,25 @@ fn main() -> ExitCode {
                             eprintln!("No hook installer for agent {}", spec.label);
                             return ExitCode::FAILURE;
                         }
+                    }
+                }
+                HooksAction::Refresh { json } => {
+                    let report = dot_agent_deck::hooks_refresh::refresh();
+                    if json {
+                        match serde_json::to_string(&report) {
+                            Ok(line) => println!("{line}"),
+                            Err(e) => {
+                                eprintln!("Failed to write the hooks report: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    } else {
+                        for line in report.render() {
+                            println!("{line}");
+                        }
+                    }
+                    if !report.ok {
+                        return ExitCode::FAILURE;
                     }
                 }
                 HooksAction::Uninstall { agent } => {
@@ -1389,7 +2174,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             to,
-            subject,
+            supersede,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1416,19 +2201,13 @@ fn main() -> ExitCode {
             // could not reach.
             let pane_id_for_report = pane_id.clone();
             let signal_roles = to.clone();
-            // Issue #567 (mirrors fork #358 / issue #461's `work-done` read
-            // exactly): see `read_registration_context`'s doc for why these
-            // are read from this process's own env rather than asked of the
-            // live daemon.
-            let (generation, daemon_boot_id) = read_registration_context();
             let signal = dot_agent_deck::event::DelegateSignal {
                 pane_id,
                 task,
                 to,
+                supersede,
                 timestamp: chrono::Utc::now(),
-                generation,
-                daemon_boot_id,
-                subject,
+                token: dot_agent_deck::hook_provenance::token_from_env(),
             };
             let msg = dot_agent_deck::event::DaemonMessage::Delegate(signal);
             let json = match serde_json::to_string(&msg) {
@@ -1462,9 +2241,21 @@ fn main() -> ExitCode {
                 }
                 // Handed to the socket of a daemon that answered nothing
                 // readable in `DELEGATE_REPLY_TIMEOUT` — usually one predating
-                // this response. Pre-response contract: unverifiable, and the
-                // caller must not turn that into a phantom failure. See
-                // `SocketReply::NoReply`.
+                // this response — or, since issue #434, a request write that
+                // broke with bytes already gone. Pre-response contract:
+                // unverifiable, and the caller must not turn that into a
+                // phantom failure. See `SocketReply::NoReply`.
+                //
+                // Deliberately silent as well as successful, and the broken
+                // write is why that is worth stating rather than inheriting.
+                // The orchestrator reading this is an agent: a stderr line
+                // saying the delegate might not have landed is an invitation
+                // to send it again, and the daemon may already be holding a
+                // complete line (`read_capped_line` treats a trailing
+                // unterminated line as a line), so the retry is what
+                // double-dispatches the worker. Exit 0 with no output is the
+                // "do not resend" signal; the record of the broken write is
+                // the `warn!` `request_from_socket_at_detailed` logs.
                 SocketReply::NoReply => return ExitCode::SUCCESS,
                 SocketReply::Line(line) => line,
             };
@@ -1505,9 +2296,9 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // `--list-targets` is a READ-ONLY daemon round-trip (the `get-seed`
-            // pattern): the daemon answers from the PANE's cwd and config, which is
-            // the same basis the dispatch itself resolves from. Computing it here
+            // `--list-targets` is a READ-ONLY daemon round-trip: the daemon
+            // answers from the PANE's cwd and config, which is the same basis
+            // the dispatch itself resolves from. Computing it here
             // from the CLI's own `current_dir()` diverged whenever the agent had
             // `cd`'d, and offered targets the dispatch could not start.
             //
@@ -1516,7 +2307,10 @@ fn main() -> ExitCode {
             // real dispatch and still exit 0.
             if list_targets {
                 let req = dot_agent_deck::event::DaemonMessage::ListTargets(
-                    dot_agent_deck::event::ListTargetsRequest { pane_id },
+                    dot_agent_deck::event::ListTargetsRequest {
+                        pane_id,
+                        token: dot_agent_deck::hook_provenance::token_from_env(),
+                    },
                 );
                 let json = match serde_json::to_string(&req) {
                     Ok(j) => j,
@@ -1598,6 +2392,7 @@ fn main() -> ExitCode {
                     task: Some(task_text),
                     shape,
                     timestamp: chrono::Utc::now(),
+                    token: dot_agent_deck::hook_provenance::token_from_env(),
                 };
                 let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);
                 let json = match serde_json::to_string(&msg) {
@@ -1607,18 +2402,14 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                    eprintln!("Failed to send dispatch signal to daemon socket.");
-                    return ExitCode::FAILURE;
-                }
-                ExitCode::SUCCESS
+                send_signal_and_report_ack(&json, "dispatch", "dispatch")
             }
         }
         Some(Commands::WorkDone {
             task,
             task_file,
             done,
-            subject,
+            task_id,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1649,34 +2440,105 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // Fork #358 (M2 redesign, M4) / issue #461: see
-            // `read_registration_context`'s doc for why these are read from
-            // this process's own env rather than asked of the live daemon.
-            let (generation, daemon_boot_id) = read_registration_context();
-            let signal = dot_agent_deck::event::WorkDoneSignal {
-                pane_id,
-                task,
-                done,
-                timestamp: chrono::Utc::now(),
-                generation,
-                daemon_boot_id,
-                subject,
-            };
-            let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("Failed to serialize work-done signal: {e}");
-                    return ExitCode::FAILURE;
+            run_work_done(pane_id, task, done, task_id)
+        }
+        Some(Commands::Inbox { action }) => match action {
+            InboxAction::Fetch {
+                doorbell: Some(id),
+                adapter_integration,
+                rx,
+                ..
+            } => dot_agent_deck::inbox_cli::fetch_for_doorbell(&id, adapter_integration, rx),
+            InboxAction::Fetch {
+                json,
+                doorbell: None,
+                ..
+            } => dot_agent_deck::inbox_cli::fetch(json),
+            InboxAction::List { json, all } => dot_agent_deck::inbox_cli::list(json, all),
+            InboxAction::Wait {
+                agent,
+                stream,
+                adapter_integration,
+                doorbell_only,
+                resumed,
+            } => dot_agent_deck::inbox_cli::wait(
+                &agent,
+                stream,
+                dot_agent_deck::inbox_cli::Receipt {
+                    adapter_integration,
+                    doorbell_only,
+                    resumed,
+                },
+            ),
+            InboxAction::Announce { agent } => dot_agent_deck::inbox_cli::announce(&agent),
+            InboxAction::Publish { topic, body } => {
+                dot_agent_deck::inbox_cli::publish(&topic, body.text, body.file)
+            }
+            InboxAction::Offer {
+                pool,
+                body,
+                claim_ttl,
+            } => dot_agent_deck::inbox_cli::offer(&pool, body.text, body.file, claim_ttl),
+            InboxAction::Send {
+                folder,
+                orchestration,
+                name,
+                pane,
+                body,
+            } => run_inbox_send_cli(absolute_address(folder, orchestration, name, pane), body),
+            InboxAction::Complete { id } => dot_agent_deck::inbox_cli::settle(&id, true),
+            InboxAction::Release { id } => dot_agent_deck::inbox_cli::settle(&id, false),
+        },
+        Some(Commands::Ack { delivery_id, json }) => {
+            let reply = match (
+                dot_agent_deck::inbox::is_valid_message_id(&delivery_id)
+                    || is_retired_delivery_id(&delivery_id),
+                std::env::var(DOT_AGENT_DECK_PANE_ID),
+            ) {
+                (false, _) => AckReply::Malformed,
+                (true, Err(_)) => AckReply::NoPane,
+                (true, Ok(pane_id)) => {
+                    let msg = dot_agent_deck::event::DaemonMessage::Ack(
+                        dot_agent_deck::event::AckSignal {
+                            pane_id,
+                            delivery_id,
+                            agent_id: std::env::var(DOT_AGENT_DECK_AGENT_ID).ok(),
+                            token: dot_agent_deck::hook_provenance::token_from_env(),
+                        },
+                    );
+                    match serde_json::to_string(&msg) {
+                        Ok(json) => {
+                            AckReply::Socket(dot_agent_deck::hook::send_and_await_signal_ack(&json))
+                        }
+                        Err(_) => AckReply::Malformed,
+                    }
                 }
             };
-            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                eprintln!("Failed to send work-done signal to daemon socket.");
-                return ExitCode::FAILURE;
+            if json {
+                println!("{}", ack_json(&reply));
+            } else {
+                let (stream, message) = ack_report(&reply);
+                match stream {
+                    AckStream::Stdout => println!("{message}"),
+                    AckStream::Stderr => eprintln!("{message}"),
+                }
             }
-            ExitCode::SUCCESS
+            if ack_was_refused_by_id(&reply) {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
-        Some(Commands::AgentEvent { r#type }) => {
+        Some(Commands::AgentEvent {
+            r#type,
+            cwd,
+            prompt,
+            tool_name,
+            tool_detail,
+            _reports_prompts,
+            turn_reply_stdin,
+            turn_reply_failed,
+        }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
@@ -1693,8 +2555,9 @@ fn main() -> ExitCode {
                 Some(et) => et,
                 None => {
                     eprintln!(
-                        "Error: unknown agent-event --type {:?}. Expected one of: running, waiting, finished.",
-                        r#type
+                        "Error: unknown agent-event --type {:?}. Expected one of: {}.",
+                        r#type,
+                        dot_agent_deck::event::AGENT_EVENT_TYPES.join(", ")
                     );
                     return ExitCode::FAILURE;
                 }
@@ -1703,30 +2566,44 @@ fn main() -> ExitCode {
             // a bare AgentEvent with no `message_type` envelope, keyed on a
             // stable session id derived from the pane so repeated events update
             // the same card. The daemon's `run_hook_loop` falls back to
-            // `AgentEvent` and `apply_event` drives the status.
-            let event = dot_agent_deck::event::AgentEvent {
-                session_id: format!("{pane_id}-session"),
-                // TODO(companion PRD): derive agent type from the pane instead
-                // of hard-coding Pi. Safe today because the daemon's
-                // `apply_event` only UPGRADES `None` → a concrete type (never
-                // downgrades), so a hard-coded `Pi` from the `agent-event`
-                // subcommand can't clobber an already-known type.
-                agent_type: dot_agent_deck::event::AgentType::Pi,
-                event_type,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::Utc::now(),
-                user_prompt: None,
-                metadata: Default::default(),
-                pane_id: Some(pane_id),
+            // `AgentEvent` and `apply_event` drives the card.
+            // PRD #1497: the settled turn's reply rides the line beside the
+            // event, never inside it, exactly as a hook's does. It arrives on
+            // stdin, read only for a turn end and never for longer than
+            // `TURN_REPLY_STDIN_TIMEOUT`. A flagged turn end whose stdin gave
+            // nothing is a turn that ended with nothing to read (audit A2).
+            let turn_reply = (turn_reply_stdin
+                && event_type == dot_agent_deck::event::EventType::Idle)
+                .then(|| {
+                    dot_agent_deck::hook::read_turn_reply_stdin(
+                        std::io::stdin(),
+                        dot_agent_deck::hook::TURN_REPLY_STDIN_TIMEOUT,
+                    )
+                    .unwrap_or_default()
+                });
+            let reply = dot_agent_deck::hook::agent_event_cli_turn_reply(
+                &event_type,
+                turn_reply,
+                turn_reply_failed,
+            );
+            let event = dot_agent_deck::hook::build_agent_event_cli(
+                pane_id,
                 agent_id,
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-                model: None,
-            };
-            let json = match serde_json::to_string(&event) {
+                event_type,
+                dot_agent_deck::hook::AgentEventDetail {
+                    cwd,
+                    prompt,
+                    tool_name,
+                    tool_detail,
+                },
+            );
+            // Issue #318: present this pane's hook capability token.
+            let token = dot_agent_deck::hook_provenance::token_from_env();
+            let json = match dot_agent_deck::hook::agent_event_cli_line(
+                &event,
+                token.as_deref(),
+                reply.as_ref(),
+            ) {
                 Ok(j) => j,
                 Err(e) => {
                     eprintln!("Failed to serialize agent-event: {e}");
@@ -1739,73 +2616,65 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some(Commands::GetSeed) => {
-            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
-                Ok(id) => id,
-                Err(_) => {
-                    eprintln!(
-                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a worker-agent-deck managed pane."
-                    );
-                    return ExitCode::FAILURE;
-                }
+        Some(Commands::Roles {
+            json,
+            folder,
+            orchestration,
+            name,
+            pane,
+        }) => run_roles_cli(json, absolute_address(folder, orchestration, name, pane)),
+        Some(Commands::Close {
+            units,
+            unit_ids,
+            pane,
+            orchestration_of,
+            all,
+            yes,
+            dry_run,
+            force,
+            json,
+        }) => {
+            let args = dot_agent_deck::close_cli::CloseArgs {
+                units,
+                unit_ids,
+                pane,
+                orchestration_of,
+                all,
+                yes,
+                dry_run,
+                force,
+                json,
             };
-            // Issue #916: present our own registry agent id so the daemon can
-            // scope the take by identity instead of trusting the pane id alone.
-            // Optional for the same reason the `agent-event` verb's is — the
-            // daemon injects it at spawn, and a producer that never got one
-            // sends nothing rather than failing. An older daemon ignores the
-            // field; the take then falls back to the pane's live occupant.
-            //
-            // Round-2 audit (finding 6): the empty string is filtered out, so
-            // "could not say" and "said nothing" are the same case — which is
-            // what `GetSeedRequest::agent_id`'s own doc says `None` means. A
-            // bare `.ok()` yields `Some("")` for a variable that is present but
-            // empty, and on THIS verb the daemon's keyed lookup then finds no
-            // record at all and refuses the pull, costing the agent its opening
-            // task. The sibling verbs that read the same variable are left
-            // alone: their failure mode on an empty value is a different one
-            // (an event that loses its attribution, not a refused request), so
-            // widening this is a separate question rather than the same fix.
-            let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
-                .ok()
-                .filter(|id| !id.is_empty());
-            // Ask the daemon (over the hook socket) for the seed it prepared
-            // for this pane. READ-ONLY request/response — the one hook-socket
-            // verb that reads a reply. A missing daemon / older daemon that
-            // doesn't answer → `None` → we print nothing and exit 0, so the
-            // extension no-sends and the daemon's PTY-injection safety net
-            // still delivers (graceful cross-version degradation, no
-            // PROTOCOL_VERSION dependency).
-            let req = dot_agent_deck::event::DaemonMessage::GetSeed(
-                dot_agent_deck::event::GetSeedRequest { pane_id, agent_id },
-            );
-            let json = match serde_json::to_string(&req) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("Failed to serialize get-seed request: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match dot_agent_deck::hook::request_from_socket(&json) {
-                Some(line) if !line.trim().is_empty() => {
-                    match serde_json::from_str::<dot_agent_deck::event::GetSeedResponse>(&line) {
-                        Ok(resp) => {
-                            if let Some(seed) = resp.seed {
-                                // Print the seed verbatim (no trailing newline)
-                                // so the extension captures exactly the prepared
-                                // text. Empty seed → print nothing.
-                                print!("{seed}");
-                            }
-                            ExitCode::SUCCESS
+            run_close_cli(args)
+        }
+        Some(Commands::Docs { topic, all }) => {
+            use dot_agent_deck::embedded_docs::{self, DocsOutput};
+            match embedded_docs::run(embedded_docs::PAGES, topic.as_deref(), all) {
+                DocsOutput::Stdout(text) => {
+                    match embedded_docs::write_output(std::io::stdout(), &text) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => {
+                            eprintln!("error: cannot write the docs to stdout: {e}");
+                            ExitCode::FAILURE
                         }
-                        // A reply we can't parse is treated as "no seed": print
-                        // nothing, exit 0 — the fallback still covers delivery.
-                        Err(_) => ExitCode::SUCCESS,
                     }
                 }
-                // No reply (no daemon / older daemon / no seed) → no seed.
-                _ => ExitCode::SUCCESS,
+                DocsOutput::Error(message) => {
+                    eprint!("{message}");
+                    ExitCode::FAILURE
+                }
             }
+        }
+        Some(Commands::AwaitAnswer {
+            agent,
+            question,
+            ack,
+        }) => dot_agent_deck::hook::handle_await_answer(&agent, question.as_deref(), ack),
+        Some(Commands::Upgrade { check, yes }) => {
+            dot_agent_deck::self_upgrade::cli::main(dot_agent_deck::self_upgrade::cli::Args {
+                check,
+                yes,
+            })
         }
         Some(Commands::Orchestrator { cmd }) => match cmd {
             // PRD #201 M3.2: thin wrapper — wire real PATH-detection + the real
@@ -1866,6 +2735,7 @@ fn main() -> ExitCode {
                     role: role.clone(),
                     force,
                     timestamp: chrono::Utc::now(),
+                    token: dot_agent_deck::hook_provenance::token_from_env(),
                 };
                 let msg = dot_agent_deck::event::DaemonMessage::RestartRole(signal);
                 let json = match serde_json::to_string(&msg) {
@@ -1889,17 +2759,21 @@ fn main() -> ExitCode {
                     }
                     // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
                     // restart` must not read a silent close as success — but
-                    // `NoReply` folds several distinct `ReplyReadError`
-                    // causes (see its doc comment above), only one of which
-                    // is "old daemon"; a `DeadlineExpired` here means the
-                    // restart may well have already succeeded, so the
-                    // message below stays cause-agnostic rather than
-                    // asserting "old daemon" and telling the agent to
-                    // restart the whole daemon, which would be the worst
-                    // possible advice in that case (PR #783 fix round).
+                    // `NoReply` folds several distinct `NoReplyCause`s (see
+                    // its doc comment above), only one of which is "old
+                    // daemon"; a `DeadlineExpired` here means the restart may
+                    // well have already succeeded, so the message below stays
+                    // cause-agnostic rather than asserting "old daemon" and
+                    // telling the agent to restart the whole daemon, which
+                    // would be the worst possible advice in that case (PR
+                    // #918 review). Issue #434 added a cause the wording had
+                    // to lose two words for: a write that broke with bytes
+                    // already gone did not fail "in time", and the daemon may
+                    // still act on what it holds — which is the same "check
+                    // before retrying" this arm already advises.
                     SocketReply::NoReply => {
                         eprintln!(
-                            "Error: the daemon did not answer `pane restart {role}` in time — \
+                            "Error: the daemon did not answer `pane restart {role}` — \
                              either it does not support this command (an older build; restart \
                              the daemon to pick up the new one) or the restart is still in \
                              flight and may have already succeeded. Check the pane before \
@@ -1947,6 +2821,7 @@ fn main() -> ExitCode {
                     pane_id,
                     role: role.clone(),
                     timestamp: chrono::Utc::now(),
+                    token: dot_agent_deck::hook_provenance::token_from_env(),
                 };
                 let msg = dot_agent_deck::event::DaemonMessage::SpawnRole(signal);
                 let json = match serde_json::to_string(&msg) {
@@ -1971,15 +2846,17 @@ fn main() -> ExitCode {
                     }
                     // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
                     // spawn` must not read a silent close as success — but
-                    // `NoReply` folds several distinct `ReplyReadError`
-                    // causes (see its doc comment above), only one of which
-                    // is "old daemon"; a `DeadlineExpired` here means the
-                    // spawn may still be in flight, so the message below
-                    // stays cause-agnostic rather than asserting "old
-                    // daemon" (PR #783 fix round).
+                    // `NoReply` folds several distinct `NoReplyCause`s (see
+                    // its doc comment above), only one of which is "old
+                    // daemon"; a `DeadlineExpired` here means the spawn may
+                    // still be in flight, so the message below stays
+                    // cause-agnostic rather than asserting "old daemon" (PR
+                    // #918 review). Issue #434's broken write is a third
+                    // cause, and "in time" was wrong for it — see the same
+                    // arm behind `pane restart`.
                     SocketReply::NoReply => {
                         eprintln!(
-                            "Error: the daemon did not answer `pane spawn {role}` in time — \
+                            "Error: the daemon did not answer `pane spawn {role}` — \
                              either it does not support this command (an older build; restart \
                              the daemon to pick up the new one) or the spawn is still in \
                              flight. Check the pane before retrying."
@@ -2024,7 +2901,17 @@ fn main() -> ExitCode {
                 // first so the capture result is recorded; `run_daemon_serve_cli`
                 // therefore no longer initializes it.
                 init_logging_from_env();
+                // PRD #1258: time the pre-bind work, so a lazy-spawn that timed
+                // out says in the daemon's log whether the login-shell capture or
+                // the installers below took the time — the gap before the first
+                // line is process start-up itself.
+                let pre_bind_started = std::time::Instant::now();
+                tracing::info!("daemon serve: starting pre-bind work");
                 dot_agent_deck::login_shell::apply_login_shell_path();
+                tracing::info!(
+                    elapsed_ms = pre_bind_started.elapsed().as_millis() as u64,
+                    "daemon serve: login-shell PATH step done"
+                );
                 // PRD #201: materialize the bundled Pi orchestrator extension ONCE
                 // at daemon startup — parity with claude/opencode installing their
                 // hooks/plugin at startup. This covers both the lazy-spawned daemon
@@ -2036,32 +2923,68 @@ fn main() -> ExitCode {
                 // otherwise. It honors `PI_CODING_AGENT_DIR` (else `~/.pi/agent`),
                 // so it lands where pi will look — see `orchestrator_ext`.
                 dot_agent_deck::orchestrator_ext::auto_materialize(&[]);
-                // PRD #20 §4.2.1: same precedent for Codex — install the deck's
-                // `hooks.json` into the active Codex home and record SCOPED,
-                // hash-pinned trust for exactly those entries, ONCE at daemon
-                // startup. Command-agnostic on purpose: the spawn seam can only
-                // detect a `codex` basename, so a launcher (`devbox run codex-big`,
-                // `run_codex.sh`) previously got no hooks at all. With the home
-                // prepared here, its hook events reach the pane through the
-                // inherited `DOT_AGENT_DECK_PANE_ID` regardless of launch method.
-                // Runs AFTER the login-shell PATH is applied so codex-presence is
-                // detected against the daemon's real PATH. Self-guards on codex
-                // being installed and a resolvable home; a no-op otherwise.
-                dot_agent_deck::codex_hooks_manage::auto_install_and_trust_at_startup();
-                // Same precedent for Devin, which is also a native-hooks agent:
-                // merge the deck's hooks into Devin's user config ONCE at daemon
-                // startup, command-agnostically, so a headless daemon and a
-                // launcher whose basename isn't `devin` are covered too. Runs
-                // AFTER the login-shell PATH is applied so devin-presence is
-                // detected against the daemon's real PATH. Self-guards on devin
-                // being on PATH and a resolvable config dir; a no-op otherwise.
-                dot_agent_deck::devin_hooks_manage::auto_install();
-                run_daemon_serve_cli()
+                // Every shipped agent's startup auto-install, from the same
+                // registry loop `run_tui_session` runs — Claude Code's native
+                // hooks, the OpenCode plugin, Codex's `hooks.json` plus its
+                // SCOPED, hash-pinned trust (PRD #20 §4.2.1), and Devin's hooks.
+                // Each self-guards on its agent being present and is a no-op
+                // otherwise, and each runs AFTER the login-shell PATH is applied
+                // so presence is detected against the daemon's real PATH.
+                //
+                // Codex and Devin ran here explicitly because the spawn seam can
+                // only detect an agent by basename, so a launcher (`devbox run
+                // codex-big`) got no hooks unless the daemon installed them
+                // command-agnostically. Issue #1157 found the same gap one level
+                // up for Claude Code and OpenCode, which only the TUI installed:
+                // the packaged desktop app starts THIS subcommand from its
+                // bundled sidecar and never runs a TUI, so a desktop-only user
+                // got no Claude Code hooks and no OpenCode plugin at all, and
+                // therefore no hook-driven agent status. Running the whole
+                // registry here closes that, and keeps the daemon in step with
+                // the TUI when an agent is added. The TUI still runs the same
+                // loop; every installer is idempotent, and Codex and Devin have
+                // run in both processes since they were added here.
+                //
+                // Issue #1637: each installer reports what it left the agent's
+                // hooks pinned to, so the daemon can tell the user when that is
+                // an older copy of the deck before any hook fires.
+                let hook_binaries = {
+                    use dot_agent_deck::agent_registry::ALL;
+                    let mut pins = Vec::new();
+                    for spec in ALL {
+                        if let Some(install) = spec.startup_auto_install {
+                            pins.extend(install());
+                        }
+                    }
+                    // The resolution the installers' takeover check already
+                    // made, not a fresh one per caller.
+                    let resolution = dot_agent_deck::hook_binary::process_resolution();
+                    dot_agent_deck::hook_binary::HookBinaryState::from_startup(
+                        dot_agent_deck::hook_binary::DeckIdentity::current(resolution),
+                        &pins,
+                        dot_agent_deck::hook_binary::refused_ephemeral_location(resolution),
+                    )
+                };
+                tracing::info!(
+                    elapsed_ms = pre_bind_started.elapsed().as_millis() as u64,
+                    "daemon serve: pre-bind work done, starting the server"
+                );
+                run_daemon_serve_cli(hook_binaries)
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
             DaemonCmd::Status { json } => run_daemon_status_cli(json),
+            DaemonCmd::Install => run_daemon_install_cli(),
+            DaemonCmd::Uninstall => run_daemon_uninstall_cli(),
+            DaemonCmd::Endpoint => run_daemon_endpoint_cli(),
+            DaemonCmd::Probe { json } => run_daemon_probe_cli(json),
+            DaemonCmd::RestartInstalled {
+                json,
+                expect_version,
+                confirm_hex,
+                confirm_stdin,
+            } => run_daemon_restart_installed_cli(json, expect_version, confirm_hex, confirm_stdin),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -2110,9 +3033,18 @@ fn main() -> ExitCode {
             RemoteCmd::Remove { name } => {
                 let path = dot_agent_deck::remote::default_remotes_path();
                 match dot_agent_deck::remote::remove(&name, &path) {
-                    Ok(_) => {
+                    Ok(removed) => {
+                        // Issue #1372: a Homebrew-installed deck is removed
+                        // through Homebrew, not by deleting a file brew owns.
+                        let uninstall = if removed.install.as_deref()
+                            == Some(dot_agent_deck::remote::INSTALL_HOMEBREW)
+                        {
+                            "brew uninstall dot-agent-deck".to_string()
+                        } else {
+                            format!("rm {}", dot_agent_deck::remote::REMOTE_INSTALL_PATH)
+                        };
                         println!(
-                            "Removed remote '{name}' from local registry. The dot-agent-deck binary on the remote and its hooks are unaffected; if you want to clean those up, ssh in and run `dot-agent-deck hooks uninstall` and `rm ~/.local/bin/dot-agent-deck`."
+                            "Removed remote '{name}' from local registry. The dot-agent-deck binary on the remote and its hooks are unaffected; if you want to clean those up, ssh in and run `dot-agent-deck hooks uninstall` and `{uninstall}`."
                         );
                         ExitCode::SUCCESS
                     }
@@ -2127,23 +3059,8 @@ fn main() -> ExitCode {
                 name,
                 version,
                 no_install,
-            } => {
-                let opts = dot_agent_deck::remote::UpgradeOptions {
-                    name,
-                    version,
-                    no_install,
-                    release_base: dot_agent_deck::remote::RELEASE_BASE.to_string(),
-                };
-                let path = dot_agent_deck::remote::default_remotes_path();
-                let executor = dot_agent_deck::remote::SystemSshExecutor::new();
-                match dot_agent_deck::remote::upgrade(&opts, &executor, &path) {
-                    Ok(_) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("{e}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
+                json,
+            } => run_remote_upgrade(&name, version, no_install, json),
         },
         Some(Commands::Worktree { cmd }) => match cmd {
             WorktreeCmd::List { json, mine } => run_worktree_list_cli(json, mine),
@@ -2187,6 +3104,10 @@ fn main() -> ExitCode {
                             label,
                             ttl_secs,
                             timestamp: chrono::Utc::now(),
+                            // Issue #1077: the provenance gate refuses a pane
+                            // the daemon issued a token to when none is
+                            // presented, as it does for every other verb.
+                            token: dot_agent_deck::hook_provenance::token_from_env(),
                         },
                     )
                 }
@@ -2196,6 +3117,7 @@ fn main() -> ExitCode {
                         label,
                         outcome: outcome.into(),
                         timestamp: chrono::Utc::now(),
+                        token: dot_agent_deck::hook_provenance::token_from_env(),
                     },
                 ),
             };
@@ -2276,11 +3198,11 @@ fn main() -> ExitCode {
             // Issue #243: the wrapper LOGS. Until this call it did not — the
             // subcommand went straight into `run_wrap`, so the two `tracing`
             // lines the interface watch emits (which of its two facts fired, the
-            // single most useful field diagnostic the readiness mechanism
-            // produces) were dropped on the floor by the no-op global
-            // subscriber, and `crate::state::dispatch_one_owned`'s claim that
-            // the fact is "in the wrapper's log" was false. Diagnosing a Codex
-            // delegate that never got its prompt meant reading the wire.
+            // single most useful field diagnostic for a wrapped agent's boot)
+            // were dropped on the floor by the no-op global subscriber, and the
+            // daemon's claim that the fact is "in the wrapper's log" was false.
+            // Diagnosing a Codex delegate that never got its prompt meant
+            // reading the wire.
             //
             // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
             // when `DOT_AGENT_DECK_LOG` is set, and that subscriber only ever
@@ -2348,39 +3270,125 @@ async fn run_dashboard() -> ExitCode {
 /// would land inside that single-threaded window and break the `set_var`
 /// soundness invariant the login-shell PATH capture relies on.
 fn init_logging_from_env() {
-    if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
-        let is_default = log_val.is_empty() || log_val == "1";
-        let log_path = if is_default {
-            let dir = state_dir();
-            if let Err(e) = dot_agent_deck::platform::fsperm::ensure_owner_only_dir(&dir) {
-                warn_log_setup_failure("create owner-only state dir", &dir, e);
-                return;
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    // The file logger: unchanged in what it writes and at what level.
+    let file = std::env::var("DOT_AGENT_DECK_LOG")
+        .ok()
+        .and_then(|log_val| {
+            // The default path is the owner-only `state_dir()/deck.log` (this
+            // fork's decision, ruling 70 of the net merge): a world-writable
+            // `/tmp` log is a symlink target, and the state dir already holds
+            // every other per-user daemon file (CLAUDE.md rule 12 names it).
+            // `state_dir()` is resolved per platform, which is what upstream's
+            // issue #1135 needed of its own default. An explicit value is still
+            // used verbatim.
+            let is_default = log_val.is_empty() || log_val == "1";
+            let log_path = if is_default {
+                let dir = state_dir();
+                if let Err(e) = dot_agent_deck::platform::fsperm::ensure_owner_only_dir(&dir) {
+                    warn_log_setup_failure("create owner-only state dir", &dir, e);
+                    return None;
+                }
+                dir.join("deck.log")
+            } else {
+                std::path::PathBuf::from(log_val)
+            };
+            // Issues #1791, #1796: a test process does not open an inherited log
+            // that is not its own; see `config_write_guard::log_write_allowed`.
+            if !dot_agent_deck::config_write_guard::log_write_allowed(&log_path) {
+                return None;
             }
-            dir.join("deck.log")
-        } else {
-            std::path::PathBuf::from(log_val)
-        };
-        let open_result = if is_default {
-            open_deck_log_file(&log_path)
-        } else {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-        };
-        match open_result {
-            Ok(log_file) => {
-                tracing_subscriber::fmt()
-                    .with_env_filter(dot_agent_deck::logging::env_filter_from_env())
-                    .with_writer(log_file)
-                    .with_ansi(false)
-                    .init();
+            // The default `deck.log` is opened with the symlink/mode hardening
+            // `daemon.log` already has (`O_NOFOLLOW` + 0o600); an explicit
+            // `DOT_AGENT_DECK_LOG=<path>` is user-specified and stays on the
+            // plain open.
+            let open_result = if is_default {
+                open_deck_log_file(&log_path)
+            } else {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+            };
+            match open_result {
+                Ok(log_file) => Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(log_file)
+                        .with_ansi(false)
+                        .with_filter(dot_agent_deck::logging::env_filter_from_env()),
+                ),
+                Err(e) => {
+                    warn_log_setup_failure("open log file", &log_path, e);
+                    None
+                }
             }
-            Err(e) => {
-                warn_log_setup_failure("open log file", &log_path, e);
-            }
+        });
+    // Issue #1981 M8: the daemon's warnings and errors over OTLP, with a
+    // filter of its own; idle until the daemon starts its telemetry.
+    let otlp = dot_agent_deck::telemetry::logs::otlp_log_layer();
+    if file.is_none() && otlp.is_none() {
+        return;
+    }
+    tracing_subscriber::registry().with(file).with(otlp).init();
+}
+
+/// Prepare the endpoint directory, then lazy-spawn a daemon at `endpoint` if
+/// one is not already there. Returns the message to print on failure.
+///
+/// **Only ever called with a primary endpoint** — see
+/// [`dot_agent_deck::platform::paths::ResolvedEndpoint::is_primary`].
+/// `ensure_daemon_running` refuses a non-primary one itself, so this is the
+/// caller-side half of one property rather than the whole of it.
+///
+/// The preflight is issue #1121 round two, B1. `daemon serve` calls
+/// `ensure_endpoint_dir` at its own bind sites, so the directory gets created
+/// either way — but when it *cannot* be created, because a foreign uid already
+/// owns `<temp dir>/dot-agent-deck-{uid}`, the refusal that names the
+/// directory, both uids and the override goes into the **detached daemon's
+/// log**, where nobody is looking. What the operator saw was the launcher
+/// waiting out `DAEMON_START_POLL_TIMEOUT` and reporting a start timeout.
+/// Running the same idempotent call here first puts the actionable message on
+/// their terminal instead.
+///
+/// Issue #1173 then closed the wedge that preflight could only report: when
+/// another uid holds the per-uid directory's name,
+/// `endpoint_resolve::prepare_bind_endpoints` hands back the same socket name
+/// inside a relocated owner-only directory, and `endpoint` is **rewritten to
+/// it** — so the poll below waits where the daemon about to be spawned will
+/// bind, which runs the same call and reuses that directory. Every other
+/// preparation failure still stops here with the directory-naming message.
+async fn bootstrap_primary_daemon(endpoint: &mut LocalEndpoint) -> Result<(), String> {
+    let resolved = dot_agent_deck::platform::paths::ResolvedEndpoint::new(
+        endpoint.path().to_path_buf(),
+        endpoint.source(),
+    );
+    let prepared =
+        dot_agent_deck::endpoint_resolve::prepare_bind_endpoints(std::slice::from_ref(&resolved))
+            .await
+            .map(|mut paths| paths.pop().unwrap_or_else(|| endpoint.path().to_path_buf()));
+    match prepared {
+        Ok(bind_at) if bind_at != endpoint.path() => {
+            *endpoint = LocalEndpoint::from_resolved(
+                dot_agent_deck::platform::paths::ResolvedEndpoint::new(bind_at, endpoint.source()),
+            );
+        }
+        Ok(_) => {}
+        Err(source) => {
+            return Err(format!(
+                "cannot prepare the endpoint directory for {}: {source}",
+                endpoint.path().display()
+            ));
         }
     }
+    ensure_external_daemon_or_die(endpoint).await.map_err(|e| {
+        format!(
+            "failed to connect to daemon at {}: {e}",
+            endpoint.path().display()
+        )
+    })
 }
 
 /// Opens the default `deck.log` with the same symlink/mode hardening
@@ -2456,24 +3464,70 @@ async fn run_tui_session() -> ExitCode {
         eprintln!("Warning: {warning}");
     }
 
+    // Install hooks/plugins for detected agents (best-effort), driven from the
+    // agent registry: each spec's OWN startup install, in `ALL` order (PRD #20
+    // M2 / R20-010), so a future agent reusing `NativeHooks`/`Plugin` runs its
+    // own installer. Codex starts its scoped, hash-pinned trust write here too
+    // (PRD #20 §4.2.1), on a thread of its own that this does not wait for
+    // (issue #1665); Pi materializes at spawn time and has no startup install.
+    //
+    // PRD #91: BEFORE the daemon is bootstrapped, because a lazy-spawned
+    // daemon runs the same installs before it binds and would leave nothing
+    // for this one to change, so the TUI could never say that it changed the
+    // hooks. Whatever it changed or could not change is the note `run_tui`
+    // shows as it starts. The daemon's own pass then finds nothing to do.
+    // On a blocking thread, since the installers read and write files and run
+    // the agents' CLIs (Qodo on PR #1925).
+    let mut startup_hooks = UnshownStartupNote(
+        tokio::task::spawn_blocking(dot_agent_deck::hooks_refresh::startup_install)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("startup hook install did not finish: {e}");
+                None
+            }),
+    );
+
     let state = Arc::new(RwLock::new(AppState::default()));
     // PRD #741 M2: the TUI always talks to the daemon on this machine, so it
     // names it as one. `attach_path` stays the same value it always was — the
     // endpoint's address — for the messages and the subscriber below.
-    let endpoint = LocalEndpoint::from_config();
-    let attach_path = endpoint.path().to_path_buf();
+    //
+    // Issue #1121 round two: resolved with its provenance, because what may be
+    // done to the address depends on which arm produced it. A
+    // `LegacyCompat` one names a daemon from a pre-#1121 build that answered a
+    // probe a moment ago: this process may talk to it, and must not unlink it,
+    // lazy-spawn at it, or poll it for a daemon that would bind somewhere else.
+    let mut resolved = dot_agent_deck::endpoint_resolve::client_attach_endpoint();
+    // Closes the window between the resolver's own probe and this point: the
+    // older daemon exits in between. Re-resolving to the primary endpoint is
+    // what turns that into an ordinary cold start instead of a 15-second wait
+    // for a daemon at an address nothing will ever bind.
+    //
+    // It does not close every such window, and an earlier version of this
+    // comment claimed it was "the one" — a *later* one is still open, between
+    // this probe and the handshake's own `connect`, and is recovered at the
+    // handshake call below rather than here. No probe can be the last word:
+    // each one only narrows the gap between the last check and the first use.
+    if !resolved.is_primary()
+        && !dot_agent_deck::endpoint_resolve::endpoint_is_answering(resolved.path())
+    {
+        resolved = dot_agent_deck::endpoint_resolve::primary_attach_endpoint();
+    }
+    let mut endpoint = LocalEndpoint::from_resolved(resolved);
+    let mut attach_path = endpoint.path().to_path_buf();
 
-    // If the attach socket is missing, `ensure_external_daemon_or_die`
-    // fork-execs `dot-agent-deck daemon serve` detached under
-    // flock-serialized contention (so two simultaneous TUIs can't both
-    // win the bind — M1.3) and trust-checks any existing socket
-    // (uid + 0o600 + is-socket) before the TUI's DaemonClient touches it.
-    if let Err(e) = ensure_external_daemon_or_die(&endpoint).await {
-        eprintln!(
-            "failed to connect to daemon at {}: {e}",
-            attach_path.display()
-        );
-        return ExitCode::FAILURE;
+    // If the attach socket is missing, `bootstrap_primary_daemon` fork-execs
+    // `dot-agent-deck daemon serve` detached under flock-serialized contention
+    // (so two simultaneous TUIs can't both win the bind — M1.3) and
+    // trust-checks any existing socket (uid + 0o600 + is-socket) before the
+    // TUI's DaemonClient touches it. Skipped outright for a legacy endpoint,
+    // which by construction already has a daemon answering on it.
+    if endpoint.is_primary() {
+        if let Err(message) = bootstrap_primary_daemon(&mut endpoint).await {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+        attach_path = endpoint.path().to_path_buf();
     }
     // PRD #103 Phase 2 / PRD #161 Part A: build-version handshake against
     // the running daemon. Runs unconditionally — including the
@@ -2493,25 +3547,62 @@ async fn run_tui_session() -> ExitCode {
     //     declines (`ProceedOnExisting`, keep the existing daemon — D4
     //     never-strand).
     //   - Agents + non-TTY: prints the recovery hint to stderr and exits
-    //     non-zero (the only non-zero-exit path).
+    //     non-zero.
+    // Issue #405: a daemon on another attach protocol is never attached to —
+    // a build-id match or a declined restart exits non-zero with a refusal
+    // instead (`ProtocolMismatch`); the restart arms above are unchanged.
     // Errors are already user-visible inside the helper, so we render no
     // further message here.
+    let mut handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
+    // Issue #1121: the window the probe above leaves open, one step further
+    // along — a legacy daemon that exits between that probe and the
+    // handshake's own `connect`. `Probe` is exactly that shape ("the socket is
+    // there but nothing is answering"), and on a non-primary endpoint the
+    // address can only be the pre-#1121 spelling of a daemon that has now
+    // gone. Left alone it is a hard `ExitCode::FAILURE` on a host whose only
+    // problem is that it has no daemon — the same class as a legacy endpoint
+    // reaching an operation that cannot cope with it, so it gets the same
+    // remedy the `Recovered` branch below uses: re-resolve to the endpoint the
+    // daemon we are about to spawn will actually bind, and cold-start there.
     //
-    // Fork issue #17: the helper ALSO enforces `PROTOCOL_VERSION` before any of
-    // that, and a skew returns `HandshakeError::ProtocolMismatch`. That variant
-    // carries its whole (multi-line, actionable) message in `Display`, so the
-    // catch-all `Err(e)` arm below is what renders it — no special-casing here.
-    let handshake_outcome =
-        match build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await {
-            Ok(outcome) => outcome,
-            Err(build_version_handshake::HandshakeError::MismatchAborted) => {
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    // Deliberately one retry and not a loop. The retried endpoint IS primary,
+    // so a second `Probe` there is a genuinely broken host rather than a
+    // transition artefact, and must still be reported. The handshake is re-run
+    // rather than assumed to match, for the reason the comment above gives: it
+    // is the smoke test of the handshake itself, and a stale daemon of another
+    // build may be sitting on the primary endpoint too — that outcome is
+    // `Recovered` and composes with the branch below.
+    if !endpoint.is_primary()
+        && matches!(
+            handshake,
+            Err(build_version_handshake::HandshakeError::Probe(_))
+        )
+    {
+        endpoint = LocalEndpoint::from_resolved(
+            dot_agent_deck::endpoint_resolve::primary_attach_endpoint(),
+        );
+        if let Err(message) = bootstrap_primary_daemon(&mut endpoint).await {
+            eprintln!("after the discovered daemon went away: {message}");
+            return ExitCode::FAILURE;
+        }
+        attach_path = endpoint.path().to_path_buf();
+        handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
+    }
+    let handshake_outcome = match handshake {
+        Ok(outcome) => outcome,
+        // Both already printed their message inside the helper; issue #405's
+        // protocol refusal left the daemon and its agents running.
+        Err(
+            build_version_handshake::HandshakeError::MismatchAborted
+            | build_version_handshake::HandshakeError::ProtocolMismatch { .. },
+        ) => {
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // After a `Recovered` outcome the old daemon was just SIGTERM'd; the
     // next attach lazy-spawns a fresh one. Re-run the bootstrap so the
     // socket is back before any client (DaemonClient::list_agents,
@@ -2522,13 +3613,22 @@ async fn run_tui_session() -> ExitCode {
     if matches!(
         handshake_outcome,
         build_version_handshake::HandshakeOutcome::Recovered
-    ) && let Err(e) = ensure_external_daemon_or_die(&endpoint).await
-    {
-        eprintln!(
-            "failed to re-spawn daemon at {} after version-mismatch recovery: {e}",
-            attach_path.display()
+    ) {
+        // Issue #1121: re-resolve before re-spawning, and to the **primary**
+        // endpoint specifically. The daemon we just SIGTERM'd may have been an
+        // older build reached through the compatibility read of the pre-#1121
+        // fallback endpoint; nothing answers there any more, and the daemon
+        // about to be spawned binds the new spelling. Polling the address of
+        // the daemon we killed would time out while a perfectly healthy
+        // replacement was already up.
+        endpoint = LocalEndpoint::from_resolved(
+            dot_agent_deck::endpoint_resolve::primary_attach_endpoint(),
         );
-        return ExitCode::FAILURE;
+        if let Err(message) = bootstrap_primary_daemon(&mut endpoint).await {
+            eprintln!("after version-mismatch recovery: {message}");
+            return ExitCode::FAILURE;
+        }
+        attach_path = endpoint.path().to_path_buf();
     }
     // Test-only escape hatch (PRD #103 M4.2): integration tests in
     // tests/build_version_handshake.rs need to exercise the handshake
@@ -2572,12 +3672,10 @@ async fn run_tui_session() -> ExitCode {
         });
     }
 
-    let version_state = state.clone();
-    tokio::spawn(async move {
-        if let Some(latest) = dot_agent_deck::version::check_for_update().await {
-            version_state.write().await.update_available = Some(latest);
-        }
-    });
+    // Issue #1635: check for a newer release at start and every re-check
+    // interval, and plan this machine's copies, for the footer badge and the
+    // upgrade dialog.
+    tokio::spawn(dot_agent_deck::upgrade_dialog::run_checker(state.clone()));
 
     let config = dot_agent_deck::config::DashboardConfig::load();
 
@@ -2589,36 +3687,23 @@ async fn run_tui_session() -> ExitCode {
     // the alt-screen, so loading here keeps the warnings ahead of it.
     let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
 
-    // Auto-install hooks/plugins for detected agents (silent, best-effort).
-    // PRD #20 M2 / R20-010: driven from the agent registry — iterate the shipped
-    // agents and run each spec's OWN startup auto-install action. Order is stable
-    // (`ALL` order). Dispatching per-spec (rather than mapping the reusable
-    // `IntegrationStrategy` enum to a hardcoded incumbent) means a future agent
-    // reusing `NativeHooks`/`Plugin` runs ITS OWN installer, not Claude's or
-    // OpenCode's. Claude installs native hooks and OpenCode its plugin at
-    // startup; Codex installs its native `hooks.json` AND records scoped,
-    // hash-pinned trust for it here too (PRD #20 §4.2.1 — command-agnostic, so a
-    // launcher like `devbox run codex-big` that the spawn seam can't detect is
-    // still covered); Pi (`Extension`) materializes at spawn-time (see
-    // `agent_pty`), so its `startup_auto_install` is `None` and it is skipped.
-    {
-        use dot_agent_deck::agent_registry::ALL;
-        for spec in ALL {
-            if let Some(install) = spec.startup_auto_install {
-                install();
-            }
-        }
-    }
-
     let pane_controller: Arc<dyn PaneController> = Arc::new(
         EmbeddedPaneController::new(attach_path.clone(), tokio::runtime::Handle::current())
+            .with_protocol_gate()
             // Fork issue #36: hydration waits on this gate before snapshotting
             // and releases it once every rebuilt pane is seeded.
             .with_hydration_gate(hydration_gate),
     );
     let tui_state = state.clone();
+    let startup_note = startup_hooks.0.take();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(tui_state, pane_controller, config, keybindings)
+        run_tui(
+            tui_state,
+            pane_controller,
+            config,
+            keybindings,
+            startup_note,
+        )
     })
     .await;
 
@@ -2634,6 +3719,126 @@ async fn run_tui_session() -> ExitCode {
         eprintln!("TUI error: {e}");
     }
     ExitCode::SUCCESS
+}
+
+/// PRD #91: the startup hook install's note until `run_tui` takes it. A launch
+/// that returns before the TUI opens (a failed bootstrap or handshake) drops
+/// it here instead, and what the user has to fix goes to stderr, as the TUI
+/// would have printed it on exit (Qodo on PR #1925).
+struct UnshownStartupNote(Option<dot_agent_deck::hooks_refresh::StartupNote>);
+
+impl Drop for UnshownStartupNote {
+    fn drop(&mut self) {
+        for warning in self.0.take().map(|note| note.warnings).unwrap_or_default() {
+            eprintln!("{warning}");
+        }
+    }
+}
+
+/// PRD #76 M2.17: spawn the TUI's event subscriber — see
+/// [`dot_agent_deck::event_subscriber`].
+///
+/// Fork issue #36: spawned through `run_gated` with the controller's `gate`, so
+/// the subscription is confirmed before hydration snapshots and the stream's
+/// messages are held back until hydration has seeded its cards. Upstream's
+/// `run` is the same loop with a gate that is already open.
+fn spawn_event_subscriber(
+    attach_path: std::path::PathBuf,
+    state: dot_agent_deck::state::SharedState,
+    gate: HydrationGate,
+) {
+    use dot_agent_deck::event_subscriber::{SubscriberConfig, run_gated};
+
+    let config = SubscriberConfig {
+        #[cfg(feature = "e2e")]
+        drop_event: Some(e2e_subscriber_drops),
+        #[cfg(feature = "e2e")]
+        break_on_event: Some(e2e_subscriber_breaks),
+        #[cfg(feature = "e2e")]
+        applied: Some(e2e_subscriber_applied),
+        ..SubscriberConfig::default()
+    };
+    // PRD #1666 part 2 (`lifecycle/handshake/011`): every subscription,
+    // listing included, rides a connection whose own `Hello` passed.
+    tokio::spawn(run_gated(
+        DaemonClient::new(attach_path).with_protocol_gate(),
+        state,
+        config,
+        gate,
+    ));
+}
+
+/// Issue #621 e2e seam: make this subscriber miss a conversation's events, the
+/// way it did when they arrived while it was reconnecting — it resubscribed
+/// without replaying what it missed, so the daemon knew the conversation and
+/// the TUI never learned it. (Since issue #1520 a reconnect re-reads the
+/// daemon's state, so this seam now models a gap the subscriber does not see,
+/// which the daemon's `stale` refusal still covers.) A reconnect cannot be timed against an agent's boot
+/// from a PTY test, so the test names a session-id prefix in
+/// `DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS` instead, and `prompt/pane-input/044`
+/// asserts the prompt is still delivered.
+///
+/// EVERY event of that conversation is dropped, not only its `SessionStart`:
+/// any later frame carrying the session id — the daemon's own `ShellIdle` for a
+/// pane that went quiet, measured arriving right behind the start — would
+/// establish the generation in the TUI's view on its own, so a gap that misses
+/// the start alone recovers by itself. The failure needs the gap to cover the
+/// boot, and this models exactly that.
+///
+/// Compiled only into the `e2e` build, like `effective_current_exe`'s seam in
+/// `platform/paths.rs`, so a shipped binary has no switch that discards events.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_drops(event: &dot_agent_deck::event::AgentEvent) -> bool {
+    std::env::var("DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS")
+        .is_ok_and(|prefix| !prefix.is_empty() && event.session_id.starts_with(&prefix))
+}
+
+/// Issue #1520 e2e seam: tear this subscriber's stream down ONCE, losing the
+/// event that triggered it, the way a `KIND_STREAM_END "lagged"` loses whatever
+/// the daemon never forwarded — so a PTY test can make the deck reconnect at a
+/// moment it chooses, which neither a real lag (1024 unread broadcasts) nor a
+/// daemon restart (which takes the agents with it) gives it.
+/// `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON` names `<pane id>/<EventType>`, the
+/// event type spelled as its `Debug` name (`Thinking`); `session/live/019`
+/// uses it. Compiled only into the `e2e` build, like the seam above.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_breaks(event: &dot_agent_deck::event::AgentEvent) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    let Ok(target) = std::env::var("DOT_AGENT_DECK_E2E_BREAK_STREAM_ON") else {
+        return false;
+    };
+    let Some((pane, kind)) = target.split_once('/') else {
+        return false;
+    };
+    event.pane_id.as_deref() == Some(pane)
+        && format!("{:?}", event.event_type) == kind
+        && !FIRED.swap(true, Ordering::SeqCst)
+}
+
+/// Reviewer R9T-05 e2e seam: when `DOT_AGENT_DECK_E2E_APPLIED_LOG` names a
+/// file, append `<pane id>\t<EventType>` to it for each event this subscriber
+/// has applied to the TUI's state, so a PTY test can hold a step until an
+/// event is in that state rather than merely on the socket
+/// (`newagent/visibility/001`'s attach race). Compiled only into the `e2e`
+/// build, like the seams above.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_applied(event: &dot_agent_deck::event::AgentEvent) {
+    let Some(path) = std::env::var_os("DOT_AGENT_DECK_E2E_APPLIED_LOG") else {
+        return;
+    };
+    let line = format!(
+        "{}\t{:?}\n",
+        event.pane_id.as_deref().unwrap_or(""),
+        event.event_type
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
 }
 
 /// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an
@@ -2754,6 +3959,472 @@ fn run_daemon_hello_cli() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `dot-agent-deck daemon endpoint` — the remote half of ssh endpoint
+/// discovery (issue #1174).
+///
+/// # What it is for
+///
+/// The desktop forwards a remote deck's attach socket with `ssh -L`, and to do
+/// that it must first learn *where* that socket is: OpenSSH expands neither `~`
+/// nor an environment variable on the remote side of `-L`, and the far host's
+/// `XDG_RUNTIME_DIR` and uid are not knowable from this end. Discovery used to
+/// be a shell snippet ([`dot_agent_deck::remote_tunnel::REMOTE_SOCKET_PROBE`])
+/// that restated [`attach_socket_path`]'s rules in `sh` and picked a candidate
+/// with filesystem tests alone. Two consequences, both of which this command
+/// exists to remove:
+///
+/// 1. **Nothing connected**, so a stale inode left behind by a dead daemon was
+///    selected exactly as a live one was, and the forward then came up against
+///    a socket nobody was listening on.
+/// 2. **The rule had two implementations** — this program's and a shell
+///    restatement of it — under a doc-comment obligation to keep them in step
+///    that nothing enforced.
+///
+/// Running the installed binary over there answers from *inside* the same
+/// implementation instead. The snippet stays as the fallback for a host whose
+/// binary is older than this subcommand or is not installed at all, so
+/// discovery still works against those; that fallback is what keeps this
+/// additive.
+///
+/// # What printing a path asserts, and what it does not
+///
+/// It asserts exactly three things, each checked here:
+///
+/// - the path is the one [`attach_socket_path`] resolves, which is the one this
+///   build's daemon calls `bind(2)` on — the same function, not a copy of it;
+/// - it passes [`dot_agent_deck::platform::fsperm::verify_endpoint_trusted`]:
+///   not a symlink, a socket, owned by this uid, at mode `0o600`. The snippet
+///   tested none of the mode and (before #1121) none of the ownership;
+/// - a live listener completed an attach-protocol `Hello` within
+///   [`ENDPOINT_RESOLVE_TIMEOUT`].
+///
+/// # Three exit codes, because the caller acts on the difference
+///
+/// The probe treats a refusal from *this* command differently from a host that
+/// could not run it, and that distinction is the whole reason the checks above
+/// bind rather than merely advise (PR #1191 review, P1):
+///
+/// - **`0`** — a trusted, live endpoint. The path is on stdout.
+/// - **[`ENDPOINT_UNTRUSTED`] (`1`)** — something is at the path and it failed
+///   a trust check. The probe **stops**: falling through would print the same
+///   path unchecked and forward it, which would make every check here
+///   advisory. This is the code a `0666` listener earns.
+/// - **[`ENDPOINT_UNDETERMINED`] (`3`)** — nothing is at the path, or nothing
+///   answered, or the handshake timed out. Nothing was *learned*, so the probe
+///   falls through to its remaining candidates and then to the shell rungs.
+///   Keeping this separate from `1` is what stops a dead first candidate from
+///   hiding a live second one, and what leaves a version-skewed daemon to be
+///   classified by the desktop rather than reported as a missing socket.
+///
+/// Neither collides with clap's own `2` (an older build that does not know the
+/// subcommand) or a shell's `126`/`127`, which are the "this host cannot run
+/// it" codes the probe must also fall through on.
+///
+/// **It does not authenticate the listener**, and no claim here should be read
+/// as saying it does. A `Hello` proves something is listening and speaks this
+/// wire; it does not prove that something is the deck's daemon. Against a
+/// foreign uid the three checks bite — with ordinary permissions on the paths
+/// involved, that uid cannot satisfy the ownership check, cannot write the
+/// install path this rung runs from, and (under an owner-only endpoint
+/// directory) cannot create the entry at all. Against an attacker already
+/// running **as the remote login user** they do not: that actor can bind a
+/// `0o600` socket of
+/// their own at the path, and can replace the binary this very command runs
+/// from. Closing *that* needs the remote end to assert an identity in-band,
+/// which is issue #1189 — see `docs/develop/remote-endpoint-discovery.md`.
+///
+/// # Wire cost: none
+///
+/// The round trip is an existing [`dot_agent_deck::daemon_protocol::AttachRequest::Hello`]
+/// via [`DaemonClient::capabilities`], so this command puts nothing new on the
+/// wire and owes no `PROTOCOL_VERSION` bump — the same reasoning
+/// `daemon status` records (issue #459). An older daemon answers a newer CLI's
+/// `Hello` exactly as it always did.
+#[tokio::main]
+async fn run_daemon_endpoint_cli() -> ExitCode {
+    // Issue #1173: the pure resolution, or a relocated endpoint a daemon of
+    // this build is answering at because the per-uid directory was taken.
+    let path = dot_agent_deck::endpoint_resolve::served_attach_endpoint().into_path();
+    let shown = path.display();
+
+    // The endpoint path can come from `DOT_AGENT_DECK_ATTACH_SOCKET` in the
+    // remote login environment, and the caller reads our stdout line by line.
+    // A control byte in the path would let that environment choose which line
+    // the caller believes, so refuse to print one rather than emit a value
+    // whose framing we do not control. The local `RemoteSocketPath` parser
+    // refuses these too; this is the same refusal one hop earlier, where the
+    // reason can still be reported.
+    if shown.to_string().contains(|c: char| c.is_control()) {
+        eprintln!("daemon endpoint: the endpoint path contains a control character");
+        return ExitCode::from(ENDPOINT_UNTRUSTED);
+    }
+
+    // Split "there is nothing here" from "there is something here and it is
+    // wrong" BEFORE running the trust check, because the two earn different
+    // exit codes and `verify_endpoint_trusted` folds them into one `String`.
+    // An absent endpoint is ordinary — the deck over there is simply not
+    // running — and must not stop the probe trying its other candidates.
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(source) => {
+            eprintln!("daemon endpoint: nothing at {shown}: {source}");
+            return ExitCode::from(ENDPOINT_UNDETERMINED);
+        }
+    }
+
+    if let Err(reason) = dot_agent_deck::platform::fsperm::verify_endpoint_trusted(&path) {
+        eprintln!("daemon endpoint: {shown} is not a trusted endpoint: {reason}");
+        return ExitCode::from(ENDPOINT_UNTRUSTED);
+    }
+
+    // A `Hello` over the existing wire. Bounded, because a listener that
+    // accepts and then says nothing would otherwise hold the ssh probe open
+    // until its own 20s deadline killed it, turning "the deck is not running"
+    // into "the host timed out".
+    let client = DaemonClient::new(path.clone());
+    match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.capabilities()).await {
+        Ok(Ok(_capabilities)) => {}
+        // Every handshake failure is UNDETERMINED rather than UNTRUSTED, and
+        // deliberately so. A refused connect is a stale inode or a daemon that
+        // is not running; a refused `Hello` is usually version skew, which the
+        // desktop names far better (`HandshakeRefused`, `ProtocolRefused`) once
+        // the socket is forwarded than this command could. Both are reasons to
+        // keep looking, not grounds to call the endpoint hostile.
+        Ok(Err(e)) => {
+            eprintln!("daemon endpoint: nothing usable answered at {shown}: {e}");
+            return ExitCode::from(ENDPOINT_UNDETERMINED);
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon endpoint: the listener at {shown} did not complete a handshake within {}s",
+                ENDPOINT_RESOLVE_TIMEOUT.as_secs()
+            );
+            return ExitCode::from(ENDPOINT_UNDETERMINED);
+        }
+    }
+
+    println!("{shown}");
+    ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck remote upgrade <name> [--version V] [--no-install] [--json]`
+/// (PRD #1487): install and restart through
+/// [`dot_agent_deck::daemon_upgrade::upgrade_daemon`], the function every
+/// client shares. The restart question is asked only when stdin and stdout are
+/// both terminals; otherwise no one can answer, and live work keeps the
+/// running daemon. With `--json`, stdout carries only the outcome. Exits
+/// non-zero only for a failed stage.
+fn run_remote_upgrade(name: &str, version: String, no_install: bool, json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_upgrade::{
+        NoDecider, RestartDecider, SshInstaller, TtyDecider, UpgradePlan, upgrade_daemon,
+        upgrade_ssh_executor,
+    };
+    use dot_agent_deck::remote::{RemoteUpgradeError, RemotesFile};
+    use std::io::{IsTerminal, Write};
+
+    let path = dot_agent_deck::remote::default_remotes_path();
+    // Unknown names and an unreadable registry fail before any ssh, as before.
+    let entry = match RemotesFile::load(&path) {
+        Ok(file) => file.remotes.into_iter().find(|r| r.name == name),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(entry) = entry else {
+        eprintln!(
+            "{}",
+            RemoteUpgradeError::UnknownName {
+                name: name.to_string()
+            }
+        );
+        return ExitCode::FAILURE;
+    };
+
+    // What is said along the way goes to stdout, or to stderr under `--json`
+    // so stdout holds the outcome alone.
+    let report: fn() -> Box<dyn Write> = if json {
+        || Box::new(std::io::stderr())
+    } else {
+        || Box::new(std::io::stdout())
+    };
+    // The row read above, for the install as for the port, so both reach
+    // the same machine even if the row changes meanwhile.
+    let mut installer = SshInstaller::for_entry(&entry, path.clone(), report());
+    installer.no_install = no_install;
+    let port =
+        dot_agent_deck::remote_daemon::SshDaemonPort::for_entry(upgrade_ssh_executor(), &entry);
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let tty;
+    let decider: &dyn RestartDecider = if interactive {
+        tty = TtyDecider::new(std::io::stdin().lock(), report());
+        &tty
+    } else {
+        &NoDecider
+    };
+    let plan = UpgradePlan {
+        version,
+        successor: dot_agent_deck::daemon_protocol::RestartSuccessor::Installed,
+    };
+    let mut progress_out = report();
+    let outcome = upgrade_daemon(name, &plan, &installer, &port, decider, &mut |p| {
+        dot_agent_deck::connect::print_upgrade_progress(name, &p, &mut *progress_out)
+    });
+
+    if json {
+        match serde_json::to_string(&outcome) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("remote upgrade: could not encode the outcome: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if outcome.is_failure() {
+        eprintln!("{}", outcome.summary(name));
+    } else {
+        println!("{}", outcome.summary(name));
+    }
+    if outcome.is_failure() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck daemon probe [--json]` (PRD #1487, hidden plumbing). One
+/// bounded `Hello` against the running daemon at this host's endpoint, through
+/// [`DaemonClient::probe_running`], which never lazy-spawns. "Nothing running"
+/// is an answer (exit 0, `running: false`); a probe that learned nothing — a
+/// transport error or no reply within [`ENDPOINT_RESOLVE_TIMEOUT`] — is a
+/// failure on stderr. Puts nothing new on the wire.
+#[tokio::main]
+async fn run_daemon_probe_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_restart::DaemonProbe;
+    let client = DaemonClient::new(client_attach_socket_path());
+    let hello = match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.probe_running()).await {
+        Ok(Ok(hello)) => hello,
+        Ok(Err(e)) => {
+            eprintln!("daemon probe: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon probe: no handshake within {}s",
+                ENDPOINT_RESOLVE_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let probe = DaemonProbe {
+        running: hello.is_some(),
+        hello,
+        confirm_stdin: true,
+    };
+    if json {
+        match serde_json::to_string(&probe) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("daemon probe: could not encode the result: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match probe
+            .hello
+            .as_ref()
+            .and_then(|h| h.daemon_version.as_deref())
+        {
+            Some(v) => println!("running: {v}"),
+            None if probe.running => println!("running"),
+            None => println!("not running"),
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck daemon restart-installed [--json] [--expect-version V]
+/// [--confirm-hex H | --confirm-stdin]` (PRD #1487, hidden plumbing). Asks the
+/// running daemon at this host's endpoint to restart onto the build installed
+/// at its own path, through [`DaemonClient::restart_daemon`] — the verb's only
+/// sender, which withholds it from a daemon that does not advertise it.
+/// Prints one [`dot_agent_deck::daemon_restart::RemoteRestartReport`]: no daemon running,
+/// the daemon too old for the verb, or the daemon's reply (accepted, needs
+/// confirmation, refused) — all exit 0, because each is an answer. A failure
+/// is on stderr, and its exit code says whether the request had been sent:
+/// [`dot_agent_deck::daemon_restart::RESTART_NOT_SENT_EXIT`] before it,
+/// [`dot_agent_deck::daemon_restart::RESTART_UNANSWERED_EXIT`] after it.
+#[tokio::main]
+async fn run_daemon_restart_installed_cli(
+    json: bool,
+    expect_version: Option<String>,
+    confirm_hex: Option<String>,
+    confirm_stdin: bool,
+) -> ExitCode {
+    use dot_agent_deck::daemon_client::{ClientError, GatedQuery, RestartDaemonRequest};
+    use dot_agent_deck::daemon_protocol::{RestartDaemonReply, RestartSuccessor};
+    use dot_agent_deck::daemon_restart::{
+        CONFIRM_STDIN_TIMEOUT, RESTART_NOT_SENT_EXIT, RESTART_UNANSWERED_EXIT, RemoteRestartReport,
+        decode_stop_set_hex, read_stop_set,
+    };
+
+    // Read before the daemon is asked anything, so a malformed set is refused
+    // with nothing sent. The read blocks until stdin closes, so it runs on a
+    // plain thread, not a runtime worker, under a bound of its own; a thread
+    // still blocked when the bound passes ends with the process (Qodo
+    // 4236427318).
+    let confirm = if confirm_stdin {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_stop_set(std::io::stdin().lock()));
+        });
+        match tokio::time::timeout(CONFIRM_STDIN_TIMEOUT, rx).await {
+            Ok(Ok(read)) => read.map(Some),
+            Ok(Err(_)) => Err("the stdin reader stopped without an answer".to_string()),
+            Err(_) => Err(format!(
+                "stdin did not close within {}s",
+                CONFIRM_STDIN_TIMEOUT.as_secs()
+            )),
+        }
+        .map_err(|e| format!("--confirm-stdin: {e}"))
+    } else {
+        confirm_hex
+            .as_deref()
+            .map(decode_stop_set_hex)
+            .transpose()
+            .map_err(|e| format!("--confirm-hex: {e}"))
+    };
+    let confirm = match confirm {
+        Ok(confirm) => confirm,
+        Err(e) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.probe_running()).await {
+        Ok(Ok(Some(_))) => {}
+        Ok(Ok(None)) => {
+            return print_restart_report(
+                json,
+                &RemoteRestartReport {
+                    running: false,
+                    reply: None,
+                    unsupported: false,
+                },
+            );
+        }
+        Ok(Err(e)) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon restart-installed: no handshake within {}s",
+                ENDPOINT_RESOLVE_TIMEOUT.as_secs()
+            );
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
+        }
+    }
+    let request = RestartDaemonRequest {
+        confirm,
+        expected_version: expect_version,
+        successor: RestartSuccessor::Installed,
+    };
+    let report = match client.restart_daemon(request).await {
+        Ok(GatedQuery::Answered(reply)) => RemoteRestartReport {
+            running: true,
+            reply: Some(reply),
+            unsupported: false,
+        },
+        Ok(GatedQuery::Unsupported) => RemoteRestartReport {
+            running: true,
+            reply: None,
+            unsupported: true,
+        },
+        // Sent, then no answer: the daemon may be restarting, which the
+        // caller has to be able to tell from a request that never went out.
+        Err(e @ ClientError::Unanswered(_)) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::from(RESTART_UNANSWERED_EXIT);
+        }
+        Err(e) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
+        }
+    };
+    if !json {
+        // A short human line; the JSON form is what callers parse.
+        let line = match &report.reply {
+            Some(RestartDaemonReply::Accepted { to_version, .. }) => format!(
+                "restart accepted{}",
+                to_version
+                    .as_deref()
+                    .map(|v| format!(" (onto {v})"))
+                    .unwrap_or_default()
+            ),
+            Some(RestartDaemonReply::NeedsConfirmation { at_stake, .. }) => format!(
+                "needs confirmation: {} agent(s), {} orchestration role(s) would be stopped",
+                at_stake.agents.len(),
+                at_stake.roles.len()
+            ),
+            Some(RestartDaemonReply::Refused { message, .. }) => format!("refused: {message}"),
+            None => "the running daemon is too old to restart this way".to_string(),
+        };
+        println!("{line}");
+        return ExitCode::SUCCESS;
+    }
+    // The daemon has answered: a report that cannot be printed is a lost
+    // reply, not a request that was never sent.
+    match print_restart_report(json, &report) {
+        code if code == ExitCode::SUCCESS => code,
+        _ => ExitCode::from(RESTART_UNANSWERED_EXIT),
+    }
+}
+
+/// Print a [`dot_agent_deck::daemon_restart::RemoteRestartReport`] as one JSON
+/// line (or a short human line without `--json`).
+fn print_restart_report(
+    json: bool,
+    report: &dot_agent_deck::daemon_restart::RemoteRestartReport,
+) -> ExitCode {
+    if !json {
+        println!("no daemon running");
+        return ExitCode::SUCCESS;
+    }
+    match serde_json::to_string(report) {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("daemon restart-installed: could not encode the result: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// [`run_daemon_endpoint_cli`]: something is at the endpoint path and it failed
+/// a trust check, so the caller must **not** keep looking and must not forward
+/// it. Distinct from clap's `2` so an older build is never mistaken for one.
+const ENDPOINT_UNTRUSTED: u8 = 1;
+
+/// [`run_daemon_endpoint_cli`]: nothing was learned — no inode, nothing
+/// answering, or a handshake that timed out — so the caller should try its
+/// remaining candidates. Deliberately not `2` (clap's) and not `126`/`127` (a
+/// shell's), which mean the same thing for a different reason.
+const ENDPOINT_UNDETERMINED: u8 = 3;
+
+/// How long [`run_daemon_endpoint_cli`] waits for a listener to complete the
+/// `Hello`.
+///
+/// Comfortably inside `remote_tunnel`'s own 20s probe deadline, so a wedged
+/// listener on the far host is reported by *this* command as "no daemon here"
+/// and the snippet's fallback still gets its turn, rather than the whole ssh
+/// probe being killed from the near side with nothing learned. Matches
+/// `daemon_status::STATUS_REQUEST_TIMEOUT`, which bounds the same kind of
+/// single round trip against the same daemon.
+const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// `dot-agent-deck daemon status [--json]`. Read-only CLI
 /// consumer of the existing `AttachRequest::ListAgents`
 /// ([`dot_agent_deck::daemon_client::DaemonClient::list_agents`]) — no new
@@ -2773,15 +4444,22 @@ fn run_daemon_hello_cli() -> ExitCode {
 /// unlike `daemon stop`'s idempotent "no daemon running" — but deliberately
 /// never with clap's own exit code 2, so a caller can tell "this build
 /// doesn't understand the request" apart from "the daemon didn't answer".
-/// Never spawns, retries, or otherwise perturbs the daemon it's asking
-/// about: a timeout abandons the query rather than looping.
+/// Never spawns a daemon, never sends a mutation request, and never retries: a
+/// timeout abandons the query rather than looping. "Otherwise perturbs the
+/// daemon" is what this used to claim and is now too strong (issue #1121 round
+/// two, N11) — resolving the endpoint through `client_attach_socket_path` makes
+/// a successful connection of its own before the status connection, so on a
+/// host in the fallback case the daemon sees one extra accept and one extra
+/// client. No protocol byte is written on it, but it is observable in timings
+/// such as idle observation, and a comment that says otherwise is read as a
+/// guarantee.
 #[tokio::main]
 async fn run_daemon_status_cli(json: bool) -> ExitCode {
     use dot_agent_deck::daemon_status::{
         STATUS_REQUEST_TIMEOUT, StatusDocument, build_status_agents_with_delegations, format_human,
     };
 
-    let client = DaemonClient::new(attach_socket_path());
+    let client = DaemonClient::new(client_attach_socket_path());
     let (records, delegations) =
         match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents_full()).await {
             Ok(Ok((listing, delegations))) => (listing.records, delegations),
@@ -2821,6 +4499,100 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
     } else {
         print!("{}", format_human(&agents));
         ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck close` — PRD #1589. Connect-only: it never starts a daemon,
+/// because closing agents on a daemon it just started would close nothing. The
+/// request building and rendering live in [`dot_agent_deck::close_cli`].
+#[tokio::main]
+async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
+    let identity = match dot_agent_deck::close_cli::ambient_identity() {
+        Ok(identity) => identity,
+        Err(message) => {
+            let output = dot_agent_deck::close_cli::identity_error_output(args.json, message);
+            print!("{}", output.stdout);
+            eprint!("{}", output.stderr);
+            return ExitCode::from(output.code);
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    let output = dot_agent_deck::close_cli::run_close(&client, &args, &identity).await;
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    ExitCode::from(output.code)
+}
+
+/// `--folder`, made absolute against this shell's cwd and left otherwise as
+/// spelled: the daemon canonicalises it.
+fn absolute_address(
+    folder: Option<String>,
+    orchestration: Option<String>,
+    name: Option<String>,
+    pane: Option<String>,
+) -> dot_agent_deck::orchestrator_address::MessageAddress {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    dot_agent_deck::orchestrator_address::MessageAddress {
+        folder: folder.map(|f| dot_agent_deck::roles_cli::absolute_folder(&f, &cwd)),
+        orchestration,
+        name,
+        pane,
+    }
+}
+
+fn print_cli_output(output: dot_agent_deck::roles_cli::CliOutput) -> ExitCode {
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    ExitCode::from(output.code)
+}
+
+/// `dot-agent-deck roles` — issue #1947. See [`dot_agent_deck::roles_cli`].
+#[tokio::main]
+async fn run_roles_cli(
+    json: bool,
+    address: dot_agent_deck::orchestrator_address::MessageAddress,
+) -> ExitCode {
+    let client = DaemonClient::new(client_attach_socket_path());
+    print_cli_output(dot_agent_deck::roles_cli::run_roles(&client, json, &address).await)
+}
+
+/// `dot-agent-deck inbox send` — issue #1947. Connect-only, like `close`:
+/// messaging an orchestrator on a daemon this call just started would reach
+/// nobody.
+#[tokio::main]
+async fn run_inbox_send_cli(
+    address: dot_agent_deck::orchestrator_address::MessageAddress,
+    body: InboxBody,
+) -> ExitCode {
+    let identity = match dot_agent_deck::close_cli::ambient_identity() {
+        Ok(identity) => identity,
+        Err(message) => {
+            let message = message
+                .replace("run `close`", "run `inbox send`")
+                .replace("Nothing was closed.", "Nothing was sent.");
+            eprintln!("{message}");
+            return ExitCode::from(dot_agent_deck::close_cli::EXIT_REFUSED);
+        }
+    };
+    let text = match dot_agent_deck::roles_cli::read_body(body.text, body.file, std::io::stdin()) {
+        Ok(text) => text,
+        Err(why) => {
+            eprintln!("refused: {why}; nothing was sent.");
+            return ExitCode::from(dot_agent_deck::close_cli::EXIT_REFUSED);
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    print_cli_output(dot_agent_deck::roles_cli::run_send(&client, &identity, address, text).await)
+}
+
+#[tokio::main]
+async fn run_daemon_install_cli() -> ExitCode {
+    match dot_agent_deck::daemon_service::run_install().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("daemon install: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -3386,6 +5158,17 @@ fn run_issue_release_cli(
     }
 }
 
+#[tokio::main]
+async fn run_daemon_uninstall_cli() -> ExitCode {
+    match dot_agent_deck::daemon_service::run_uninstall().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("daemon uninstall: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// The exit code IS the mechanism here, more than usually: PR #573's
 /// fix-round hook (`.claude/hooks/check-issue-claim.sh`) reads exactly these
 /// four codes to tell a confident lock refusal apart from a merely
@@ -3523,12 +5306,19 @@ async fn run_daemon_restart_cli(force: bool) -> ExitCode {
 /// (Daemon::with_attach + run_daemon_with) so a remote running this
 /// subcommand binds the same two sockets a local TUI would.
 ///
-/// Hook auto-install is skipped here on purpose: `remote add` already runs
-/// `hooks install` on the remote, and the on-disk hook scripts only need
-/// to be (re)installed when the binary version changes — not every time
-/// the daemon starts.
+/// Every agent's hook auto-install runs before this, in the `DaemonCmd::Serve`
+/// arm (issue #1157), so an agent this daemon starts with no TUI attached —
+/// a scheduled task, a dispatched unit, a restored pane — finds hooks naming
+/// a live deck. The OpenCode plugin's install also runs again before each
+/// OpenCode agent starts (PRD #1666 §11), so a plugin missing, or pinned to a
+/// deleted copy, because OpenCode was set up or a copy removed after this
+/// daemon started is repaired before the agent loads it (PRD #190,
+/// `hooks/install/023`). A pin to another live, durable install is kept by the
+/// same rules as at startup.
 #[tokio::main]
-async fn run_daemon_serve_cli() -> ExitCode {
+async fn run_daemon_serve_cli(
+    hook_binaries: dot_agent_deck::hook_binary::HookBinaryState,
+) -> ExitCode {
     // NOTE: logging is initialized by the `DaemonCmd::Serve` dispatch arm in
     // `main`, before the login-shell PATH capture and before this runtime is
     // built — so it is intentionally NOT initialized again here (a second
@@ -3548,14 +5338,70 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // `tracing::warn!` calls inside `init_and_watch` already land in that
     // same log file.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
-    let state = Arc::new(RwLock::new(AppState::default()));
-    let path = socket_path();
-    let attach_path = attach_socket_path();
+    let mut initial = AppState::default();
+    initial.hook_binaries = hook_binaries;
+    let state = Arc::new(RwLock::new(initial));
+    // Issue #1121: the BIND side, so these are deliberately the pure
+    // resolvers and not `endpoint_resolve`'s client ones — the primary
+    // endpoint is the new spelling, never one the compatibility read chose.
+    //
+    // Issue #1173: …except that when another uid holds the per-uid fallback
+    // directory's name, both sockets go into a relocated owner-only sibling
+    // instead of the daemon refusing to start. On every other host this hands
+    // back the resolved addresses unchanged. Both in ONE call, so the two
+    // sockets can never be split across directories by a squatter removing
+    // their entry between two decisions. The launcher runs the same rule
+    // before it spawns us, so it polls where we are about to bind.
+    let prepared = dot_agent_deck::endpoint_resolve::prepare_bind_endpoints(&[
+        dot_agent_deck::platform::paths::resolve_socket_path(),
+        dot_agent_deck::platform::paths::resolve_attach_socket_path(),
+    ])
+    .await;
+    let (path, attach_path) = match prepared.as_deref() {
+        Ok([path, attach_path]) => (path.clone(), attach_path.clone()),
+        Ok(other) => {
+            eprintln!("Daemon error: expected two prepared endpoints, got {other:?}");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("Daemon error: cannot prepare the endpoints: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let daemon = Daemon::with_attach(state, attach_path.clone());
-    if let Err(e) = run_daemon_with(&path, daemon).await {
+    // PRD #1487: record this daemon's own binary now, at startup, so a later
+    // `restart-daemon` resolves "the build installed at my own path" from where
+    // it started rather than from whatever `current_exe()` reports after an
+    // upgrade replaced the file.
+    let restart_control = Arc::new(dot_agent_deck::daemon_restart::RestartControl::new(
+        dot_agent_deck::daemon_restart::InstallRecord::capture(),
+    ));
+    // PRD #2050 (auditor M2): likewise this binary's file identity, which the
+    // OpenCode plugin install compares with the file at its pin to tell an
+    // older daemon still running after an upgrade from a rolled-back deck.
+    dot_agent_deck::opencode_manage::note_own_executable();
+    let refresh_state = state.clone();
+    let daemon = Daemon::with_attach(state, attach_path.clone())
+        .with_restart_control(restart_control.clone());
+    // Issue #1637: re-read the agents' hook configs periodically, so a notice
+    // about an older copy the hooks are still set up to call stays, and one
+    // the user has since fixed clears, without a restart. Here rather than in
+    // `run_daemon_with`, which in-process test daemons also run: only this
+    // daemon was started with the hook pins it reads.
+    let pin_refresh = tokio::spawn(dot_agent_deck::daemon::run_hook_pin_refresh(
+        refresh_state,
+        daemon.event_tx.clone(),
+    ));
+    let result = run_daemon_with(&path, daemon).await;
+    pin_refresh.abort();
+    if let Err(e) = result {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;
+    }
+    // PRD #1487: a supervised daemon that accepted a restart started no
+    // successor; this status is what makes its service manager start one.
+    if restart_control.handed_to_supervisor() {
+        return ExitCode::from(dot_agent_deck::daemon_restart::SUPERVISED_RESTART_EXIT);
     }
     ExitCode::SUCCESS
 }
@@ -3577,7 +5423,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
     match &action {
         ScheduleAction::RunNow { name } => {
             use dot_agent_deck::daemon_client::RunNowOutcome;
-            let client = DaemonClient::new(attach_socket_path());
+            let client = DaemonClient::new(client_attach_socket_path());
             return match client.run_now(name).await {
                 // PRD #127 C5: report skipped distinctly (still exit 0 — the
                 // task is registered and the request succeeded).
@@ -3596,7 +5442,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             };
         }
         ScheduleAction::Reload => {
-            let client = DaemonClient::new(attach_socket_path());
+            let client = DaemonClient::new(client_attach_socket_path());
             return match client.reload_schedules().await {
                 Ok(names) => {
                     println!("reloaded; registered: {}", names.join(", "));
@@ -3662,6 +5508,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
                 // knobs added without a matching `schedule add` flag.
                 repo_allowlist: None,
                 dry_run: false,
+                claim: Default::default(),
             });
             schedule_cli::add(
                 &mut tasks,
@@ -3722,7 +5569,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
 
     // Trigger a live reload so a running daemon picks the change up. A daemon
     // that isn't running is not an error — the change loads on next serve.
-    let client = DaemonClient::new(attach_socket_path());
+    let client = DaemonClient::new(client_attach_socket_path());
     match client.reload_schedules().await {
         Ok(_) => {}
         Err(e) => {
@@ -3768,12 +5615,119 @@ mod tests {
         }
     }
 
+    /// Issue #530: `dispatch --help` states what the exit status asserts, and
+    /// quotes the two openings the caller is told to read the outcome from.
+    ///
+    /// The exit status is the provenance gate's acknowledgement — pinned by
+    /// `daemon::hook_ingestion_tests::a_dispatch_its_handler_rejects_is_still_acknowledged_as_accepted`
+    /// — so the help is where a caller learns that exit 0 does not mean a unit
+    /// started. Both quotes are checked against the values the daemon builds its
+    /// messages from, so rewording either message fails here rather than leaving
+    /// the help describing a reply nothing sends.
+    #[test]
+    fn dispatch_help_says_what_its_exit_status_asserts() {
+        let cli = Cli::command();
+        let dispatch = cli
+            .find_subcommand("dispatch")
+            .expect("the dispatch subcommand");
+        let help = dispatch
+            .get_long_about()
+            .expect("dispatch carries a long help")
+            .to_string();
+        // clap re-flows doc-comment text, so every quote is matched with its
+        // whitespace collapsed rather than byte for byte.
+        let flat: String = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let completed_opening = "dispatch: a unit you dispatched has completed";
+        for (quote, why) in [
+            (
+                "Exit status when starting a unit: 0 means the daemon admitted the request",
+                "what exit 0 asserts",
+            ),
+            (
+                "does not mean the worktree was created",
+                "what exit 0 does NOT assert",
+            ),
+            (
+                dot_agent_deck::dispatch::SPAWNED_OPENING,
+                "the success reply's real opening",
+            ),
+            (completed_opening, "the completion report's opening"),
+        ] {
+            assert!(flat.contains(quote), "the help must state {why}:\n{help}");
+        }
+        let completed =
+            dot_agent_deck::dispatch_return::compose_completion_report("probe", "report", None);
+        assert!(
+            completed.starts_with(completed_opening),
+            "the completion report no longer opens the way the help quotes it: {completed}"
+        );
+    }
+
     /// `--orchestration` REQUIRES its value, so it can never consume the unit name.
     ///
     /// With `num_args = 0..=1` clap consumed the next bare token, so
     /// `dispatch --orchestration my-unit --task "…"` bound the UNIT NAME as the
     /// orchestration and aborted for a missing positional. A required value makes
     /// both orderings unambiguous.
+    /// Issue #2053 (Qodo and Greptile on PR #2055): an agent's name may start
+    /// with `-`, so `--name` and `--pane` take such a value whether it is
+    /// typed as the next word or as `--name=…`, the form the reply command the
+    /// deck prints uses.
+    #[test]
+    fn name_and_pane_take_a_value_that_starts_with_a_hyphen() {
+        for argv in [
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--name",
+                "-docs",
+                "--text",
+                "t",
+            ][..],
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--folder=/w",
+                "--name=--builder",
+                "--text",
+                "t",
+            ],
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--pane",
+                "-p",
+                "--text",
+                "t",
+            ],
+            &["dot-agent-deck", "roles", "--name", "-docs", "--pane", "-p"],
+        ] {
+            let parsed = Cli::try_parse_from(argv.iter().copied());
+            let (name, pane) = match parsed.map(|cli| cli.command) {
+                Ok(Some(Commands::Inbox {
+                    action: InboxAction::Send { name, pane, .. },
+                })) => (name, pane),
+                Ok(Some(Commands::Roles { name, pane, .. })) => (name, pane),
+                Ok(_) => panic!("{argv:?}: parsed as another command"),
+                Err(error) => panic!("{argv:?}: {error}"),
+            };
+            let given = |flag: &str| {
+                argv.iter()
+                    .position(|a| *a == flag)
+                    .map(|i| argv[i + 1].to_string())
+                    .or_else(|| {
+                        argv.iter()
+                            .find_map(|a| a.strip_prefix(&format!("{flag}=")).map(str::to_string))
+                    })
+            };
+            assert_eq!(name, given("--name"), "{argv:?}");
+            assert_eq!(pane, given("--pane"), "{argv:?}");
+        }
+    }
+
     #[test]
     fn orchestration_value_is_required_so_it_cannot_eat_the_unit_name() {
         // Flag-first with a name still binds correctly: `probe` is the VALUE, and
@@ -4152,12 +6106,12 @@ mod tests {
                 task,
                 task_file,
                 to,
-                subject,
+                supersede,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("/tmp/t.txt"));
                 assert_eq!(to, vec!["coder".to_string()]);
-                assert_eq!(subject, None);
+                assert!(!supersede, "--supersede is opt-in (issue #580)");
             }
             _ => panic!("expected `delegate`"),
         }
@@ -4193,12 +6147,12 @@ mod tests {
                 task,
                 task_file,
                 done,
-                subject,
+                task_id,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("-"));
                 assert!(!done);
-                assert_eq!(subject, None);
+                assert_eq!(task_id, None);
             }
             _ => panic!("expected `work-done`"),
         }
@@ -4237,6 +6191,148 @@ mod tests {
             error: error.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    fn busy(role: &str, outstanding: u32) -> dot_agent_deck::event::BusyWorker {
+        dot_agent_deck::event::BusyWorker {
+            role: role.to_string(),
+            outstanding,
+            oldest_age_secs: 12 * 60,
+        }
+    }
+
+    use spec::spec;
+
+    fn blocked(
+        role: &str,
+        kind: dot_agent_deck::state::BlockedKind,
+    ) -> dot_agent_deck::event::BlockedWorker {
+        dot_agent_deck::event::BlockedWorker {
+            role: role.to_string(),
+            kind,
+            blocked_for_secs: 5 * 60,
+            resets_in_secs: None,
+        }
+    }
+
+    /// Scenario: Feed `delegate`'s verdict a daemon reply naming a blocked
+    /// worker that was delivered to, then one naming a blocked worker that was
+    /// refused as busy. The first warns that the task was delivered but will
+    /// likely not be worked on and still exits 0; the second names the busy
+    /// role as blocked so `--supersede` is not mistaken for a fix, with the
+    /// reset the provider gave. Neither carries any agent text.
+    #[spec("orchestration/delegate/038")]
+    #[test]
+    fn orchestration_delegate_038_verdict_reports_blocked_for_delivered_and_busy() {
+        use dot_agent_deck::state::BlockedKind;
+        let mut resp = reply(&["coder"], &[], None);
+        resp.blocked = vec![blocked("coder", BlockedKind::CreditsDepleted)];
+        let v = delegate_verdict("pane-1", &[], &resp);
+        assert!(!v.failed, "the task WAS delivered: exit 0");
+        let msg = v.message.expect("a blocked worker must never be silent");
+        assert!(
+            msg.contains("appear BLOCKED by a provider usage limit or credit pool")
+                && msg.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
+                && msg.contains("reported 5 minutes ago by the agent")
+                && msg.contains("credits do not reset on their own")
+                && msg.contains("The task WAS delivered"),
+            "{msg}"
+        );
+
+        // Busy AND blocked, nothing delivered: the routing failure, annotated.
+        let mut resp = reply(&[], &[], Some("this delegate was NOT sent"));
+        resp.busy = vec![busy("coder", 1)];
+        resp.blocked = vec![dot_agent_deck::event::BlockedWorker {
+            resets_in_secs: Some(90 * 60),
+            ..blocked("coder", BlockedKind::UsageLimit)
+        }];
+        let v = delegate_verdict("pane-1", &[], &resp);
+        assert!(v.failed, "nothing was dispatched: non-zero");
+        let msg = v.message.expect("reported");
+        assert!(
+            msg.contains("NOT sent")
+                && msg.contains("busy worker(s)")
+                && msg.contains("also appear BLOCKED")
+                && msg.contains("--supersede will likely not get the task worked on")
+                && msg.contains("; resets in 1h 30m")
+                && !msg.contains("credits do not reset"),
+            "{msg}"
+        );
+
+        // Busy-and-blocked beside a delivered, healthy role: exit 0, both said.
+        let mut resp = reply(&["tester"], &[], None);
+        resp.busy = vec![busy("coder", 1)];
+        resp.blocked = vec![blocked("coder", BlockedKind::UsageLimit)];
+        let v = delegate_verdict("pane-1", &[], &resp);
+        assert!(!v.failed);
+        let msg = v.message.expect("reported");
+        assert!(
+            msg.contains("also appear BLOCKED") && msg.contains("NOT sent"),
+            "{msg}"
+        );
+        assert!(!msg.contains("The task WAS delivered but"), "{msg}");
+
+        // The reply carries no pane text to leak, and an older daemon's reply
+        // (no `blocked` key) decodes to an empty list and prints nothing extra.
+        let old: DelegateResponse =
+            serde_json::from_str(r#"{"kind":"delegate","delivered":["coder"]}"#).unwrap();
+        assert!(old.blocked.is_empty());
+        assert!(delegate_verdict("pane-1", &[], &old).message.is_none());
+    }
+
+    /// Issue #580: a busy worker beside a delivered one is a partial outcome.
+    /// Exit 0 — the delivered role really has the task, and a failure would
+    /// invite a retry that dispatches it twice — with a warning naming the busy
+    /// role, what it owes, and the remedy.
+    #[test]
+    fn delegate_verdict_warns_about_a_busy_worker_on_a_partial_delivery() {
+        let mut resp = reply(&["tester"], &[], None);
+        resp.busy = vec![busy("coder", 1)];
+        let v = delegate_verdict("pane-1", &[], &resp);
+        assert!(!v.failed, "the tester was dispatched: exit 0");
+        let msg = v.message.expect("a busy worker must never be silent");
+        assert!(
+            msg.contains("NOT sent")
+                && msg.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
+                && msg.contains("1 unanswered delegation,")
+                && msg.contains("12 minutes ago")
+                && msg.contains("It WAS delivered to: tester")
+                && msg.contains("--supersede"),
+            "the warning must name the busy role, its debt, the delivered roles and the \
+             remedy: {msg}"
+        );
+    }
+
+    /// Issue #580: when every worker was busy the daemon sets `error`, and the
+    /// verdict is the ordinary routing failure — non-zero, because nothing landed.
+    #[test]
+    fn delegate_verdict_fails_when_every_worker_was_busy() {
+        let mut resp = reply(&[], &[], Some("this delegate was NOT sent"));
+        resp.busy = vec![busy("coder", 2)];
+        let v = delegate_verdict("pane-1", &[], &resp);
+        assert!(v.failed, "nothing was dispatched: non-zero");
+        assert!(v.message.expect("reported").contains("NOT sent"));
+
+        // Defense in depth: the same outcome without `error` is still a failure.
+        let mut resp = reply(&[], &[], None);
+        resp.busy = vec![busy("coder", 2)];
+        assert!(delegate_verdict("pane-1", &[], &resp).failed);
+    }
+
+    /// Issue #580: a `--supersede` that replaced an unanswered delegation is
+    /// reported rather than silent — "at minimum reported as superseding" — but
+    /// it is a success: the task was dispatched as asked.
+    #[test]
+    fn delegate_verdict_reports_a_supersession_without_failing() {
+        let mut resp = reply(&["coder"], &[], None);
+        resp.superseded = vec![busy("coder", 1)];
+        let v = delegate_verdict("pane-1", &[], &resp);
+        assert!(!v.failed);
+        let msg = v.message.expect("a supersession must be reported");
+        assert!(
+            msg.contains("still owed a work-done") && msg.contains("UNTRUSTED-ROLE-LABEL: coder"),
+            "the note must name the superseded worker: {msg}"
+        );
     }
 
     /// `&[&str]` to the `Vec<String>` `delegate_verdict`'s `requested_roles`
@@ -4288,15 +6384,23 @@ mod tests {
             msg.contains("ghost"),
             "the message must name the role that missed: {msg}"
         );
-        // The three causes, not the one that happens to be most common: the
+        // The five causes, not the one that happens to be most common: the
         // old message told the user to go check role names in the toml even
         // when the role was sitting there correctly and was simply the
-        // orchestrator itself, or had had its worker pane closed.
+        // orchestrator itself, or had had its worker pane closed — or, issue
+        // #554, had been renamed in the toml after the orchestration started,
+        // which leaves the file looking right while the daemon still routes by
+        // the old name — or, issue #524, had a worker that exited on its own.
         assert!(
             msg.contains(".dot-agent-deck.toml")
                 && msg.contains("orchestrator cannot delegate to itself")
-                && msg.contains("worker pane has been closed"),
-            "the message must state all three causes, not assert one: {msg}"
+                && msg.contains("worker pane has been closed")
+                && msg.contains("worker has exited")
+                && msg.contains("pane restart <role>")
+                && msg.contains(
+                    "renamed or added in .dot-agent-deck.toml after this orchestration started"
+                ),
+            "the message must state all five causes, not assert one: {msg}"
         );
     }
 
@@ -4415,109 +6519,130 @@ mod tests {
         );
     }
 
-    // --- issue #461: `read_registration_context`'s reader-seam extraction ---
-    //
-    // `std::env::set_var`/`remove_var` are process-global, and all three
-    // tests below mutate the same two vars, so they serialize against this
-    // module-level lock. As with `issue_claim.rs`'s `PANE_ID_ENV_LOCK`, real
-    // soundness rests on `cargo nextest`'s process-per-test isolation
-    // (CLAUDE.md rule 5's actual gate) — this mutex only protects this
-    // module's own tests from each other under a plain thread-per-test
-    // `cargo test` run.
-    static WORK_DONE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Scenario: set both `DOT_AGENT_DECK_REGISTRATION_GENERATION` and
-    /// `DOT_AGENT_DECK_DAEMON_BOOT_ID` to real values, call
-    /// `read_registration_context`, and confirm it returns exactly what was
-    /// set — the parsed generation and the boot id verbatim.
+    /// Issue #1383: `ack` exits 0 whatever happens, and says on stderr — never
+    /// as a failure — when receipt could not be confirmed. Only an accepted ack
+    /// whose id matched a message the deck holds prints "Acknowledged"; an unanswered
+    /// one (an older daemon) and a bare admission (PR #1414 review) do not.
     #[test]
-    fn read_registration_context_reads_both_vars_when_present() {
-        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
-        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
-
-        // SAFETY: lock held for the duration; restored below.
-        unsafe {
-            std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, "3");
-            std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, "boot-abc123");
-        }
-
-        assert_eq!(read_registration_context(), (3, "boot-abc123".to_string()));
-
-        // SAFETY: same lock; restore.
-        unsafe {
-            match prev_gen {
-                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
-                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
+    fn ack_report_is_never_a_failure_and_says_what_happened() {
+        use dot_agent_deck::event::{AckDelivery, SignalAck};
+        use dot_agent_deck::hook::SocketReply;
+        let line = |ack: SignalAck| {
+            AckReply::Socket(SocketReply::Line(serde_json::to_string(&ack).unwrap()))
+        };
+        let refused =
+            serde_json::to_string(&SignalAck::refused("missing_token", "no token")).unwrap();
+        let cases = [
+            (
+                line(SignalAck::acknowledged(AckDelivery::Acknowledged)),
+                AckStream::Stdout,
+            ),
+            (
+                line(SignalAck::acknowledged(AckDelivery::AlreadyAcknowledged)),
+                AckStream::Stdout,
+            ),
+            // Admitted, but the daemon did not say the id matched: an admission
+            // is not a match.
+            (line(SignalAck::accepted()), AckStream::Stderr),
+            // A delivery outcome a later daemon added.
+            (
+                AckReply::Socket(SocketReply::Line(
+                    r#"{"kind":"signal_ack","accepted":true,"delivery":"something_new"}"#
+                        .to_string(),
+                )),
+                AckStream::Stderr,
+            ),
+            // An older daemon that does not know `ack` answers nothing: that
+            // must not read as "Acknowledged".
+            (AckReply::Socket(SocketReply::NoReply), AckStream::Stderr),
+            (
+                AckReply::Socket(SocketReply::Line("not json".to_string())),
+                AckStream::Stderr,
+            ),
+            (
+                AckReply::Socket(SocketReply::Line(refused)),
+                AckStream::Stderr,
+            ),
+            (
+                AckReply::Socket(SocketReply::Unreachable),
+                AckStream::Stderr,
+            ),
+            (AckReply::Malformed, AckStream::Stderr),
+            (AckReply::NoPane, AckStream::Stderr),
+        ];
+        for (reply, expected) in cases {
+            let (stream, message) = ack_report(&reply);
+            assert_eq!(stream, expected, "{message}");
+            match stream {
+                AckStream::Stdout => {
+                    assert_eq!(message, "Acknowledged. Carry on with your task.")
+                }
+                AckStream::Stderr => {
+                    assert!(message.starts_with("Could not confirm receipt with the deck ("));
+                    assert!(message.ends_with("this is harmless — carry on with your task."));
+                }
             }
-            match prev_boot {
-                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
-                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
-            }
         }
+        // A mistyped or stale id is said so, still harmlessly and never as
+        // "Acknowledged".
+        let (stream, unknown) = ack_report(&line(SignalAck::acknowledged(AckDelivery::Unknown)));
+        assert_eq!(stream, AckStream::Stderr, "{unknown}");
+        assert!(!unknown.contains("Acknowledged"), "{unknown}");
+        assert!(unknown.contains("no delivery under that id"), "{unknown}");
+        assert!(
+            unknown.ends_with("this is harmless — carry on with your task."),
+            "{unknown}"
+        );
+        let (_, refused_message) = ack_report(&AckReply::Socket(SocketReply::Line(
+            serde_json::to_string(&dot_agent_deck::event::SignalAck::refused(
+                "missing_token",
+                "no token",
+            ))
+            .unwrap(),
+        )));
+        assert!(
+            refused_message.contains("missing_token"),
+            "{refused_message}"
+        );
     }
 
-    /// Scenario: with both env vars unset, call `read_registration_context`
-    /// and confirm it falls back to `(0, String::new())` — the defaults an
-    /// old CLI predating these variables, or a caller that didn't go through
-    /// a dot-agent-deck-managed spawn, must degrade to so the report is
-    /// refused at delivery rather than silently accepted.
+    /// PR #1735 second review: `ack --json` says whether the deck recorded the
+    /// acknowledgement, and whether a refusal is final, for the components
+    /// that confirm theirs.
     #[test]
-    fn read_registration_context_defaults_when_vars_are_unset() {
-        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
-        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
-
-        // SAFETY: lock held for the duration; restored below.
-        unsafe {
-            std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION);
-            std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID);
+    fn ack_json_says_whether_the_deck_recorded_it() {
+        use dot_agent_deck::event::{AckDelivery, SignalAck};
+        use dot_agent_deck::hook::SocketReply;
+        let line = |ack: SignalAck| {
+            AckReply::Socket(SocketReply::Line(serde_json::to_string(&ack).unwrap()))
+        };
+        for delivery in [AckDelivery::Acknowledged, AckDelivery::AlreadyAcknowledged] {
+            assert_eq!(
+                ack_json(&line(SignalAck::acknowledged(delivery))),
+                serde_json::json!({"acknowledged": true})
+            );
         }
-
-        assert_eq!(read_registration_context(), (0, String::new()));
-
-        // SAFETY: same lock; restore.
-        unsafe {
-            match prev_gen {
-                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
-                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
-            }
-            match prev_boot {
-                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
-                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
-            }
+        for (delivery, reason) in [
+            (AckDelivery::Unknown, "unknown"),
+            (AckDelivery::WrongAgent, "wrong_agent"),
+            (AckDelivery::Undeliverable, "undeliverable"),
+        ] {
+            let reply = ack_json(&line(SignalAck::acknowledged(delivery)));
+            assert_eq!(reply["acknowledged"], false, "{reply}");
+            assert_eq!(reply["final"], true, "{reply}");
+            assert_eq!(reply["reason"], reason, "{reply}");
         }
-    }
-
-    /// Scenario: set `DOT_AGENT_DECK_REGISTRATION_GENERATION` to a
-    /// non-numeric value with the boot id unset, and confirm
-    /// `read_registration_context` silently falls back to `0` rather than
-    /// panicking — matching `.and_then(|v| v.parse().ok())`'s existing
-    /// silent-fallback behavior for a malformed value.
-    #[test]
-    fn read_registration_context_falls_back_to_zero_on_unparseable_generation() {
-        let _g = WORK_DONE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_gen = std::env::var(DOT_AGENT_DECK_REGISTRATION_GENERATION).ok();
-        let prev_boot = std::env::var(DOT_AGENT_DECK_DAEMON_BOOT_ID).ok();
-
-        // SAFETY: lock held for the duration; restored below.
-        unsafe {
-            std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, "not-a-number");
-            std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID);
-        }
-
-        assert_eq!(read_registration_context(), (0, String::new()));
-
-        // SAFETY: same lock; restore.
-        unsafe {
-            match prev_gen {
-                Some(v) => std::env::set_var(DOT_AGENT_DECK_REGISTRATION_GENERATION, v),
-                None => std::env::remove_var(DOT_AGENT_DECK_REGISTRATION_GENERATION),
-            }
-            match prev_boot {
-                Some(v) => std::env::set_var(DOT_AGENT_DECK_DAEMON_BOOT_ID, v),
-                None => std::env::remove_var(DOT_AGENT_DECK_DAEMON_BOOT_ID),
-            }
+        for reply in [
+            line(SignalAck::accepted()),
+            line(SignalAck::refused("inbox_not_agent_process", "outside")),
+            AckReply::Socket(SocketReply::NoReply),
+            AckReply::Socket(SocketReply::Unreachable),
+            AckReply::NoPane,
+        ] {
+            let reply = ack_json(&reply);
+            assert_eq!(reply["acknowledged"], false, "{reply}");
+            assert_eq!(reply["final"], false, "{reply}");
+            assert!(reply["reason"].is_string(), "{reply}");
         }
     }
 }

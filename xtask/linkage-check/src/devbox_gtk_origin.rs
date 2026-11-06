@@ -1,9 +1,11 @@
 //! Issue #815: `scripts/devbox-check-gtk.sh` must reject a pkg-config answer
-//! that resolves Tauri's GTK stack outside `/nix/store`.
+//! that resolves the desktop crate's system libraries outside `/nix/store` —
+//! Tauri's GTK stack, and ALSA since PRD #802 M7 put `cpal` in that crate.
 //!
 //! That property is a RUNTIME one — the script either compares the resolved
 //! `libdir` against the store prefix or it does not, and no compile step can
-//! tell. It is the same shape CLAUDE.md rule 5 records for
+//! tell. It is the same shape `docs/develop/e2e-lanes.md` ("`--workspace` on all
+//! three aliases, and the fast-tier exceptions") records for
 //! `xtask/linkage-check/src/clean_tmp.rs` and `junit_strip.rs`: a script whose
 //! whole value is an assertion, which is exactly the class that stays green
 //! while doing nothing.

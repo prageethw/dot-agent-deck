@@ -54,7 +54,7 @@ fn remap_001_global_action_rebind() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Alt+Shift+l: Alt sends an ESC prefix; Shift+l is the uppercase
     // `L`. One write so crossterm decodes it as a single chord.
@@ -73,7 +73,7 @@ fn remap_001_global_action_rebind() {
     // order; a second toggle would have produced "Layout: stacked".
     deck.send_keys(b"\x14"); // Ctrl+t
     deck.send_keys(b"?"); // help (default binding, unchanged)
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
     assert!(
         !deck.snapshot_grid().contains("Layout: stacked"),
         "old default Ctrl+t still toggled the layout after the action was \
@@ -86,7 +86,7 @@ fn remap_001_global_action_rebind() {
 /// Scenario: Stage a `keybindings.toml` that rebinds the dashboard
 /// `help` action from `?` to `F1`, launch against the `minimal` fixture,
 /// and press `F1`. The help overlay should appear (it carries the
-/// "Create new pane" line).
+/// "Create new agent" line).
 #[spec("keybindings/remap/002")]
 #[test]
 fn remap_002_dashboard_action_rebind() {
@@ -100,15 +100,15 @@ fn remap_002_dashboard_action_rebind() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // F1 under TERM=xterm-256color is the SS3 sequence ESC O P.
     deck.send_keys(b"\x1bOP");
 
-    // The help overlay lists "Create new pane" among the global
+    // The help overlay lists "Create new agent" among the global
     // shortcuts. RED today: F1 is not bound to anything, so the overlay
     // never opens and this times out.
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
 }
 
 /// Scenario: Stage a `keybindings.toml` that tries to hijack `Ctrl+C`
@@ -133,7 +133,7 @@ fn safety_001_ctrl_c_always_quits() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Ctrl+C == 0x03.
     deck.send_keys(b"\x03");
@@ -168,7 +168,7 @@ fn safety_002_ctrl_c_survives_tab_nav_hijack() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Ctrl+C == 0x03.
     deck.send_keys(b"\x03");
@@ -197,7 +197,7 @@ fn unbind_001_empty_binding_is_noop() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Ctrl+n == 0x0e. With new_pane unbound this must do nothing; today
     // the deck ignores the config and Ctrl+n opens the directory picker.
@@ -208,7 +208,7 @@ fn unbind_001_empty_binding_is_noop() {
     // directory picker had opened (RED, today), `?` is swallowed and the
     // help overlay never appears, so this times out.
     deck.send_keys(b"?");
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
 
     // And the directory-picker chrome must be absent.
     assert!(
@@ -240,11 +240,11 @@ fn fallback_001_malformed_config() {
         .launch_with_fixture("minimal");
 
     // The deck still launches to its empty dashboard.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Default bindings still work: `?` opens the help overlay.
     deck.send_keys(b"?");
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
 
     // A warning mentioning "keybindings" is printed to stderr at startup
     // (merged into the PTY byte stream before the TUI clears the screen,
@@ -256,7 +256,7 @@ fn fallback_001_malformed_config() {
 
 /// Scenario: Seed a global `schedules.toml` (one enabled task, `kbsopen`) via
 /// `DOT_AGENT_DECK_SCHEDULES`, launch against the `minimal` fixture, and from
-/// the empty dashboard press the DEFAULT lowercase `s`. The "Scheduled Tasks"
+/// the empty dashboard press the DEFAULT lowercase `s`. The "Schedules"
 /// manager dialog must open — proving the dialog open-shortcut is routed
 /// through the keybinding registry with a case-insensitive default (lowercase
 /// `s` as well as `S`, like the registry's `t`/`T` and `l`/`L` pairs), rather
@@ -291,7 +291,7 @@ fn scheduler_001_lowercase_s_opens_manager() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Default lowercase `s` in dashboard command mode.
     deck.send_keys(b"s");
@@ -300,5 +300,104 @@ fn scheduler_001_lowercase_s_opens_manager() {
     // dialog's list (never the button bar), so its appearance proves the
     // manager dialog opened from the lowercase `s` press.
     deck.wait_for_string("kbsopen");
+    drop(dir);
+}
+
+/// Scenario: Launch the deck with a restored pane running `cat`, which opens
+/// focused, and type `tz` and Enter into it: `cat` echoes `tz` back and the
+/// layout does not change. Press `Ctrl+D` for command mode, then a plain `t`:
+/// the layout toggles and the bar says `Layout:`, as `Ctrl+t` would.
+#[spec("keybindings/letters/004")]
+#[test]
+fn letters_004_plain_letter_acts_in_command_mode_and_reaches_the_pane_program() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_continue_session("lp", "cat")
+        .launch_with_fixture("minimal");
+    // The restored pane opens focused: keys go to `cat`.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    // In the pane, `t` and `z` are the program's: the tty echoes the line as
+    // typed and `cat` prints it back, so it shows twice, and neither letter
+    // toggles the layout or zooms.
+    deck.send_bytes(b"tz\r");
+    deck.wait_until_grid("cat echoed the typed letters", |g| {
+        // A row of the pane is its text between the pane's `│` borders.
+        g.lines()
+            .filter(|line| line.split('│').any(|cell| cell.trim() == "tz"))
+            .count()
+            >= 2
+    });
+    assert!(
+        !deck.snapshot_grid().contains("Layout:"),
+        "a `t` typed into the pane toggled the layout\n{}",
+        deck.snapshot_grid()
+    );
+
+    // In command mode the same plain `t` is the layout toggle.
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
+    deck.send_bytes(b"t");
+    deck.wait_for_string("Layout:");
+}
+
+/// Scenario: Launch the deck with a restored pane running `cat`, which opens
+/// focused, and a seeded schedule. In the pane, type `ab` and press `Ctrl+R`:
+/// the pane's terminal reprints the line (`^R`), so the chord reached the
+/// program, and no rename opens. Press `Ctrl+D` for command mode, then
+/// `Ctrl+S`: the Schedules manager opens, as a plain `s` does.
+#[spec("keybindings/letters/007")]
+#[test]
+fn letters_007_ctrl_form_acts_in_command_mode_and_reaches_the_pane_program() {
+    let dir = common::harness_tempdir().expect("scratch tempdir");
+    let sched_path = dir.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        "[[scheduled_tasks]]\n\
+         name = \"ctrlsopen\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"ctrlsopen prompt\"\n\
+         enabled = true\n",
+    )
+    .expect("write fixture schedules.toml");
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_continue_session("lp", "cat")
+        .launch_with_fixture("minimal");
+    // The restored pane opens focused: keys go to `cat`.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    // `Ctrl+R` in the pane is the program's: the pane's line discipline
+    // answers it by reprinting the line, which it shows as `^R`.
+    deck.send_bytes(b"ab\x12");
+    deck.wait_until_grid("the pane's terminal reprinted the line on Ctrl+R", |g| {
+        g.contains("ab^R")
+    });
+    assert!(
+        !deck.snapshot_grid().contains("Rename: "),
+        "Ctrl+R in the pane opened a rename\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_bytes(b"\r");
+    deck.wait_until_grid("cat echoed the line", |g| {
+        g.lines()
+            .filter(|line| line.split('│').any(|cell| cell.trim() == "ab"))
+            .count()
+            >= 2
+    });
+    assert!(
+        !deck.snapshot_grid().contains("ctrlsopen"),
+        "the Schedules manager opened from the pane\n{}",
+        deck.snapshot_grid()
+    );
+
+    // In command mode the same kind of chord is the command.
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
+    deck.send_bytes(b"\x13"); // Ctrl+S
+    deck.wait_for_string("ctrlsopen");
     drop(dir);
 }

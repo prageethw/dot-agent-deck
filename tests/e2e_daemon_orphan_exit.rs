@@ -34,10 +34,11 @@ use spec::spec;
 /// Scenario: Launch `dot-agent-deck daemon serve` (idle shutdown DISABLED) from
 /// a short-lived intermediate `sh` parent that backgrounds it and records its
 /// pid, with `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED=1`. Wait for the daemon to bind
-/// its attach socket (watchdog armed), then SIGKILL the intermediate parent so
-/// the daemon is orphaned to init. Assert the daemon process terminates within
-/// a few seconds — proving the watchdog gracefully shuts an orphaned, otherwise
-/// never-exiting test daemon down instead of leaking it to PID 1.
+/// its attach socket with a bounded load-scaled startup wait (watchdog armed),
+/// then SIGKILL the intermediate parent so the daemon is orphaned to init.
+/// Assert the daemon process terminates within a few seconds — proving the
+/// watchdog gracefully shuts an orphaned, otherwise never-exiting test daemon
+/// down instead of leaking it to PID 1.
 #[spec("lifecycle/orphan-exit/001")]
 #[test]
 fn orphan_exit_001_orphaned_daemon_self_exits() {
@@ -90,9 +91,12 @@ fn orphan_exit_001_orphaned_daemon_self_exits() {
     let daemon_pid = read_pid().expect("daemon pid recorded");
 
     // Wait for the daemon to bind its attach socket — by then the watchdog has
-    // captured its original parent pid and is polling.
+    // captured its original parent pid and is polling. Startup is a fixture
+    // precondition, not the watchdog's shutdown budget; allow for I/O starvation.
     assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            attach_socket.exists()
+        }),
         "daemon never bound its attach socket"
     );
     assert!(
@@ -125,9 +129,9 @@ fn orphan_exit_001_orphaned_daemon_self_exits() {
 }
 
 /// Scenario: Start `dot-agent-deck daemon serve` with idle shutdown DISABLED and
-/// file logging pointed at a tempdir, wait for it to bind its attach socket,
-/// then send it a plain SIGTERM — the same signal `daemon stop` / `daemon
-/// restart` use. Assert the daemon exits within a few seconds AND that it left a
+/// file logging pointed at a tempdir, allow a bounded load-scaled wait for its
+/// attach socket, then send it a plain SIGTERM — the same signal `daemon stop` /
+/// `daemon restart` use. Assert the daemon exits within a few seconds AND that it left a
 /// log line naming the signal, so a daemon that vanishes mid-session is never
 /// again silent about why.
 #[spec("lifecycle/sigterm/001")]
@@ -166,7 +170,9 @@ fn sigterm_001_daemon_logs_and_exits_gracefully_on_sigterm() {
     // Bound the wait on readiness: once the attach socket exists the signal
     // handler is installed (both are set up before the hook loop runs).
     assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            attach_socket.exists()
+        }),
         "daemon never bound its attach socket"
     );
 
@@ -208,10 +214,10 @@ fn sigterm_001_daemon_logs_and_exits_gracefully_on_sigterm() {
     }
 }
 
-/// Scenario: Start a daemon, then send it TWO SIGTERMs in a row. The first
-/// begins graceful shutdown; the second must force an immediate exit with status
-/// 143 rather than being swallowed. Installing a handler replaces the default
-/// disposition process-wide, so without this escape hatch a wedged shutdown
+/// Scenario: Start a daemon with a bounded load-scaled readiness wait, then send
+/// it TWO SIGTERMs in a row. The first begins graceful shutdown; the second must
+/// leave the process gone rather than being swallowed. Installing a handler
+/// replaces the default disposition process-wide, so without this escape hatch a wedged shutdown
 /// could no longer be ended with `pkill` — which sends SIGTERM by default.
 #[spec("lifecycle/sigterm/002")]
 #[test]
@@ -245,7 +251,9 @@ fn sigterm_002_second_signal_forces_exit_instead_of_being_swallowed() {
 
     let daemon_pid = daemon.id() as i32;
     assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            attach_socket.exists()
+        }),
         "daemon never bound its attach socket"
     );
 
@@ -283,6 +291,146 @@ fn sigterm_002_second_signal_forces_exit_instead_of_being_swallowed() {
     );
     let _ = daemon.wait();
 
+    if common::process_running(daemon_pid) {
+        // SAFETY: best-effort cleanup kill.
+        unsafe {
+            libc::kill(daemon_pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Scenario: Start a real `daemon serve` with file logging and a bounded
+/// load-scaled readiness wait, ask it over its attach socket to start one agent
+/// carrying an orchestration `TabMembership` (so the daemon registers a real
+/// orchestration role for that pane), then send
+/// a plain SIGTERM. Assert the daemon's log names the pane, the role, the
+/// orchestration and the fact that the registration is gone for good — a stray
+/// signal must leave a record of what it destroyed, not just that it happened.
+#[spec("lifecycle/sigterm/003")]
+#[tokio::test]
+async fn sigterm_003_signal_shutdown_names_the_agents_and_roles_it_destroys() {
+    use dot_agent_deck::daemon_client::issue_command;
+    use dot_agent_deck::daemon_protocol::{AttachRequest, TabMembership};
+    use dot_agent_deck::platform::ipc::IpcStream;
+
+    const PANE: &str = "sched-issue-work-1109-r0";
+    const ORCHESTRATION: &str = "issue-work";
+    const ROLE: &str = "orchestrator";
+
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let dir = common::race_safe_tempdir();
+    let work = dir.path();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).expect("create HOME");
+    let attach_socket = work.join("attach.sock");
+    let hook_socket = work.join("hook.sock");
+    let state_dir = work.join("state");
+    let log_path = work.join("deck.log");
+
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let mut daemon = std::process::Command::new(bin)
+        .arg("daemon")
+        .arg("serve")
+        .env_clear()
+        .env("PATH", &path_env)
+        .env("HOME", &home)
+        .env("DOT_AGENT_DECK_SOCKET", &hook_socket)
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", &attach_socket)
+        .env("DOT_AGENT_DECK_STATE_DIR", &state_dir)
+        // Only the signal handler may end this daemon — an idle shutdown would
+        // drain the registry first and the disclosure would have nothing left
+        // to name, which is the false green `lifecycle/teardown-inventory/002`
+        // pins from the other side.
+        .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
+        .env("DOT_AGENT_DECK_LOG", &log_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn `dot-agent-deck daemon serve`");
+
+    let daemon_pid = daemon.id() as i32;
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            attach_socket.exists()
+        }),
+        "daemon never bound its attach socket"
+    );
+
+    // One agent, registered as an orchestration role by the production
+    // `StartAgent` handler — the same path `spawn` takes. A stand-in command,
+    // because the disclosure reads the registry and the role maps and neither
+    // cares what the child is.
+    let stream = IpcStream::connect(&attach_socket)
+        .await
+        .expect("connect to the attach socket");
+    let (mut rd, mut wr) = stream.into_split();
+    let resp = issue_command(
+        &mut rd,
+        &mut wr,
+        &AttachRequest::StartAgent {
+            command: Some("sleep 60".into()),
+            cwd: Some(work.display().to_string()),
+            display_name: Some(ROLE.into()),
+            rows: 24,
+            cols: 80,
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE.into())],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: ORCHESTRATION.to_string(),
+                role_index: 0,
+                role_name: ROLE.to_string(),
+                is_start_role: true,
+                orchestration_cwd: Some(work.display().to_string()),
+                display_title: None,
+                orchestration_id: Some("inst-1109".to_string()),
+            }),
+            agent_type: None,
+            seed: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
+            isolated_clone_origin: None,
+        },
+    )
+    .await
+    .expect("start-agent round trip");
+    assert!(resp.ok, "start-agent failed: {:?}", resp.error);
+    drop(rd);
+    drop(wr);
+
+    // The behaviour under test: a plain SIGTERM, exactly what a stray
+    // `pkill -f "daemon serve"` delivers.
+    // SAFETY: kill(2) with a real pid and SIGTERM; ESRCH/EPERM are ignored.
+    unsafe {
+        libc::kill(daemon_pid, libc::SIGTERM);
+    }
+    assert!(
+        common::wait_until(Duration::from_secs(20), || !common::process_running(
+            daemon_pid
+        )),
+        "daemon (pid {daemon_pid}) did not exit on SIGTERM"
+    );
+    let _ = daemon.wait();
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    for expected in [
+        "terminating 1 managed agent(s)",
+        "destroying 1 orchestration role registration(s)",
+        PANE,
+        ROLE,
+        ORCHESTRATION,
+        "can never delegate again",
+    ] {
+        assert!(
+            log.contains(expected),
+            "the signal shutdown must name {expected:?}. Issue #1109: the signal \
+             path deliberately does NOT refuse — a refused SIGTERM is escalated \
+             to SIGKILL by its sender — so the record it leaves is the whole \
+             mitigation, and #428's occurrence #5 needed log archaeology \
+             precisely because this line named nothing.\nlog was:\n{log}"
+        );
+    }
+
+    // Defensive: never leak the daemon out of the test.
     if common::process_running(daemon_pid) {
         // SAFETY: best-effort cleanup kill.
         unsafe {

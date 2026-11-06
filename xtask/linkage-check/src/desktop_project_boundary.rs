@@ -1,4 +1,4 @@
-//! PRD #819 M7 — check 12: a regression tripwire over the desktop crate's
+//! PRD #819 M7 — rule 12: a regression tripwire over the desktop crate's
 //! production sources.
 //!
 //! # What this is, and what it is NOT
@@ -60,8 +60,9 @@
 //!    remove: on a remote daemon it resolves against the wrong filesystem and
 //!    is silently wrong.
 //!
-//! **Measured, not assumed.** Rule 5's note is that linkage-check's assertions
-//! are runtime-only — the compile half is already covered by
+//! **Measured, not assumed.** `docs/develop/e2e-lanes.md`'s note ("`--workspace`
+//! on all three aliases, and the fast-tier exceptions") is that linkage-check's
+//! assertions are runtime-only — the compile half is already covered by
 //! `cargo clippy --workspace --all-targets`, so a rule gutted to `Vec::new()`
 //! stays green. Appending an aliased import, an aliased call, a `format!`-wrapped
 //! `.dot-agent-deck.toml` and a `std::env::current_dir()` to
@@ -102,7 +103,7 @@ pub const DESKTOP_BOUNDARY_RULE: &str = "client-side project resolution in the d
      against a filesystem (PRD #819). This is a regression TRIPWIRE, not enforcement and not a \
      security boundary: the desktop path-depends on the whole root crate, so a wrapper with an \
      innocuous name bypasses it. Ask the daemon (list-projects / resolve-project / \
-     prepare-workflow) instead of reading the project here";
+     prepare-orchestration) instead of reading the project here";
 
 /// The **positive** boundary: root-crate modules the production desktop may
 /// reach across.
@@ -114,15 +115,148 @@ pub const DESKTOP_BOUNDARY_RULE: &str = "client-side project resolution in the d
 const ALLOWED_ROOT_MODULES: &[&str] = &[
     "agent_pty",
     "agent_registry",
+    // PRD #1223 M7, argued rather than added quietly. The desktop names ONE
+    // item here, `AuthoringKind` — the closed wire enum `StartAgent`'s
+    // `authoring_kind` carries — because `DaemonClient::start_authoring_agent`
+    // takes it, and because decoding the webview's kind straight into it is
+    // what makes an unknown kind a decode error rather than a plain start with
+    // no seed. A desktop-side copy of the enum would be a second list to keep
+    // in step with the daemon's.
+    //
+    // The module's seed text and `compose_*_seed` functions are NOT something
+    // the desktop calls: the daemon composes and delivers the seed (PRD #1223's
+    // "the seeds move to the daemon"), so a desktop call to them would be the
+    // drift #1043 describes even though it crosses none of this rule's lines.
+    // Checked against those lines: the module resolves no project, reads no
+    // file at all, names no FORBIDDEN_SYMBOL or project-state literal, and
+    // contains no `std::env::current_dir` — all zero for it.
+    "authoring_seeds",
     "build_id",
     "config",
     "daemon_attach",
     "daemon_client",
     "daemon_protocol",
+    // Issue #1490, argued rather than added quietly. `daemon_start` is the ONE
+    // start procedure and the ONE "why is this deck not connected" decision
+    // every client calls (PRD #1487's D1, applied to starting), so the
+    // desktop's Start daemon has to reach it — a desktop-side copy of the
+    // probe, the Start-versus-Reconnect rule or the failure classification is
+    // the second copy of a policy the module exists to keep single. The
+    // desktop names `DisconnectedReason`, `StartOutcome` and its problem
+    // types, and `start_local` / `start_remote` with their probes. It starts a
+    // daemon, it does not resolve a project: a local deck is probed at its
+    // socket and started through `daemon_attach`'s lazy-spawn (already
+    // allowlisted), a remote one over ssh through `remote_daemon`'s
+    // `SshDaemonPort` (allowlisted below). Checked
+    // against this rule's lines: the module resolves no project, reads no
+    // project state file, names no FORBIDDEN_SYMBOL or project-state literal,
+    // and contains no `std::env::current_dir` — all zero for it.
+    "daemon_start",
     "daemon_stop",
+    // PRD #1487 M5, argued rather than added quietly. `daemon_upgrade` is the
+    // ONE upgrade procedure every client calls (the PRD's D1: no client
+    // carries its own upgrade policy), so the desktop's Upgrade and Replace
+    // daemon have to reach it — a desktop-side copy of the procedure, the
+    // newer-only offer rule or the outcome type is exactly the third copy of a
+    // policy about stopping somebody's agents that the PRD exists to prevent.
+    // The desktop names its result and progress types, `upgrade_offer`, the
+    // `RestartDecider` seam it answers through a dialog, and the production
+    // installers and daemon ports. Checked against this rule's lines: the
+    // module resolves no project, reads no project state file, names no
+    // FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it. (It calls
+    // `std::env::current_exe` once, in `NoInstall`, to name the client's own
+    // binary; that is not a project read.)
+    "daemon_upgrade",
+    // Issue #1350, argued rather than added quietly. `deck_list` reads and
+    // edits `remotes.toml`, the user's list of WHICH daemons to connect to —
+    // the CLI's `connect` registry, which the desktop now shares as its deck
+    // list. That list is the client's by definition: it names the daemons, so
+    // no daemon can be asked for it, and a daemon holding it would have to be
+    // reached before the client knew where it was. It is not a project either:
+    // the file is a per-user config file resolved from the user's config
+    // directory (or `DOT_AGENT_DECK_REMOTES`), never from a project directory.
+    //
+    // CLAUDE.md rule 18 and #1350 put the format in ONE library in the root
+    // crate so the two clients cannot drift; a desktop-side copy of it would be
+    // the second list this rule's neighbours exist to prevent. Checked against
+    // this rule's lines: the module resolves no project, reads no project state
+    // file, names no FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "deck_list",
     "event",
+    // Issue #1198, argued rather than added quietly. The desktop names two
+    // things here: the six `show_desktop_*` wrappers, one per surface the
+    // app hides behind the `experimental` flag (CLAUDE.md rule 9 puts every
+    // gate behind a wrapper in this module, so a desktop-side copy of the
+    // flag read would be the second list the rule exists to prevent), and
+    // `init_from_process_env`, which resolves the flag for this process.
+    //
+    // That entry point is the one the desktop may call, and it crosses none
+    // of this rule's lines: it reads `DOT_AGENT_DECK_EXPERIMENTAL` and the
+    // file `DOT_AGENT_DECK_FEATURES_CONFIG` names outright, takes no project
+    // directory, walks nowhere and never calls `std::env::current_dir`.
+    //
+    // The module ITSELF is not that clean, and saying so is the point of
+    // arguing the entry: `init_and_watch` — the TUI's and the daemon's entry
+    // point — resolves the flag against a project directory its caller walked
+    // to, and a desktop call to it would be the client-side project read PRD
+    // #819 removed. The first commit that wired the desktop did exactly that
+    // (with a `current_dir` walk, which the `cwd-fallback` finding caught).
+    // With this entry allowlisted, a desktop call to `init_and_watch` is the
+    // "root-crate wrapper with an innocuous name" residual this file's header
+    // already admits: nothing here would catch it.
+    "features",
+    // Issue #1635, argued rather than added quietly, with `self_upgrade`
+    // below. The desktop names ONE item here, `capture_login_shell_path`: a
+    // GUI app's own `PATH` usually lacks the user's shell setup, so finding the
+    // `dot-agent-deck` CLI installed beside the app, and the `brew`, `gh` and
+    // `pkexec` an upgrade uses, needs the login shell's `PATH`. It is the same
+    // capture the daemon runs at start; a desktop-side copy would be a second
+    // copy of the `-ilc` sentinel parsing. It runs the user's `$SHELL`, which
+    // reads the user's own dotfiles and no project's. Checked against this
+    // rule's lines: it resolves no project, reads no project state file, names
+    // no FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "login_shell",
     "platform",
-    "prompt_delivery",
+    // PRD #1401, argued rather than added quietly. The desktop names
+    // `PullRequestInfo` here — the type `SessionSnapshot.pull_request` carries,
+    // which `dto::DesktopAgent` copies through to the webview as is — so the
+    // pull request badge has one shape on both clients. The module is the
+    // value's shape and nothing else, split out of `pull_request` for exactly
+    // this rule: `pull_request` is the daemon's resolver, which runs `git` and
+    // `gh` against each session's working directory, and stays off this list.
+    // Checked against this rule's lines: three serde types, no function, no
+    // I/O, no project, no FORBIDDEN_SYMBOL or project-state literal, and no
+    // `std::env::current_dir` — all zero for it.
+    "pull_request_info",
+    // PRD #1497, argued rather than added quietly. Reading mode names ONE item
+    // here, `NOTIFICATION_TYPE_METADATA_KEY`: it tells a Claude-shaped
+    // permission prompt from the other `WaitingForInput` notifications on the
+    // agent's status stream, so a permission prompt is announced and an idle
+    // reminder is not. A desktop-side copy of the key's spelling would be a
+    // second copy to keep in step with the hook that writes it. Checked
+    // against this rule's lines: the module holds metadata keys, reason types
+    // and the rule for lifting a block; it resolves no project, reads no file
+    // at all, names no FORBIDDEN_SYMBOL or project-state literal, and contains
+    // no `std::env::current_dir` — all zero for it.
+    "quota_block",
+    // PRD #1542, argued rather than added quietly. The desktop names the
+    // pending-question model the daemon carries on the snapshot
+    // (`PendingQuestion` and its parts, read to project it for the webview),
+    // the `QuestionAnswer` an `AnswerQuestion` sends, the `AnswerRefusal` it
+    // can come back with, and three bounds (`MAX_QUESTIONS`, `MAX_OPTIONS`,
+    // `MAX_ANSWER_TEXT_CHARS`) its IPC boundary checks a form against. These
+    // are wire types and their limits: a desktop-side copy would be a second
+    // definition of the contract to keep in step with the daemon's (CLAUDE.md
+    // rule 18). The module's producer helpers (`claude_permission_request` and
+    // the rest) build questions from hook payloads and are the daemon's and the
+    // hook's to call, not the desktop's. Checked against this rule's lines: the
+    // module resolves no project, reads no file, names no FORBIDDEN_SYMBOL or
+    // project-state literal, and contains no `std::env::current_dir` — all
+    // zero for it.
+    "question",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings
     // schema is built from this module's validating ssh-argument newtypes
     // (`Hostname`, `SshUser`, `KeyPath`, `HostAlias`, `RemoteSocketPath`), and
@@ -160,9 +294,45 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // project, reads a project state file, names a FORBIDDEN_SYMBOL, or
     // contains `std::env::current_dir` — checked, both are zero for it.
     "remote",
+    // PRD #1487 M5, argued with `daemon_upgrade` above: `SshDaemonPort`, the
+    // remote half of the upgrade, reaches a remote machine's daemon by running
+    // that machine's freshly installed binary over the deck list's own ssh
+    // route. It reads no local file at all; checked against this rule's lines,
+    // all zero for it.
+    "remote_daemon",
     "remote_doctor",
+    // Issue #1635, argued rather than added quietly. `self_upgrade` is the ONE
+    // implementation of upgrading this machine's own copies — install
+    // detection, the plan and every sentence a client shows about it,
+    // verification and execution — so the TUI, `dot-agent-deck upgrade` and
+    // the desktop's upgrade dialog say the same thing in the same words
+    // (CLAUDE.md rule 22). A desktop-side copy would be the second copy of a
+    // policy about replacing executables, which is exactly what the module
+    // exists to prevent. It reads the running executable's path, the release
+    // checksum manifests and the files it stages under the deck's state
+    // directory; it resolves no project. Checked against this rule's lines: it
+    // reads no project state file, names no FORBIDDEN_SYMBOL or project-state
+    // literal, and contains no `std::env::current_dir` — all zero for it.
+    "self_upgrade",
     "state",
-    "ui",
+    // PRD #1666, argued rather than added quietly. The desktop names ONE item
+    // here, `truncate_on_char_boundary`, the byte bound it puts on a host
+    // metrics disk role (PRD #1258); it lived in `prompt_delivery`, which PRD
+    // #1666 deleted with the typed delivery it served, and it moved here.
+    // Checked against this rule's lines: string functions only — no I/O, no
+    // project, no FORBIDDEN_SYMBOL or project-state literal, and no
+    // `std::env::current_dir` — all zero for it.
+    "submitted_prompt",
+    // PRD #1401, argued rather than added quietly. The desktop's Open in
+    // browser hands the page to `system_browser::open_with_platform_opener`,
+    // the same watched launch the TUI's `o` uses, so a platform opener that
+    // exits non-zero is a failure in both clients rather than a success in
+    // one of them (CLAUDE.md rule 22). Checked against this rule's lines: the
+    // module validates a URL and spawns a browser or the platform opener on
+    // it; it resolves no project, reads no file outside its tests, names no
+    // FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "system_browser",
     // PRD #741 M7, argued rather than added quietly.
     // `untrusted_text::strip_control_and_bidi` is the policy the connection
     // footer applies to a settings-supplied endpoint label: `dto::safe_message`
@@ -266,9 +436,10 @@ impl Finding {
 /// and `prepare_orchestrator_prompt` calls behind them, the
 /// `.dot-agent-deck.toml` and `orchestrator-context.md` literals they spelled,
 /// and `desktop_project_cwd()`'s `std::env::current_dir` guess. M6 replaced the
-/// pair with the daemon's `prepare-workflow` verb and deleted the function, so
-/// every one of them matched nothing and the forcing function below took the
-/// check red until they went with it — which is exactly what it is for.
+/// pair with the daemon's `prepare-workflow` verb (since #1045
+/// `prepare-orchestration`) and deleted the function, so every one of them
+/// matched nothing and the forcing function below took the check red until they
+/// went with it — which is exactly what it is for.
 ///
 /// **Keep it empty.** A new entry is a new client-side project read being
 /// excused rather than fixed, and the excuse outlives whoever wrote it. If a
@@ -284,8 +455,8 @@ pub fn run(root: &Path) -> Vec<String> {
     // and `resurrected_changelog_fragment.rs`'s own self-tests, which drive
     // the real `xtask-linkage-check` binary against a throwaway tempdir with
     // only a `[workspace]` `Cargo.toml` and a `tests/` directory), not a
-    // dot-agent-deck checkout whose desktop crate moved. That is check 16's
-    // and checks 14/15's own "precondition does not apply here" skip, not a
+    // dot-agent-deck checkout whose desktop crate moved. That is rule 22's
+    // and rules 20/21's own "precondition does not apply here" skip, not a
     // failure — matches `fork_declined_items::run`'s `.dot-agent-deck.toml`
     // handling. `desktop/src-tauri/src` specifically going missing while
     // `desktop/` itself is present IS the real regression this rule exists to
@@ -302,7 +473,7 @@ pub fn run(root: &Path) -> Vec<String> {
     let dir = root.join(DESKTOP_SRC);
     if !dir.is_dir() {
         return vec![format!(
-            "{DESKTOP_SRC} is missing — check 12 covers nothing. If the desktop crate moved, move \
+            "{DESKTOP_SRC} is missing — rule 12 covers nothing. If the desktop crate moved, move \
              this rule with it; do not leave it pointing at a path that no longer exists"
         )];
     }
@@ -325,7 +496,7 @@ pub fn run(root: &Path) -> Vec<String> {
         match violations(&display, &text) {
             Ok(found) => findings.extend(found),
             Err(e) => failures.push(format!(
-                "failed to parse {display} as Rust: {e} — check 12 cannot see a file it cannot \
+                "failed to parse {display} as Rust: {e} — rule 12 cannot see a file it cannot \
                  parse, so this is a failure rather than a skip"
             )),
         }
@@ -442,7 +613,7 @@ impl Scan {
     /// [`TokenStream`], so neither [`Visit::visit_lit_str`] nor
     /// [`Visit::visit_path`] ever sees inside one — and the desktop's project
     /// prose lives almost entirely inside `format!`. Measured: without this,
-    /// check 12 found **zero** of `lib.rs`'s project-state literals.
+    /// rule 12 found **zero** of `lib.rs`'s project-state literals.
     ///
     /// This walks the tokens rather than expanding the macro. String literals
     /// are checked as literals; runs of `ident (:: ident)*` are reassembled and
@@ -577,7 +748,7 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {}
 }
 
-fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
+pub(crate) fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
     Some(match item {
         syn::Item::Const(i) => &i.attrs,
         syn::Item::Enum(i) => &i.attrs,
@@ -598,7 +769,7 @@ fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
     })
 }
 
-fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
+pub(crate) fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
     Some(match item {
         syn::ImplItem::Const(i) => &i.attrs,
         syn::ImplItem::Fn(i) => &i.attrs,
@@ -622,7 +793,7 @@ fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
 /// PRODUCTION block as test-only and silently dropped it from the scan — the
 /// exact fail-open direction this module's docs promise to avoid. Only a bare
 /// `test` **path** counts now; a string literal's contents never do.
-fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
             return false;
@@ -693,8 +864,8 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Rule 5's note: linkage-check's assertions are RUNTIME-only — the compile
-    /// half is already covered by `cargo clippy --workspace --all-targets`, so a
+    /// `docs/develop/e2e-lanes.md`'s note: linkage-check's assertions are
+    /// RUNTIME-only — the compile half is already covered by `cargo clippy --workspace --all-targets`, so a
     /// rule gutted to `Vec::new()` stays green without these.
     fn kinds(display: &str, src: &str) -> Vec<(String, String)> {
         violations(display, src)

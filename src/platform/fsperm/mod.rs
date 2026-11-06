@@ -25,20 +25,86 @@ mod windows;
 #[cfg(unix)]
 pub use unix::{
     create_owner_only_dir, ensure_owner_only_dir, set_create_mode_owner_only,
-    set_endpoint_mode_owner_only, set_file_owner_only, verify_endpoint_trusted, with_socket_umask,
+    set_create_mode_owner_only_readable, set_endpoint_mode_owner_only, set_file_owner_only,
+    verify_endpoint_trusted, with_socket_umask,
 };
-// The Windows list carries three extras with no Unix counterpart to export —
+// The Windows list carries extras with no Unix counterpart to export —
 // `pipe_security_descriptor` / `OwnedSecurityDescriptor` /
 // `verify_object_owner_is_current_user`, which together close PRD #163's
 // [BLOCKER]. On Unix those same two properties *are* the socket's 0o600 mode and
-// `verify_endpoint_trusted`'s `stat`, so there is nothing to name.
+// `verify_endpoint_trusted`'s `stat`, so there is nothing to name. Likewise
+// `verify_file_owner_is_current_user`, whose Unix counterpart is a caller's own
+// `metadata.uid()` comparison.
 #[cfg(windows)]
 pub use windows::{
     OwnedSecurityDescriptor, create_owner_only_dir, ensure_owner_only_dir,
-    pipe_security_descriptor, set_create_mode_owner_only, set_endpoint_mode_owner_only,
-    set_file_owner_only, verify_endpoint_trusted, verify_object_owner_is_current_user,
-    with_socket_umask,
+    pipe_security_descriptor, set_create_mode_owner_only, set_create_mode_owner_only_readable,
+    set_endpoint_mode_owner_only, set_file_owner_only, verify_endpoint_trusted,
+    verify_file_owner_is_current_user, verify_object_owner_is_current_user, with_socket_umask,
 };
+// Windows-only, for the receipt spool's trusted traversal (PRD #1666): a
+// directory created with its owner-only DACL in the same call, the stored DACL
+// read back from a handle, and the check that refuses anything wider. Their
+// Unix counterparts are `mkdirat(…, 0o700)` and an `fstat` mode check, which
+// the spool does itself.
+#[cfg(all(windows, test))]
+pub(crate) use windows::read_dacl;
+#[cfg(windows)]
+pub(crate) use windows::{create_dir_owner_only, verify_dacl_owner_only};
+
+/// An access-allowed ACE (`ACCESS_ALLOWED_ACE_TYPE`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const ACE_ALLOWED: u8 = 0;
+/// An access-denied ACE (`ACCESS_DENIED_ACE_TYPE`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const ACE_DENIED: u8 = 1;
+
+/// One ACE of a stored DACL: its type and, for an allow or deny ACE, its
+/// trustee's canonical SID string.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AceSummary {
+    pub(crate) kind: u8,
+    pub(crate) sid: String,
+}
+
+/// A stored DACL as data: whether one is present at all (a NULL DACL grants
+/// everyone everything), whether it is protected from inheritance, and its
+/// ACEs in order.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaclSummary {
+    pub(crate) present: bool,
+    pub(crate) protected: bool,
+    pub(crate) aces: Vec<AceSummary>,
+}
+
+/// Decide whether a stored DACL is owner-only (PRD #1666 §3): present,
+/// protected, and granting access to `our_sid` alone. A deny ACE only removes
+/// access, so it is accepted; any other ACE type is refused because it cannot
+/// be vouched for. The pure-data core of the spool's Windows directory check,
+/// testable on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn dacl_is_owner_only(dacl: &DaclSummary, our_sid: &str) -> Result<(), String> {
+    if our_sid.is_empty() {
+        return Err("the current user's SID is empty".to_string());
+    }
+    if !dacl.present {
+        return Err("it has no DACL, which grants everyone access".to_string());
+    }
+    if !dacl.protected {
+        return Err("its DACL is not protected, so it inherits its parent's ACEs".to_string());
+    }
+    for ace in &dacl.aces {
+        match ace.kind {
+            ACE_ALLOWED if ace.sid.eq_ignore_ascii_case(our_sid) => {}
+            ACE_ALLOWED => return Err(format!("its DACL grants access to {}", ace.sid)),
+            ACE_DENIED => {}
+            other => return Err(format!("its DACL holds an ACE of type {other}")),
+        }
+    }
+    Ok(())
+}
 
 /// Decide whether an endpoint owned by `owner_sid` is trusted, given that we are
 /// `our_sid` (PRD #163 M4). Both are canonical SID strings (`S-1-5-21-…`).
@@ -67,6 +133,43 @@ pub(crate) fn endpoint_owner_is_trusted(owner_sid: &str, our_sid: &str) -> Resul
         ));
     }
     Ok(())
+}
+
+/// Decide whether a **file the process created with a default security
+/// descriptor** is ours, given its owner SID, our user SID and our token's
+/// default owner SID (`TokenOwner`). All canonical SID strings.
+///
+/// [`endpoint_owner_is_trusted`] accepts only the user SID, which is right for
+/// the pipe and the spawn mutex because both are created with an explicit
+/// `O:<our-sid>`. A file written without one is owned by the token's default
+/// owner instead, and under an elevated administrator token that is
+/// `BUILTIN\Administrators`, so the user-SID rule refuses our own file. This
+/// accepts either SID and nothing else. It stays a real check because Windows
+/// lets a process set an object's owner only to its user SID or to a group its
+/// token marks as owner-assignable (an arbitrary owner needs
+/// `SeRestorePrivilege`). Administrators is owner-assignable only in an elevated
+/// administrator token, which already outranks the daemon's user. For an
+/// ordinary token the default owner *is* the user SID, so this is exactly
+/// [`endpoint_owner_is_trusted`].
+///
+/// Fails closed: an empty owner or user SID is refused, and an empty default
+/// owner adds nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn file_owner_is_trusted(
+    owner_sid: &str,
+    our_sid: &str,
+    default_owner_sid: &str,
+) -> Result<(), String> {
+    match endpoint_owner_is_trusted(owner_sid, our_sid) {
+        Ok(()) => Ok(()),
+        Err(_)
+            if !default_owner_sid.is_empty()
+                && owner_sid.eq_ignore_ascii_case(default_owner_sid) =>
+        {
+            Ok(())
+        }
+        Err(reason) => Err(reason),
+    }
 }
 
 /// How a permission site upholds its security property on Windows.
@@ -148,6 +251,17 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
         ),
     },
     PermissionSite {
+        function: "set_create_mode_owner_only_readable",
+        unix: "the same OpenOptionsExt::mode(0o600); read access comes from .read(true), which \
+               the mode does not touch",
+        windows: WindowsCounterpart::Enforced(
+            "OpenOptionsExt::access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC) — the \
+             write-only mask plus the read a caller needs to inspect a file before rewriting it \
+             on the same handle (issue #331). WRITE_DAC is kept, so set_file_owner_only still \
+             applies the DACL before the first content byte, with the same empty-file residual.",
+        ),
+    },
+    PermissionSite {
         function: "set_file_owner_only",
         unix: "fchmod(0o600) on the open handle, re-asserted before the atomic rename",
         windows: WindowsCounterpart::Enforced(
@@ -167,8 +281,11 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
     },
     PermissionSite {
         function: "verify_endpoint_trusted",
-        unix: "stat: is a socket, owned by our uid, mode 0o600 — out-of-band, because the \
-               connect that follows is unguarded",
+        unix: "lstat: is a socket (never a symlink), owned by our uid, mode 0o600 — out-of-band, \
+               ahead of the connect. Since issue #1121 the connect itself is guarded too: a \
+               peer-uid refusal (SO_PEERCRED / getpeereid) is welded into all three entry \
+               points (IpcStream::connect, IpcClient::connect, IpcClient::connect_timeout), \
+               which is what covers the replacement window a pathname check cannot",
         windows: WindowsCounterpart::Enforced(
             "GetSecurityInfo on the pipe handle compares the server's owner SID with ours. Also \
              welded into BOTH client entry points (IpcStream::connect and IpcClient::connect), \
@@ -199,6 +316,7 @@ mod tests {
         let _: fn(&Path) -> std::io::Result<()> = ensure_owner_only_dir;
         let _: fn(&Path) -> std::io::Result<()> = create_owner_only_dir;
         let _: fn(&mut std::fs::OpenOptions) = set_create_mode_owner_only;
+        let _: fn(&mut std::fs::OpenOptions) = set_create_mode_owner_only_readable;
         let _: fn(&std::fs::File) -> std::io::Result<()> = set_file_owner_only;
         let _: fn(&Path) -> std::io::Result<()> = set_endpoint_mode_owner_only;
         let _: fn(&Path) -> Result<(), String> = verify_endpoint_trusted;
@@ -206,7 +324,7 @@ mod tests {
 
         assert_eq!(
             SITE_AUDIT.len(),
-            7,
+            8,
             "every exported fsperm seam function needs exactly one audit row"
         );
         for site in SITE_AUDIT {
@@ -285,5 +403,80 @@ mod tests {
         assert!(endpoint_owner_is_trusted("", SID).is_err());
         assert!(endpoint_owner_is_trusted(SID, "").is_err());
         assert!(endpoint_owner_is_trusted("", "").is_err());
+    }
+
+    fn dacl(present: bool, protected: bool, aces: &[(u8, &str)]) -> DaclSummary {
+        DaclSummary {
+            present,
+            protected,
+            aces: aces
+                .iter()
+                .map(|(kind, sid)| AceSummary {
+                    kind: *kind,
+                    sid: sid.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The spool's Windows directory check accepts a present, protected DACL
+    /// that grants access to us alone (a deny ACE only narrows it).
+    #[test]
+    fn an_owner_only_protected_dacl_is_accepted() {
+        dacl_is_owner_only(&dacl(true, true, &[(ACE_ALLOWED, SID)]), SID).expect("owner only");
+        dacl_is_owner_only(
+            &dacl(true, true, &[(ACE_DENIED, OTHER_SID), (ACE_ALLOWED, SID)]),
+            SID,
+        )
+        .expect("a deny ACE only removes access");
+        dacl_is_owner_only(&dacl(true, true, &[]), SID).expect("an empty protected DACL");
+    }
+
+    /// …and refuses a missing or inheriting DACL, another principal's allow
+    /// ACE, any ACE type it cannot vouch for, and an unknown "us".
+    #[test]
+    fn a_wider_or_inheriting_dacl_is_refused() {
+        assert!(dacl_is_owner_only(&dacl(false, true, &[]), SID).is_err());
+        assert!(dacl_is_owner_only(&dacl(true, false, &[(ACE_ALLOWED, SID)]), SID).is_err());
+        let err = dacl_is_owner_only(
+            &dacl(true, true, &[(ACE_ALLOWED, SID), (ACE_ALLOWED, OTHER_SID)]),
+            SID,
+        )
+        .expect_err("another user's allow ACE");
+        assert!(err.contains(OTHER_SID), "{err}");
+        assert!(dacl_is_owner_only(&dacl(true, true, &[(ACE_ALLOWED, "S-1-1-0")]), SID).is_err());
+        assert!(dacl_is_owner_only(&dacl(true, true, &[(9, SID)]), SID).is_err());
+        assert!(dacl_is_owner_only(&dacl(true, true, &[(ACE_ALLOWED, SID)]), "").is_err());
+    }
+
+    /// `BUILTIN\Administrators`, the default owner of an elevated admin token.
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+
+    /// A file we created is owned by our user SID under an ordinary token and by
+    /// the token's default owner under an elevated one; both are ours.
+    #[test]
+    fn file_owner_trust_accepts_our_sid_or_our_token_default_owner() {
+        file_owner_is_trusted(SID, SID, SID).expect("an ordinary token's own file");
+        file_owner_is_trusted(ADMINISTRATORS, SID, ADMINISTRATORS)
+            .expect("an elevated token's own file is owned by its default owner");
+        file_owner_is_trusted(SID, SID, ADMINISTRATORS)
+            .expect("a file an unelevated run of the same user wrote");
+        file_owner_is_trusted(&ADMINISTRATORS.to_lowercase(), SID, ADMINISTRATORS)
+            .expect("case must not matter");
+    }
+
+    /// Anything else is refused: a foreign user's file, an Administrators-owned
+    /// file when our token does not default to Administrators, and every
+    /// missing value.
+    #[test]
+    fn file_owner_trust_refuses_any_other_owner() {
+        let err = file_owner_is_trusted(OTHER_SID, SID, ADMINISTRATORS)
+            .expect_err("a foreign user's file must fail");
+        assert!(err.contains(OTHER_SID), "{err}");
+        assert!(file_owner_is_trusted(ADMINISTRATORS, SID, SID).is_err());
+        assert!(file_owner_is_trusted("", SID, SID).is_err());
+        assert!(file_owner_is_trusted("", SID, "").is_err());
+        assert!(file_owner_is_trusted(SID, "", "").is_err());
+        assert!(file_owner_is_trusted(OTHER_SID, SID, "").is_err());
     }
 }

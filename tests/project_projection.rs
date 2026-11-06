@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 
 use dot_agent_deck::daemon_protocol::AttachResponse;
 use dot_agent_deck::event::{
-    KnownProject, PreparedWorkflow, ProjectListing, ProjectOrchestration, ProjectRole,
+    KnownProject, PreparedOrchestration, ProjectListing, ProjectOrchestration, ProjectRole,
     ResolvedProject,
 };
 use serde::Serialize;
@@ -110,18 +110,18 @@ fn projection_types_round_trip_through_serde() {
     let decoded: ResolvedProject = serde_json::from_str(&encoded).expect("deserialize");
     assert_eq!(decoded, resolved);
 
-    let prepared = PreparedWorkflow {
-        context_path: "/home/dev/project/.dot-agent-deck/orchestrator-context.md".into(),
+    let prepared = PreparedOrchestration {
+        context_path: "/home/dev/project/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md".into(),
         // PRD #819 M6 added `path` and `prompt`: the canonical directory the
         // preparation resolved to, and the one-liner the client injects. Both
         // are additive response fields, so they round-trip like the rest.
         path: "/home/dev/project".into(),
         token: "prep-abc123".into(),
         roles: vec![sample_role()],
-        prompt: "Read .dot-agent-deck/orchestrator-context.md for your role.".into(),
+        prompt: "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md for your role.".into(),
     };
-    let encoded = serde_json::to_string(&prepared).expect("serialize PreparedWorkflow");
-    let decoded: PreparedWorkflow = serde_json::from_str(&encoded).expect("deserialize");
+    let encoded = serde_json::to_string(&prepared).expect("serialize PreparedOrchestration");
+    let decoded: PreparedOrchestration = serde_json::from_str(&encoded).expect("deserialize");
     assert_eq!(decoded, prepared);
 }
 
@@ -165,7 +165,6 @@ fn older_peer_reply_without_the_new_fields_still_deserializes() {
 
     assert!(decoded.ok);
     assert_eq!(decoded.server_version, Some(8));
-    assert_eq!(decoded.guarded_send, Some(true));
     assert!(decoded.projects.is_none());
     assert!(decoded.project.is_none());
     assert!(decoded.workflow_prepared.is_none());
@@ -217,12 +216,12 @@ fn attach_response_round_trips_the_new_fields() {
         primary: None,
     });
     resp.project = Some(sample_resolved());
-    resp.workflow_prepared = Some(PreparedWorkflow {
-        context_path: "/home/dev/project/.dot-agent-deck/orchestrator-context.md".into(),
+    resp.workflow_prepared = Some(PreparedOrchestration {
+        context_path: "/home/dev/project/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md".into(),
         path: "/home/dev/project".into(),
         token: "prep-abc123".into(),
         roles: vec![sample_role()],
-        prompt: "Read .dot-agent-deck/orchestrator-context.md for your role.".into(),
+        prompt: "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md for your role.".into(),
     });
 
     let encoded = serde_json::to_string(&resp).expect("serialize AttachResponse");

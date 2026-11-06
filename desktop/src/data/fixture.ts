@@ -1,4 +1,9 @@
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
+import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
+import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion";
+import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
+import PROMPT_KEYS_JSON from "./prompt-keys.json";
+import { voicePagesFleet } from "./fixtureCrowded";
 
 /**
  * The fixture's stand-in for a deck identity — used as BOTH `deckId` and
@@ -42,7 +47,18 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question" | "docs-restart";
+
+/**
+ * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
+ * older one their remote daemons run. Live mode reads both from the crate
+ * (`daemon_upgrade::upgrade_offer`); the fixture only has to be consistent.
+ */
+export const FIXTURE_APP_VERSION = "0.45.0";
+export const FIXTURE_DAEMON_VERSION = "0.44.0";
+/** How long each fixture upgrade stage lasts — long enough to see, short enough for a browser test. */
+export const FIXTURE_UPGRADE_STEP_MS = 250;
+const FIXTURE_OLDER: { kind: "offered"; from: string; to: string } = { kind: "offered", from: FIXTURE_DAEMON_VERSION, to: FIXTURE_APP_VERSION };
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -175,14 +191,14 @@ const evidence: EvidenceItem[] = [
     at: "14:37:09",
     command: "pnpm test -- bridge",
     exitCode: 1,
-    reason: "A failed transition returns to the owning role with precise evidence, not a pasted transcript.",
+    reason: "A failed transition returns to the owning role with precise events, not a pasted transcript.",
     acknowledged: true,
   },
   {
     id: "ev-plan",
     verdict: "PASS",
     title: "Implementation contract accepted",
-    summary: "The plan limits this milestone to the daemon client, terminal deck, agent profiles, and observable loop.",
+    summary: "The plan limits this milestone to the daemon client, terminal grid, agent profiles, and observable loop.",
     from: "Planner",
     to: "Builder",
     at: "14:32:44",
@@ -191,7 +207,42 @@ const evidence: EvidenceItem[] = [
   },
 ];
 
-const agents: AgentSession[] = [
+/**
+ * PRD #1541 — the agent identity a deck reports beside the binary: its type,
+ * whether it is mid-turn, and its prompt keys.
+ *
+ * The keys come from `prompt-keys.json`, which the desktop crate's
+ * `the_browser_fixture_prompt_keys_match_the_registry` pins to what a deck
+ * built from this tree serves, so the preview presses the real keys. Devin
+ * and an unrecognised binary get no keys, as from a real deck.
+ */
+export const FIXTURE_PROMPT_KEYS = PROMPT_KEYS_JSON as Partial<Record<AgentTypeId, PromptKeys>>;
+
+const FIXTURE_AGENT_TYPES: Record<string, AgentTypeId> = {
+  claude: "claude_code",
+  opencode: "open_code",
+  codex: "codex",
+  pi: "pi",
+  devin: "devin",
+};
+
+export function fixtureAgentIdentity(cli: string | undefined, status: AgentStatus): Pick<AgentSession, "agentType" | "turn" | "promptKeys"> {
+  const agentType = (cli && FIXTURE_AGENT_TYPES[cli]) || "none";
+  const promptKeys = FIXTURE_PROMPT_KEYS[agentType];
+  // What `agentTurn` makes of the daemon status each fixture status stands for.
+  const turn = status === "running" ? "working" : status === "needs_input" || status === "idle" ? "idle" : undefined;
+  return {
+    agentType,
+    ...(turn ? { turn } : {}),
+    ...(promptKeys ? { promptKeys } : {}),
+  };
+}
+
+function withAgentIdentity(agent: AgentSession): AgentSession {
+  return { ...agent, ...fixtureAgentIdentity(agent.cli, agent.status) };
+}
+
+const agents: AgentSession[] = ([
   {
     id: "planner",
     daemonId: FIXTURE_DAEMON_ID,
@@ -217,7 +268,7 @@ const agents: AgentSession[] = [
     diff: [],
     checks: [{ id: "plan-contract", name: "Acceptance contract", status: "passed", duration: "0.2s" }],
     handoffIds: ["ev-plan"],
-    artifacts: [{ id: "prd", name: "Desktop GUI PRD", kind: "file", path: "prds/176-desktop-gui.md" }],
+    artifacts: [{ id: "prd", name: "Desktop GUI PRD", kind: "file", path: "prds/done/176-desktop-gui.md" }],
   },
   {
     id: "builder",
@@ -241,7 +292,7 @@ const agents: AgentSession[] = [
     cols: 110,
     activeTool: "cargo check",
     toolCount: 18,
-    transcript: "\u001b[2m14:34:02\u001b[0m  added desktop workspace scaffold\r\n\u001b[2m14:36:41\u001b[0m  wired daemon snapshot + terminal events\r\n\u001b[31mFAIL\u001b[0m  bridge test: listener disposed twice\r\n\u001b[33mRETRY 2/3\u001b[0m  isolating failed subscription case\r\n\u001b[2m14:40:58\u001b[0m  fixed idempotent detach cleanup\r\n\u001b[32mPASS\u001b[0m  24 tests · 0 warnings\r\n\r\nWaiting for reviewer evidence…\r\n",
+    transcript: "\u001b[2m14:34:02\u001b[0m  added desktop workspace scaffold\r\n\u001b[2m14:36:41\u001b[0m  wired daemon snapshot + terminal events\r\n\u001b[31mFAIL\u001b[0m  bridge test: listener disposed twice\r\n\u001b[33mRETRY 2/3\u001b[0m  isolating failed subscription case\r\n\u001b[2m14:40:58\u001b[0m  fixed idempotent detach cleanup\r\n\u001b[32mPASS\u001b[0m  24 tests · 0 warnings\r\n\r\nWaiting for reviewer events…\r\n",
     diff: ["+ desktop/src/App.tsx", "+ desktop/src/lib/bridge.ts", "+ desktop/src/styles.css", "~ Cargo.toml"],
     checks: [
       { id: "typecheck", name: "TypeScript", status: "passed", duration: "2.1s", command: "pnpm tsc" },
@@ -249,7 +300,7 @@ const agents: AgentSession[] = [
       { id: "rust", name: "Rust check", status: "passed", duration: "8.4s", command: "cargo check" },
     ],
     handoffIds: ["ev-fix", "ev-pass"],
-    artifacts: [{ id: "cast", name: "Control deck smoke run", kind: "recording", path: ".dot-agent-deck/recordings/gui.cast" }],
+    artifacts: [{ id: "cast", name: "Control room smoke run", kind: "recording", path: ".dot-agent-deck/recordings/gui.cast" }],
   },
   {
     id: "reviewer",
@@ -260,7 +311,7 @@ const agents: AgentSession[] = [
     cli: "codex",
     model: "gpt-5.6-sol",
     status: "running",
-    task: "Audit terminal lifecycle, unsafe actions, and evidence integrity.",
+    task: "Audit terminal lifecycle, unsafe actions, and event integrity.",
     cwd: "/dev/active/dot-agent-deck-gui",
     attempt: 1,
     duration: "02:26",
@@ -310,7 +361,7 @@ const agents: AgentSession[] = [
     handoffIds: [],
     artifacts: [],
   },
-];
+] satisfies AgentSession[]).map(withAgentIdentity);
 
 /** One agent in the crowded scenario, described only by what a daemon reports. */
 interface CrowdedSeed {
@@ -372,12 +423,13 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
     role: seed.role,
     displayName: seed.displayName,
     cli: seed.cli,
+    ...fixtureAgentIdentity(seed.cli, seed.status),
     model: "Unavailable",
     status: seed.status,
     task: seed.lastUserPrompt
       ?? (seed.activeTool
         ? `Active tool: ${seed.activeTool}${seed.activeToolDetail ? ` · ${seed.activeToolDetail}` : ""}`
-        : "Task metadata unavailable from the deck"),
+        : "Task metadata unavailable from the daemon"),
     cwd: seed.cwd,
     // No attempt: live mode reports none, and the crowded scenario is meant to
     // be a faithful preview of a real daemon (PRD #745 M8).
@@ -412,6 +464,201 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
   };
 }
 
+/** What the preview was asked to start — `start_agent`'s fields plus the id the fixture deck minted. */
+export interface FixtureStartedAgent {
+  id: string;
+  daemonId: string;
+  displayName?: string;
+  command?: string;
+  cwd?: string;
+  rows?: number;
+  cols?: number;
+  /** Issue #1496: recorded on the agent, as the live daemon records it. */
+  authoringKind?: AuthoringKind;
+}
+
+/**
+ * The agent a fixture deck gains when the preview starts one (PRD #1223 M3).
+ *
+ * Shaped the way `agentFromDto` shapes a freshly spawned LIVE agent, by the
+ * convention {@link crowdedAgent} set: an agent that has emitted no hook event
+ * yet is `running` (the crate maps a record with no hook state to `running`),
+ * every field the daemon does not report carries live mode's placeholder, and
+ * there is no tool, prompt or activity to show. The CLI is the command's first
+ * word and absent when no command was given — the daemon then starts its
+ * default shell and names no binary, and absence is the honest rendering.
+ */
+export function createFixtureStartedAgent(started: FixtureStartedAgent): AgentSession {
+  const cli = started.command?.trim().split(/\s+/)[0] || undefined;
+  const role = cli ? cli.charAt(0).toUpperCase() + cli.slice(1) : "Agent";
+  return {
+    id: started.id,
+    daemonId: started.daemonId,
+    role,
+    displayName: started.displayName || role,
+    cli,
+    // None: the tile prints the model in fixture mode, and a live tile has
+    // none to print (issue #2001), so an empty one previews it faithfully.
+    model: "",
+    status: "running",
+    task: "Task metadata unavailable from the daemon",
+    cwd: started.cwd,
+    duration: "—",
+    tokens: 0,
+    cost: 0,
+    contextPercent: 0,
+    worktree: "Unavailable",
+    writeLease: "unknown",
+    spawnedAtMs: Date.now(),
+    ...(started.authoringKind ? { authoringKind: started.authoringKind } : {}),
+    rows: started.rows ?? 24,
+    cols: started.cols ?? 80,
+    toolCount: 0,
+    transcript: "",
+    diff: [],
+    checks: [],
+    handoffIds: [],
+    artifacts: [],
+    tab: { kind: "dashboard" },
+    inOrchestration: false,
+    isStartRole: false,
+  };
+}
+
+/**
+ * The next id a fixture deck mints: the lowest positive integer none of its
+ * agents already uses. A daemon mints per-daemon monotonic integers, so two
+ * decks answering the same id is the ordinary case the preview must show too.
+ */
+export function nextFixtureAgentId(agents: readonly AgentSession[]): string {
+  let next = 1;
+  while (agents.some((agent) => agent.id === String(next))) next += 1;
+  return String(next);
+}
+
+/**
+ * PRD #1223 M4 — each connected fixture deck's home directory, which is where
+ * the New agent dialog's directory step opens on it.
+ *
+ * Different per deck on purpose: a preview that listed the wrong deck's tree
+ * would show the wrong home, where two identical trees would hide it.
+ */
+export const FIXTURE_HOMES: Readonly<Record<string, string>> = {
+  [FIXTURE_DAEMON_ID]: "/home/dev",
+  [FIXTURE_REMOTE_DAEMON_ID]: "/home/build",
+};
+
+/** One directory of a fixture deck's tree, shaped the way a deck lists one. */
+export interface FixtureDirectory {
+  path: string;
+  parent?: string;
+  entries: DeckDirectoryEntry[];
+}
+
+/**
+ * The filesystem a fixture deck lists, rooted at `/`: a home holding a project
+ * directory (it carries the marker) and an ordinary one, and a directory one
+ * level deeper inside the ordinary one — enough to browse into, confirm a
+ * directory with no subdirectories, and go back up through every parent.
+ *
+ * Issue #1240: `scratch/notes` also holds a hidden directory (`.drafts`) and a
+ * symlink (`latest`, leading to `demo-project`), which a deck lists only when
+ * asked — so by default `notes` still has no subdirectories.
+ *
+ * Every path here is the fixture DECK's answer, the way a daemon answers with
+ * its own canonical spelling. The dialog never builds one of these itself.
+ */
+export function fixtureDirectoryTree(home: string): Map<string, FixtureDirectory> {
+  const user = home.split("/").filter(Boolean).at(-1) ?? "dev";
+  const entry = (path: string, isProject = false): DeckDirectoryEntry => ({ path, displayName: path.split("/").at(-1) ?? path, isProject });
+  const tree: FixtureDirectory[] = [
+    { path: "/", entries: [entry("/home")] },
+    { path: "/home", parent: "/", entries: [entry(`/home/${user}`)] },
+    { path: home, parent: "/home", entries: [entry(`${home}/demo-project`, true), entry(`${home}/scratch`)] },
+    { path: `${home}/demo-project`, parent: home, entries: [] },
+    { path: `${home}/scratch`, parent: home, entries: [entry(`${home}/scratch/notes`), entry(`${home}/scratch/twin-project`, true)] },
+    { path: `${home}/scratch/notes`, parent: `${home}/scratch`, entries: [entry(`${home}/scratch/notes/.drafts`), { path: `${home}/demo-project`, displayName: "latest", isProject: true, isSymlink: true }] },
+    { path: `${home}/scratch/notes/.drafts`, parent: `${home}/scratch/notes`, entries: [] },
+    { path: `${home}/scratch/twin-project`, parent: `${home}/scratch`, entries: [] },
+  ];
+  return new Map(tree.map((directory) => [directory.path, directory]));
+}
+
+/**
+ * PRD #1223 M6 — the orchestrations a fixture deck's `demo-project` defines, as
+ * that deck's `ResolveProject` answers them: one, `demo-loop`, whose
+ * `planner` starts the run and whose `builder` works for it.
+ *
+ * `scratch/twin-project` is the audit F2 case: it defines `twin-loop` TWICE —
+ * which a real config may, since validation only warns — and `solo-loop` once,
+ * so the preview shows namesakes disabled beside an orchestration that can be
+ * chosen. Every other directory in {@link fixtureDirectoryTree} is an ordinary
+ * one.
+ */
+export function fixtureProjectOrchestrations(home: string, path: string): DaemonOrchestration[] | undefined {
+  if (path === `${home}/scratch/twin-project`) {
+    const single = (name: string, role: string): DaemonOrchestration => ({ name, displayName: name, default: false, roles: [{ name: role, displayName: role, start: true }] });
+    return [single("twin-loop", "planner"), single("solo-loop", "planner"), single("twin-loop", "builder")];
+  }
+  if (path !== `${home}/demo-project`) return undefined;
+  return [
+    {
+      name: "demo-loop",
+      displayName: "demo-loop",
+      default: true,
+      roles: [
+        { name: "planner", displayName: "planner", start: true },
+        { name: "builder", displayName: "builder", start: false },
+      ],
+    },
+  ];
+}
+
+/**
+ * The commands `demo-loop`'s roles are configured with on a fixture deck — the
+ * deck's own config, which never crosses the wire. The fixture deck starts each
+ * role with its command the way a live deck does for a launch from the New
+ * agent dialog, so the preview's role panes are labelled by what they run.
+ */
+export const FIXTURE_ROLE_COMMANDS: Readonly<Record<string, string>> = {
+  planner: "claude",
+  builder: "codex",
+};
+
+/**
+ * The agent registry a fixture deck reports, shaped as `new-agent-options`
+ * reports the real one: each entry's first basename as the id, its label, its
+ * default command, in registry order. The fixture has no Rust to ask, so this
+ * is preview data — a live deck answers with its own build's list, and an
+ * older live deck's fallback comes from this app's Rust build, never from here.
+ */
+export function fixtureAgentRegistry(): NewAgentOption[] {
+  return [
+    { id: "claude", displayName: "ClaudeCode", defaultCommand: "claude" },
+    { id: "opencode", displayName: "OpenCode", defaultCommand: "opencode" },
+    { id: "pi", displayName: "Pi", defaultCommand: "pi" },
+    { id: "codex", displayName: "Codex", defaultCommand: "codex" },
+    { id: "devin", displayName: "Devin", defaultCommand: "devin" },
+  ];
+}
+
+/**
+ * The `default_command` each fixture deck's host configures, if any. The remote
+ * deck has one and the local deck does not, so the preview shows both halves
+ * of the Command prefill order.
+ */
+export const FIXTURE_DEFAULT_COMMANDS: Readonly<Record<string, string>> = {
+  [FIXTURE_REMOTE_DAEMON_ID]: "claude",
+};
+
+/**
+ * The fixture decks whose own experimental flag is on (PRD #1223 M7). The
+ * remote deck's is and the local deck's is not, so the preview shows the
+ * `schedule: issues` chip on one deck and withholds it on the other — the flag
+ * is the deck's, not this app's.
+ */
+export const FIXTURE_EXPERIMENTAL_DECKS: ReadonlySet<string> = new Set([FIXTURE_REMOTE_DAEMON_ID]);
+
 function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false, cwd?: string): AgentTab {
   return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole, cwd };
 }
@@ -438,27 +685,274 @@ const PRD_CWD = "/home/dev/code/dot-agent-deck-dispatch-prd-745";
  * right rather than one accident of declaration order.
  */
 const crowdedAgents: AgentSession[] = [
-  crowdedAgent({ id: "2", displayName: "coder", role: "Coder", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 132, upForMinutes: 41, quietForMinutes: 0, activeTool: "edit", activeToolDetail: "desktop/src/components/AgentOverview.tsx", writeLease: "write", lastUserPrompt: "Surface the honest fields and stop presenting attempt and branch as facts.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "coder", 1, false, PRD_CWD) }),
+  crowdedAgent({ id: "2", displayName: "coder", role: "Coder", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 132, upForMinutes: 41, quietForMinutes: 0, activeTool: "edit", activeToolDetail: "desktop/src/components/AgentOverview.tsx", writeLease: "write", lastUserPrompt: "Surface the honest fields and stop presenting attempt and branch as facts.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "coder", 1, false, PRD_CWD) }),
   crowdedAgent({ id: "7", displayName: "writer", role: "Writer", cli: "claude", status: "running", cwd: DECK_CWD, toolCount: 19, upForMinutes: 96, quietForMinutes: 2, activeTool: "write", activeToolDetail: "docs/develop/desktop-gui.md", writeLease: "write", lastUserPrompt: "Document the overview screen and the demand-driven attach model.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "writer", 0, false, DECK_CWD) }),
   // No prompt and no lease: a pane the daemon adopted but that has emitted no
   // prompt event yet. Both columns stay blank, which is the case the screen has
   // to look right for.
-  crowdedAgent({ id: "13", displayName: "Scratch shell", role: "Codex", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 2, tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 47, upForMinutes: 194, quietForMinutes: 0, activeTool: "read", activeToolDetail: "prds/745-desktop-agent-overview-landing-screen.md", writeLease: "write", lastUserPrompt: "Run PRD 745 to done: delegate each milestone and verify the gates yourself.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "orchestrator", 0, true, PRD_CWD) }),
+  crowdedAgent({ id: "13", displayName: "Scratch shell", role: "Codex", cli: "codex", status: "idle", cwd: DECK_CWD, toolCount: 2, tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 47, upForMinutes: 194, quietForMinutes: 0, activeTool: "read", activeToolDetail: "prds/done/745-desktop-agent-overview-landing-screen.md", writeLease: "write", lastUserPrompt: "Run PRD 745 to done: delegate each milestone and verify the gates yourself.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "orchestrator", 0, true, PRD_CWD) }),
   // History-only: a wrapped session the deck can replay but cannot type into.
   crowdedAgent({ id: "11", displayName: "Second opinion", role: "Open code", cli: "opencode", status: "running", cwd: DECK_CWD, toolCount: 33, upForMinutes: 12, quietForMinutes: 1, activeTool: "read", activeToolDetail: "src/state.rs", writeLease: "read", lastUserPrompt: "Read the daemon state module and tell me which fields never reach the desktop.", tab: { kind: "mode", name: "review" } }),
-  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 0, upForMinutes: 58, quietForMinutes: 34, writeLease: "write", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "docs", 4, false, PRD_CWD) }),
-  crowdedAgent({ id: "9", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "waiting", cwd: DECK_CWD, toolCount: 12, upForMinutes: 213, quietForMinutes: 8, writeLease: "write", lastUserPrompt: "Refresh the docs set for the release and hand each page to a reviewer.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "orchestrator", 2, true, DECK_CWD) }),
-  crowdedAgent({ id: "4", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "running", cwd: PRD_CWD, toolCount: 24, upForMinutes: 47, quietForMinutes: 3, activeTool: "grep", activeToolDetail: "attachAgents", writeLease: "write", lastUserPrompt: "Audit the attach path: prove the overview opens no socket, report findings only.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "reviewer", 3, false, PRD_CWD) }),
+  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "idle", cwd: PRD_CWD, toolCount: 0, upForMinutes: 58, quietForMinutes: 34, writeLease: "write", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "docs", 4, false, PRD_CWD) }),
+  crowdedAgent({ id: "9", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "idle", cwd: DECK_CWD, toolCount: 12, upForMinutes: 213, quietForMinutes: 8, writeLease: "write", lastUserPrompt: "Refresh the docs set for the release and hand each page to a reviewer.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "orchestrator", 2, true, DECK_CWD) }),
+  crowdedAgent({ id: "4", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "running", cwd: PRD_CWD, toolCount: 24, upForMinutes: 47, quietForMinutes: 3, activeTool: "grep", activeToolDetail: "attachAgents", writeLease: "write", lastUserPrompt: "Audit the attach path: prove the overview opens no socket, report findings only.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "reviewer", 3, false, PRD_CWD) }),
   crowdedAgent({ id: "14", displayName: "Changelog sweep", role: "Claude code", cli: "claude", status: "running", cwd: DECK_CWD, toolCount: 15, upForMinutes: 3, quietForMinutes: 0, activeTool: "bash", activeToolDetail: "git log --oneline -20", writeLease: "write", lastUserPrompt: "Collect every changelog fragment merged since the last tag and group them.", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "6", displayName: "release", role: "Release", cli: "claude", status: "failed", cwd: PRD_CWD, toolCount: 8, upForMinutes: 88, quietForMinutes: 71, activeTool: "bash", activeToolDetail: "cargo test-fast", writeLease: "write", lastUserPrompt: "Cut the release once the fast tier is green.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "release", 5, false, PRD_CWD) }),
-  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 61, upForMinutes: 33, quietForMinutes: 17, writeLease: "write", lastUserPrompt: "Write the failing test first, then hand it back without fixing it.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "tester", 2, false, PRD_CWD) }),
-  crowdedAgent({ id: "10", displayName: "publisher", role: "Publisher", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 0, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "publisher", 3, false, DECK_CWD) }),
+  crowdedAgent({ id: "6", displayName: "release", role: "Release", cli: "claude", status: "failed", cwd: PRD_CWD, toolCount: 8, upForMinutes: 88, quietForMinutes: 71, activeTool: "bash", activeToolDetail: "cargo test-fast", writeLease: "write", lastUserPrompt: "Cut the release once the fast tier is green.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "release", 5, false, PRD_CWD) }),
+  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "needs_input", cwd: PRD_CWD, toolCount: 61, upForMinutes: 33, quietForMinutes: 17, writeLease: "write", lastUserPrompt: "Write the failing test first, then hand it back without fixing it.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "tester", 2, false, PRD_CWD) }),
+  crowdedAgent({ id: "10", displayName: "publisher", role: "Publisher", cli: "codex", status: "idle", cwd: DECK_CWD, toolCount: 0, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "publisher", 3, false, DECK_CWD) }),
   // View-only: the daemon knows the session but holds nothing it can write to.
-  crowdedAgent({ id: "15", displayName: "pi-extension spike", role: "Pi", cli: "pi", status: "waiting", cwd: `${DECK_CWD}/pi-extension`, toolCount: 0, quietForMinutes: 2760, writeLease: "none", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "8", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 5, upForMinutes: 168, quietForMinutes: 128, writeLease: "write", lastUserPrompt: "Review the docs refresh for accuracy against the current CLI flags.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "reviewer", 1, false, DECK_CWD) }),
-  crowdedAgent({ id: "12", displayName: "Security pass", role: "Claude code", cli: "claude", status: "waiting", cwd: DECK_CWD, toolCount: 7, upForMinutes: 27, quietForMinutes: 9, tab: { kind: "mode", name: "review" } }),
+  crowdedAgent({ id: "15", displayName: "pi-extension spike", role: "Pi", cli: "pi", status: "idle", cwd: `${DECK_CWD}/pi-extension`, toolCount: 0, quietForMinutes: 2760, writeLease: "none", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "8", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "idle", cwd: DECK_CWD, toolCount: 5, upForMinutes: 168, quietForMinutes: 128, writeLease: "write", lastUserPrompt: "Review the docs refresh for accuracy against the current CLI flags.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "reviewer", 1, false, DECK_CWD) }),
+  crowdedAgent({ id: "12", displayName: "Security pass", role: "Claude code", cli: "claude", status: "needs_input", cwd: DECK_CWD, toolCount: 7, upForMinutes: 27, quietForMinutes: 9, tab: { kind: "mode", name: "review" } }),
 ];
+
+/**
+ * The `?fixture=1&state=docs` scenario: the four agents the TUI half of the
+ * docs screenshots opens in dashboard panes and describes with synthetic hook
+ * events (`DASHBOARD_AGENTS` in `tests/e2e_docs_screenshots.rs`, issue #1322), so the
+ * TUI and desktop images of the `dashboard` scenario depict ONE state. Names,
+ * agent types, directory, prompts, tools and ages are the TUI's; each status is
+ * what live mode maps the TUI's hook state to (`DAEMON_STATUS` in
+ * `lib/bridge.ts`), which keeps the TUI's Idle and Needs Input as `idle` and
+ * `needs_input` and folds its Working into `running`. Keep the two lists in step when either moves.
+ *
+ * Separate from `agents` on purpose: the `connected` scenario is what the unit
+ * and snapshot tests are written against, and a docs image must not be able to
+ * move them.
+ */
+const DOCS_CWD = "/home/dev/storefront";
+/*
+ * Each docs agent's uptime in minutes: `up_for_minutes` of the same-named agent
+ * in `DASHBOARD_AGENTS` (`tests/e2e_docs_screenshots.rs`), which stamps that
+ * agent's `session_start` this far back. The TUI capture's status events are
+ * stamped seconds before the capture (`quiet_for_secs`, the cards' `Last:`
+ * labels: a TUI card's last activity cannot read older than its pane, and the
+ * capture opens the panes), so every docs agent's last activity here is
+ * `DOCS_QUIET_MINUTES` — under a minute, which the overview reads as `just now`.
+ * The depicted state is one fleet: agents up for hours, each active seconds
+ * ago. Change a value here and in the test together.
+ */
+const DOCS_UP_MINUTES = {
+  plan: 135,
+  impl: 65,
+  review: 70,
+  verify: 80,
+} as const;
+const DOCS_QUIET_MINUTES = 0;
+/**
+ * What the docs `agent-pane` screenshot shows in the open agent's terminal.
+ * The browser fixture has no PTY, so the pane shows the transcript the
+ * terminal writes on mount; without one the image is a blank terminal. Fixed
+ * text only: no timestamps, pids or host paths, so the capture is stable.
+ */
+const DOCS_IMPL_TRANSCRIPT = [
+  "\u001b[1m›\u001b[0m Add the retry action to the checkout view.",
+  "",
+  "\u001b[36m•\u001b[0m Read src/components/CheckoutView.tsx",
+  "\u001b[36m•\u001b[0m Read src/api/payments.ts",
+  "\u001b[36m•\u001b[0m Edit src/components/RetryPayment.tsx",
+  "    \u001b[32m+ export function RetryPayment({ onRetry, pending }: RetryPaymentProps) {\u001b[0m",
+  "    \u001b[32m+   return <button disabled={pending} onClick={onRetry}>Retry payment</button>;\u001b[0m",
+  "    \u001b[32m+ }\u001b[0m",
+  "\u001b[36m•\u001b[0m Ran npm test -- checkout",
+  "    \u001b[32mPASS\u001b[0m  src/components/RetryPayment.test.tsx (3 tests)",
+  "",
+  "The retry button renders and disables itself while a payment is pending.",
+  "Next: wire it into CheckoutView and cover the failed-payment path.",
+  "",
+].join("\r\n");
+const docsAgents: AgentSession[] = [
+  crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "idle", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
+  { ...crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }), transcript: DOCS_IMPL_TRANSCRIPT },
+  crowdedAgent({ id: "3", displayName: "Contract review", role: "Claude code", cli: "claude", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.review, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Bash", activeToolDetail: "cargo test checkout_retry", lastUserPrompt: "Check the payment API for breaking changes.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "needs_input", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
+];
+
+/**
+ * PRD #1666 part 2: the two agents the `restart-notice` scenario's deck runs
+ * before it restarts, the names the TUI capture gives its two agents. Both are
+ * listed by the process `docs-before`; {@link restartedFixtureSnapshot} is the
+ * same deck after the restart, running none.
+ */
+const docsRestartAgents: AgentSession[] = [
+  { ...crowdedAgent({ id: "1", displayName: "api-fix", role: "Claude code", cli: "claude", status: "running", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 12, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/api/retry.rs", lastUserPrompt: "Fix the retry handling in the API client.", tab: { kind: "dashboard" } }), incarnation: "docs-before" },
+  { ...crowdedAgent({ id: "2", displayName: "docs-review", role: "Claude code", cli: "claude", status: "idle", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 9, quietForMinutes: 2, lastUserPrompt: "Review the retry section of the docs.", tab: { kind: "dashboard" } }), incarnation: "docs-before" },
+];
+
+/** How long after the app subscribes the `docs-restart` deck restarts. A delay counted from the subscription, not from any frame: it waits for nothing to be drawn, and the shot waits for the notice instead. */
+export const FIXTURE_RESTART_AFTER_MS = 1000;
+
+/**
+ * PRD #1666 part 2: the `docs-restart` deck after its daemon restarted — the
+ * same deck, listed by another process (`docs-after`) that runs no agents, so
+ * the app removes the two rows and names them in its restart notice.
+ */
+export function restartedFixtureSnapshot(): DeckSnapshot {
+  const before = createFixtureSnapshot("docs-restart");
+  return { ...before, connection: { ...before.connection, incarnation: "docs-after", message: "Daemon responding · no agents running" }, agents: [] };
+}
+
+/**
+ * PRD #1666: a Pi agent whose first prompt may not have reached it, matching
+ * the TUI's inbox-attention capture.
+ */
+const docsAttentionAgents: AgentSession[] = [
+  {
+    ...crowdedAgent({ id: "1", displayName: "builder", role: "builder", cli: "pi", status: "idle", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 4, quietForMinutes: 3, tab: { kind: "dashboard" } }),
+    paneId: "pi-builder",
+    inbox: {
+      queued: 0,
+      fetched: 1,
+      undeliverable: 0,
+      wake: "native",
+      component: "pi_extension",
+      attention: [{ messageId: "m-k3xzq2ab-0000000000000001", revision: 1, kind: "not_started", fromLabel: "dot-agent-deck (the prompt this session was started with)", subject: "first prompt" }],
+    },
+    transcript: "",
+  },
+];
+
+/** Synthetic pair matching the TUI's agent-messaging capture. */
+const docsMessagingAgents: AgentSession[] = [
+  { ...crowdedAgent({ id: "1", displayName: "planner", role: "Planner", cli: "claude", status: "running", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 30, quietForMinutes: 0, activeTool: "Read", activeToolDetail: "src/checkout/flow.ts", lastUserPrompt: "Plan the checkout retry flow.", tab: orchestrationTab("docs-messaging", "demo-loop", "demo-loop", "planner", 0, true, "/home/dev/demo-project") }), inbox: { queued: 1, fetched: 0, undeliverable: 0, wake: "doorbell" }, transcript: "Planning the checkout retry flow\r\n" },
+  { ...crowdedAgent({ id: "2", displayName: "builder", role: "Builder", cli: "codex", status: "running", cwd: "/home/dev/demo-project", toolCount: 0, upForMinutes: 30, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/checkout/RetryPayment.tsx", lastUserPrompt: "Implement the checkout retry flow.", tab: orchestrationTab("docs-messaging", "demo-loop", "demo-loop", "builder", 1, false, "/home/dev/demo-project") }), inbox: { queued: 1, fetched: 0, undeliverable: 0, wake: "doorbell" }, transcript: "Ready to implement the checkout plan\r\n" },
+];
+
+/**
+ * PRD #1631 — the docs fleet with the Desktop implementation agent (Codex)
+ * stopped on a command approval, as the daemon would project it: Codex's three
+ * options from its per-version table, answered by keys. Its pane shows the
+ * prompt Codex draws, so the `voice-question` screenshot pairs the question the
+ * voice row answers with the one on screen.
+ */
+const DOCS_QUESTION_COMMAND = "npm install --save-dev msw";
+const DOCS_QUESTION_TRANSCRIPT = [
+  // The pane's first two rows sit under its header in the preview, as the
+  // typing-mode image shows of the docs transcript; keep the prompt below them.
+  "",
+  "",
+  "  Would you like to run the following command?",
+  "",
+  "  Reason: install msw to mock the payments API in tests",
+  "",
+  `  $ ${DOCS_QUESTION_COMMAND}`,
+  "",
+  "\u001b[36m› 1. Yes, proceed (y)\u001b[0m",
+  "  2. Yes, and don't ask again for commands that start with `npm install` (p)",
+  "  3. No, and tell Codex what to do differently (esc)",
+  "",
+  "  Press enter to confirm or esc to cancel",
+].join("\r\n");
+export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
+  id: "q-docs-question",
+  kind: "permission",
+  channel: "keys",
+  questions: [{
+    prompt: "Allow Bash?",
+    multiSelect: false,
+    options: [
+      { index: 1, label: "Yes, proceed", role: "allow_once", answerable: true },
+      { index: 2, label: "Yes, and don't ask again for commands that start with the prefix shown", role: "allow_always", answerable: true, scope: `commands that start with the prefix Codex shows for \`${DOCS_QUESTION_COMMAND}\`` },
+      { index: 3, label: "No, and tell Codex what to do differently", role: "deny", answerable: true },
+    ],
+  }],
+  tool: { name: "Bash", detail: DOCS_QUESTION_COMMAND },
+  answerable: true,
+};
+const docsQuestionAgents: AgentSession[] = docsAgents.map((agent) =>
+  agent.id === "2"
+    ? { ...agent, status: "needs_input", activeTool: "Bash", activeToolDetail: DOCS_QUESTION_COMMAND, transcript: DOCS_QUESTION_TRANSCRIPT, pendingQuestion: DOCS_PENDING_QUESTION }
+    : agent,
+);
+
+/**
+ * PRD #1631 — the preview's answer to an utterance said over a pane with a
+ * question waiting. The preview has no Commands model, so it knows the three
+ * replies a permission prompt is given most ("yes" / "go ahead" / "allow it",
+ * "no" / "deny", "always allow") and calls anything else not an answer, which
+ * hands it on to the preview's ordinary vocabulary.
+ */
+export function resolveFixtureQuestion(question: PendingQuestionDto | undefined, utterance: string): QuestionResultDto {
+  const notAnswer: QuestionResultDto = { verdict: { kind: "not_answer" }, resolveMs: null, backend: "fixture" };
+  const said = utterance.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const role = ["yes", "go ahead", "allow it", "allow"].includes(said)
+    ? "allow_once"
+    : ["no", "deny", "deny it"].includes(said)
+      ? "deny"
+      : said === "always allow" ? "allow_always" : undefined;
+  const option = role && question?.questions.length === 1 ? question.questions[0].options.find((candidate) => candidate.role === role && candidate.answerable) : undefined;
+  if (!question || !option) return notAnswer;
+  const what = question.tool?.detail ?? question.tool?.name ?? question.questions[0].prompt;
+  const summary = role === "allow_once" ? `“${option.label}” (allow once) — ${what}` : role === "deny" ? `“${option.label}” (deny) — ${what}` : `“${option.label}” (always allow) — ${option.scope ?? what}`;
+  return {
+    verdict: {
+      kind: "answered",
+      form: [{ questionIndex: 0, optionIndices: [option.index] }],
+      complete: true,
+      ...(role === "allow_always" ? { always: `This will always allow ${option.scope ?? what}. Confirm?` } : {}),
+      summary,
+    },
+    resolveMs: 1,
+    backend: "fixture",
+  };
+}
+
+const FIXTURE_GIB = 1024 ** 3;
+
+/**
+ * PRD #1258 M4 — a deck's host as its daemon reports it, so fixture-mode
+ * screens (and the docs screenshots taken from them) show the host button and
+ * its popover. The numbers are fixed: a screenshot must not change between
+ * runs. `local` is this machine's deck, `remote` a smaller build box.
+ *
+ * The levels are what a daemon with the default thresholds serves for these
+ * numbers — written out, because the app never computes a level itself: the
+ * local temp root at 9% free is a warning; the remote disks at 15% free are a
+ * warning, its load of 1.35 per core too, and its memory at 7% available is
+ * critical.
+ */
+export function fixtureHostMetrics(host: "local" | "remote"): HostMetricsReport {
+  const local = host === "local";
+  const disk = (role: string, free: number, total: number, level: HostLevel) => ({ role, freeBytes: free * FIXTURE_GIB, totalBytes: total * FIXTURE_GIB, level });
+  return {
+    status: "available",
+    metrics: {
+      disks: local
+        ? [disk("working_root", 128, 512, "ok"), disk("worktree_parent", 128, 512, "ok"), disk("temp_root", 6, 64, "warn")]
+        : [disk("working_root", 37.5, 256, "warn"), disk("worktree_parent", 37.5, 256, "warn"), disk("temp_root", 9.5, 32, "ok")],
+      loadPerCpu: local ? 0.42 : 1.35,
+      cpuCount: local ? 16 : 8,
+      memoryUsedBytes: (local ? 18.5 : 12) * FIXTURE_GIB,
+      memoryAvailableBytes: (local ? 43.5 : 1) * FIXTURE_GIB,
+      loadLevel: local ? "ok" : "warn",
+      memoryLevel: local ? "ok" : "critical",
+      sampledAtMs: 1_700_000_000_000,
+      // The local deck's figures are the TUI `host-metrics` capture's
+      // (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`): change the two together.
+      sampleAgeMs: local ? 0 : 1200,
+    },
+  };
+}
+
+/** Two answering daemons with synthetic projects and no demo-run paths. */
+function docsFleet(): DeckSnapshot[] {
+  const local = createFixtureSnapshot("docs");
+  const remote: DeckSnapshot = {
+    ...createFixtureSnapshot("docs"),
+    runId: "run_docs_service",
+    repo: "service-api",
+    worktree: "/home/dev/service-api",
+    connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+    hostMetrics: fixtureHostMetrics("remote"),
+    agents: [
+      crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
+      crowdedAgent({ id: "2", displayName: "API review", role: "Claude code", cli: "claude", status: "idle", cwd: "/home/dev/service-api", toolCount: 0, upForMinutes: 19, quietForMinutes: 0, lastUserPrompt: "Review the endpoint contract.", tab: { kind: "dashboard" } }),
+    ].map((agent) => ({ ...agent, daemonId: FIXTURE_REMOTE_DAEMON_ID })),
+    totalNodes: 2,
+  };
+  return [local, remote];
+}
 
 /**
  * `empty` means CONNECTED WITH ZERO AGENTS — the first-run experience — and
@@ -509,7 +1003,7 @@ const remoteAgents: AgentSession[] = [
     daemonId: FIXTURE_REMOTE_DAEMON_ID,
     displayName: "Matrix reviewer",
     role: "Reviewer",
-    status: "waiting",
+    status: "needs_input",
     task: "Read the failing arm64 job and say whether it is the change or the runner.",
     cwd: "/home/dev/code/dot-agent-deck",
     transcript: "",
@@ -526,7 +1020,7 @@ const remoteAgents: AgentSession[] = [
     displayName: "Scratch shell",
     role: "Claude code",
     status: "failed",
-    task: "Task metadata unavailable from the deck",
+    task: "Task metadata unavailable from the daemon",
     cwd: "/home/dev/code/scratch",
     transcript: "",
     handoffIds: [],
@@ -562,7 +1056,7 @@ const staleAgents: AgentSession[] = [
     daemonId: FIXTURE_UNREACHABLE_DAEMON_ID,
     displayName: "Flake triage",
     role: "Reviewer",
-    status: "waiting",
+    status: "idle",
     task: "Classify last night's flakes by whether they touch the PTY harness.",
     cwd: "/home/ci/code/dot-agent-deck",
     transcript: "",
@@ -600,6 +1094,8 @@ function fleetDeck(
     stages: connection.status === "connected" ? base.stages : [],
     evidence: connection.status === "connected" ? base.evidence : [],
     handoffs: connection.status === "connected" ? base.handoffs : [],
+    // Only an answering deck reports its host, as in live mode.
+    ...(connection.status === "connected" ? { hostMetrics: fixtureHostMetrics(connection.deckKind === "remote" ? "remote" : "local") } : {}),
   };
 }
 
@@ -612,17 +1108,22 @@ function fleetDeck(
  * this milestone changes. `fleet` is the one that needs the array to exist.
  */
 export function createFixtureFleet(state: FixtureState = "connected"): DeckSnapshot[] {
+  if (state === "docs-fleet") return docsFleet();
+  if (state === "voice-pages") return voicePagesFleet(createFixtureSnapshot("crowded"));
+  if (state === "upgrade") return upgradeFleet();
+  if (state === "upgrade-error") return [upgradeIncompatibleDeck()];
+  if (state === "hook-notice") return hookNoticeFleet();
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
       FIXTURE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Deck responding", deckKind: "local" },
+      { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Daemon responding", deckKind: "local" },
       agents,
       "/home/dev/code/dot-agent-deck-gui",
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Deck responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -642,7 +1143,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
     */
     fleetDeck(
       FIXTURE_UNREACHABLE_DAEMON_ID,
-      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No deck is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No daemon is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
       staleAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -672,41 +1173,1251 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
   ];
 }
 
+/**
+ * PRD #1487 M5 — a remote deck whose daemon is older than this app AND across
+ * a compatibility break, so it is refused: the version-mismatch banner, with
+ * Upgrade beside Connect anyway. Nothing runs on it, so its upgrade restarts
+ * without asking.
+ */
+function upgradeIncompatibleDeck(): DeckSnapshot {
+  return fleetDeck(
+    FIXTURE_UNREACHABLE_DAEMON_ID,
+    {
+      status: "error",
+      deckId: FIXTURE_UNREACHABLE_DAEMON_ID,
+      socketPath: FIXTURE_UNREACHABLE_DAEMON_ID,
+      daemonDetected: true,
+      buildStampMismatchOnly: true,
+      runningAgentCount: 0,
+      message: "This daemon is older than this app, and a change between the two versions means it may be read wrongly.",
+      deckKind: "remote",
+      localOnlyReason: "Stop daemon acts on a process on this machine.",
+      upgradeOffer: FIXTURE_OLDER,
+    },
+    [],
+    "/home/ci/code/dot-agent-deck",
+  );
+}
+
+/**
+ * PRD #1487 M5 — the Upgrade scenario: this machine's deck at the app's own
+ * version (nothing to offer), a connected remote deck on an older version with
+ * agents running (Upgrade asks before stopping them), and the refused remote
+ * deck above.
+ */
+function upgradeFleet(): DeckSnapshot[] {
+  return [
+    fleetDeck(
+      FIXTURE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Daemon responding", deckKind: "local", upgradeOffer: { kind: "current" } },
+      // The docs agents, not the shared `connected` ones: the `daemon-upgrade`
+      // docs screenshot shows this deck behind its dialog, and the shared
+      // agents carry demo-run paths.
+      docsAgents,
+      DOCS_CWD,
+    ),
+    fleetDeck(
+      FIXTURE_REMOTE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine.", upgradeOffer: FIXTURE_OLDER },
+      remoteAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+    upgradeIncompatibleDeck(),
+  ];
+}
+
+/**
+ * Issue #1637 — `?fixture=1&state=hook-notice`: this machine's deck, whose
+ * Claude Code and Codex hooks still run an older Homebrew copy, beside a remote
+ * deck with nothing to report. The notice belongs to the first deck only.
+ */
+function hookNoticeFleet(): DeckSnapshot[] {
+  return [
+    fleetDeck(
+      FIXTURE_DAEMON_ID,
+      {
+        status: "connected",
+        deckId: FIXTURE_DAEMON_ID,
+        socketPath: FIXTURE_DAEMON_ID,
+        message: "Daemon responding",
+        deckKind: "local",
+        hookBinaryNotices: [
+          {
+            binary: "/opt/homebrew/bin/dot-agent-deck",
+            agents: ["Claude Code", "Codex"],
+            version: "0.45.1",
+            daemonVersion: "0.46.0",
+            reason: "older",
+            remedy: "Run:",
+            command: "brew upgrade dot-agent-deck",
+          },
+        ],
+      },
+      docsAgents,
+      DOCS_CWD,
+    ),
+    fleetDeck(
+      FIXTURE_REMOTE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      remoteAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+  ];
+}
+
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
+  if (state === "docs-pr") {
+    const snapshot = createFixtureSnapshot("docs");
+    return {
+      ...snapshot,
+      agents: [{
+        ...snapshot.agents[1],
+        pullRequest: {
+          number: 1234,
+          url: "https://github.com/test-org/test-repo/pull/1234",
+          state: "open",
+          review: "review_required",
+          checks: { state: "passing", passing: 24, failing: 0, pending: 0, skipped: 0 },
+        },
+      }],
+    };
+  }
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet") return createFixtureFleet(state)[0];
-  const connected = state === "connected" || state === "crowded" || state === "empty";
+  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages" || state === "upgrade" || state === "upgrade-error" || state === "hook-notice") return createFixtureFleet(state)[0];
+  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs" || state === "docs-question" || state === "docs-restart";
   const connection = connected
-    ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Deck responding · no agents running" : "Deck responding" }
+    ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding", ...(state === "docs-restart" ? { incarnation: "docs-before" } : {}) }
     : state === "error"
-      ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; deck reported v5." }
-      : { status: "disconnected" as const, message: "No deck is listening on the configured socket." };
+      ? { status: "error" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version.", detail: "The app speaks protocol 6; the daemon reports protocol 5." }
+      : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
-  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : agents;
+  const messagingParam = state === "docs" && typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("messaging") : null;
+  const messaging = messagingParam === "1" || messagingParam === "attention";
+  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
+  // The docs scenario carries only what its screenshots show, so nothing from
+  // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
+  const docs = state === "docs" || state === "docs-question" || state === "docs-restart";
 
   return {
     runId: "run_7f24a",
     repo: "dot-agent-deck",
     branch: "codex/visual-control-deck",
-    worktree: "/dev/active/dot-agent-deck-gui",
+    worktree: messaging ? "/home/dev/demo-project" : docs ? DOCS_CWD : "/dev/active/dot-agent-deck-gui",
     connection,
-    health: state === "connected" || state === "crowded" ? "healthy" : state === "error" ? "failed" : "idle",
+    health: state === "connected" || state === "crowded" || docs ? "healthy" : state === "error" ? "failed" : "idle",
     elapsed: "16:42",
     spend: 2.57,
     currentNode: 4,
     totalNodes: 6,
     currentAttempt: 1,
     paused: false,
-    stages: state === "empty" ? [] : stages.map((stage) => ({ ...stage })),
-    agents: fleet.map((agent) => ({ ...agent })),
-    handoffs: [
-      { id: "dlg-demo-3", toRole: "Reviewer", orchestration: "dot-agent-deck", taskPreview: "Review the terminal lifecycle change; report findings only.", status: "dispatched", respawned: true, at: "14:41:22" },
+    stages: state === "empty" || docs ? [] : stages.map((stage) => ({ ...stage })),
+    // Issue #2001: the docs scenarios picture a LIVE deck, whose tile prints no
+    // model, while the tile prints one in fixture mode. Emptied here rather
+    // than in `crowdedAgent`, whose placeholder the crowded scenario keeps.
+    agents: fleet.map((agent) => (docs ? { ...agent, model: "" } : { ...agent })),
+    handoffs: docs ? [] : [
+      { id: "dlg-demo-3", toRole: "Reviewer", orchestration: "dot-agent-deck", taskPreview: "Review the terminal lifecycle change; report findings only.", status: "delegated", respawned: true, at: "14:41:22" },
       { id: "dlg-demo-2", toRole: "Builder", orchestration: "dot-agent-deck", taskPreview: "Implement the Tauri client as a second daemon surface.", status: "done", respawned: true, at: "14:40:58" },
       { id: "dlg-demo-1", toRole: "Tester", orchestration: "dot-agent-deck", taskPreview: "Write the failing bridge test for listener disposal.", status: "failed", respawned: false, reason: "worker respawn failed: command not found", at: "14:33:07" },
     ],
-    evidence: state === "empty" ? [] : evidence.map((item) => ({ ...item })),
+    evidence: state === "empty" || docs ? [] : evidence.map((item) => ({ ...item })),
     profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })),
+    // The docs scenarios show the host panel the dashboard now carries; the
+    // other single-deck states stay as the unit tests were written against.
+    ...(docs ? { hostMetrics: fixtureHostMetrics("local") } : {}),
+  };
+}
+
+/**
+ * PRD #802 M6 — the deterministic stand-in for the whole voice backend.
+ *
+ * # Why the vocabulary lives HERE and not in the panel
+ *
+ * The browser tier has no Tauri runtime at all — `vite preview` serving static
+ * files — so `FixtureDeckBridge` stands in for every Rust-side stage of the
+ * pipeline: transcribe, resolve, validate, report. That makes this the fixture's
+ * *model plus its command table*, which is fixture data, exactly like the
+ * snapshots above. A panel that carried its own vocabulary would be a second
+ * resolver, and the one property PRD #802 is built on — the app renders every
+ * sentence the user reads, and renders it once — would be gone: the panel would
+ * phrase in fixture mode what Rust phrases in live mode.
+ *
+ * # Exact matching, not substring or fuzzy
+ *
+ * A fixture is one instant held still, and a deterministic preview is worth
+ * having precisely because it cannot surprise anybody. Matching is trim plus
+ * lowercase and then equality, which is also what keeps the no-match path
+ * reachable: `Go, BACK to "Deck"?!` has to resolve to nothing, and any
+ * substring rule would have it matching the deck phrases below.
+ *
+ * # Every param-free row, and no other
+ *
+ * Every param-free row is here, so the fixture can answer it honestly with no
+ * resolver of its own. `open_agent` is the one left out: it would need a second
+ * `agent_ref` resolver here to reach at all — the real one, and every refusal
+ * it produces, is covered in `voice/outcome.rs` — and inventing a stand-in for
+ * it in a browser is the drift this module's placement is about.
+ *
+ * (This heading counted *three*, then four. It names the rule now rather than a
+ * number, so the next row does not have to remember to edit a heading.)
+ *
+ * **`dictate_to_agent` used to be left out for `open_agent`'s reason and is
+ * here now, because the param it declares changed shape.** It took an
+ * `agent_ref`; it takes a `spoken_prefix`, which resolves against the
+ * TRANSCRIPT rather than against live state. That is a rule a preview can
+ * reproduce exactly — strip the opener, type the rest — where a resolver over
+ * a live fleet is not. The row below says which half is reproduced and which
+ * half (the model fallback) still is not.
+ *
+ * **`close` was left out until the voice surface could be reached on the
+ * `agent` screen at all.** That screen's whole background — the voice trigger
+ * included — was marked `inert` by the pane's modal fence, so a fixture row for
+ * it answered a question nothing could ask. `useInertBackground` now exempts
+ * the voice surface as a peer dialog, so the question is askable and the row is
+ * here to answer it.
+ */
+export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
+  readonly phrases: readonly string[];
+  readonly action: string;
+  readonly invoke: string;
+  readonly screens: readonly VoiceScreen[];
+  readonly unavailableHint: string;
+  readonly report: string;
+  /**
+   * What a dispatch of this row carries, already resolved.
+   *
+   * **This is fixture DATA, not the `agent_ref` resolver the note above refuses
+   * to invent**, and the line between them is worth stating because it is the
+   * whole reason `open_agent` still has none. A resolver takes words nobody
+   * anticipated and finds an agent; this is one canned answer for one canned
+   * phrase, exactly like every sentence in this module. `open_agent`'s entire
+   * interest IS the resolution — the ambiguity, the no-match, the reference by
+   * state — which a canned answer cannot exercise and `voice/outcome.rs`
+   * already covers properly. `dictate_to_agent`'s interest is what happens
+   * AFTER a param resolves, which is precisely what a canned one lets the
+   * browser tier drive.
+   */
+  readonly params?: readonly VoiceResolvedParamDto[];
+  /**
+   * PRD #1541 — a typing-mode prompt command: dispatched only while typing
+   * mode is on, and never by the generic phrase match below. Outside the mode
+   * on the agent screen its phrases (less {@link FIXTURE_TYPING_STOP_PHRASES})
+   * are answered with {@link FIXTURE_TYPING_MODE_FIRST}, as `local_intercept`
+   * answers them.
+   */
+  readonly typingOnly?: true;
+  /**
+   * Words this row is matched by as a PREFIX rather than by equality, with
+   * everything after them becoming the row's `spoken_prefix` param.
+   *
+   * The one departure from equality matching in this module, and it reproduces
+   * the real fast path's rule rather than inventing one — see the dictation row
+   * below for why that is a different thing from inventing an `agent_ref`
+   * resolver.
+   */
+  readonly openers?: readonly string[];
+  /**
+   * `commands.toml`'s `requires = ["directory_listing"]` or `["new_agent_form"]`:
+   * callable only while the webview has declared a directory listing, or the
+   * New agent dialog's live form, and otherwise refused with the row's own
+   * hint — the same `Not here — <hint>.` Rust renders.
+   */
+  readonly requires?: "directory_listing" | "new_agent_form" | "new_agent_dialog_closed";
+}> = [
+  {
+    phrases: ["show me every agent", "show me all the agents", "show me everything"],
+    action: "open_overview",
+    invoke: "openOverview",
+    screens: ["deck", "overview"],
+    unavailableHint: "the agent dashboard opens from the rail once the agent's pane is closed",
+    report: "Opening the agent dashboard.",
+  },
+  {
+    phrases: ["open daemons", "go back to the daemons", "back to the daemons", "go back to the deck", "back to the deck", "show me the terminals"],
+    action: "open_deck",
+    invoke: "openDeck",
+    screens: ["deck", "overview"],
+    unavailableHint: "the Daemons screen opens from the rail once the agent's pane is closed",
+    report: "Back to the Daemons screen.",
+  },
+  {
+    // Both screens, because the one rail offers Settings on both (#1197).
+    phrases: ["open settings", "settings", "open the settings"],
+    action: "open_settings",
+    invoke: "openSettings",
+    screens: ["deck", "overview"],
+    unavailableHint: "settings open from the rail once the agent's pane is closed",
+    report: "Opening settings.",
+  },
+  {
+    // PR #1672 — a daemon's Host figures, on the dashboard with the New agent
+    // dialog closed, as `commands.toml` says.
+    phrases: ["show host", "host", "open host info", "show resource usage", "how is the machine doing"],
+    action: "show_host_metrics",
+    invoke: "showHostMetrics",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "the Host figures open from the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Showing the Host figures.",
+  },
+  {
+    // The VIEW, never the terminal pane — the same line `commands.toml` draws at
+    // this row, because the two are one word apart in speech. Callable on every
+    // screen (the pull request browser's too, PRD #1401) for `voice_off`'s reason: the real row has no `screens`
+    // column, because the overlay it dismisses can be up over any of them.
+    phrases: ["close this", "close", "close the agent view", "stop looking at this one"],
+    action: "close",
+    invoke: "closeTopmost",
+    screens: ["deck", "overview", "agent", "pull_request"],
+    unavailableHint: "closing what is on top works anywhere",
+    report: "Closed.",
+  },
+  {
+    // One of the entries listing every screen — the three views and the pull
+    // request browser (PRD #1401) — because the real row lists NONE: an absent
+    // `screens` column means "everywhere". The fixture's own
+    // matcher is `screens.includes(screen)`, so an empty array here would mean
+    // the opposite of what an empty column means in `commands.toml`; spelling
+    // the three out is what keeps the preview and the table agreeing.
+    //
+    // The phrases are `voice::dictation::VOICE_OFF_PHRASES`, all of them —
+    // `fixture.test.ts` compares this row with the Rust list.
+    phrases: ["voice off", "turn off the voice", "turn voice off", "stop listening", "stop voice control", "stop voice", "mute", "mic off"],
+    action: "voice_off",
+    invoke: "stopVoice",
+    screens: ["deck", "overview", "agent", "pull_request"],
+    unavailableHint: "turning voice off works anywhere",
+    report: "Voice control off.",
+  },
+  {
+    // Callable everywhere for the same reason, and listing ITSELF in the
+    // overlay it opens — which is correct rather than cute: a user who has
+    // forgotten the phrase is exactly who reads that list.
+    /* Lower case, because the matcher lowercases the utterance before
+       comparing: a phrase with a capital in it here can never be matched. */
+    phrases: ["what can i say?", "what can i say", "what can you do?", "help"],
+    action: "list_commands",
+    invoke: "showVoiceCommands",
+    screens: ["deck", "overview", "agent", "pull_request"],
+    unavailableHint: "the list of commands opens anywhere",
+    report: "Here is what you can say.",
+  },
+  {
+    // **Matched by OPENER rather than by phrase**, which is the one place this
+    // module reproduces a rule instead of canning an answer — and it is
+    // allowed to for the reason `agent_ref` is not: the fast path's rule is
+    // local, deterministic and complete (`voice::dictation::strip_opening`
+    // strips the opener and types the rest), so reproducing it invents
+    // nothing. What a fixture could not stand in for is the MODEL fallback,
+    // which is why the openers here are exactly the four the real fast path
+    // knows and no more.
+    //
+    // `screens: ["agent"]` matches the real row: the target is the pane on
+    // screen, so the preview's dictation tests open one first. The crowded
+    // fleet's `coder` is the pane they open, and that choice is the feature's
+    // own requirement rather than an arbitrary pick — dictation types into a
+    // pane, so the target has to be an agent whose pane accepts typing. Every
+    // agent in the `connected` deck fails that (`planner` and `reviewer` hold a
+    // read lease, `tester` has no live target, `builder` has finished) while
+    // the crowded fleet's `coder` is running and holds a write lease.
+    phrases: [],
+    openers: ["type", "write", "say", "dictate"],
+    action: "dictate_to_agent",
+    invoke: "dictateToAgent",
+    screens: ["agent"],
+    unavailableHint: "typing to an agent needs that agent's pane open — open one first",
+    report: "Typed.",
+  },
+  {
+    // PRD #1260 — the dictation mode's switches, the real fast path's lists
+    // (`voice::dictation::DICTATION_ON_PHRASES` and `DICTATION_OFF_PHRASES`)
+    // matched by its whole-utterance rule ({@link fixtureSaidWhole}) ahead of
+    // the opener row, as `local_intercept` checks them.
+    phrases: [
+      "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing",
+      "talking on", "start talking", "speaking on", "start speaking", "dictate on", "writing on",
+      "start writing",
+    ],
+    action: "dictation_on",
+    invoke: "startDictation",
+    screens: ["agent"],
+    unavailableHint: "typing mode needs an agent's pane open — open one first",
+    report: "Typing to the agent.",
+  },
+  {
+    phrases: [
+      "type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing",
+      "talking off", "stop talking", "speaking off", "stop speaking", "dictate off", "writing off",
+      "stop writing",
+    ],
+    action: "dictation_off",
+    invoke: "stopDictation",
+    screens: ["agent"],
+    unavailableHint: "typing mode is only on in an agent's pane",
+    report: "Stopped typing.",
+  },
+  {
+    // Whole-utterance equality ({@link fixtureSaidWhole}) — the real fast path
+    // draws the same line, and for the reason its own constant documents at
+    // length: a trailing rule would submit "the meeting is at the" when
+    // somebody said "type the meeting is at the end".
+    //
+    // `voice::dictation::SUBMIT_PHRASES` together with
+    // `SUBMIT_WHERE_CALLABLE_PHRASES`, which is the set the mode answers ("go
+    // ahead" is one); `fixture.test.ts` compares this row with both.
+    phrases: [
+      "end", "send", "send it", "submit", "enter", "press enter",
+      "submit it", "go ahead", "that is the end", "finished", "the prompt is finished",
+    ],
+    action: "submit_prompt",
+    invoke: "submitAgentPrompt",
+    screens: ["agent"],
+    unavailableHint: "sending a prompt needs an agent's pane open — open one first",
+    report: "Sent.",
+  },
+  {
+    // PRD #1541 — the typing-mode prompt commands. The phrases are
+    // `voice::dictation::INTERRUPT_PHRASES` followed by `TYPING_STOP_PHRASES`
+    // (interrupt's bare "stop" forms, live only in typing mode),
+    // `CLEAR_PROMPT_PHRASES` and `SCRATCH_PHRASES`; `fixture.test.ts` compares
+    // each row with Rust's lists.
+    phrases: ["interrupt", "interrupt it", "interrupt that", "stop", "stop it", "stop that"],
+    action: "interrupt_agent",
+    invoke: "interruptAgent",
+    screens: ["agent"],
+    unavailableHint: "interrupting an agent works in its pane, in typing mode",
+    report: "Interrupted the agent.",
+    typingOnly: true,
+  },
+  {
+    phrases: ["clear the prompt", "clear prompt", "clear it", "clear all", "clear everything", "delete everything"],
+    action: "clear_prompt",
+    invoke: "clearAgentPrompt",
+    screens: ["agent"],
+    unavailableHint: "clearing a prompt works in an agent's pane, in typing mode",
+    report: "Cleared the prompt.",
+    typingOnly: true,
+  },
+  {
+    phrases: ["scratch that", "scratch it", "scratch the last part", "scratch the last sentence", "scratch the last prompt", "delete that", "undo that"],
+    action: "scratch_that",
+    invoke: "scratchLastDictation",
+    screens: ["agent"],
+    unavailableHint: "scratching dictated words works in an agent's pane, in typing mode",
+    report: "Scratched the last dictation.",
+    typingOnly: true,
+  },
+  {
+    // PRD #1497 — reading's switches and the way of silencing the app,
+    // `voice::dictation::READING_ON_PHRASES`, `READING_OFF_PHRASES` and
+    // `QUIET_PHRASES`, answered ahead of everything by
+    // {@link fixtureReadingIntercept} as `outcome::reading_intercept` answers
+    // them.
+    phrases: ["reading on", "start reading", "reading mode on", "read to me"],
+    action: "reading_on",
+    invoke: "startReading",
+    // Every screen (decision 2 of 2026-10-09): the switch is not tied to a pane.
+    screens: ["deck", "overview", "agent", "pull_request"],
+    unavailableHint: "turning reading on works anywhere",
+    report: "Reading on.",
+  },
+  {
+    phrases: ["reading off", "stop reading", "reading mode off", "done reading"],
+    action: "reading_off",
+    invoke: "stopReading",
+    screens: ["deck", "overview", "agent", "pull_request"],
+    unavailableHint: "turning reading off works anywhere",
+    report: "Reading off.",
+  },
+  {
+    phrases: ["quiet", "be quiet", "silence", "hush", "shush"],
+    action: "hush_reading",
+    invoke: "quietSpeech",
+    screens: ["deck", "overview", "agent", "pull_request"],
+    unavailableHint: "silencing the app's speech works anywhere",
+    report: "Quiet.",
+  },
+  {
+    // PR #1451 round 3, change 5 — the New agent browser's Filter box.
+    // Matched by OPENER — the words `commands.toml` listed as the row's
+    // `heard_as` until PRD #1733 replaced that column with a meaning check
+    // this preview has no model for; the text
+    // is then picked out of the utterance by {@link fixtureFilterText} and
+    // kept only if `voice::filter::grounded_filter_text` would keep it. The
+    // picking is the one part a model does in a live build, so the preview's
+    // version is deliberately small: a named letter, or what follows the
+    // opener.
+    phrases: [],
+    openers: ["filter", "show only", "only show", "narrow"],
+    action: "filter_directories",
+    invoke: "filterDirectories",
+    screens: ["overview"],
+    requires: "directory_listing",
+    unavailableHint: "filtering needs the New agent dialog's directory listing; say “new agent” and choose a daemon first",
+    report: "Filtering by “{text}”.",
+  },
+  {
+    phrases: ["clear filter", "clear the filter", "remove the filter", "reset the filter", "no filter", "show all directories"],
+    action: "clear_directory_filter",
+    invoke: "clearDirectoryFilter",
+    screens: ["overview"],
+    requires: "directory_listing",
+    unavailableHint: "clearing the filter needs the New agent dialog's directory listing; say “new agent” and choose a daemon first",
+    report: "Filter cleared.",
+  },
+  {
+    // PR #1451 round 4, decision D8 — the New agent form's Command field.
+    // Matched by OPENER; the command is then the rest of the utterance, kept
+    // as said by {@link fixtureGroundedCommandText}, which is
+    // `voice::command_text::grounded_command_text`'s presentation rule. A live
+    // build has the model locate the command inside a longer sentence; the
+    // preview's stand-in for that is "everything after the opener".
+    phrases: [],
+    openers: ["set the command to", "change the command to", "make the command", "the command is"],
+    action: "set_new_agent_command",
+    invoke: "setNewAgentCommand",
+    screens: ["overview"],
+    requires: "new_agent_form",
+    unavailableHint: "setting the command needs a daemon and a directory chosen in the New agent dialog; choose those first",
+    report: "Command: “{command}”.",
+  },
+  {
+    // PR #1451 round 3, change 4 — turning the page of a list voice shows a
+    // page at a time. The app refuses a turn with nothing to turn to itself.
+    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more", "page down"],
+    action: "next_page",
+    invoke: "nextPage",
+    screens: ["deck", "overview"],
+    unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
+    report: "Next page.",
+  },
+  {
+    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back", "page up"],
+    action: "previous_page",
+    invoke: "previousPage",
+    screens: ["deck", "overview"],
+    unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
+    report: "Previous page.",
+  },
+  {
+    // Issue #1492 — scrolling the agent dashboard, which no longer pages. Like
+    // the live rows, only while the New agent dialog is closed.
+    phrases: ["scroll down", "scroll down a bit", "go down", "move down"],
+    action: "scroll_down",
+    invoke: "scrollDown",
+    screens: ["overview", "pull_request"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    report: "Scrolling down.",
+  },
+  {
+    phrases: ["scroll up", "scroll up a bit", "go up", "move up"],
+    action: "scroll_up",
+    invoke: "scrollUp",
+    screens: ["overview", "pull_request"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    report: "Scrolling up.",
+  },
+  {
+    phrases: ["scroll to the top", "go to the top", "back to the top"],
+    action: "scroll_to_top",
+    invoke: "scrollToTop",
+    screens: ["overview", "pull_request"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    report: "Scrolled to the top.",
+  },
+  {
+    phrases: ["scroll to the bottom", "go to the bottom", "scroll to the end"],
+    action: "scroll_to_bottom",
+    invoke: "scrollToBottom",
+    screens: ["overview", "pull_request"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    report: "Scrolled to the bottom.",
+  },
+  {
+    // PRD #1401 — an agent's pull request, in the app's own browser.
+    phrases: ["open the pr", "show the pull request", "open the pull request"],
+    action: "open_pr",
+    invoke: "openPullRequest",
+    screens: ["overview", "agent"],
+    unavailableHint: "a pull request opens from the agent dashboard or from its agent's own screen",
+    report: "Opening the pull request.",
+  },
+  {
+    phrases: ["open it in the browser", "open in browser"],
+    action: "open_pr_in_browser",
+    invoke: "openPullRequestInBrowser",
+    screens: ["pull_request"],
+    unavailableHint: "this works while a pull request is open in the app",
+    report: "Opened it in your browser.",
+  },
+];
+
+/**
+ * The preview's vocabulary, annotated for one screen (PRD #802 D7).
+ *
+ * Derived from {@link FIXTURE_VOICE_COMMANDS} rather than written out, exactly
+ * as the live one is derived from `commands.toml`: the overlay lists what this
+ * bridge can actually resolve, so a row added above appears in it with no edit
+ * here.
+ *
+ * `description` is the one field the preview has to invent, because the fixture
+ * rows carry phrases rather than a prompt. It names the phrases, which is
+ * honest about what this stand-in is — a matcher over a fixed list — and is
+ * what a preview reader most needs to know.
+ */
+export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false, newAgentForm = false, newAgentDialog = false): VoiceCommandDto[] {
+  return FIXTURE_VOICE_COMMANDS.map((command) => ({
+    id: command.action,
+    description: `Say ${command.phrases.map((phrase) => `“${phrase}”`).join(", ")}.`,
+    callable: fixtureCallable(command, screen, directoryListing, newAgentForm, newAgentDialog),
+    unavailable_hint: command.unavailableHint,
+    params: [],
+  }));
+}
+
+/**
+ * `Heard: “<transcript>” — <situation>.`
+ *
+ * The transcript goes in verbatim, exactly as `voice::outcome`'s `heard` does:
+ * seeing what was heard is what turns a mis-transcription into a correction the
+ * user can make, so this is not the seam that bounds or scrubs it. The webview
+ * scrubs its own display copy at the render seam.
+ */
+function fixtureHeard(transcript: string, situation: string): string {
+  return `Heard: “${transcript}” — ${situation}.`;
+}
+
+/**
+ * PRD #1261 — one canned TIE, so the browser tier can drive the numbered
+ * chooser: "open the agent" on the Daemons screen or the dashboard, answered as
+ * `open_agent` with the two agents of the `connected` deck it names in turn.
+ *
+ * **Fixture data, not the `agent_ref` resolver {@link FIXTURE_VOICE_COMMANDS}
+ * refuses to invent**, for the same line that note draws: this is one canned
+ * answer for one canned phrase, whose interest is what happens AFTER the tie —
+ * the list, its answers, its expiry — which the real resolver's own tests in
+ * `voice/outcome.rs` cannot reach. The sentence and the two reports are the
+ * ones Rust renders for this tie. The agents are the `connected` state's own
+ * `planner` and `builder`, so a chosen entry opens a pane that exists, and
+ * each carries the `names` Rust's `spoken_names` gives that agent — its display
+ * name and its role — so the fallback answers "planner" as Rust would.
+ */
+const FIXTURE_VOICE_TIE = {
+  phrases: ["open the agent"] as readonly string[],
+  screens: ["deck", "overview"] as readonly VoiceScreen[],
+  candidates: [
+    { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture", names: ["Plan / architecture", "planner"] },
+    { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation", names: ["Desktop implementation", "builder"] },
+  ] as readonly VoiceResolvedParamDto[],
+} as const;
+
+/**
+ * Resolve one utterance the way the Rust pipeline would, against the screen the
+ * webview has stated.
+ *
+ * `resolveMs` is `null` and the backend is `stub` because **no backend was
+ * called** — there is none in a browser. Reporting a plausible number here
+ * would be the preview inventing a measurement, which is the same fabrication
+ * `resolve_ms: None` exists to refuse on the Rust side.
+ */
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false, newAgentDialog = false, reading: VoiceReadingStateDto = { reading: false, speaking: false }): VoiceResultDto {
+  const spoken = utterance.trim().toLowerCase();
+  const stub = { resolveMs: null, backend: "stub" } as const;
+  /* PRD #1497 — reading's switches, silencing the app, and D8's filter while
+     it speaks, ahead of the dictation mode as `reading_intercept` is. */
+  const readingAnswer = fixtureReadingIntercept(utterance, screen, dictating, reading);
+  if (readingAnswer) return { ...stub, outcome: readingAnswer };
+  /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
+     and matches only the reserved whole utterances, typing everything else
+     whole. The same rule here, over this module's own rows, in
+     `dictation_intercept`'s order: the biggest stop first. */
+  if (dictating) {
+    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt", "interrupt_agent", "clear_prompt", "scratch_that"]);
+    /* PR #1451 round 3 — `trailing_send`: a separate final send sentence types
+       what precedes it and asks the panel to send after it. */
+    const prompt = reserved ? undefined : fixtureTrailingSend(utterance);
+    const text = prompt ?? utterance.trim();
+    return {
+      ...stub,
+      outcome: reserved
+        ? { kind: "dispatch", transcript: utterance, action: reserved.action, invoke: reserved.invoke, params: [], sentence: reserved.report }
+        : {
+          kind: "dispatch",
+          transcript: utterance,
+          action: "dictate_to_agent",
+          invoke: "dictateToAgent",
+          params: [{ name: "prefix", kind: "spoken_prefix", spoken: "", value: text, label: text }],
+          sentence: prompt === undefined ? `Typed: “${text}”.` : `Typed: “${text}”. Sent.`,
+          ...(prompt === undefined ? {} : { thenSubmit: true }),
+        },
+    };
+  }
+  /* Outside the mode `local_intercept` answers the switches and a submit by
+     the same whole-utterance rule, ahead of the `type` opener — "type on"
+     opens with `type` and would otherwise type the word "on". */
+  const reserved = fixtureReserved(utterance, ["dictation_on", "dictation_off", "submit_prompt"]);
+  /* PRD #1541 — a typing-mode prompt command said with the mode OFF: on the
+     agent screen it runs nothing and says to say "typing on" first. On the
+     other screens Rust's model answers it, which the preview stands in for
+     with the row's own hint. A bare "stop" is neither: Rust hands it to the
+     model, and here it falls through like any other phrase. */
+  const typingOnly = reserved || fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES)
+    ? undefined
+    : FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.typingOnly && fixtureSaidWhole(utterance, candidate.phrases));
+  if (typingOnly) {
+    const hint = screen === "agent" ? FIXTURE_TYPING_MODE_FIRST : typingOnly.unavailableHint;
+    const sentence = screen === "agent" ? `${hint[0].toUpperCase()}${hint.slice(1)}.` : `Not here — ${hint}.`;
+    return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: typingOnly.action, hint, sentence } };
+  }
+  if (!reserved && FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
+    const hint = "opening an agent works from the Daemons screen or the agent dashboard";
+    if (!FIXTURE_VOICE_TIE.screens.includes(screen)) {
+      return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: "open_agent", hint, sentence: `Not here — ${hint}.` } };
+    }
+    const candidates = [...FIXTURE_VOICE_TIE.candidates];
+    const matches = candidates.map((candidate) => candidate.label);
+    return {
+      ...stub,
+      outcome: {
+        kind: "param_ambiguous",
+        transcript: utterance,
+        action: "open_agent",
+        invoke: "openAgent",
+        param: "agent",
+        spoken: "agent",
+        matches,
+        candidates,
+        params: [],
+        reports: matches.map((label) => `Opening ${label}.`),
+        sentence: fixtureHeard(utterance, `“agent” matches more than one agent: ${matches.join(", ")}`),
+      },
+    };
+  }
+  const command = reserved
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => !candidate.typingOnly && candidate.phrases.includes(spoken))
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
+  if (!command) {
+    return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
+  }
+  if (!fixtureCallable(command, screen, directoryListing, newAgentForm, newAgentDialog)) {
+    return {
+      ...stub,
+      outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
+    };
+  }
+  /* PRD #1401 — the dashboard has no pane whose pull request a bare "open the
+     PR" means, and the preview resolves no agent names, so it asks, as Rust
+     does when several agents are on the dashboard. */
+  if (command.action === "open_pr" && screen === "overview") {
+    return { ...stub, outcome: { kind: "param_missing", transcript: utterance, action: command.action, param: "agent", sentence: fixtureHeard(utterance, "say which agent's pull request to open") } };
+  }
+  if (command.action === "filter_directories") {
+    const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined);
+    // Not `fixtureOpening`'s text: that drops a leading `-`, and "filter -tmp"
+    // means `-tmp`. Only separators that cannot open a name are dropped here.
+    const rest = opener === undefined ? undefined : utterance.trim().slice(opener.length).replace(/^[\s:,]+/u, "");
+    const text = rest === undefined ? undefined : fixtureFilterText(utterance, rest);
+    if (text === undefined) {
+      return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
+    }
+    return {
+      ...stub,
+      outcome: {
+        kind: "dispatch",
+        transcript: utterance,
+        action: command.action,
+        invoke: command.invoke,
+        params: [{ name: "text", kind: "filter_text", spoken: text, value: text, label: text }],
+        sentence: command.report.replace("{text}", text),
+      },
+    };
+  }
+  if (command.action === "set_new_agent_command") {
+    const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined)!;
+    const said = utterance.trim().slice(opener.length).trim();
+    const value = fixtureGroundedCommandText(utterance, said);
+    if (value === undefined) {
+      return { ...stub, outcome: { kind: "param_missing", transcript: utterance, action: command.action, param: "command", sentence: fixtureHeard(utterance, "I could not tell what command you said, so the command was not changed") } };
+    }
+    return {
+      ...stub,
+      outcome: {
+        kind: "dispatch",
+        transcript: utterance,
+        action: command.action,
+        invoke: command.invoke,
+        params: [{ name: "command", kind: "command_text", spoken: said, value, label: value }],
+        sentence: command.report.replace("{command}", value),
+      },
+    };
+  }
+  /* The typed text is a slice of the UTTERANCE, never of anything this module
+     made up — which is the property the real pipeline holds and the preview
+     would be misleading about if it canned a string here. */
+  const opener = (command.openers ?? []).find((candidate) => fixtureOpening(utterance, candidate) !== undefined);
+  const text = opener === undefined ? undefined : fixtureOpening(utterance, opener);
+  const params: VoiceResolvedParamDto[] = text === undefined
+    ? [...command.params ?? []]
+    : [{ name: "prefix", kind: "spoken_prefix", spoken: opener!, value: text, label: text }];
+  return {
+    ...stub,
+    outcome: {
+      kind: "dispatch",
+      transcript: utterance,
+      action: command.action,
+      invoke: command.invoke,
+      params,
+      sentence: text === undefined ? command.report : `Typed: “${text}”.`,
+    },
+  };
+}
+
+/** Whether `command` can run on `screen`, given whether a directory listing and a live New agent form are declared. */
+function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean, newAgentForm: boolean, newAgentDialog = false): boolean {
+  if (!command.screens.includes(screen)) return false;
+  if (command.requires === "new_agent_dialog_closed") return !newAgentDialog;
+  if (command.requires === "directory_listing") return directoryListing;
+  if (command.requires === "new_agent_form") return newAgentForm;
+  return true;
+}
+
+/** The quote pairs `voice::command_text` drops from around a command. */
+const FIXTURE_COMMAND_QUOTES: ReadonlyArray<readonly [string, string]> = [["\"", "\""], ["'", "'"], ["`", "`"], ["“", "”"], ["‘", "’"]];
+
+/**
+ * `voice::command_text::grounded_command_text`'s presentation rule: the
+ * command `value` without surrounding whitespace, a sentence's trailing full
+ * stop (a single `.` after a letter, digit or closing quote — `cd ..` keeps
+ * its dots) or one pair of surrounding quotes, and otherwise exactly as said.
+ * It must occur in `transcript` as whole spoken tokens, and hold no control,
+ * format character or line separator.
+ */
+export function fixtureGroundedCommandText(transcript: string, value: string): string | undefined {
+  const withoutFullStop = (text: string) => (/[\p{L}\p{N}”’"'`]\.$/u.test(text) ? text.slice(0, -1).trimEnd() : text);
+  let text = withoutFullStop(value.trim());
+  const pair = FIXTURE_COMMAND_QUOTES.find(([open, close]) => text.length >= 2 && text.startsWith(open) && text.endsWith(close) && !text.slice(1, -1).includes(open) && !text.slice(1, -1).includes(close));
+  if (pair) text = withoutFullStop(text.slice(1, -1).trim());
+  if (text === "" || FIXTURE_COMMAND_INVISIBLE.test(text)) return undefined;
+  const opens = (c: string | undefined) => FIXTURE_COMMAND_QUOTES.some(([open]) => open === c);
+  const closes = (c: string | undefined) => FIXTURE_COMMAND_QUOTES.some(([, close]) => close === c);
+  const edge = (c: string | undefined) => c === undefined || /\s/u.test(c);
+  // Whole spoken tokens, as `starts_a_token` / `ends_a_token`: whitespace or an
+  // end of the transcript, past one opening quote before and a full stop and
+  // one closing quote after.
+  const whole = (at: number) => {
+    let before = at - 1;
+    if (opens(transcript[before])) before -= 1;
+    if (!edge(transcript[before])) return false;
+    let after = at + text.length;
+    let last: string | undefined = text[text.length - 1];
+    let stopped = false;
+    let quoted = false;
+    for (;;) {
+      const next = transcript[after];
+      if (next === "." && !stopped && last !== undefined && (/[\p{L}\p{N}]/u.test(last) || closes(last))) stopped = true;
+      else if (!quoted && closes(next)) quoted = true;
+      else break;
+      last = next;
+      after += 1;
+    }
+    return edge(transcript[after]);
+  };
+  for (let at = transcript.indexOf(text); at >= 0; at = transcript.indexOf(text, at + 1)) {
+    if (whole(at)) return text;
+  }
+  return undefined;
+}
+
+/** What `voice::command_text::has_invisible` refuses: controls (C0 and C1), format characters, and line or paragraph separators. */
+const FIXTURE_COMMAND_INVISIBLE = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+
+/**
+ * The Filter box's text out of what followed the opener: a letter named after
+ * "letter" ("show only those starting with letter D" is "d"), or else the rest
+ * less a leading "by" ("filter by api" is "api"). Kept only if
+ * {@link fixtureGroundedFilterText} keeps it, which is the half of the live
+ * path this reproduces exactly.
+ */
+function fixtureFilterText(utterance: string, rest: string): string | undefined {
+  const letter = /\bletter\s+(\p{L})(?![\p{L}\p{N}])/iu.exec(rest);
+  const value = letter ? letter[1] : rest.replace(/^by\s+/iu, "");
+  return fixtureGroundedFilterText(utterance, value);
+}
+
+/**
+ * `voice::filter::grounded_filter_text`: the value, trimmed of what is not a
+ * letter or digit (but keeping joiners at the front) and lowercased, made only
+ * of letters, digits, spaces and the joiners `-` `_` `.`, and said — its words adjacent in the transcript, or one
+ * letter named straight after "letter". Spelled letter names ("letter dee")
+ * are Rust's alone; the preview has no model that would produce one.
+ */
+function fixtureGroundedFilterText(transcript: string, value: string): string | undefined {
+  const text = value.replace(/^[^\p{L}\p{N}._-]+|[^\p{L}\p{N}]+$/gu, "").toLowerCase();
+  const core = text.replace(/^[._-]+/u, "");
+  const lead = text.slice(0, text.length - core.length);
+  if (core === "" || !/^[\p{L}\p{N} ._-]+$/u.test(core)) return undefined;
+  const wanted = fixtureSpokenWords(core);
+  const said = [...transcript.matchAll(/[\p{L}\p{N}]+/gu)].map((match) => ({ at: match.index, word: match[0].toLowerCase() }));
+  const windows = said.filter((_, at) => wanted.every((word, offset) => said[at + offset]?.word === word));
+  if (windows.length === 0) return undefined;
+  // A leading joiner stays only where the transcript opens that word's token
+  // with it, as `voice::filter::lead_before` reads it.
+  const leadBefore = (at: number) => {
+    const run = /[._-]*$/u.exec(transcript.slice(0, at))![0];
+    return /[\p{L}\p{N}]$/u.test(transcript.slice(0, at - run.length)) ? "" : run;
+  };
+  const kept = windows.some(({ at }) => leadBefore(at) === lead) ? lead : "";
+  return kept + core.split(/\s+/u).join(" ");
+}
+
+/**
+ * `voice::outcome::WHOLE_UTTERANCE_POLITENESS` — words that may open or close a
+ * reserved phrase without making it a different request ("okay, send it
+ * please"). Only these, and only at the edges; `fixture.test.ts` says every
+ * one of them on both edges of every reserved phrase.
+ */
+const FIXTURE_WHOLE_UTTERANCE_POLITENESS: readonly string[] = [
+  "okay", "ok", "alright", "yes", "yeah", "please", "just", "now", "thanks",
+];
+
+/** `voice::table::spoken_words`: lowercased runs of letters and digits, so a transcriber's case and punctuation decide nothing. */
+function fixtureSpokenWords(text: string): string[] {
+  return text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word !== "");
+}
+
+/**
+ * `voice::outcome::said_whole`: the utterance's words less any edge politeness
+ * word ARE one of `phrases`. Never a prefix or a suffix test, so "please send
+ * it to the tester later" is not a send.
+ */
+function fixtureSaidWhole(utterance: string, phrases: readonly string[]): boolean {
+  const words = fixtureSpokenWords(utterance);
+  const polite = (word: string) => FIXTURE_WHOLE_UTTERANCE_POLITENESS.includes(word);
+  const start = words.findIndex((word) => !polite(word));
+  if (start < 0) return false;
+  const end = words.length - [...words].reverse().findIndex((word) => !polite(word));
+  const said = words.slice(start, end).join(" ");
+  return phrases.some((phrase) => fixtureSpokenWords(phrase).join(" ") === said);
+}
+
+/**
+ * `voice::dictation::TRAILING_SEND_PHRASES` — the send phrases that also count
+ * as a separate final sentence of a longer utterance in typing mode. The wider
+ * `submit_prompt` list ("end", "enter", "finished", "go ahead") sends only as
+ * the whole utterance.
+ */
+const FIXTURE_TRAILING_SEND_PHRASES: readonly string[] = ["send", "send it", "submit", "press enter"];
+
+/**
+ * `voice::dictation::TYPING_STOP_PHRASES` — interrupt's bare "stop" forms,
+ * which interrupt only in typing mode and are not answered locally outside it.
+ */
+const FIXTURE_TYPING_STOP_PHRASES: readonly string[] = ["stop", "stop it", "stop that"];
+
+/** `voice::outcome::TYPING_MODE_FIRST_HINT`, which `fixture.test.ts` compares. */
+const FIXTURE_TYPING_MODE_FIRST = "say “typing on” first — interrupting, clearing and scratching work in typing mode";
+
+/**
+ * `voice::outcome::trailing_send`: the words before a separate final sentence
+ * that, less an edge politeness word, IS one of
+ * {@link FIXTURE_TRAILING_SEND_PHRASES}. The final sentence follows the last
+ * `.`, `?` or `!` that is followed by whitespace, once the utterance's own
+ * closing punctuation is set aside; what precedes it must carry a word.
+ */
+function fixtureTrailingSend(utterance: string): string | undefined {
+  const body = utterance.replace(/[\s.?!]+$/u, "");
+  let cut = -1;
+  for (let at = 0; at + 1 < body.length; at += 1) {
+    if (".?!".includes(body[at]) && /\s/u.test(body[at + 1])) cut = at + 1;
+  }
+  if (cut < 0) return undefined;
+  const prompt = body.slice(0, cut).trim();
+  if (!fixtureSaidWhole(body.slice(cut), FIXTURE_TRAILING_SEND_PHRASES)) return undefined;
+  return /[\p{L}\p{N}]/u.test(prompt) ? prompt : undefined;
+}
+
+/** The first of `actions`, in order, whose row's phrases the whole utterance is. */
+/** `outcome::DROPPED_WHILE_SPEAKING`. */
+export const FIXTURE_DROPPED_WHILE_SPEAKING = "only “stop” or “quiet” works while the app is speaking";
+
+/**
+ * PRD #1497 — the preview's copy of `outcome::reading_intercept`: "quiet"
+ * while reading is on or the app was speaking, the bare "stop" forms while the
+ * app was speaking or while reading is on outside typing mode; while the app
+ * was speaking, everything else is dropped (D8); then the reading switches, in
+ * every mode. With reading off and nothing spoken, "quiet" is left to the
+ * rest of the resolver, as in Rust.
+ */
+function fixtureReadingIntercept(utterance: string, screen: VoiceScreen, typing: boolean, reading: VoiceReadingStateDto): VoiceResultDto["outcome"] | undefined {
+  const dispatch = (action: string): VoiceResultDto["outcome"] | undefined => {
+    const row = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.action === action);
+    if (!row) return undefined;
+    if (!row.screens.includes(screen)) {
+      return { kind: "unavailable", transcript: utterance, action, hint: row.unavailableHint, sentence: `Not here — ${row.unavailableHint}.` };
+    }
+    return { kind: "dispatch", transcript: utterance, action, invoke: row.invoke, params: [], sentence: row.report };
+  };
+  const quietLive = reading.speaking || reading.reading;
+  const stopsQuiet = reading.speaking || (reading.reading && !typing);
+  if ((quietLive && fixtureReserved(utterance, ["hush_reading"])) || (stopsQuiet && fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES))) return dispatch("hush_reading");
+  if (reading.speaking) {
+    return { kind: "dropped", transcript: utterance, sentence: `Heard: “${utterance.trim()}” — ${FIXTURE_DROPPED_WHILE_SPEAKING}.` };
+  }
+  const reserved = fixtureReserved(utterance, ["reading_on", "reading_off"]);
+  return reserved ? dispatch(reserved.action) : undefined;
+}
+
+function fixtureReserved(utterance: string, actions: readonly string[]): (typeof FIXTURE_VOICE_COMMANDS)[number] | undefined {
+  for (const action of actions) {
+    const row = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.action === action);
+    if (row && fixtureSaidWhole(utterance, row.phrases)) return row;
+  }
+  return undefined;
+}
+
+/**
+ * Everything after `opener`, or `undefined` if the utterance does not open with
+ * it — the preview's copy of `voice::dictation::strip_opening`, matched on
+ * whole words so *"typescript is confusing"* does not open with *"type"*.
+ *
+ * A remainder of nothing is `undefined` too: *"type"* alone is not a dictation,
+ * exactly as it is not one in Rust, where it falls through to the model.
+ */
+function fixtureOpening(utterance: string, opener: string): string | undefined {
+  const words = utterance.trim();
+  const lowered = words.toLowerCase();
+  const marked = opener.toLowerCase();
+  if (!lowered.startsWith(marked)) return undefined;
+  const rest = words.slice(marked.length);
+  if (rest !== "" && /[\p{L}\p{N}]/u.test(rest[0])) return undefined;
+  const text = rest.replace(/^[\s:,-]+/u, "");
+  return text === "" ? undefined : text;
+}
+
+/**
+ * The bound a live capture is held to, echoed so the preview reports the same
+ * shape rather than a made-up one. Keep identical to `voice::MAX_UTTERANCE`.
+ */
+const FIXTURE_VOICE_MAX_MS = 30_000;
+
+/**
+ * The microphone the browser preview does not have (PRD #802 M7).
+ *
+ * With no overrides this reports a runtime that offers no microphone path at
+ * all, which is what the browser preview genuinely is: no Rust side, no
+ * container, and a CSP that leaves the webview unable to reach a network
+ * origin. That lets the browser tier drive the *unavailable* path with no
+ * microphone, no credential and no Tauri runtime anywhere near it — and the
+ * surface says how to turn voice on rather than looking broken.
+ *
+ * It is no longer what a live app reports on its defaults. PRD #802's provider
+ * work gave Speech a keyless container on loopback and deleted `off`, so the
+ * Tauri side now always reports `available: true` and the *not set up* case is
+ * reported where it bites, as a `not_configured` transcription outcome naming
+ * the container to start.
+ *
+ * The overrides are what lets the same tier drive the OTHER path — see
+ * {@link fixtureVoiceHeard}.
+ */
+export function fixtureVoiceStatus(overrides: Partial<VoiceStatusDto> = {}): VoiceStatusDto {
+  return {
+    state: "idle",
+    capturedMs: 0,
+    maxMs: FIXTURE_VOICE_MAX_MS,
+    capped: false,
+    // The preview has no microphone to hear speech with, so it reports none.
+    // An override is how a test drives the other answer — which is what PRD
+    // #802's dictation countdown is cancelled by.
+    speech: false,
+    available: false,
+    // The backend that WOULD answer, which for the preview is the app's own
+    // default — nothing does, and `available: false` is what says so. `off`
+    // stood here until the union was corrected, naming a variant PRD #802's
+    // provider work deleted and the wire has never carried.
+    backend: "local",
+    ...overrides,
+  };
+}
+
+/**
+ * What the preview says when something asks it to listen (PRD #802 M7's
+ * `TranscriptionOutcome::NotConfigured`).
+ *
+ * `not_configured` rather than `failed`, and the distinction is the point: the
+ * preview has no microphone because it is a browser, which is not a fault to
+ * report. `transcribeMs` is `null` for the reason `resolveFixtureVoice`'s is.
+ */
+export function fixtureVoiceTranscription(): VoiceTranscriptionDto {
+  return {
+    outcome: {
+      kind: "not_configured",
+      detail: "the browser preview has no microphone",
+      sentence: "Nothing to listen with — the browser preview has no microphone.",
+    },
+    transcribeMs: null,
+    backend: "off",
+    audioMs: 0,
+  };
+}
+
+/**
+ * The DEFAULT line the preview's simulated microphone says.
+ *
+ * A phrase from {@link FIXTURE_VOICE_COMMANDS} rather than a fresh literal, so
+ * a row renamed there changes what the preview hears instead of leaving a
+ * canned utterance that quietly stops resolving.
+ *
+ * It is not the only one it can say: `?voice=` on the preview URL supplies a
+ * whole script of utterances instead (see {@link fixtureVoiceScript}).
+ */
+export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
+
+/**
+ * What the preview's microphone will say, in order, read off the URL.
+ *
+ * Repeated `?voice=` parameters rather than one delimited value: an utterance
+ * is a sentence and every delimiter worth choosing occurs inside one. The
+ * browser tier drives a whole session this way — *"type run the login tests"*,
+ * then *"send it"* — which is what lets a Playwright test ask about the
+ * utterance AFTER the first one, and a stand-in that spoke once could not be
+ * asked that at all.
+ *
+ * With no parameter it is the single canned utterance the preview has always
+ * had, so every existing page and test sees exactly what it saw before.
+ *
+ * Blank phrases are dropped, and a `?voice=` that held only blank ones is an
+ * EMPTY script: a microphone that hears nothing at all. It used to fall back to
+ * the canned utterance instead, so the browser spec that asks for silence to
+ * read the empty-state hint got a real utterance on the first status poll. The
+ * hint was then replaced, and the spec passed only when it read the hint
+ * before that poll landed.
+ */
+export function fixtureVoiceScript(search: string): string[] {
+  const params = new URLSearchParams(search);
+  if (!params.has("voice")) {
+    /* PR #1451 round 3, change 4 — the crowded paging state is about what voice
+       SHOWS (pages, numbers, markers), so its microphone says nothing unless a
+       spec scripts it: the default line would navigate away from the screen
+       under test the moment voice turns on. */
+    return params.get("state") === "voice-pages" ? [] : [FIXTURE_VOICE_UTTERANCE];
+  }
+  return params.getAll("voice").filter((phrase) => phrase.trim() !== "");
+}
+
+/**
+ * One simulated utterance, so the browser tier can drive the WHOLE voice loop
+ * (PRD #802 M6).
+ *
+ * The preview still has no microphone. What it has is a deterministic stand-in
+ * for one: with a transcription backend chosen in its settings, a start is
+ * accepted, the next status poll reports the utterance over, and this is what a
+ * stop returns. That is the segment → transcribe → resolve → execute → listen
+ * again cycle end to end, driven with no credential and no device — which is
+ * what the withdrawn typed path used to be the only way to reach.
+ *
+ * `transcribeMs` is `null` and the backend is `stub` for `resolveFixtureVoice`'s
+ * reason: nothing was transcribed, so there is no measurement to report.
+ */
+export function fixtureVoiceHeard(transcript: string = FIXTURE_VOICE_UTTERANCE): VoiceTranscriptionDto {
+  return {
+    outcome: {
+      kind: "heard",
+      transcript,
+      // Rendered as Rust's `heard_sentence` renders it: no colon, and no
+      // second full stop after a transcript that already ends a sentence.
+      sentence: `Heard “${transcript}”${/[.?!…]$/.test(transcript) ? "" : "."}`,
+    },
+    transcribeMs: null,
+    backend: "stub",
+    audioMs: 1_200,
+  };
+}
+
+/**
+ * Issue #1635 — the versions the `?selfupgrade=1` preview plays: the copies on
+ * this machine, and the newer release they are behind.
+ */
+export const FIXTURE_SELF_CURRENT_VERSION = "0.46.0";
+export const FIXTURE_SELF_LATEST_VERSION = "0.47.0";
+
+const line = (text: string) => ({ text, command: null });
+
+function fixtureSelfPlan(copy: SelfCopy, label: string, action: SelfUpgradePlan["action"], how: string[]): SelfUpgradePlan {
+  const headline = `${label}: update available: v${FIXTURE_SELF_LATEST_VERSION} (current: v${FIXTURE_SELF_CURRENT_VERSION})`;
+  return {
+    copy,
+    label,
+    headline,
+    current: FIXTURE_SELF_CURRENT_VERSION,
+    latest: FIXTURE_SELF_LATEST_VERSION,
+    action,
+    actionable: true,
+    confirmQuestion: `Upgrade ${label} to v${FIXTURE_SELF_LATEST_VERSION}?`,
+    provenance: { checked: true, reason: null },
+    lines: [headline, ...how].map(line),
+  };
+}
+
+/**
+ * Issue #1635 — the fixture's stand-in for `desktop_self_upgrade_check`: a Mac
+ * whose app was installed from the `.dmg` into `/Applications` (the swap-app
+ * plan) and whose `dot-agent-deck` CLI came from Homebrew, both one release
+ * behind (`selfupgrade=1`), or, with `selfupgrade=cli`, only the CLI behind
+ * an app that is current (issue #1753). Every sentence is the crate's `UpgradePlan` wording for that machine
+ * (`src/self_upgrade/plan.rs`), so the `self-upgrade` docs screenshot reads as
+ * the app does; the vitest suite does not pin them, the Rust tests do.
+ *
+ * Selected by `?fixture=1&…&selfupgrade=1`, and only in fixture mode: `App`
+ * asks for it behind `import.meta.env.TAURI_ENV_PLATFORM`, which the Tauri CLI
+ * sets for every build it runs, so the Tauri build folds the call away and
+ * keeps the real bridge. Nothing is installed: Upgrade resolves with the
+ * outcome the crate reports, and Relaunch does nothing.
+ */
+export function fixtureSelfUpgradeApi(search: string = window.location.search): SelfUpgradeApi | undefined {
+  const mode = new URLSearchParams(search).get("selfupgrade");
+  if (mode !== "1" && mode !== "cli") return undefined;
+  const latest = FIXTURE_SELF_LATEST_VERSION;
+  const appHeadline = `Agent Deck (desktop app) is up to date (v${latest}).`;
+  const app: SelfUpgradePlan = mode === "cli"
+    ? { copy: "app", label: "Agent Deck (desktop app)", headline: appHeadline, current: latest, latest, action: "up-to-date", actionable: false, confirmQuestion: null, provenance: { checked: true, reason: null }, lines: [line(appHeadline)] }
+    : fixtureSelfPlan("app", "Agent Deck (desktop app)", "swap-app", [
+      `Agent Deck at /Applications/Agent Deck.app. Upgrading downloads \`dot-agent-deck-desktop-alpha-macos-arm64.dmg\` from release v${latest}, checks its checksum, signature and notarization, and replaces the app. Agent Deck then restarts to run v${latest}.`,
+      "Its checksum is checked against the release's checksum file, and that file's build provenance with `gh attestation verify`.",
+    ]);
+  const cli = fixtureSelfPlan("cli", "dot-agent-deck CLI", "brew-upgrade", [
+    "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew update`, which refreshes Homebrew's copy of the tap, then `brew upgrade dot-agent-deck`, which installs the formula's latest release.",
+  ]);
+  /* The app-wide notice is about the app alone (issue #1753). */
+  const appBehind = mode === "1";
+  const check: SelfUpgradeCheck = { checkId: 1, latest, updateAvailable: appBehind, notice: appBehind ? app.headline : null, installed: null, app, cli, recheckAfterSecs: 6 * 60 * 60 };
+  const results: Record<SelfCopy, SelfUpgradeResult> = {
+    app: {
+      copy: "app",
+      ok: true,
+      installed: true,
+      relaunch: true,
+      lines: [`Replaced /Applications/Agent Deck.app with v${latest}. Quit and reopen Agent Deck to run it.`, "Build provenance verified with `gh attestation verify`."].map(line),
+    },
+    cli: { copy: "cli", ok: true, installed: true, relaunch: false, lines: [line(`\`brew upgrade dot-agent-deck\` finished; it now reports v${latest}.`)] },
+  };
+  /* Once the CLI is upgraded, the next check finds it current, as the bridge's would. */
+  const cliHeadline = `dot-agent-deck CLI is up to date (v${latest}).`;
+  let cliUpgraded = false;
+  return {
+    check: async () => (cliUpgraded
+      ? { ...check, checkId: check.checkId + 1, cli: { ...cli, headline: cliHeadline, current: latest, action: "up-to-date", actionable: false, confirmQuestion: null, lines: [line(cliHeadline)] } }
+      : check),
+    run: (copy) => new Promise((resolve) => window.setTimeout(() => {
+      if (copy === "cli") cliUpgraded = true;
+      resolve(results[copy]);
+    }, FIXTURE_UPGRADE_STEP_MS)),
+    relaunch: async () => undefined,
   };
 }

@@ -42,7 +42,7 @@
  * used to carry a paragraph explaining *why* the agent terminals stay dark in
  * both appearances. That is an engineering constraint, it is true, and it
  * changed nothing a reader does next — so it now lives only in
- * `docs/develop/desktop-gui.md` and `prds/743-desktop-light-dark-appearance.md`.
+ * `docs/develop/desktop-gui.md` and `prds/done/743-desktop-light-dark-appearance.md`.
  * The failed-save alert below stays, because it is a consequence the user has to
  * act on.
  *
@@ -100,10 +100,14 @@ export function AppearancePanel({ settings, onSave, saveError }: SettingsPanelPr
         </div>
       </div>
 
+      {/* Rendered verbatim: `saveError` is a complete sentence composed by
+          `useDesktopSettings`, because the same prop also carries "your
+          settings file cannot be read" (issue #1072) — which must not acquire a
+          "saving it failed" preamble it has not earned. */}
       {saveError && (
         <p className="settings-error" role="alert">
           <AlertTriangle size={13} />
-          <span>This appearance is applied, but saving it failed, so it will not survive a restart. {saveError}</span>
+          <span>{saveError}</span>
         </p>
       )}
     </div>

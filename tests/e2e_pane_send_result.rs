@@ -1,35 +1,30 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Synthetic L2 coverage for history-only input delivery and visible feedback.
 
 mod common;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(feature = "e2e", unix))]
+#[path = "support/inbox_route.rs"]
+mod route;
 
 use std::time::Duration;
 
-use common::{TuiDeck, commit_fixture};
-use dot_agent_deck::daemon_client::DaemonClient;
-use dot_agent_deck::daemon_protocol::AttachRequest;
-use dot_agent_deck::event::SendResult;
+use common::TuiDeck;
 use serde_json::json;
 use spec::spec;
 
-#[cfg(unix)]
-fn write_executable(path: &std::path::Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, contents).expect("write send-result recorder");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod send-result recorder");
-}
-
 /// Scenario: Launch a real dashboard with a long-lived synthetic pane, then
 /// identify its Codex session as history-only through a synthetic hook event.
-/// An unidentified atomic send must fail closed, while an identified send and
-/// dashboard entry still report and visibly explain the history-only target.
+/// Pressing the card's key must visibly explain the history-only target instead
+/// of entering PaneInput.
 #[spec("prompt/pane-input/004")]
 #[test]
 fn pane_input_004_history_only_send_reports_result_and_feedback() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_continue_session("history-codex", "cat")
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -62,46 +57,11 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
         .expect("inject history-only Codex SessionStart");
     deck.wait_for_absence("No agent");
 
-    let unidentified_response = common::attach_request_on(
-        deck.attach_socket_path(),
-        &AttachRequest::WriteAndSubmit {
-            pane_id: pane_id.clone(),
-            text: "this must not reach a history-only target".to_string(),
-        },
-    )
-    .expect("send input request");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build identity-bearing send runtime");
-    let identified_result = runtime
-        .block_on(
-            DaemonClient::new(deck.attach_socket_path().to_path_buf())
-                .write_and_submit_with_identity(
-                    &pane_id,
-                    "this identified send must not reach a history-only target",
-                    Some(&agent_id),
-                    Some("history-codex-session"),
-                    Some("history-only-identified-004"),
-                ),
-        )
-        .expect("send identified input request");
-
     deck.send_keys(b"1");
     let feedback = "History-only session cannot accept live input";
     let feedback_visible = deck.wait_for_grid_string_within(feedback, Duration::from_secs(2));
     let grid = deck.snapshot_grid();
 
-    assert_eq!(
-        unidentified_response.send_result,
-        Some(SendResult::NoLiveTarget),
-        "an unidentified paned send must fail closed as no-live-target; feedback_visible={feedback_visible}\nFinal grid:\n{grid}"
-    );
-    assert_eq!(
-        identified_result,
-        SendResult::HistoryOnly,
-        "an identified send must preserve the honest history-only result; feedback_visible={feedback_visible}\nFinal grid:\n{grid}"
-    );
     assert!(
         feedback_visible,
         "the dashboard must surface `{feedback}` instead of entering PaneInput or silently dropping the send\nFinal grid:\n{grid}"
@@ -124,6 +84,7 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
         ("paste", b"\x1b[200~rejected-paste\x1b[201~".as_slice()),
     ] {
         let deck = TuiDeck::builder()
+            .impersonating_pane_signals()
             .with_continue_session(format!("stream-rejection-{input_kind}"), "cat")
             .launch_with_fixture("minimal");
         deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -173,157 +134,10 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
     );
 }
 
-/// Scenario: Open an orchestration whose start role declares itself
-/// history-only, let the real spawn-time prompt action receive that non-applied
-/// result, then transition the same role to live. The UI must show feedback,
-/// avoid marking the role Working, retain the prompt, and deliver it after live.
+/// Scenario: Open an orchestration through the real TUI and report its start role history-only. The remit remains Queued without a typed pointer, then the same role becoming live fetches and visibly renders it.
 #[spec("prompt/pane-input/007")]
 #[test]
 #[cfg(unix)]
 fn pane_input_007_orchestrator_prompt_retries_after_non_applied_result() {
-    const MARKER: &str = "ORCHESTRATORRESULTMARKER20";
-    const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
-    let deck = TuiDeck::launch_with_fixture("send-result-orchestration");
-    deck.wait_for_string("No active sessions");
-    let script = deck.workdir().join("orchestrator-send-result.sh");
-    write_executable(
-        &script,
-        r#"#!/bin/sh
-emit_target() {
-    WRITABLE="$1" python3 - <<'PY'
-import datetime
-import json
-import os
-import socket
-
-pane = os.environ["DOT_AGENT_DECK_PANE_ID"]
-payload = {
-    "session_id": "orchestrator-send-result-session",
-    "agent_type": "codex",
-    "event_type": "session_start",
-    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    "pane_id": pane,
-    "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
-    "live_target": {
-        "kind": "pty" if os.environ["WRITABLE"] == "live" else "process",
-        "writable": os.environ["WRITABLE"],
-    },
-}
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(os.environ["DOT_AGENT_DECK_SOCKET"])
-s.sendall((json.dumps(payload) + "\n").encode())
-s.close()
-PY
-}
-
-emit_target history-only
-while [ ! -f allow-live-target ]; do sleep 0.05; done
-emit_target live
-while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; done
-"#,
-    );
-
-    // Isolated-clone provisioning needs a ref to branch from — an unborn
-    // HEAD (the harness's own bare `git init`) does not provide one. `git
-    // clone` only carries COMMITTED content into the isolated clone, so the
-    // orchestrator's `./orchestrator-send-result.sh` role command (just
-    // written above) must be committed too, or its spawn fails inside the
-    // clone with the script missing.
-    commit_fixture(deck.workdir());
-    common::run_git(deck.workdir(), &["add", "orchestrator-send-result.sh"]);
-    common::run_git(
-        deck.workdir(),
-        &[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "send-result script",
-        ],
-    );
-    deck.send_keys(b"\x0e");
-    deck.wait_for_string("Select Directory");
-    deck.send_keys(b" ");
-    deck.wait_for_string("No mode");
-    deck.send_keys(b"\x1b[C");
-    deck.wait_for_absence("Command:");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"\r");
-
-    // 30s rather than 5s. This wait covers a chain that spawns the pane, runs
-    // the stand-in through a `python3` interpreter, round-trips a
-    // `session_start` over the daemon socket and repaints — and it fails as a
-    // unit when the runner stalls. Measured 2026-09-07: this test took 20.9s on
-    // a `ubuntu-latest` runner against 1.54s on the same tier's green run of
-    // `main` (13.6x its own CI-normal), expiring this budget AND the delivery
-    // budget below before asserting. That is NOT a slower runner: across the
-    // 2653 tests the two reports share, the median CI/local per-test ratio is
-    // 0.96x, and this test is faster on a healthy runner (1.54s) than locally
-    // (1.94s). It is an intermittent stall, and 30s — the modal
-    // `wait_for_grid_string_within` budget in this suite, 19 of 61 uses — rides
-    // it out. The wait returns as soon as the string paints, so a healthy run
-    // pays nothing for the headroom; only a genuine failure waits longer.
-    let feedback = deck.wait_for_grid_string_within(
-        "History-only session cannot accept live input",
-        Duration::from_secs(30),
-    );
-    let marked_working = deck.snapshot_grid().contains("Working");
-
-    // PRD fork#544 M2b: isolation is unconditional, so the orchestrator
-    // role's script (and everything it writes — the live-target sentinel,
-    // its prompt log, its generated context file) runs inside its own
-    // isolated clone, not `deck.workdir()`. Read the daemon's own record of
-    // the role pane's cwd rather than assuming it's the fixture's source
-    // dir.
-    let role_cwd = common::agent_records_on(deck.attach_socket_path())
-        .into_iter()
-        .find_map(|r| {
-            matches!(
-                &r.tab_membership,
-                Some(dot_agent_deck::agent_pty::TabMembership::Orchestration { role_name, .. })
-                    if role_name == "orchestrator"
-            )
-            .then_some(r.cwd)
-            .flatten()
-        })
-        .map(std::path::PathBuf::from)
-        .expect("orchestrator role pane must be registered with a recorded cwd");
-
-    std::fs::write(role_cwd.join("allow-live-target"), "")
-        .expect("allow synthetic role to become live");
-    // 15s rather than 10s, for the same stall: the run above expired this
-    // budget too, so widening only the feedback wait would not have saved it.
-    // 15s is the top of the range this helper already uses across the suite
-    // (10s in 13 places, 15s in 10).
-    let delivered = common::wait_for_file_substr_count(
-        &role_cwd.join("orchestrator-prompt.log"),
-        DELIVERED_POINTER,
-        1,
-        Duration::from_secs(15),
-    );
-    let context = std::fs::read_to_string(role_cwd.join(".dot-agent-deck/orchestrator-context.md"))
-        .expect("read generated orchestrator context");
-    let grid = deck.snapshot_grid();
-
-    assert!(
-        feedback,
-        "the orchestrator prompt's HistoryOnly result must surface visible feedback\nFinal grid:\n{grid}"
-    );
-    assert!(
-        !marked_working,
-        "a role whose prompt was not delivered must not be marked Working\nFinal grid:\n{grid}"
-    );
-    assert!(
-        delivered,
-        "the non-delivered orchestrator prompt must be retained and retried after the role becomes live\nFinal grid:\n{grid}"
-    );
-    assert!(
-        context.contains(MARKER),
-        "the delivered context pointer must reference the generated context containing the role prompt"
-    );
+    route::client_orchestration(false);
 }

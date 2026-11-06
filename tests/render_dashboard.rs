@@ -12,7 +12,13 @@ use std::sync::{Arc, Mutex};
 use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
-use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
+use dot_agent_deck::pull_request_info::{
+    PullRequestChecks, PullRequestChecksState, PullRequestInfo, PullRequestReview, PullRequestState,
+};
+use dot_agent_deck::state::{
+    ActiveTool, AppState, BlockedKind, BlockedReason, DashboardStats, SessionSnapshot,
+    SessionState, SessionStatus,
+};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
@@ -29,6 +35,18 @@ use ratatui::style::{Color, Modifier};
 use ratatui::widgets::Widget;
 use spec::spec;
 use unicode_width::UnicodeWidthStr;
+
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
+/// Issue #413: the instant every card fixture in this file is built against
+/// and rendered at. The card seams take `now` instead of reading the clock, so
+/// a card's `Last:` field is a pure function of the fixture's own timestamps —
+/// a fixed calendar instant cannot drift as the test ages, and no delay between
+/// building a fixture and drawing it can move a snapshot.
+fn render_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("a valid fixed instant")
+}
 
 /// Stringify the rendered buffer — one line per row, with cells joined
 /// into the symbol layer. `insta` then captures this representation, so
@@ -48,6 +66,494 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
+/// Scenario: Render a PR card at the widths where review, lifecycle, stats and
+/// the entire badge stop fitting. Snapshot the rendered boundaries and every
+/// lifecycle/review value, including unknown values displayed as question marks.
+#[spec("dashboard/pane/016")]
+#[test]
+fn pane_016_pull_request_badge_at_roomy_and_narrow_widths() {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.pull_request = Some(PullRequestInfo {
+        number: 1234,
+        url: "https://github.com/test-org/test-repo/pull/1234".into(),
+        state: PullRequestState::Open,
+        review: Some(PullRequestReview::ReviewRequired),
+        checks: None,
+    });
+    for width in [80, 30] {
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            true,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        assert!(
+            rendered.contains("#1234 ⊙ ◉"),
+            "card must show its PR number, state and review at width {width}:\n{rendered}"
+        );
+        insta::assert_snapshot!(format!("pull_request_badge_width_{width}"), rendered);
+    }
+    let mut boundaries = String::new();
+    for (width, badge, stats) in [
+        (22, "#1234 ⊙ ◉", true),
+        (21, "#1234 ⊙", true),
+        (20, "#1234 ⊙", true),
+        (19, "#1234", true),
+        (18, "#1234", true),
+        (17, "#1234 ⊙ ◉", false),
+        (13, "#1234 ⊙ ◉", false),
+        (12, "#1234 ⊙", false),
+        (11, "#1234 ⊙", false),
+        (10, "#1234", false),
+        (9, "#1234", false),
+        (8, "", false),
+    ] {
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            true,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        let border = rendered.lines().last().unwrap();
+        assert_eq!(
+            border.contains("#1234"),
+            !badge.is_empty(),
+            "width {width}: {border}"
+        );
+        assert_eq!(
+            border.contains('⊙'),
+            badge.contains('⊙'),
+            "width {width}: {border}"
+        );
+        assert_eq!(
+            border.contains('◉'),
+            badge.contains('◉'),
+            "width {width}: {border}"
+        );
+        assert_eq!(border.contains("1h"), stats, "width {width}: {border}");
+        boundaries.push_str(&format!("width {width}\n{rendered}\n"));
+    }
+    insta::assert_snapshot!("pull_request_badge_boundaries", boundaries);
+
+    let mut values = String::new();
+    for (state, state_glyph) in [
+        (PullRequestState::Open, "⊙"),
+        (PullRequestState::Draft, "◌"),
+        (PullRequestState::Merged, "◆"),
+        (PullRequestState::Closed, "⊘"),
+        (PullRequestState::Unknown, "?"),
+    ] {
+        for (review, review_glyph) in [
+            (None, ""),
+            (Some(PullRequestReview::Approved), " ✓"),
+            (Some(PullRequestReview::ChangesRequested), " ±"),
+            (Some(PullRequestReview::ReviewRequired), " ◉"),
+            (Some(PullRequestReview::Unknown), " ?"),
+        ] {
+            let pr = session.pull_request.as_mut().unwrap();
+            pr.state = state;
+            pr.review = review;
+            let rendered = buffer_to_text(&render_card_to_buffer(
+                &session,
+                Some("api-svc"),
+                Some(1),
+                CardDensityKind::Normal,
+                0,
+                render_now(),
+                true,
+                80,
+                CardDensityKind::Normal.rendered_height(),
+            ));
+            let border = rendered.lines().last().unwrap();
+            let badge = format!(" #1234 {state_glyph}{review_glyph} ");
+            assert!(border.contains(&badge), "{state:?}/{review:?}: {border}");
+            values.push_str(&format!("{state:?}/{review:?}\n{border}\n"));
+        }
+    }
+    insta::assert_snapshot!("pull_request_badge_states_and_reviews", values);
+}
+
+/// Scenario: Render a card whose pull request has CI checks and a review, for
+/// every CI result, and then at the widths where each glyph stops fitting. The
+/// CI mark sits between the state and the review, and the review alone is a
+/// filled cell, so a passing CI and an approval never look alike.
+#[spec("dashboard/pane/017")]
+#[test]
+fn pane_017_pull_request_badge_shows_ci_beside_the_review() {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    let checks = |state| PullRequestChecks {
+        state,
+        passing: 24,
+        failing: 1,
+        pending: 0,
+        skipped: 0,
+    };
+    session.pull_request = Some(PullRequestInfo {
+        number: 1234,
+        url: "https://github.com/test-org/test-repo/pull/1234".into(),
+        state: PullRequestState::Open,
+        review: Some(PullRequestReview::Approved),
+        checks: Some(checks(PullRequestChecksState::Passing)),
+    });
+    let render = |session: &SessionState, width: u16| {
+        render_card_to_buffer(
+            session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            true,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        )
+    };
+
+    let mut values = String::new();
+    for (state, glyph, colour) in [
+        (PullRequestChecksState::Passing, "✓", Color::Green),
+        (PullRequestChecksState::Failing, "✗", Color::Red),
+        (PullRequestChecksState::Pending, "●", Color::Yellow),
+        (PullRequestChecksState::Unknown, "?", Color::DarkGray),
+    ] {
+        session.pull_request.as_mut().unwrap().checks = Some(checks(state));
+        let buffer = render(&session, 80);
+        let rendered = buffer_to_text(&buffer);
+        let border = rendered.lines().last().unwrap();
+        assert!(
+            border.contains(&format!(" #1234 ⊙ {glyph} ✓ ")),
+            "{state:?}: {border}"
+        );
+        // `┗ #1234 ⊙ ` puts the CI mark at column 10 and the review at 12.
+        let y = buffer.area().height - 1;
+        let ci = &buffer[(10, y)];
+        let review = &buffer[(12, y)];
+        assert_eq!((ci.symbol(), ci.fg), (glyph, colour), "{state:?}");
+        assert!(
+            !ci.modifier.contains(Modifier::REVERSED),
+            "{state:?}: the CI mark is a bare glyph"
+        );
+        assert_eq!((review.symbol(), review.fg), ("✓", Color::Green));
+        assert!(
+            review.modifier.contains(Modifier::REVERSED),
+            "{state:?}: the review is a filled cell"
+        );
+        values.push_str(&format!("{state:?}\n{border}\n"));
+    }
+    insta::assert_snapshot!("pull_request_badge_ci_states", values);
+
+    // A PR with checks but no review decision shows the CI mark alone.
+    session.pull_request.as_mut().unwrap().review = None;
+    session.pull_request.as_mut().unwrap().checks = Some(checks(PullRequestChecksState::Failing));
+    let border = buffer_to_text(&render(&session, 80));
+    assert!(
+        border.lines().last().unwrap().contains(" #1234 ⊙ ✗ ━"),
+        "{border}"
+    );
+
+    // Narrowing drops the review, then the CI mark, then the state.
+    session.pull_request.as_mut().unwrap().review = Some(PullRequestReview::ReviewRequired);
+    session.pull_request.as_mut().unwrap().checks = Some(checks(PullRequestChecksState::Pending));
+    let mut boundaries = String::new();
+    for (width, badge, stats) in [
+        (24, "#1234 ⊙ ● ◉", true),
+        (23, "#1234 ⊙ ●", true),
+        (22, "#1234 ⊙ ●", true),
+        (21, "#1234 ⊙", true),
+        (19, "#1234", true),
+        (15, "#1234 ⊙ ● ◉", false),
+        (14, "#1234 ⊙ ●", false),
+        (12, "#1234 ⊙", false),
+        (10, "#1234", false),
+        (8, "", false),
+    ] {
+        let rendered = buffer_to_text(&render(&session, width));
+        let border = rendered.lines().last().unwrap();
+        let shown = border
+            .trim_matches(|c| "┗┛━ ".contains(c))
+            .split("  ")
+            .next()
+            .unwrap_or("");
+        let shown = shown.split(" ━").next().unwrap_or("").trim();
+        if badge.is_empty() {
+            assert!(!border.contains("#1234"), "width {width}: {border}");
+        } else {
+            assert!(shown.starts_with(badge), "width {width}: {border}");
+            assert_eq!(
+                shown.chars().count(),
+                badge.chars().count(),
+                "width {width}: {border}"
+            );
+        }
+        assert_eq!(border.contains("1h"), stats, "width {width}: {border}");
+        boundaries.push_str(&format!("width {width}\n{rendered}\n"));
+    }
+    insta::assert_snapshot!("pull_request_badge_ci_boundaries", boundaries);
+}
+
+/// Scenario: Hydrate Idle cards with background commands and subagents, then render wide and narrow cards at a fixed clock. The visible line uses the shared singular/plural and elapsed vocabulary, omits zero kinds and invalid durations, and disappears without background work.
+#[spec("status/background/004")]
+#[test]
+fn background_004_card_counts_elapsed_skew_and_narrow_layout() {
+    let now = render_now();
+    let cases = [
+        (
+            2,
+            1,
+            Some(now.timestamp_millis() - 11_520_000),
+            "Background: 2 commands, 1 subagent · 3h 12m",
+        ),
+        (
+            1,
+            0,
+            Some(now.timestamp_millis() - 240_000),
+            "Background: 1 command · 4m",
+        ),
+        (
+            0,
+            1,
+            Some(now.timestamp_millis() - 240_000),
+            "Background: 1 subagent · 4m",
+        ),
+        (
+            0,
+            2,
+            Some(now.timestamp_millis() + 30_000),
+            "Background: 2 subagents · 0s",
+        ),
+        (
+            1,
+            0,
+            Some(now.timestamp_millis() + 60_001),
+            "Background: 1 command",
+        ),
+        (1, 0, Some(i64::MIN), "Background: 1 command"),
+        (1, 0, None, "Background: 1 command"),
+        (0, 0, None, ""),
+    ];
+    let mut visible_lines = Vec::new();
+    for (commands, subagents, since_ms, expected) in cases {
+        let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "Idle", "agent_type": "claude_code", "tool_count": 0,
+            "last_activity_ms": now.timestamp_millis(),
+            "background": {"commands": commands, "subagents": subagents, "since_ms": since_ms},
+            "background_revision": 1,
+        }))
+        .unwrap();
+        let mut state = AppState::default();
+        state.register_pane("background-card".into());
+        state.seed_hydrated_session(
+            "background-card".into(),
+            None,
+            None,
+            None,
+            Some(&snapshot),
+            None,
+        );
+        let session = state.sessions.values().next().unwrap();
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            session,
+            Some("background"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            now,
+            false,
+            80,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        if commands == 2 && subagents == 1 {
+            insta::assert_snapshot!("background_004_mixed_card", rendered);
+        }
+        let line = rendered
+            .lines()
+            .find(|line| line.contains("Background:"))
+            .map(|line| line.trim_matches(['│', ' ']).to_string())
+            .unwrap_or_else(|| "<none>".into());
+        visible_lines.push(line);
+        // Narrow geometry still allocates a row for the indicator and keeps
+        // its count legible rather than dropping the row for lack of budget.
+        let narrow = buffer_to_text(&render_card_to_buffer(
+            session,
+            Some("background"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            now,
+            false,
+            32,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        if !expected.is_empty() {
+            assert!(
+                narrow.contains("Background:"),
+                "narrow card lost its background row:\n{narrow}"
+            );
+        } else {
+            assert!(
+                !narrow.contains("Background:"),
+                "zero counts must be hidden"
+            );
+        }
+    }
+    insta::assert_snapshot!(visible_lines.join("\n"), @"
+    Background: 2 commands, 1 subagent · 3h 12m
+    Background: 1 command · 4m
+    Background: 1 subagent · 4m
+    Background: 2 subagents · 0s
+    Background: 1 command
+    Background: 1 command
+    Background: 1 command
+    <none>
+    ");
+}
+
+/// Scenario: Hydrate a Blocked card that also has background work and render it at Minimal density, whose one content row the Blocked reason takes. The reason keeps the row and the background line follows it on that row after ` · `, cut with `…` on a narrow card; an orphaned card does the same, and at Normal density the two stay on rows of their own.
+#[spec("status/background/016")]
+#[test]
+fn background_016_minimal_card_keeps_background_beside_its_reason() {
+    let now = render_now();
+    let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+        "status": "Blocked", "agent_type": "claude_code", "tool_count": 0,
+        "last_activity_ms": now.timestamp_millis(),
+        "blocked": {"kind": "usage_limit", "detected_at_ms": now.timestamp_millis()},
+        "background": {"commands": 1, "subagents": 1, "since_ms": now.timestamp_millis() - 240_000},
+        "background_revision": 1,
+    }))
+    .unwrap();
+    let mut state = AppState::default();
+    state.register_pane("background-card".into());
+    state.seed_hydrated_session(
+        "background-card".into(),
+        None,
+        None,
+        None,
+        Some(&snapshot),
+        None,
+    );
+    let blocked = state.sessions.values().next().unwrap().clone();
+    let render = |session: &SessionState, density: CardDensityKind, width: u16| {
+        buffer_to_text(&render_card_to_buffer(
+            session,
+            Some("background"),
+            Some(1),
+            density,
+            0,
+            now,
+            false,
+            width,
+            density.rendered_height(),
+        ))
+    };
+
+    let minimal = render(&blocked, CardDensityKind::Minimal, 80);
+    insta::assert_snapshot!("background_016_minimal_blocked_card", minimal);
+
+    // Narrow: the reason is kept whole and the background part is cut.
+    let narrow = render(&blocked, CardDensityKind::Minimal, 40);
+    let row = narrow.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert_eq!(row, "⚠ Usage limit reached · Background: 1…");
+
+    // Orphaned (and not Blocked): the orphaned line shares its row the same way.
+    let mut orphaned = blocked.clone();
+    orphaned.status = SessionStatus::Idle;
+    orphaned.blocked = None;
+    orphaned.orchestration_orphaned = true;
+    let row = render(&orphaned, CardDensityKind::Minimal, 120);
+    let row = row.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert_eq!(
+        row,
+        "Orphaned — delegation unavailable · Background: 1 command, 1 subagent · 4m"
+    );
+
+    // Normal has room for both rows, so each keeps its own.
+    let normal = render(&blocked, CardDensityKind::Normal, 80);
+    let rows: Vec<&str> = normal
+        .lines()
+        .map(|line| line.trim_matches(['│', ' ']))
+        .collect();
+    assert!(rows.contains(&"⚠ Usage limit reached"), "{normal}");
+    assert!(
+        rows.contains(&"Background: 1 command, 1 subagent · 4m"),
+        "{normal}"
+    );
+}
+
+/// Scenario: Hydrate an Error card whose message the deck could not deliver and which also has background work, and render it at Minimal density, whose one content row both want. The not-delivered notice keeps the row, as the desktop tile shows it ahead of the background line, and the background line follows it on that row after ` · `; at Normal density each keeps a row of its own.
+#[spec("status/background/017")]
+#[test]
+fn background_017_minimal_card_keeps_the_delivery_notice_ahead_of_background() {
+    let now = render_now();
+    let notice = "Not delivered: review fixture (agent exited)";
+    let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+        "status": "Error", "agent_type": "claude_code", "tool_count": 0,
+        "last_activity_ms": now.timestamp_millis(),
+        "delivery_notice": notice,
+        "background": {"commands": 1, "subagents": 1, "since_ms": now.timestamp_millis() - 240_000},
+        "background_revision": 1,
+    }))
+    .unwrap();
+    let mut state = AppState::default();
+    state.register_pane("background-card".into());
+    state.seed_hydrated_session(
+        "background-card".into(),
+        None,
+        None,
+        None,
+        Some(&snapshot),
+        None,
+    );
+    let card = state.sessions.values().next().unwrap().clone();
+    assert_eq!(card.delivery_notice(), Some(notice), "the premise");
+    let render = |density: CardDensityKind, width: u16| {
+        buffer_to_text(&render_card_to_buffer(
+            &card,
+            Some("background"),
+            Some(1),
+            density,
+            0,
+            now,
+            false,
+            width,
+            density.rendered_height(),
+        ))
+    };
+
+    let minimal = render(CardDensityKind::Minimal, 120);
+    let row = minimal.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert_eq!(
+        row,
+        "Not delivered: review fixture (agent exited) · Background: 1 command, 1 subagent · 4m",
+        "{minimal}"
+    );
+
+    // Narrow: the notice is kept whole and the background part is cut.
+    let narrow = render(CardDensityKind::Minimal, 60);
+    let row = narrow.lines().nth(1).unwrap().trim_matches(['│', ' ']);
+    assert!(row.starts_with(notice), "{narrow}");
+
+    let normal = render(CardDensityKind::Normal, 120);
+    let rows: Vec<&str> = normal
+        .lines()
+        .map(|line| line.trim_matches(['│', ' ']))
+        .collect();
+    assert!(rows.contains(&notice), "{normal}");
+    assert!(
+        rows.contains(&"Background: 1 command, 1 subagent · 4m"),
+        "{normal}"
+    );
+}
+
 /// Scenario: Render a single dashboard card for a Working agent with a Read
 /// tool and recent prompt into an 80-column, Normal-density L1 buffer, then
 /// snapshot it. The title row must carry the card number and status badge,
@@ -64,33 +570,24 @@ fn pane_004_card_title_row() {
     // doesn't need its own fn — keeping the test body
     // self-contained also reads as cleaner generated `.md` Steps).
     //
-    // Both timestamps derive from one current instant so the fixture starts
-    // with a compact `0s` elapsed value; a fixed calendar instant previously
-    // drifted into a large hour count as the test aged (M3 fix). `last_activity`
-    // is nudged 30s into the *future* of that instant rather than left equal to
-    // it (issue #15): the bottom border's `Last:` field is computed from
-    // `Utc::now()` at render time (`format_elapsed`, src/ui.rs), not at fixture
-    // build time, and that renderer clamps a negative elapsed delta to zero
-    // (`delta.num_seconds().max(0)`). Seeding `last_activity == now` put the
-    // rendered value exactly on the boundary between `0s` and `1s` — any
-    // scheduling delay between building the fixture and the snapshot render
-    // (routine under parallel test load) could tip it over intermittently. A
-    // *past* offset (e.g. `now - 500ms`) would only shrink that safety margin
-    // further; nudging forward instead means the render-time delta stays
-    // negative (clamped to `0s`) for any render happening within 30s of this
-    // instant, which comfortably covers ordinary scheduling jitter.
-    let now = chrono::Utc::now();
+    // Both timestamps are the instant the card is rendered at, so the bottom
+    // border reads `Last: 0s`. Issue #413: that instant is `render_now()`, handed
+    // to the seam rather than read from the clock at render time, so the value
+    // is `0s` however long the render takes — the 30s forward nudge #350 used to
+    // bound the race is gone with the race.
+    let now = render_now();
     let session = SessionState {
         session_id: "sess-abc123".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
         }),
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 7,
         last_user_prompt: Some("fix the login bug".to_string()),
@@ -100,6 +597,8 @@ fn pane_004_card_title_row() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -109,6 +608,12 @@ fn pane_004_card_title_row() {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -121,8 +626,9 @@ fn pane_004_card_title_row() {
         Some("example-coder"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,            // animation tick
+        render_now(), // render instant
+        false,        // not selected
         width,
         height,
     );
@@ -131,14 +637,15 @@ fn pane_004_card_title_row() {
 
 /// Build a live card fixture whose stable values make the card-stats layout
 /// assertions readable: one hour since activity, fourteen tools, one prompt,
-/// and one active Read tool. The hour form remains `1h` for 60 seconds of drift.
+/// and one active Read tool, measured against `render_now()` (issue #413).
 fn card_stats_session(cwd: &str) -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     SessionState {
         session_id: "sess-card-stats".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some(cwd.to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/ui.rs".to_string()),
@@ -154,6 +661,8 @@ fn card_stats_session(cwd: &str) -> SessionState {
         display_name: Some("api-svc".to_string()),
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -163,7 +672,563 @@ fn card_stats_session(cwd: &str) -> SessionState {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     }
+}
+
+/// Feed the daemon's existing record/resync seam before rendering the card.
+/// No invented card-only inbox field: ListAgents already carries this data.
+fn inbox_card_session(queued: usize, fetched: usize, acknowledged: bool) -> SessionState {
+    inbox_card_session_with(queued, fetched, acknowledged, false)
+}
+
+fn inbox_card_session_with(
+    queued: usize,
+    fetched: usize,
+    acknowledged: bool,
+    wake_stalled: bool,
+) -> SessionState {
+    let session = card_stats_session("/home/dev/api-svc");
+    let record: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+            "live": session.live_snapshot(),
+            "inbox": {
+                "queued": queued, "fetched": fetched, "undeliverable": 0,
+                "last_acked_at": acknowledged.then_some(render_now()),
+                "wake": "doorbell", "component": null,
+                "wake_stalled": wake_stalled
+            }
+        }))
+        .expect("the daemon's existing AgentRecord wire shape");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    state.resync_after_event_gap(&[record]);
+    state.sessions.remove("sess-card-stats").unwrap()
+}
+
+fn inbox_display_words() -> serde_json::Value {
+    serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap()
+}
+
+/// Scenario: Refresh a card from daemon inbox summaries containing queued, fetched or both kinds of pending messages. All three renders must show the same envelope count and queued wording as the desktop.
+#[spec("inbox/status/006")]
+#[test]
+fn status_006_card_counts_queued_and_fetched_messages() {
+    let words = inbox_display_words();
+    for (queued, fetched) in [(2, 0), (0, 2), (1, 1)] {
+        let session = inbox_card_session(queued, fetched, false);
+        let buffer = render_card_to_buffer(
+            &session,
+            Some("api-svc"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            false,
+            80,
+            CardDensityKind::Normal.rendered_height(),
+        );
+        let rendered = buffer_to_text(&buffer);
+        let badge = format!("{}2", words["glyph"].as_str().unwrap());
+        assert!(
+            rendered.contains(&badge),
+            "pending inbox badge {badge} missing for {queued} queued + {fetched} fetched:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(words["queued"].as_str().unwrap()),
+            "pending inbox must use the shared queued wording:\n{rendered}"
+        );
+    }
+}
+
+/// Scenario: The daemon reports that nothing has woken an agent for its one waiting message. Its card must say the message is waiting to wake and what to do, in the words the desktop uses, instead of only counting it as queued.
+#[spec("inbox/status/012")]
+#[test]
+fn status_012_card_says_a_stalled_wake_and_what_to_do() {
+    let words = inbox_display_words();
+    // The deck says so only of an agent that is not working.
+    let mut session = inbox_card_session_with(1, 0, false, true);
+    session.status = SessionStatus::Idle;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let line = format!(
+        "{}1 {}: {}",
+        words["glyph"].as_str().unwrap(),
+        words["wakeStalled"].as_str().unwrap(),
+        words["wakeStalledHint"].as_str().unwrap()
+    );
+    assert!(
+        rendered.contains(&line),
+        "a stalled wake must say {line:?}:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// PRD #1666 §6.5: a card whose daemon summary carries `notices` (the attention
+/// items, the integration notice, failed receipts, paused hand-outs) beside
+/// one fetched message, rendered at the Normal density's 80 columns.
+fn inbox_notice_card(notices: serde_json::Value) -> String {
+    let session = card_stats_session("/home/dev/api-svc");
+    let mut inbox = serde_json::json!({
+        "queued": 0, "fetched": 1, "undeliverable": 0,
+        "last_acked_at": null, "wake": "native", "component": "opencode_plugin"
+    });
+    for (key, value) in notices.as_object().unwrap() {
+        inbox[key] = value.clone();
+    }
+    let record: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+            "live": session.live_snapshot(), "inbox": inbox
+        }))
+        .expect("the daemon's AgentRecord wire shape with PRD #1666 card notices");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    state.resync_after_event_gap(&[record]);
+    let session = state.sessions.remove("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    buffer_to_text(&buffer)
+}
+
+fn attention_item(id: &str, kind: &str) -> serde_json::Value {
+    serde_json::json!({"message_id": id, "revision": 4, "kind": kind,
+        "from_label": "the orchestrator", "subject": "review the fixture"})
+}
+
+/// Scenario: The daemon's snapshot lists one deck message whose delivery is uncertain. The card says `delivery uncertain` in the words the desktop uses, instead of only counting it.
+#[spec("inbox/status/013")]
+#[test]
+fn status_013_card_says_one_delivery_is_uncertain() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain")]
+    }));
+    let line = format!(
+        "{} {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertain"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    let reason: String = words["uncertainReason"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Three deck messages on one card are uncertain, one of them out of attempts. The card counts them together as `3 deliveries uncertain`.
+#[spec("inbox/status/014")]
+#[test]
+fn status_014_card_counts_several_uncertain_deliveries() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b852", "out_of_attempts")
+        ]
+    }));
+    let line = format!(
+        "{} 3 {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertainMany"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+}
+
+/// Scenario: The daemon's snapshot lists one deck message whose delivery is uncertain and out of attempts, so its row offers Cancel alone. The card still says `delivery uncertain`, and its notice row says what running out of attempts means instead of offering Retry, in the words the desktop uses.
+#[spec("inbox/status/026")]
+#[test]
+fn status_026_card_explains_a_delivery_out_of_attempts() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "out_of_attempts")]
+    }));
+    let line = format!(
+        "{} {}",
+        words["glyph"].as_str().unwrap(),
+        words["uncertain"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    let reason: String = words["outOfAttempts"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Retry"),
+        "no Retry is offered:\n{rendered}"
+    );
+}
+
+/// Scenario: A deck message has been held by the agent for an hour without a commit. The card shows the one-shot held-for-an-hour attention, not a failure.
+#[spec("inbox/status/015")]
+#[test]
+fn status_015_card_shows_held_long_attention() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "held_long")]
+    }));
+    let head: String = words["heldLong"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+    assert!(
+        !rendered.contains("Error"),
+        "held_long is not a failure:\n{rendered}"
+    );
+}
+
+/// Scenario: The agent's integration is out of date, or its CLI too old, or it has not connected yet. The card shows that notice in the words the desktop uses, under its directory.
+#[spec("inbox/status/016")]
+#[test]
+fn status_016_card_shows_the_integration_notice() {
+    let words = inbox_display_words();
+    for (code, key) in [
+        ("adapter_too_old", "adapterTooOld"),
+        ("cli_too_old", "cliTooOld"),
+        ("not_armed", "notArmed"),
+    ] {
+        let rendered = inbox_notice_card(serde_json::json!({ "integration": code }));
+        let head: String = words[key].as_str().unwrap().chars().take(40).collect();
+        assert!(
+            rendered.contains(&head),
+            "{code}: {head:?} missing:\n{rendered}"
+        );
+    }
+}
+
+/// Scenario: Hand-outs to the agent are paused because its evidence store is full. The card says deck messages are paused and how many delivered messages still wait.
+#[spec("inbox/status/017")]
+#[test]
+fn status_017_card_shows_paused_hand_outs() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({ "evidence_paused": 7 }));
+    let text = words["evidencePaused"]
+        .as_str()
+        .unwrap()
+        .replace("{n}", "7");
+    let head: String = text.chars().take(40).collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+}
+
+/// Scenario: The deck cannot record message receipts for the agent. The card warns that messages may repeat, under its directory.
+#[spec("inbox/status/018")]
+#[test]
+fn status_018_card_warns_that_messages_may_repeat() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({ "receipts_degraded": "disk full" }));
+    let head: String = words["receiptsDegraded"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+}
+
+/// Scenario: The deck refused the agent's own request for its waiting messages, while its hooks are also out of date. The card says messages can't reach this agent, why and to restart it from the deck, in the words the desktop tile uses, ahead of the hooks notice.
+#[spec("inbox/status/027")]
+#[test]
+fn status_027_card_says_messages_cannot_reach_the_agent() {
+    let words = inbox_display_words();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "queued": 1,
+        "admission_refused": "inbox_nested_agent",
+        "integration": "hooks_too_old"
+    }));
+    let head = format!(
+        "{}: its connection to the deck",
+        words["admissionRefused"].as_str().unwrap()
+    );
+    assert!(rendered.contains(&head), "{head:?} missing:\n{rendered}");
+    assert!(
+        !rendered.contains(words["hooksTooOld"].as_str().unwrap()),
+        "the refusal leads the hooks notice:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: The daemon's snapshot lists deck messages a Pi agent may not have received: one alone, two together, and one beside an uncertain delivery and a held-long one. The card says `may not have reached the agent` ahead of the queued count, with its count for two and the reason under it, never as an error, and an uncertain delivery still leads.
+#[spec("inbox/status/023")]
+#[test]
+fn status_023_card_says_a_message_may_not_have_reached_the_agent() {
+    let words = inbox_display_words();
+    let glyph = words["glyph"].as_str().unwrap();
+    let not_started = words["notStarted"].as_str().unwrap();
+    let rendered = inbox_notice_card(serde_json::json!({
+        "attention": [attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "not_started")]
+    }));
+    let line = format!("{glyph} {not_started}");
+    assert!(rendered.contains(&line), "{line:?} missing:\n{rendered}");
+    assert!(
+        !rendered.contains(&format!("{glyph}1 {}", words["queued"].as_str().unwrap())),
+        "it leads the queued count:\n{rendered}"
+    );
+    let reason: String = words["notStartedReason"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        rendered.contains(&reason),
+        "{reason:?} missing:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Error"),
+        "it is attention, not a failure:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+
+    let two = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "not_started"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "not_started")
+        ]
+    }));
+    let line = format!("{glyph} 2 {not_started}");
+    assert!(two.contains(&line), "{line:?} missing:\n{two}");
+
+    let mixed = inbox_notice_card(serde_json::json!({
+        "attention": [
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b850", "uncertain"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b851", "not_started"),
+            attention_item("m-k3xzq2ab-0f3c9a71d2e4b852", "held_long")
+        ]
+    }));
+    let line = format!("{glyph} {}", words["uncertain"].as_str().unwrap());
+    assert!(mixed.contains(&line), "{line:?} missing:\n{mixed}");
+    assert!(
+        !mixed.contains(not_started),
+        "the uncertain delivery leads:\n{mixed}"
+    );
+}
+
+/// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must fit beside Thinking without removing the tools counter or overrunning either border.
+#[spec("inbox/status/007")]
+#[test]
+fn status_007_narrow_card_keeps_inbox_status_and_stats() {
+    let session = inbox_card_session(1, 1, false);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Compact,
+        0,
+        render_now(),
+        false,
+        20,
+        CardDensityKind::Compact.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("✉2"),
+        "narrow card lost its inbox badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Thinking"),
+        "inbox badge displaced the status:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("14 tools"),
+        "inbox badge displaced the tools counter:\n{rendered}"
+    );
+    for row in rendered.lines() {
+        assert_eq!(
+            UnicodeWidthStr::width(row),
+            20,
+            "narrow card overran its width:\n{rendered}"
+        );
+    }
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: An undeliverable message emits the existing delivery_notice error channel for this pane. Its card must show Error and the complete not-delivered notice instead of keeping the old user prompt as its only explanation.
+#[spec("inbox/status/008")]
+#[test]
+fn status_008_card_shows_not_delivered_error_notice() {
+    let session = card_stats_session("/home/dev/api-svc");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    let words = inbox_display_words();
+    let notice = format!(
+        "{}: review fixture (agent exited)",
+        words["notDelivered"].as_str().unwrap()
+    );
+    state.apply_daemon_report_event(AgentEvent {
+        session_id: "sess-card-stats".into(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Error,
+        tool_name: None,
+        tool_detail: Some(notice.clone()),
+        cwd: None,
+        timestamp: render_now(),
+        user_prompt: None,
+        metadata: HashMap::from([(
+            dot_agent_deck::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+            notice.clone(),
+        )]),
+        pane_id: Some("pane-card-stats".into()),
+        agent_id: Some("agent-card-stats".into()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+        model: None,
+    });
+    let session = state.sessions.get("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Error"),
+        "undeliverable message did not make the card Error:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&notice),
+        "Error card lost its not-delivered explanation:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: After a human prompt, the daemon broadcasts a deck-message prompt labelled with its subject. The card must render that envelope subject, while its user-prompt history still contains only the human's text.
+#[spec("inbox/status/009")]
+#[test]
+fn status_009_card_labels_deck_subject_without_replacing_user_prompt() {
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.last_user_prompt = Some("inspect the human fixture".into());
+    session.first_prompts = vec!["inspect the human fixture".into()];
+    state.sessions.insert(session.session_id.clone(), session);
+    state.apply_event(AgentEvent {
+        session_id: "sess-card-stats".into(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Thinking,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: render_now(),
+        user_prompt: Some("✉ review fixture".into()),
+        metadata: HashMap::from([(
+            dot_agent_deck::inbox_prompt::DECK_MESSAGE_METADATA_KEY.to_string(),
+            "1".into(),
+        )]),
+        pane_id: Some("pane-card-stats".into()),
+        agent_id: Some("agent-card-stats".into()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+        model: None,
+    });
+    let session = state.sessions.get("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let prompt = rendered.lines().find(|row| row.contains("Prmt:")).unwrap();
+    assert!(
+        prompt.contains("✉ review fixture"),
+        "card prompt line must show the deck subject:\n{rendered}"
+    );
+    assert_eq!(
+        session.last_user_prompt.as_deref(),
+        Some("inspect the human fixture")
+    );
+    assert_eq!(session.first_prompts, ["inspect the human fixture"]);
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Refresh a card whose pending messages have been acknowledged. Its rendered inbox state must say delivered, using the same fixture as the desktop, and its pending envelope count must disappear.
+#[spec("inbox/status/010")]
+#[test]
+fn status_010_card_uses_shared_delivered_word_after_ack() {
+    let session = inbox_card_session(0, 0, true);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    let words = inbox_display_words();
+    assert!(
+        rendered.contains(words["delivered"].as_str().unwrap()),
+        "acknowledged inbox must say delivered, matching the desktop:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("✉0"),
+        "an empty inbox must not show a pending count:\n{rendered}"
+    );
 }
 
 /// Scenario: Render an over-long directory in a narrow L1 card, then render a
@@ -183,6 +1248,7 @@ fn pane_006_card_fields_and_full_width_ellipsized_dir() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         density.rendered_height(),
@@ -215,6 +1281,7 @@ fn pane_006_card_fields_and_full_width_ellipsized_dir() {
         Some(1),
         CardDensityKind::Compact,
         0,
+        render_now(),
         false,
         14,
         CardDensityKind::Compact.rendered_height(),
@@ -240,6 +1307,7 @@ fn card_stats_001_wide_card_places_full_stats_in_bottom_right_border() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         density.rendered_height(),
@@ -282,6 +1350,111 @@ fn card_stats_001_wide_card_places_full_stats_in_bottom_right_border() {
     );
 }
 
+/// Scenario: Reconnect a TUI to a daemon whose agent has been quiet for an hour: seed the card from the daemon's snapshot the way hydration does, then render it into an 80-column L1 buffer. The bottom border must read `Last: 1h`, not the `0s` a freshly minted placeholder shows. A snapshot from an older daemon that omits the instant, or one carrying an instant no timestamp can hold, still renders the placeholder's seconds-old readout.
+#[spec("session/live/016")]
+#[test]
+fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
+    // The real clock, not `render_now()`: hydration mints the placeholder card
+    // with its own `Utc::now()`, which this test cannot inject. Issue #413: it is
+    // read ONCE, and the snapshot's hour is counted back from it.
+    let now = chrono::Utc::now();
+    let quiet_for_an_hour = (now - chrono::Duration::hours(1)).timestamp_millis();
+    let bottom_border_after_reconnect = |last_activity_ms: Option<i64>| {
+        let snapshot = SessionSnapshot {
+            output_set_status: false,
+            subagent_wait: None,
+            status: SessionStatus::Idle,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 14,
+            first_prompts: vec!["move the stats into the border".to_string()],
+            last_user_prompt: Some("move the stats into the border".to_string()),
+            live_target: None,
+            last_activity_ms,
+            blocked: None,
+            hook_generation: None,
+            delivery_notice: None,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: None,
+            background: None,
+            background_revision: None,
+            shell_synthetic_working: false,
+            model: None,
+            monitored_wait_active: false,
+            wait_synthetic_working: false,
+            shell_descendant_busy: false,
+            wait_deferred_revert: false,
+            agent_report_activity_seen: false,
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-reconnect".to_string());
+        state.seed_hydrated_session(
+            "pane-reconnect".to_string(),
+            Some("/home/dev/api-svc".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some("agent-reconnect".to_string()),
+            Some(&snapshot),
+            None,
+        );
+        let session = state
+            .sessions
+            .get("pane-pane-reconnect")
+            .expect("hydration seeds the pane's card");
+        let density = CardDensityKind::Normal;
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            session,
+            Some("api-svc"),
+            Some(1),
+            density,
+            0,
+            now,
+            false,
+            80,
+            density.rendered_height(),
+        ));
+        rendered
+            .lines()
+            .last()
+            .expect("card must have a bottom border")
+            .to_string()
+    };
+
+    let bottom = bottom_border_after_reconnect(Some(quiet_for_an_hour));
+    assert!(
+        bottom.contains(" Last: 1h  Tools: 14 "),
+        "a reconnected card must say how long the agent has been quiet, not reset to 0s:\n{bottom}"
+    );
+
+    for (case, last_activity_ms) in [
+        ("an older daemon's snapshot without the instant", None),
+        (
+            "an instant outside what a timestamp can hold",
+            Some(i64::MAX),
+        ),
+    ] {
+        let bottom = bottom_border_after_reconnect(last_activity_ms);
+        let elapsed = bottom
+            .split(" Last: ")
+            .nth(1)
+            .and_then(|rest| rest.split("  Tools: ").next())
+            .unwrap_or_else(|| panic!("{case}: the full stats label must render:\n{bottom}"));
+        // The seconds form, not a pinned `0s`. The render itself reads no clock
+        // (issue #413), and in the ordinary case the placeholder is minted after
+        // `now` was read and clamps to `0s`. But the placeholder's instant comes
+        // from hydration's own `Utc::now()`, which this test cannot inject, so a
+        // backwards wall-clock step between the two reads would show as a few
+        // seconds.
+        assert!(
+            elapsed.ends_with('s')
+                && elapsed[..elapsed.len() - 1]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()),
+            "{case}: the card must keep the freshly minted placeholder's readout, got `{elapsed}`:\n{bottom}"
+        );
+    }
+}
+
 /// Scenario: Render a card at the narrowest realistic 20-column width. The
 /// bottom-right stats title must use the `1h · 14 tools` fallback while both
 /// bottom corner glyphs remain intact and no stats row appears in the content.
@@ -297,6 +1470,7 @@ fn card_stats_002_narrow_card_degrades_label_without_overrunning_corners() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         density.rendered_height(),
@@ -340,6 +1514,7 @@ fn card_stats_003_old_sixty_column_boundary_is_structurally_inert() {
             Some(1),
             density,
             0,
+            render_now(),
             false,
             width,
             density.rendered_height(),
@@ -498,23 +1673,21 @@ fn buffer_to_color_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// `theme/contrast/001` and `theme/guard/001` drive these same seams; the
 /// label is only used to point assertion failures at the offending surface.
 fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
-    // Representative mix so every status segment renders, 140 cells wide so the
-    // whole bar fits without truncation (mirrors the prior contrast fixtures).
+    // Representative status mix, 140 cells wide so the bar fits without
+    // truncation (mirrors the prior contrast fixtures).
     let stats = DashboardStats {
         active: 6,
         working: 1,
         thinking: 1,
         waiting: 1,
         errors: 1,
+        blocked: 0,
         idle: 1,
         compacting: 1,
         total_tools: 42,
     };
     vec![
-        (
-            "stats",
-            render_stats_bar_to_buffer(&stats, Some("plan"), 140, 1),
-        ),
+        ("stats", render_stats_bar_to_buffer(&stats, 140, 1)),
         ("quit", render_quit_confirm_to_buffer(0, 80, 24)),
         ("stop", render_stop_confirm_to_buffer(0, 2, 80, 24)),
         ("star", render_star_prompt_to_buffer(80, 24)),
@@ -537,12 +1710,13 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
 /// `theme/guard/001`. `is_placeholder`'s "No agent" status label reads only
 /// `agent_type`, so this does not change that assertion.
 fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
-    let now = chrono::Utc::now();
+    let now = render_now();
     let placeholder = SessionState {
         session_id: String::new(),
         agent_type: AgentType::None,
         cwd: None,
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -555,6 +1729,8 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         display_name: Some("placeholder-agent".to_string()),
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -564,6 +1740,12 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -574,6 +1756,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         None,
         density,
         0,
+        render_now(),
         selected,
         UiMode::Normal,
         width,
@@ -779,14 +1962,15 @@ fn pane_007_pi_card_omits_agent_type_badge() {
     // type specifically, since Pi historically needed its own identity
     // check (PRD #201) to prove it renders as a first-class agent at all.
     //
-    // A current activity time keeps the compact bottom-border elapsed value
-    // small; this identity test does not assert its exact value.
-    let now = chrono::Utc::now();
+    // Activity at the render instant keeps the compact bottom-border elapsed
+    // value small; this identity test does not assert its exact value.
+    let now = render_now();
     let session = SessionState {
         session_id: "orch-01".to_string(),
         agent_type: AgentType::Pi,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -801,6 +1985,8 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -810,6 +1996,12 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -819,8 +2011,9 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         None, // no display name
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,            // animation tick
+        render_now(), // render instant
+        false,        // not selected
         width,
         height,
     );
@@ -865,33 +2058,21 @@ fn pane_007_pi_card_omits_agent_type_badge() {
 #[spec("dashboard/pane/008")]
 #[test]
 fn pane_008_codex_card_omits_agent_type_badge() {
-    // `last_activity` is nudged 30s into the future of `now` rather than left
-    // equal to it (issue #15): this fixture feeds both the immediate snapshot
-    // below AND the later `pane_008_named_agent_badges` snapshot (via
-    // `session.clone()` in the loop further down), so by the time the second
-    // snapshot renders, real wall-clock time has already passed doing the
-    // first snapshot's assertions and comparisons. The bottom border's
-    // `Last:` field is computed from `Utc::now()` at render time
-    // (`format_elapsed`, src/ui.rs), not at fixture build time, so seeding
-    // `last_activity == now` raced that elapsed computation across a whole
-    // second boundary under any scheduling delay (routine under parallel test
-    // load) — intermittently rendering `Last: 1s` instead of the pinned
-    // `Last: 0s`. A *past* offset (e.g. `now - 500ms`) would only shrink the
-    // safety margin further and make the race worse, not fix it. Nudging
-    // forward instead relies on `format_elapsed`'s existing clamp of a
-    // negative elapsed delta to zero (`delta.num_seconds().max(0)`): the
-    // render-time delta stays negative (clamped to `0s`) for any render
-    // happening within 30s of this instant, comfortably covering both
-    // snapshots in this test.
-    let now = chrono::Utc::now();
+    // This fixture feeds *both* snapshots below — the immediate one, and
+    // `pane_008_named_agent_badges` via `session.clone()` in the loop further
+    // down. Issue #413: both render at `render_now()`, the fixture's own
+    // instant, so both read `Last: 0s` however much time the first snapshot's
+    // assertions spend before the second renders.
+    let now = render_now();
     let session = SessionState {
         session_id: "wrapped-01".to_string(),
         agent_type: AgentType::Codex,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: None,
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: Some("inspect the repository".to_string()),
@@ -901,6 +2082,8 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -910,11 +2093,27 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
     let height = density.rendered_height();
-    let buffer = render_card_to_buffer(&session, None, Some(1), density, 0, false, width, height);
+    let buffer = render_card_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        width,
+        height,
+    );
     let text = buffer_to_text(&buffer);
     assert!(
         !text.contains("Codex"),
@@ -950,6 +2149,7 @@ fn pane_008_codex_card_omits_agent_type_badge() {
             Some(1),
             density,
             0,
+            render_now(),
             false,
             width,
             height,
@@ -1037,6 +2237,15 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        blocked: None,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1049,6 +2258,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -1076,6 +2286,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -1126,6 +2337,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -1150,6 +2362,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -1206,6 +2419,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
             Some(1),
             density,
             0,
+            now,
             false,
             UiMode::Normal,
             width,
@@ -1299,6 +2513,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
             Some(1),
             density,
             0,
+            now,
             false,
             UiMode::Normal,
             width,
@@ -1318,6 +2533,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
             Some(1),
             density,
             0,
+            now,
             false,
             UiMode::Normal,
             width,
@@ -1382,6 +2598,15 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        blocked: None,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let placeholder_on = render_card_for_mode_to_buffer(
         &placeholder,
@@ -1389,6 +2614,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -1453,6 +2679,8 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
             schema_version: None,
             live_target: None,
             model: model.map(str::to_string),
+            background: None,
+            background_revision: None,
         }
     }
 
@@ -1470,6 +2698,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
             Some(1),
             density,
             0,
+            chrono::Utc::now(),
             false,
             UiMode::Normal,
             width,
@@ -1633,6 +2862,8 @@ fn agent_badge_005_long_model_cannot_starve_the_identity_row() {
         schema_version: None,
         live_target: None,
         model: Some(long_model),
+        background: None,
+        background_revision: None,
     });
     let session = state
         .sessions
@@ -1649,6 +2880,7 @@ fn agent_badge_005_long_model_cannot_starve_the_identity_row() {
         Some(1),
         density,
         0,
+        chrono::Utc::now(),
         false,
         UiMode::Normal,
         width,
@@ -1709,6 +2941,8 @@ fn agent_badge_006_model_with_format_chars_is_sanitized() {
         schema_version: None,
         live_target: None,
         model: Some(hostile_model.to_string()),
+        background: None,
+        background_revision: None,
     });
     let session = state
         .sessions
@@ -1725,6 +2959,7 @@ fn agent_badge_006_model_with_format_chars_is_sanitized() {
         Some(1),
         density,
         0,
+        chrono::Utc::now(),
         false,
         UiMode::Normal,
         width,
@@ -1790,6 +3025,8 @@ fn agent_badge_007_display_name_is_sanitized_and_clamped() {
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     });
     let session = state
         .sessions
@@ -1877,6 +3114,8 @@ fn agent_badge_012_tool_detail_with_format_chars_is_sanitized_in_render() {
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     });
     state.apply_event(AgentEvent {
         session_id: "tool-cf-id-01".to_string(),
@@ -1894,6 +3133,8 @@ fn agent_badge_012_tool_detail_with_format_chars_is_sanitized_in_render() {
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     });
     let session = state
         .sessions
@@ -1910,6 +3151,7 @@ fn agent_badge_012_tool_detail_with_format_chars_is_sanitized_in_render() {
         Some(1),
         density,
         0,
+        chrono::Utc::now(),
         false,
         UiMode::Normal,
         width,
@@ -1992,6 +3234,15 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         expects_agent_report: false,
         agent_report_activity_seen: true,
         outstanding_delegation: None,
+        blocked: None,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -2007,6 +3258,7 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -2039,6 +3291,7 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -2051,6 +3304,7 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -2082,6 +3336,7 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -2114,6 +3369,7 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -2128,6 +3384,7 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -2156,7 +3413,8 @@ fn agent_badge_008_resolved_codex_placeholder_still_shows_known_model() {
 /// draws into the last row of the left dashboard column whenever panes are open.
 /// The bar must spend that width on the status counts and the `tools` total, with
 /// no per-agent-type breakdown: the breakdown used to consume ~30 columns here and
-/// silently clip the `tools` total off the right edge.
+/// silently clip the `tools` total off the right edge. A second render with a
+/// waiting agent must call that status "needs input" in the visible bar.
 #[spec("dashboard/stats/001")]
 #[test]
 fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
@@ -2183,6 +3441,8 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
             schema_version: None,
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         });
     }
 
@@ -2192,7 +3452,7 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
         "all 22 mixed-agent sessions count as active"
     );
 
-    let buffer = render_stats_bar_to_buffer(&stats, None, 60, 1);
+    let buffer = render_stats_bar_to_buffer(&stats, 60, 1);
     let rendered = buffer_to_text(&buffer);
     assert!(
         rendered.contains("22 active") && rendered.contains("tools"),
@@ -2202,6 +3462,17 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
         !rendered.contains("ClaudeCode") && !rendered.contains("Codex"),
         "the stats bar must not spend its width on a per-agent-type breakdown \
          (every card already carries a registry-colored type badge):\n{rendered}"
+    );
+
+    let waiting_stats = DashboardStats {
+        active: 1,
+        waiting: 1,
+        ..DashboardStats::default()
+    };
+    let waiting_bar = buffer_to_text(&render_stats_bar_to_buffer(&waiting_stats, 80, 1));
+    assert!(
+        waiting_bar.contains("1 needs input"),
+        "waiting agent must be labeled like its card in the stats bar:\n{waiting_bar}"
     );
 }
 
@@ -2244,6 +3515,7 @@ fn pane_009_history_only_card_marks_and_dims_input_affordance() {
         None,
         density,
         0,
+        render_now(),
         width,
     );
     let text = buffer_to_text(&buffer);
@@ -2282,12 +3554,13 @@ fn pane_009_history_only_card_marks_and_dims_input_affordance() {
 /// role. Its current activity time keeps the compact border value small; these
 /// tests inspect only the border color, never the body.
 fn palette_session(status: SessionStatus) -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     SessionState {
         session_id: "sess-palette".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -2300,6 +3573,8 @@ fn palette_session(status: SessionStatus) -> SessionState {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -2309,6 +3584,208 @@ fn palette_session(status: SessionStatus) -> SessionState {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
+    }
+}
+
+/// Scenario: Render a credits-depleted Blocked card and blocked stats bar,
+/// checking the badge, reason, and error colour. At every density, a full
+/// Blocked card keeps its credit reason and newest tool line visible. An
+/// Orphaned+Blocked card keeps both status rows, its newest tool line, and the
+/// `Prmt:` label on the first visible prompt at every density.
+#[spec("status/badge/002")]
+#[test]
+fn status_badge_002_blocked_card_snapshot() {
+    let mut session = palette_session(SessionStatus::Blocked);
+    session.blocked = Some(BlockedReason {
+        kind: BlockedKind::CreditsDepleted,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: Some("structured provider error: credits depleted".to_string()),
+        resets_at_ms: None,
+    });
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("quota-worker"),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Blocked"),
+        "missing Blocked badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Credits"),
+        "missing credits reason:\n{rendered}"
+    );
+    assert_eq!(border_style_at_mid(&buffer).0, Color::Red);
+    insta::assert_snapshot!(rendered);
+
+    let stats = DashboardStats {
+        blocked: 1,
+        ..DashboardStats::default()
+    };
+    let stats_buffer = render_stats_bar_to_buffer(&stats, 80, 1);
+    let stats_text = buffer_to_text(&stats_buffer);
+    let blocked_byte = stats_text
+        .find("1 blocked")
+        .unwrap_or_else(|| panic!("missing blocked stats segment:\n{stats_text}"));
+    let blocked_x = stats_text[..blocked_byte].chars().count() as u16;
+    for x in blocked_x..blocked_x + "1 blocked".len() as u16 {
+        assert_eq!(
+            stats_buffer[(x, 0)].fg,
+            Color::Red,
+            "blocked stats segment must use the error colour:\n{}",
+            buffer_to_color_text(&stats_buffer)
+        );
+    }
+
+    let mut full = filled_session();
+    for density in [
+        CardDensityKind::Normal,
+        CardDensityKind::Spacious,
+        CardDensityKind::Compact,
+    ] {
+        let render = |session: &SessionState| {
+            buffer_to_text(&render_card_to_buffer(
+                session,
+                Some("quota-worker"),
+                Some(1),
+                density,
+                0,
+                render_now(),
+                false,
+                80,
+                density.rendered_height(),
+            ))
+        };
+        let control = render(&full);
+        assert!(
+            control.contains("Bash — cargo test"),
+            "control card lost its last tool line at {density:?}:\n{control}"
+        );
+        full.status = SessionStatus::Blocked;
+        full.blocked = session.blocked.clone();
+        let blocked = render(&full);
+        assert!(
+            blocked.contains("Credits"),
+            "Blocked card lost its reason at {density:?}:\n{blocked}"
+        );
+        if density != CardDensityKind::Compact {
+            for tool in ["Read — src/main.rs", "Edit — src/ui.rs"] {
+                assert!(
+                    blocked.contains(tool),
+                    "Blocked card clipped a tool line at {density:?}:\n{blocked}"
+                );
+            }
+        }
+        assert!(
+            blocked.contains("Bash — cargo test"),
+            "Blocked card clipped its last tool line at {density:?}:\n{blocked}"
+        );
+
+        full.orchestration_orphaned = true;
+        let orphaned_blocked = render(&full);
+        for status in ["Orphaned — delegation unavailable", "Credits"] {
+            assert!(
+                orphaned_blocked.contains(status),
+                "Orphaned+Blocked card lost {status} at {density:?}:\n{orphaned_blocked}"
+            );
+        }
+        assert!(
+            orphaned_blocked.contains("Bash — cargo test"),
+            "Orphaned+Blocked card clipped its newest tool at {density:?}:\n{orphaned_blocked}"
+        );
+        let first_visible_prompt = orphaned_blocked.lines().find(|row| {
+            ["first prompt", "second prompt", "third prompt"]
+                .iter()
+                .any(|prompt| row.contains(prompt))
+        });
+        if density == CardDensityKind::Spacious {
+            assert!(
+                orphaned_blocked.contains("second prompt")
+                    && orphaned_blocked.contains("third prompt"),
+                "Spacious Orphaned+Blocked card must retain its two newest prompts:\n{orphaned_blocked}"
+            );
+        }
+        if let Some(row) = first_visible_prompt {
+            assert!(
+                row.contains("Prmt: "),
+                "first visible prompt lost its Prmt: label at {density:?}:\n{orphaned_blocked}"
+            );
+        }
+        full.orchestration_orphaned = false;
+        full.status = SessionStatus::Working;
+        full.blocked = None;
+    }
+}
+
+/// Scenario: Render a Blocked card whose provider supplies a reset two hours
+/// and ten minutes after the fixed render clock. The card tells the user when
+/// the usage limit resets, and a reset at either extreme of the range still
+/// renders the reason, with no countdown.
+#[spec("status/badge/003")]
+#[test]
+fn status_badge_003_blocked_card_shows_reset() {
+    let mut session = palette_session(SessionStatus::Blocked);
+    session.blocked = Some(BlockedReason {
+        kind: BlockedKind::UsageLimit,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: None,
+        resets_at_ms: Some(
+            (render_now() + chrono::Duration::hours(2) + chrono::Duration::minutes(10))
+                .timestamp_millis(),
+        ),
+    });
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("quota-worker"),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("resets in 2h 10m"),
+        "the blocked card omitted its provider reset:\n{rendered}"
+    );
+
+    // A reset no provider could have sent — the extremes a malformed snapshot
+    // can carry — still renders the card, with the reason and no countdown.
+    for extreme in [i64::MIN, i64::MAX] {
+        session.blocked.as_mut().unwrap().resets_at_ms = Some(extreme);
+        let buffer = render_card_to_buffer(
+            &session,
+            Some("quota-worker"),
+            Some(1),
+            density,
+            0,
+            render_now(),
+            false,
+            80,
+            density.rendered_height(),
+        );
+        let rendered = buffer_to_text(&buffer);
+        assert!(
+            rendered.contains("Usage limit") && !rendered.contains("resets in"),
+            "reset {extreme} must render the reason without a countdown:\n{rendered}"
+        );
     }
 }
 
@@ -2336,8 +3813,9 @@ fn card_border_at_mid(status: SessionStatus) -> (Color, Modifier) {
         Some("example-agent"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,            // animation tick
+        render_now(), // render instant
+        false,        // not selected
         width,
         height,
     );
@@ -2372,7 +3850,7 @@ fn render_pane_border_buffer(
         height: 6,
     };
     // Inner area is 20×4; size the screen to match (no contract fallback).
-    let parser = vt100::Parser::new(4, 20, 0);
+    let parser = dot_agent_deck::vt_grid::parser(4, 20, 0);
     let parser = Arc::new(Mutex::new(parser));
     let title = match &status {
         Some(s) => format!("{s:?}"),
@@ -2406,10 +3884,10 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
     buffer[(0, y)].symbol().to_string()
 }
 
-/// The six status roles in the centralized palette and the named-ANSI color each
+/// The seven status values in the centralized palette and the named-ANSI color each
 /// must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
-/// compacting=Blue (shares the thinking role), waiting=Magenta, error=Red,
-/// idle=DarkGray. The single source of truth shared by the deck-card (T1) and
+/// compacting=Blue (shares the thinking role), waiting=Magenta, error and
+/// blocked=Red, idle=DarkGray. The single source of truth shared by the deck-card (T1) and
 /// embedded-pane (T2) assertions.
 ///
 /// Waiting left Yellow in issue #579: yellow measured 1.70:1 against a white
@@ -2419,7 +3897,7 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
 /// clears AA on a light *and* a dark terminal. `theme/contrast/002` asserts the
 /// ratios; these tests keep asserting identity, which is what makes the two
 /// complementary rather than redundant.
-fn status_role_colors() -> [(SessionStatus, Color); 6] {
+fn status_role_colors() -> [(SessionStatus, Color); 7] {
     [
         (SessionStatus::Working, Color::Green),
         (SessionStatus::Thinking, Color::Blue),
@@ -2430,15 +3908,16 @@ fn status_role_colors() -> [(SessionStatus, Color); 6] {
         (SessionStatus::Compacting, Color::Blue),
         (SessionStatus::WaitingForInput, Color::Magenta),
         (SessionStatus::Error, Color::Red),
+        (SessionStatus::Blocked, Color::Red),
         (SessionStatus::Idle, Color::DarkGray),
     ]
 }
 
-/// Scenario: Render a deck card for each of the six agent statuses
-/// (working/thinking/compacting/waiting/error/idle), none selected or focused,
+/// Scenario: Render a deck card for each of the seven agent statuses
+/// (working/thinking/compacting/waiting/error/blocked/idle), none selected or focused,
 /// and assert the card's border color is the matching centralized status role —
 /// working=Green, thinking=Blue, compacting=Blue (it shares the thinking role),
-/// waiting=Magenta, error=Red, idle=DarkGray. Also assert each status border is a
+/// waiting=Magenta, error/blocked=Red, idle=DarkGray. Also assert each status border is a
 /// status role and never an accent role (Reset=selected, Cyan=focused), so a
 /// status can never collide with selection/focus. This pins PRD #155 Option A:
 /// the deck-card border encodes status via the centralized palette roles.
@@ -2469,8 +3948,8 @@ fn palette_001_deck_card_border_is_status_role() {
     }
 }
 
-/// Scenario: For each of the six agent statuses
-/// (working/thinking/compacting/waiting/error/idle), render the deck card AND an
+/// Scenario: For each of the seven agent statuses
+/// (working/thinking/compacting/waiting/error/blocked/idle), render the deck card AND an
 /// embedded pane (neither selected nor focused) and assert the pane's border
 /// color is the SAME as the deck card's for that status — and that both equal the
 /// palette status role color. This is the consistency criterion: a given state
@@ -2515,8 +3994,9 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
         Some("example-agent"),
         Some(1),
         density,
-        0,    // animation tick
-        true, // SELECTED
+        0,            // animation tick
+        render_now(), // render instant
+        true,         // SELECTED
         UiMode::Normal,
         width,
         height,
@@ -2590,8 +4070,9 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
         Some("example-agent"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,
+        render_now(), // animation tick
+        false,        // not selected
         width,
         height,
     );
@@ -2624,8 +4105,9 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
         Some("example-agent"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,
+        render_now(), // animation tick
+        false,        // not selected
         width,
         height,
     );
@@ -2653,8 +4135,9 @@ fn palette_007_wait_promoted_working_card_shows_observing_badge_and_color() {
         Some("example-agent"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,
+        render_now(), // animation tick
+        false,        // not selected
         width,
         height,
     );
@@ -2708,8 +4191,9 @@ fn palette_008_idle_card_with_outstanding_delegation_shows_delegated_badge_and_c
         Some("example-agent"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,
+        render_now(), // animation tick
+        false,        // not selected
         width,
         height,
     );
@@ -2737,6 +4221,7 @@ fn palette_008_idle_card_with_outstanding_delegation_shows_delegated_badge_and_c
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         height,
@@ -2782,6 +4267,7 @@ fn palette_009_wait_promoted_working_card_shows_bare_observing_label() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         height,
@@ -2816,6 +4302,7 @@ fn palette_009_wait_promoted_working_card_shows_bare_observing_label() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         height,
@@ -2844,6 +4331,7 @@ fn palette_009_wait_promoted_working_card_shows_bare_observing_label() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         height,
@@ -2965,7 +4453,7 @@ fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
     );
 
     // FOCUS SURVIVES: thickness takes over the job colour just gave up, so a
-    // multi-pane mode tab still shows which pane `Ctrl+D` / `Enter` returns to.
+    // multi-pane orchestration tab still shows which pane `Ctrl+D` / `Enter` returns to.
     let live_glyph = border_glyph_at_mid(&live);
     let parked_glyph = border_glyph_at_mid(&parked);
     assert_eq!(
@@ -3019,6 +4507,7 @@ fn palette_006_selection_is_visible_at_every_status() {
                     Some(1),
                     density,
                     0,
+                    render_now(),
                     selected,
                     mode,
                     width,
@@ -3279,25 +4768,22 @@ fn pane_005_highlight_follows_selected_session_id() {
     // point the selection at the 2nd, so a regression that ignored the
     // stable id (highlighting card 0) would visibly diff the snapshot.
     //
-    // All sessions share one current activity time, keeping their compact
-    // bottom-border elapsed values identical in the snapshot. `last_activity`
-    // is nudged 30s into the future of that shared instant rather than left
-    // equal to it — see the identical rationale in `pane_004_card_title_row`
-    // above (issue #15): the render-time `Last:` field races the wall clock
-    // when seeded at exactly `now`, and `format_elapsed`'s clamp to zero for a
-    // negative delta (src/ui.rs) makes a forward offset the safe fix.
-    let now = chrono::Utc::now();
+    // All sessions share one activity time, which is also the instant the
+    // cards are rendered at (`render_now()`, issue #413), so every card's
+    // bottom border reads `Last: 0s` in the snapshot.
+    let now = render_now();
     let make = |sid: &str, pane: &str, name: &str, cwd: &str| SessionState {
         session_id: sid.to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some(cwd.to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
         }),
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 3,
         last_user_prompt: Some("do the thing".to_string()),
@@ -3307,6 +4793,8 @@ fn pane_005_highlight_follows_selected_session_id() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -3316,6 +4804,12 @@ fn pane_005_highlight_follows_selected_session_id() {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -3354,7 +4848,8 @@ fn pane_005_highlight_follows_selected_session_id() {
         // `Some(idx)` paints the highlight on that card.
         Some(selected_index),
         CardDensityKind::Normal,
-        0, // animation tick
+        0,            // animation tick
+        render_now(), // render instant
         80,
     );
     insta::assert_snapshot!(buffer_to_text(&buffer));
@@ -3400,6 +4895,8 @@ fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     });
 
     // The card list the dashboard would build for this pane.
@@ -3424,7 +4921,14 @@ fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
     );
 
     let cards: [(&SessionState, Option<&str>); 1] = [(on_pane[0], Some("worker"))];
-    let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), CardDensityKind::Normal, 0, 80);
+    let buffer = render_dashboard_cards_to_buffer(
+        &cards,
+        Some(0),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        80,
+    );
     let rendered = buffer_to_text(&buffer);
     // The status badge is per-card, so counting it counts cards — and keeps the
     // assertion readable without committing another snapshot file.
@@ -3530,6 +5034,15 @@ fn pane_014_role_name_on_its_own_body_row() {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        blocked: None,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -3545,6 +5058,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -3594,6 +5108,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -3657,6 +5172,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -3691,6 +5207,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         width,
@@ -3735,7 +5252,7 @@ fn pane_014_role_name_on_its_own_body_row() {
 /// these tests inspect only blank/non-blank rows, so its exact value is
 /// irrelevant.
 fn filled_session() -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     let mut events: VecDeque<AgentEvent> = VecDeque::new();
     for prompt in ["first prompt", "second prompt", "third prompt"] {
         events.push_back(AgentEvent {
@@ -3754,6 +5271,8 @@ fn filled_session() -> SessionState {
             schema_version: None,
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         });
     }
     for (name, detail) in [
@@ -3777,6 +5296,8 @@ fn filled_session() -> SessionState {
             schema_version: None,
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         });
     }
     SessionState {
@@ -3784,6 +5305,7 @@ fn filled_session() -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Bash".to_string(),
             detail: Some("cargo test".to_string()),
@@ -3799,6 +5321,8 @@ fn filled_session() -> SessionState {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -3808,6 +5332,12 @@ fn filled_session() -> SessionState {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -3843,7 +5373,7 @@ fn trailing_blank_inner_rows(buffer: &ratatui::buffer::Buffer) -> usize {
 }
 
 /// Scenario: Render a single fully-populated session card at each density tier
-/// (Compact, Normal, Spacious) in a wide 80-column viewport sized to the tier's
+/// (Minimal, Compact, Normal, Spacious) in a wide 80-column viewport sized to the tier's
 /// own `rendered_height`, then assert the card has zero trailing blank rows —
 /// the row directly above the bottom border carries rendered content on every
 /// tier. This locks in PRD #147's content-derived `card_height`: the reserved
@@ -3862,6 +5392,7 @@ fn density_004_no_trailing_blank_rows() {
     let session = filled_session();
     let width: u16 = 80;
     for (density, label) in [
+        (CardDensityKind::Minimal, "Minimal"),
         (CardDensityKind::Compact, "Compact"),
         (CardDensityKind::Normal, "Normal"),
         (CardDensityKind::Spacious, "Spacious"),
@@ -3872,8 +5403,9 @@ fn density_004_no_trailing_blank_rows() {
             Some("example-coder"),
             Some(1),
             density,
-            0,     // animation tick
-            false, // not selected
+            0,            // animation tick
+            render_now(), // render instant
+            false,        // not selected
             width,
             height,
         );
@@ -3896,7 +5428,7 @@ fn filled_idle_session() -> SessionState {
     SessionState {
         status: SessionStatus::Idle,
         active_tool: None,
-        last_activity: chrono::Utc::now() - chrono::Duration::hours(1),
+        last_activity: render_now() - chrono::Duration::hours(1),
         display_name: Some("example-coder".to_string()),
         ..filled_session()
     }
@@ -3929,6 +5461,7 @@ fn density_005_spacious_idle_shows_flashing_dot_over_card_content() {
             Some(1),
             density,
             tick,
+            render_now(),
             false, // not selected
             width,
             density.rendered_height(),
@@ -3990,9 +5523,10 @@ fn density_005_spacious_idle_shows_flashing_dot_over_card_content() {
     insta::assert_snapshot!(flash_on);
 }
 
-/// Replicate `choose_density`'s tier selection using the public
+/// Replicate the renderer's tier selection using the public
 /// `rendered_height` seam: pick the largest tier whose stacked card rows fit
-/// in `avail`, falling back to Compact. Mirrors `src/ui.rs::choose_density` so
+/// in `avail`, falling back to Compact. For a width that holds one card column this is what
+/// `src/ui.rs::choose_grid_layout` picks (issue #1568's Minimal tier included), so
 /// the orchestration capacity test tracks the same selection the renderer uses
 /// without depending on the private function.
 fn pick_density(n_decks: usize, cols: usize, avail: u16) -> CardDensityKind {
@@ -4001,6 +5535,7 @@ fn pick_density(n_decks: usize, cols: usize, avail: u16) -> CardDensityKind {
         CardDensityKind::Spacious,
         CardDensityKind::Normal,
         CardDensityKind::Compact,
+        CardDensityKind::Minimal,
     ] {
         if rows * density.rendered_height() <= avail {
             return density;
@@ -4087,7 +5622,7 @@ fn layout_001_seven_decks_fit_single_column() {
             names.iter().map(|n| (&session, Some(n.as_str()))).collect();
         // PRD #113: `selected` is `Option<usize>`; this capacity test highlights
         // nothing, so pass `None` (the old out-of-range `usize::MAX` sentinel).
-        let buffer = render_dashboard_cards_to_buffer(&cards, None, density, 0, 64);
+        let buffer = render_dashboard_cards_to_buffer(&cards, None, density, 0, render_now(), 64);
         let text = buffer_to_text(&buffer);
         assert!(
             text.contains("deck-7"),
@@ -4128,6 +5663,7 @@ fn layout_001_seven_decks_fit_single_column() {
             card_number,
             CardDensityKind::Compact,
             0,
+            render_now(),
             false,
             64,
             *height,
@@ -4161,9 +5697,9 @@ fn layout_001_seven_decks_fit_single_column() {
 /// fix. The `1`-`9` Normal-mode digit-jump shortcut (`Action::FocusCard`) is
 /// untouched by this fix and stays out of scope here — no card past
 /// position 9 gains a single-keypress shortcut.
-#[spec("dashboard/pane/017")]
+#[spec("dashboard/pane/026")]
 #[test]
-fn pane_017_card_number_badge_past_nine() {
+fn pane_026_card_number_badge_past_nine() {
     // Ten unique, digit-free display names so a `" 10 "` match in the
     // rendered text can only be the number badge, never part of a name.
     const NAMES: [&str; 10] = [
@@ -4181,7 +5717,7 @@ fn pane_017_card_number_badge_past_nine() {
     // Compact-density rows (`10 * 6 = 60`) avoids both scrolling and a widened
     // column count, so `flat_index` lines up 1:1 with session order and the
     // tenth session lands at `card_number = Some(10)`.
-    let (grid_buffer, _) = render_card_grid_to_buffer(&cards, None, 0, 90, 70);
+    let (grid_buffer, _) = render_card_grid_to_buffer(&cards, None, 0, render_now(), 90, 70);
     let grid_text = buffer_to_text(&grid_buffer);
     // `render_card_grid` draws row 0 as the deck title (`deck_title_line`,
     // src/ui.rs ~19190) BEFORE any card. With 10 sessions and none hidden,
@@ -4209,8 +5745,14 @@ fn pane_017_card_number_badge_past_nine() {
     // (2) `render_dashboard_cards_to_buffer`: one card per row, with the
     // buffer height derived to fit every card exactly — no scrolling is
     // possible, so the tenth card is always on screen.
-    let dashboard_buffer =
-        render_dashboard_cards_to_buffer(&cards, None, CardDensityKind::Compact, 0, 64);
+    let dashboard_buffer = render_dashboard_cards_to_buffer(
+        &cards,
+        None,
+        CardDensityKind::Compact,
+        0,
+        render_now(),
+        64,
+    );
     let dashboard_text = buffer_to_text(&dashboard_buffer);
     assert!(
         dashboard_text.contains(" 10 "),
@@ -4297,6 +5839,8 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     });
     let poisoned = state
         .sessions
@@ -4325,6 +5869,7 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
         Some(0),
         CardDensityKind::Normal,
         0,
+        render_now(),
         80,
     ));
 
@@ -4361,6 +5906,7 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
                 Some(1),
                 CardDensityKind::Normal,
                 0,
+                render_now(),
                 false,
                 80,
                 CardDensityKind::Normal.rendered_height(),
@@ -4434,6 +5980,8 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
             schema_version: None,
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         });
         state
             .sessions
@@ -4510,7 +6058,7 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         (&overlong, None),
         (&healthy_b, None),
     ];
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 80, 40);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 80, 40);
     let rendered = buffer_to_text(&buffer);
 
     // One status badge per card, so counting badges counts surviving cards.
@@ -4597,7 +6145,7 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         (&overlong, None),
         (&healthy_b, None),
     ];
-    let (buffer, _) = render_card_grid_to_buffer(&renamed, Some(0), 0, 80, 40);
+    let (buffer, _) = render_card_grid_to_buffer(&renamed, Some(0), 0, render_now(), 80, 40);
     let rendered = buffer_to_text(&buffer);
     assert!(
         rendered.contains("example-beta"),
@@ -4660,7 +6208,7 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         (&overlong, pane_names.get("3").map(String::as_str)),
         (&healthy_b, None),
     ];
-    let (buffer, _) = render_card_grid_to_buffer(&restored, Some(0), 0, 80, 40);
+    let (buffer, _) = render_card_grid_to_buffer(&restored, Some(0), 0, render_now(), 80, 40);
     let rendered = buffer_to_text(&buffer);
     assert!(
         rendered.contains("example-beta"),
@@ -4687,15 +6235,16 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
 #[spec("dashboard/pane/013")]
 #[test]
 fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
-    let now = chrono::Utc::now();
+    let now = render_now();
     let mut session = SessionState {
         session_id: "declared-agent".to_string(),
         agent_type: AgentType::None,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
@@ -4705,6 +6254,8 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         agent_id: Some("agent-declared-agent".to_string()),
         display_name: Some("reviewer".to_string()),
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -4714,6 +6265,12 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -4723,6 +6280,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
             Some(1),
             density,
             0,
+            render_now(),
             false,
             UiMode::Normal,
             declared_agent_type,
@@ -4776,9 +6334,9 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
 /// planted character in any cell anywhere in the deck, the over-long detail
 /// must be stored clamped, and both neighbouring cards must keep their own
 /// titles and status badges.
-#[spec("dashboard/pane/015")]
+#[spec("dashboard/pane/024")]
 #[test]
-fn pane_015_hostile_tool_text_cannot_corrupt_the_card() {
+fn pane_024_hostile_tool_text_cannot_corrupt_the_card() {
     // Issue #833 gap 2. `tool_name` / `tool_detail` arrive on the hook socket —
     // the same surface `dashboard/pane/012` covers for `display_name` — and
     // `apply_event` stored them verbatim on both the session's `active_tool`
@@ -4814,6 +6372,8 @@ fn pane_015_hostile_tool_text_cannot_corrupt_the_card() {
             schema_version: None,
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         });
         state
             .sessions
@@ -4883,7 +6443,7 @@ fn pane_015_hostile_tool_text_cannot_corrupt_the_card() {
         (&overlong, Some("example-overlong")),
         (&healthy_b, Some("example-gamma")),
     ];
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 80, 40);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 80, 40);
     let rendered = buffer_to_text(&buffer);
 
     // One status badge per card, so counting badges counts surviving cards.
@@ -4936,12 +6496,12 @@ fn pane_015_hostile_tool_text_cannot_corrupt_the_card() {
 /// synthetic `Thinking` fixture below, matching issue #730's live evidence,
 /// though the mechanism that actually produces a live `Thinking` for such a
 /// pane in the field is now tracked separately as issue #732 — see
-/// `dashboard/pane/016`'s CATALOG entry). A second case in the same test
+/// `dashboard/pane/025`'s CATALOG entry). A second case in the same test
 /// covers `status: Idle`, the shape `insert_placeholder_session_inner`
 /// actually seeds and the one most likely to occur in production.
-#[spec("dashboard/pane/016")]
+#[spec("dashboard/pane/025")]
 #[test]
-fn pane_016_declared_agent_pending_report_shows_starting_not_live_status() {
+fn pane_025_declared_agent_pending_report_shows_starting_not_live_status() {
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "declared-agent-pending".to_string(),
@@ -4980,6 +6540,15 @@ fn pane_016_declared_agent_pending_report_shows_starting_not_live_status() {
         expects_agent_report: true,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        blocked: None,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     };
     let density = CardDensityKind::Normal;
     let buffer = render_card_with_declared_agent_to_buffer(
@@ -4988,6 +6557,7 @@ fn pane_016_declared_agent_pending_report_shows_starting_not_live_status() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         Some(&AgentType::Codex),
@@ -5045,6 +6615,7 @@ fn pane_016_declared_agent_pending_report_shows_starting_not_live_status() {
         Some(1),
         density,
         0,
+        now,
         false,
         UiMode::Normal,
         Some(&AgentType::Codex),
@@ -5058,6 +6629,115 @@ fn pane_016_declared_agent_pending_report_shows_starting_not_live_status() {
         "the production-reachable shape (status: Idle, expects_agent_report: true, \
          declared Codex) must also show 'Starting…':\n{idle_rendered}"
     );
+}
+
+/// Scenario: Render a card whose display name is `项目目录管理` — six characters
+/// but twelve terminal columns — into a 40-column Normal-density buffer, where
+/// the title region is only 26 columns wide. The card's top border must show the
+/// name cut short and marked with an `…` that is itself inside the budget, with
+/// the `● Thinking` badge still whole beside it, instead of the full name
+/// running over the badge and being bare-clipped at the right edge. An ASCII
+/// name of the same character count renders untouched, and a name of eight
+/// `❤️` — one column per `char`, two as drawn — is cut and marked the same way.
+#[spec("dashboard/pane/015")]
+#[test]
+fn pane_015_wide_title_is_ellipsized_within_the_column_budget() {
+    // Issue #357. `truncate_styled_segments` budgeted Unicode scalar values
+    // while its caller's budget is a slice of the card rectangle — cells on one
+    // row. `项目目录管理` is 6 scalars against 12 columns, so the whole title
+    // (` 1 `, the `ClaudeCode` badge and ` · 项目目录管理 `) measured 23
+    // "characters" inside a 26-cell budget and was returned untouched at 29
+    // columns; ratatui then clipped the overhang at the right edge with no `…`,
+    // so the card gave no sign it had shortened anything.
+    //
+    // 40 columns is chosen for what it leaves rather than as a round number: the
+    // badge (` ● Thinking ` = 12 cells) and the two borders take 14, leaving 26
+    // for the title — which the ASCII control fits and the CJK name does not.
+    const WIDTH: u16 = 40;
+    let density = CardDensityKind::Normal;
+
+    let wide = buffer_to_text(&render_card_to_buffer(
+        &card_stats_session("/home/dev/example-project"),
+        Some("项目目录管理"),
+        Some(1),
+        density,
+        0,            // animation tick
+        render_now(), // render instant
+        false,        // not selected
+        WIDTH,
+        density.rendered_height(),
+    ));
+    let title_row = wide.lines().next().expect("the card draws a top border");
+
+    assert!(
+        title_row.contains('…'),
+        "a name too wide for the title region must be marked as cut:\n{wide}"
+    );
+    assert!(
+        !title_row.contains('管') && !title_row.contains('理'),
+        "the characters past the budget must be dropped, not drawn over the badge:\n{wide}"
+    );
+    // The badge is right-aligned on the same row, so an over-wide title shows up
+    // as the badge losing cells to it.
+    assert!(
+        title_row.contains("● Thinking"),
+        "the status badge must survive the title beside it:\n{wide}"
+    );
+    // Cells, not display columns: `buffer_to_text` joins a wide glyph's second
+    // (padding) cell in as a space, so the row holds exactly one `char` per cell
+    // and counting them is counting the card's width. A title that overran would
+    // have had to take cells from the badge to fit.
+    assert_eq!(
+        title_row.chars().count(),
+        WIDTH as usize,
+        "the top border must occupy exactly the card's width:\n{wide}"
+    );
+
+    // The control: six ASCII characters are six columns, so the same card at the
+    // same width draws the name whole and marks nothing. This is the property
+    // that keeps every committed card snapshot from churning.
+    let ascii = buffer_to_text(&render_card_to_buffer(
+        &card_stats_session("/home/dev/example-project"),
+        Some("abcdef"),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        WIDTH,
+        density.rendered_height(),
+    ));
+    let ascii_title_row = ascii.lines().next().expect("the card draws a top border");
+    assert!(
+        ascii_title_row.contains("· abcdef") && !ascii_title_row.contains('…'),
+        "an ASCII name inside the budget renders untouched:\n{ascii}"
+    );
+
+    // A name whose glyphs are grapheme CLUSTERS wider than their `char`s:
+    // `❤️` is U+2764 + VARIATION SELECTOR-16, one column summed per `char` and
+    // two as ratatui draws it. Eight of them are 16 columns, past what the
+    // title's 26-cell region has left once the 16-cell prefix is paid for, so
+    // the cut must be marked. Budgeting per `char` measured them at 8, passed
+    // the title whole, and the badge was drawn over its tail — no `…`, no
+    // border fill, the CJK symptom again, on input the char count had handled.
+    let hearts = buffer_to_text(&render_card_to_buffer(
+        &card_stats_session("/home/dev/example-project"),
+        Some(&"❤\u{fe0f}".repeat(8)),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        WIDTH,
+        density.rendered_height(),
+    ));
+    let hearts_title_row = hearts.lines().next().expect("the card draws a top border");
+    assert!(
+        hearts_title_row.contains('…') && hearts_title_row.contains("● Thinking"),
+        "a name of VS16 emoji too wide for the title region must be marked as cut:\n{hearts}"
+    );
+
+    insta::assert_snapshot!(wide);
 }
 
 // ---------------------------------------------------------------------------
@@ -5077,20 +6757,19 @@ const REPORTED_ROLES: [&str; 7] = [
     "documenter",
 ];
 
-/// One live role card. `last_activity` is nudged 30s into the future for the
-/// reason `pane_004_card_title_row` documents: `Last:` is computed from
-/// `Utc::now()` at render time, so an equal timestamp sits on the `0s`/`1s`
-/// boundary and tips snapshots under parallel test load.
+/// One live role card, active at `render_now()` — the instant the grid is
+/// rendered at — so its bottom border reads `Last: 0s` (issue #413).
 fn role_session(index: usize, role: &str) -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     SessionState {
         session_id: format!("sess-role-{index:02}"),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/dot-agent-deck".to_string()),
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
@@ -5100,6 +6779,8 @@ fn role_session(index: usize, role: &str) -> SessionState {
         agent_id: Some(format!("agent-role-{index:02}")),
         display_name: Some(role.to_string()),
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -5109,6 +6790,12 @@ fn role_session(index: usize, role: &str) -> SessionState {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -5165,7 +6852,7 @@ fn grid_001_short_deck_still_paints_every_role() {
     // `orchestrator … releaser`, dropping `researcher` and `documenter`. Two
     // columns need only 7.div_ceil(2) * 5 = 20 rows, and 90 columns is two cards
     // of 45 — comfortably past MIN_CARD_W.
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 27);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 90, 27);
     let rendered = buffer_to_text(&buffer);
 
     for role in REPORTED_ROLES {
@@ -5190,7 +6877,7 @@ fn grid_001_short_deck_still_paints_every_role() {
     // Control: the same seven roles on a deck tall enough that one column always
     // fitted them. If this one failed too, the fixture — not the height — would
     // be what the assertion above is really measuring.
-    let (tall_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 60);
+    let (tall_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 90, 60);
     let tall = buffer_to_text(&tall_buffer);
     for role in REPORTED_ROLES {
         assert!(
@@ -5243,7 +6930,8 @@ fn grid_002_nav_columns_match_the_drawn_grid() {
 
     for (count, width, height, what) in cases {
         let cards = as_cards(&sessions[..count]);
-        let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, width, height);
+        let (buffer, probe) =
+            render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), width, height);
         let rendered = buffer_to_text(&buffer);
         assert_eq!(
             probe.nav_columns,
@@ -5278,7 +6966,7 @@ fn grid_003_unavoidable_overflow_is_signalled() {
     // `available_for_cards = 3 < 4`, which is still genuinely unavoidable —
     // and the widened 2-column count is what the old scroll/truncate
     // fallback then renders at.
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 5);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 90, 5);
     let rendered = buffer_to_text(&buffer);
     let title = rendered.lines().next().expect("a rendered title row");
 
@@ -5293,7 +6981,7 @@ fn grid_003_unavoidable_overflow_is_signalled() {
         "a sliced grid must count the cards it is not showing in its title:\n{title}"
     );
     assert!(
-        title.contains("7 session(s)"),
+        title.contains("7 agent(s)"),
         "the title must still name the full role count:\n{title}"
     );
     assert_eq!(
@@ -5308,7 +6996,7 @@ fn grid_003_unavoidable_overflow_is_signalled() {
     insta::assert_snapshot!(rendered);
 
     // Scrolled to the bottom: the marker must flip to counting what is above.
-    let (scrolled, _) = render_card_grid_to_buffer(&cards, Some(6), 0, 90, 5);
+    let (scrolled, _) = render_card_grid_to_buffer(&cards, Some(6), 0, render_now(), 90, 5);
     let scrolled_title = buffer_to_text(&scrolled)
         .lines()
         .next()
@@ -5388,6 +7076,8 @@ fn observing_hook_event(
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -5945,9 +7635,8 @@ fn observing_agent_record(
         cols: 80,
         live: None,
         spawned_at_ms: None,
-        daemon_boot_id: None,
-        registration_generation: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         outstanding_delegation: delegated_by.map(|orchestrator_pane| {
             dot_agent_deck::agent_pty::WatchSnapshot {
@@ -5955,8 +7644,10 @@ fn observing_agent_record(
                 orchestrator_pane_id: orchestrator_pane.to_string(),
             }
         }),
-        silence_watch: None,
         delegation_commission: None,
+        orchestrator_context_path: None,
+        authoring_kind: None,
+        inbox: None,
     }
 }
 
@@ -6503,4 +8194,313 @@ fn observing_019_delegation_stays_with_the_pane_when_a_session_changes_pane() {
         "its only delegation was retired",
     );
     assert_observing_tally(&state, 3, 3, "nothing is outstanding any more");
+}
+
+// ---------------------------------------------------------------------------
+// dashboard/density — the 3-row Minimal tier (issue #1568)
+// ---------------------------------------------------------------------------
+
+/// The height of every card in a SINGLE-COLUMN grid, top to bottom, read off
+/// the drawn border corners: a card runs from a row whose first cell is a
+/// top-left corner (`┌`, or `┏` when selected) to the next row whose first cell
+/// is a bottom-left corner (`└` / `┗`). Measured from the buffer rather than
+/// asked of the layout code, like [`drawn_cards`].
+fn single_column_card_heights(rendered: &str) -> Vec<usize> {
+    let mut heights = Vec::new();
+    let mut top = None;
+    for (y, line) in rendered.lines().enumerate() {
+        match line.chars().next() {
+            Some('┌' | '┏') => top = Some(y),
+            Some('└' | '┗') => {
+                if let Some(t) = top.take() {
+                    heights.push(y - t + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    heights
+}
+
+/// The rendered card whose top border carries `name`, as its rows — so an
+/// assertion can talk about one card of a grid without depending on where in
+/// the buffer the layout put it.
+fn card_rows<'a>(rendered: &'a str, name: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = rendered.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains(name))
+        .unwrap_or_else(|| panic!("no card titled {name:?}:\n{rendered}"));
+    let bottom = lines[top..]
+        .iter()
+        .position(|line| line.starts_with('└') || line.starts_with('┗'))
+        .unwrap_or_else(|| panic!("card {name:?} has no bottom border:\n{rendered}"));
+    lines[top..=top + bottom].to_vec()
+}
+
+/// Scenario: Render the seven-role orchestration into a 79-column deck — one
+/// column, since 79 columns cannot hold two cards — that is 25 rows tall, too
+/// short for seven 5-row Compact cards. Every card is drawn at 3 rows with its
+/// name and status on the top border, its `Dir:` row, and `Last:` / `Tools:`
+/// counters on the bottom border, and nothing scrolls. A 37-row control deck,
+/// where Compact fits, still draws every card at Compact's 5 rows.
+#[spec("dashboard/density/006")]
+#[test]
+fn density_006_minimal_cards_replace_scrolling_when_compact_cannot_fit() {
+    let sessions = reported_role_sessions();
+    let cards = as_cards(&sessions);
+
+    // Control first: 37 rows leaves 35 for cards, exactly seven Compact cards.
+    // The snapshot pins that a deck which fits at Compact renders exactly as it
+    // did before the Minimal tier existed.
+    let (control_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 37);
+    let control = buffer_to_text(&control_buffer);
+    assert_eq!(
+        single_column_card_heights(&control),
+        vec![5; REPORTED_ROLES.len()],
+        "control: a deck that fits at Compact keeps its 5-row cards:\n{control}"
+    );
+    assert!(
+        !control.lines().next().unwrap_or_default().contains('↓'),
+        "control: nothing is hidden:\n{control}"
+    );
+    insta::assert_snapshot!("density_006_compact_control", control);
+
+    // 25 rows leaves 23: seven Compact cards need 35, seven Minimal cards 21.
+    let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
+    let rendered = buffer_to_text(&buffer);
+    let title = rendered.lines().next().expect("a rendered title row");
+
+    assert_eq!(probe.nav_columns, 1, "79 columns holds one card column");
+    assert_eq!(
+        single_column_card_heights(&rendered),
+        vec![3; REPORTED_ROLES.len()],
+        "every card must be drawn, each at the 3-row Minimal height:\n{rendered}"
+    );
+    assert!(
+        !title.contains('↓') && !title.contains('↑'),
+        "Minimal replaces scrolling, so no card may be hidden:\n{title}"
+    );
+    for role in REPORTED_ROLES {
+        let card = card_rows(&rendered, role);
+        assert_eq!(
+            card.len(),
+            3,
+            "{role}: a Minimal card is 3 rows:\n{rendered}"
+        );
+        assert!(
+            card[0].contains("Idle"),
+            "{role}: the top border keeps the status badge:\n{rendered}"
+        );
+        assert!(
+            card[1].contains("Dir:  dot-agent-deck"),
+            "{role}: the middle row is the Dir row:\n{rendered}"
+        );
+        assert!(
+            card[2].contains("Last:") && card[2].contains("Tools:"),
+            "{role}: the bottom border keeps its counters:\n{rendered}"
+        );
+    }
+    insta::assert_snapshot!("density_006_minimal", rendered);
+}
+
+/// Scenario: Render the seven-role deck at the Minimal height with the second
+/// role Blocked on depleted credits and the third orphaned. Each of those two
+/// cards shows its status row where the `Dir:` row would be, because a 3-row
+/// card has no spare row and the status matters more than the directory; the
+/// other five cards keep their `Dir:` row.
+#[spec("dashboard/density/007")]
+#[test]
+fn density_007_minimal_status_row_takes_the_dir_rows_place() {
+    let mut sessions = reported_role_sessions();
+    sessions[1].status = SessionStatus::Blocked;
+    sessions[1].blocked = Some(BlockedReason {
+        kind: BlockedKind::CreditsDepleted,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: None,
+        resets_at_ms: None,
+    });
+    sessions[2].orchestration_orphaned = true;
+    let cards = as_cards(&sessions);
+
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
+    let rendered = buffer_to_text(&buffer);
+    assert_eq!(
+        single_column_card_heights(&rendered),
+        vec![3; REPORTED_ROLES.len()],
+        "the fixture must land in the Minimal tier:\n{rendered}"
+    );
+
+    let blocked = card_rows(&rendered, REPORTED_ROLES[1]);
+    assert!(
+        blocked[0].contains("Blocked"),
+        "the Blocked badge stays on the top border:\n{rendered}"
+    );
+    assert!(
+        blocked[1].contains('⚠') && blocked[1].contains("Credits"),
+        "a Minimal Blocked card shows its reason in the middle row:\n{rendered}"
+    );
+    assert!(
+        !blocked[1].contains("Dir:"),
+        "the Blocked reason takes the Dir row's place:\n{rendered}"
+    );
+
+    let orphaned = card_rows(&rendered, REPORTED_ROLES[2]);
+    assert!(
+        orphaned[1].contains("Orphaned — delegation unavailable"),
+        "a Minimal orphaned card shows its status in the middle row:\n{rendered}"
+    );
+    assert!(
+        !orphaned[1].contains("Dir:"),
+        "the Orphaned row takes the Dir row's place:\n{rendered}"
+    );
+
+    for role in [0, 3, 4, 5, 6].map(|i| REPORTED_ROLES[i]) {
+        assert!(
+            card_rows(&rendered, role)[1].contains("Dir:"),
+            "{role}: a card with no status row keeps its Dir row:\n{rendered}"
+        );
+    }
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Render the seven-role deck into a 79x20 deck, too short for seven
+/// cards even at the 3-row Minimal height. The grid scrolls exactly as it did
+/// before Minimal existed: three 5-row Compact cards are drawn and the title
+/// counts the four below the window.
+#[spec("dashboard/density/008")]
+#[test]
+fn density_008_a_deck_too_large_for_minimal_scrolls_at_compact() {
+    let sessions = reported_role_sessions();
+    let cards = as_cards(&sessions);
+
+    // 20 rows leaves 18: seven Minimal cards need 21.
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 20);
+    let rendered = buffer_to_text(&buffer);
+    let title = rendered.lines().next().expect("a rendered title row");
+
+    assert_eq!(
+        single_column_card_heights(&rendered),
+        vec![5; 3],
+        "an overflowing deck keeps Compact's 5-row cards, three of which fit:\n{rendered}"
+    );
+    assert!(
+        title.contains("(↓4)"),
+        "the title counts the cards below the window:\n{title}"
+    );
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Feed Inbox broadcasts through the real TUI subscriber, followed by ordinary tool events as ordered ingestion barriers. The rendered card must count a queued message once, keep that count when fetched, and replace it with delivered on acknowledgement without a ListAgents refresh.
+#[spec("inbox/status/011")]
+#[cfg(unix)]
+#[test]
+fn status_011_live_subscriber_updates_the_rendered_inbox_card() {
+    use dot_agent_deck::daemon_client::DaemonClient;
+    use dot_agent_deck::daemon_protocol::{
+        AttachRequest, AttachResponse, KIND_EVENT, KIND_REQ, KIND_RESP, read_frame, write_frame,
+    };
+    use dot_agent_deck::event::BroadcastMsg;
+    use dot_agent_deck::event_subscriber::{SubscriberConfig, run};
+    use std::time::Duration;
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let root = test_temp::tempdir().unwrap();
+        let socket = root.path().join("inbox.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (send, mut batches) = tokio::sync::mpsc::unbounded_channel::<Vec<BroadcastMsg>>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (kind, payload) = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(kind, KIND_REQ);
+            let request = serde_json::from_slice::<AttachRequest>(&payload).unwrap();
+            // The ordered first-subscription path probes capabilities before
+            // subscribing. An old daemon advertises none and receives the plain
+            // subscription on the next connection. Also accept the pre-probe
+            // subscriber so this test keeps its rendered-card claim on either
+            // side of that production change. The probe is also the protocol
+            // check (PRD #1666 part 2), so it is answered on this build's
+            // protocol, as any daemon a subscription may follow does.
+            let request = if matches!(request, AttachRequest::Hello { .. }) {
+                let hello = AttachResponse::hello(dot_agent_deck::daemon_protocol::PROTOCOL_VERSION);
+                write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&hello).unwrap())
+                    .await.unwrap();
+                drop(stream);
+                stream = listener.accept().await.unwrap().0;
+                let (kind, payload) = read_frame(&mut stream).await.unwrap().unwrap();
+                assert_eq!(kind, KIND_REQ);
+                serde_json::from_slice::<AttachRequest>(&payload).unwrap()
+            } else {
+                request
+            };
+            assert!(matches!(
+                request,
+                AttachRequest::SubscribeEvents
+            ));
+            write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
+                .await.unwrap();
+            while let Some(batch) = batches.recv().await {
+                for event in batch {
+                    write_frame(&mut stream, KIND_EVENT, &serde_json::to_vec(&event).unwrap())
+                        .await.unwrap();
+                }
+            }
+        });
+        let mut app = AppState::default();
+        app.register_pane("pane-card-stats".into());
+        let session = card_stats_session("/home/dev/api-svc");
+        app.sessions.insert(session.session_id.clone(), session);
+        let state = Arc::new(tokio::sync::RwLock::new(app));
+        let subscriber = tokio::spawn(run(DaemonClient::new(socket), state.clone(), SubscriberConfig::default()));
+        for (index, (pane, message_state, expected)) in [
+            ("foreign-pane", "queued", ""),
+            ("pane-card-stats", "queued", "✉1"),
+            ("pane-card-stats", "queued", "✉1"),
+            ("pane-card-stats", "fetched", "✉1"),
+            ("pane-card-stats", "acknowledged", "delivered"),
+        ].into_iter().enumerate() {
+            let barrier = format!("InboxBarrier{index}");
+            let notice: BroadcastMsg = serde_json::from_value(serde_json::json!({
+                "kind":"inbox", "pane_id":pane, "agent_id":"agent-card-stats",
+                "message_id":"m-k3xzq2ab-0f3c9a71d2e4b850", "subject":"review fixture",
+                "from_label":"the orchestrator", "state":message_state
+            })).unwrap();
+            let event = AgentEvent {
+                session_id: "sess-card-stats".into(), agent_type: AgentType::ClaudeCode,
+                event_type: EventType::ToolStart, tool_name: Some(barrier.clone()), tool_detail: None,
+                cwd: None, timestamp: render_now() + chrono::Duration::seconds(index as i64),
+                user_prompt: None, metadata: HashMap::new(), pane_id: Some("pane-card-stats".into()),
+                agent_id: Some("agent-card-stats".into()), agent_version: None,
+                schema_version: None, live_target: None,
+                background: None,
+                background_revision: None,
+                model: None,
+            };
+            send.send(vec![notice, BroadcastMsg::Event(event)]).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if state.read().await.sessions["sess-card-stats"].active_tool.as_ref()
+                        .is_some_and(|tool| tool.name == barrier) { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("ordinary event after Inbox must be applied as an ingestion barrier");
+            let app = state.read().await;
+            let rendered = buffer_to_text(&render_card_to_buffer(
+                &app.sessions["sess-card-stats"], Some("api-svc"), Some(1),
+                CardDensityKind::Normal, 0, render_now(), false, 80,
+                CardDensityKind::Normal.rendered_height(),
+            ));
+            if expected.is_empty() {
+                assert!(!rendered.contains("✉1"), "foreign inbox notice changed this card:\n{rendered}");
+            } else {
+                assert!(rendered.contains(expected), "live Inbox {message_state} must render {expected} after its ingestion barrier:\n{rendered}");
+                assert!(!rendered.contains("✉2"), "duplicate/transition counted twice:\n{rendered}");
+            }
+            if message_state == "acknowledged" {
+                assert!(!rendered.contains("✉1"), "acknowledged message still pending:\n{rendered}");
+            }
+        }
+        subscriber.abort();
+        server.abort();
+    });
 }

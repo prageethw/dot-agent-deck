@@ -1,0 +1,3224 @@
+//! PRD #802 M7: the transcription seam, and the one backend behind it.
+//!
+//! [`super::capture`] produces 16 kHz mono PCM; this turns it into a
+//! [`super::Transcript`], which is what [`super::handle_utterance`] already
+//! knows how to route. The shape deliberately mirrors
+//! [`super::resolver::IntentResolver`]: an object-safe trait, a boxed future,
+//! one `…_for` function that reads the settings at call time, and a stub every
+//! test downstream drives.
+//!
+//! # One backend, and the keyless one is the default
+//!
+//! PRD #802 shipped with transcription as the **one** stage it claimed had no
+//! no-key trick — Siri matches declared App Intents rather than handing over a
+//! transcript, `SFSpeechRecognizer` exists on one of three platforms, and local
+//! whisper was deferred behind a decision to take a C/C++ toolchain into
+//! `cargo test-fast`. The provider-selection work found the route that argument
+//! had missed: **a container on loopback, over the same HTTP this file already
+//! spoke.** Measured — `ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu` on
+//! `127.0.0.1:18000`, the same multipart parts, the same `text` field
+//! back, 0.653 s median warm, and no credential anywhere.
+//!
+//! So there is **no `off` variant and no second implementation**.
+//! [`HttpTranscriber`] is the whole of it, and the difference between local and
+//! hosted is one field: [`HttpTranscriber::keyless`] holds no [`SecretStore`]
+//! and sends no `Authorization` header, [`HttpTranscriber::keyed`] holds one
+//! and does. The keyless path is not a credentialed path whose lookup happens
+//! to return nothing — there is no lookup.
+//!
+//! [`TranscriptionOutcome::NotConfigured`] survives all of that, and earns its
+//! keep on a better case than `off` ever was: **an endpoint nobody is
+//! listening at**. *Start the container* and *the request timed out* are
+//! different things to do next, and a prerequisite dressed as an error teaches
+//! people the feature is broken. [`unreachable_detail`] is the sentence.
+//!
+//! # The credential is read here and never crosses into the webview
+//!
+//! Same rule and same mechanism as [`super::remote`]: the key is loaded from
+//! [`SecretStore`] at call time, in this process, and goes straight into a
+//! request header. There is no `desktop_load_secret` command and M7 does not
+//! add one — a credential in the webview is one `JSON.stringify` from the
+//! `localStorage` half of PRD #803's rule.
+//!
+//! # No utterance is persisted by this module, and that includes the audio
+//!
+//! PRD #802's Open Question 5. Nothing here writes a buffer or a transcript to
+//! disk, and nothing logs one at any level: the request body is assembled in
+//! memory, sent, and dropped. The error paths quote the API's own message and
+//! the HTTP status and never the audio or the text.
+//!
+//! **Scoped to this module deliberately.** The claim holds without qualification
+//! here — this is an HTTPS request and nothing else. It used to need a second
+//! half: the agent-CLI intent backend handed its prompt to another program that
+//! had storage of its own, and [`super::Transcript`] still carries the sentence
+//! covering both because that is the rule a future backend inherits. That
+//! backend is gone, so today every stage of this feature is an HTTPS request.
+//! What the remote endpoint does with an upload is the endpoint's policy and
+//! not a property this app can assert at all.
+
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::Value;
+
+use crate::model_service::{ModelId, ServiceUrl};
+use crate::secrets::{SecretId, SecretStore, load_off_runtime};
+use crate::settings::{
+    KEYLESS_OFF_MACHINE, LOCAL_SPEECH_IMAGE, SpeechLanguage, TranscriptionBackend,
+    TranscriptionSettings,
+};
+
+use super::Transcript;
+use super::capture::{MIN_SPEECH, Pcm16, SPEECH_WINDOW, SpeechMeasure};
+use super::evidence::{self, Timed, Timing};
+use super::human_voice::{self, MIN_VOICE, VoiceMeasure, VoiceTimeline};
+
+/// How long the request gets before the attempt is abandoned.
+///
+/// Generous on purpose, and for [`super::remote::REMOTE_TIMEOUT`]'s reason: a
+/// backstop against a hung connection, not a latency budget. This one is longer
+/// because the request carries up to [`super::capture::MAX_UTTERANCE`] of audio
+/// — 960 KB — so the upload is part of the wait on a slow link, and a user who
+/// has already spoken is better served by a slow answer than by a failure
+/// sentence.
+pub const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What the report would say about audio that held no words: the gate refused
+/// it, or the model's answer to it held none.
+///
+/// **No surface shows it while voice is listening.** PR #1451's hand test: a
+/// user typing on the keyboard with voice on saw a refusal for every burst of
+/// keys, each carrying milliseconds and RMS levels, about audio they had never
+/// meant as speech. The webview now drops a `silent` outcome without a word
+/// (`VoiceControlPanel`'s `takeUtterance`), so this sentence is what a future
+/// surface gets if it does report one — for instance after an explicit press
+/// to talk, where the user did mean to speak — and it is written for that user:
+/// plain words, something to do, no measurement.
+pub const NOTHING_HEARD: &str = "I could not make out any words. Say that again; still listening.";
+
+/// [`NOTHING_HEARD`]'s counterpart for audio in which nothing at all rose out
+/// of the room: the thing to do is different — speak up or move closer — so
+/// the sentence is too.
+pub const TOO_QUIET: &str =
+    "That was too quiet to make out. Move closer or turn the input up; still listening.";
+
+/// The measurement and the sentence for a segment the audio gate refused.
+///
+/// # Two refusals, because there are two things to do about them
+///
+/// [`SpeechMeasure`]'s two fields pick which it is:
+///
+/// * **nothing ever rose out of the room** — no frame anywhere in the buffer
+///   counted as speech, so no gate at any length would have passed it.
+///   [`TOO_QUIET`].
+/// * **something did and there was not enough of it** — too short or too
+///   sparse to be a word, which is also what a keyboard tap is.
+///   [`NOTHING_HEARD`].
+///
+/// Neither is phrased as a failure or as a fault in the user's hardware, which
+/// is the rule [`TranscriptionOutcome::Silent`] exists to keep: nothing is
+/// broken, voice is still on, and the microphone is still open.
+///
+/// # The numbers are in the detail, not the sentence
+///
+/// The `detail` states what the rule measured in its own terms — the loudest
+/// moment, the room it was measured against and the bar that produced — which
+/// is what a maintainer diagnosing a refused utterance needs: PRD #802's
+/// product owner once had to be asked for exactly those numbers. They used to
+/// be in the sentence as well, so any user could self-diagnose; PR #1451's
+/// hand test showed the cost of that, a status line full of thresholds about
+/// noise the user had not meant as speech. They stay on the outcome, where the
+/// developer docs (`docs/develop/desktop-gui.md`) say to find them, and leave
+/// the screen.
+fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
+    let against = format!(
+        "the loudest moment reached {} against a room at {}, where speech has to reach {}",
+        measure.peak_rms,
+        measure.room_rms,
+        measure.required_rms()
+    );
+    // The branch is on whether ANY frame counted, not on a level comparison:
+    // the bar moves with the room, so a peak that clears the bar printed here
+    // may still have arrived where the room was louder. `voiced` is the rule's
+    // own answer to "did anything count", and it is the only one that cannot
+    // contradict the sentence beside it.
+    if measure.voiced.is_zero() {
+        return (format!("too quiet — {against}"), TOO_QUIET.into());
+    }
+    let detail = format!(
+        "only {} ms of speech inside the loudest {} ms, where {} ms is needed — {against}",
+        measure.voiced.as_millis(),
+        SPEECH_WINDOW.as_millis(),
+        MIN_SPEECH.as_millis()
+    );
+    (detail, NOTHING_HEARD.into())
+}
+
+/// The detail for a segment that rose out of the room but held no voice
+/// ([`human_voice`]): a breath, a cough, a knock, a beep — issue #1450.
+fn no_voice(measure: &VoiceMeasure) -> String {
+    format!(
+        "no voice — {} ms of the segment scored as voice, where {} ms is needed (the highest \
+         score was {:.2})",
+        measure.voice.as_millis(),
+        MIN_VOICE.as_millis(),
+        measure.peak_score
+    )
+}
+
+/// Whether `audio` is worth sending to any backend: where its voice is when it
+/// is, and the detail and the sentence its refusal carries when it is not.
+///
+/// Two questions, cheapest first: did enough of it rise out of the room to be
+/// a word ([`MIN_SPEECH`]), and is what rose a human voice ([`human_voice`]).
+/// The voice's [`VoiceTimeline`] is what the backend's answer is held against
+/// afterwards ([`super::evidence`]).
+///
+/// CPU-bound — the voice check runs a model over every 16 ms of the segment,
+/// up to [`super::capture::MAX_UTTERANCE`] of it — so [`handle_audio`] runs it
+/// on a blocking worker rather than on the async runtime (Qodo on PR #1550).
+fn eligibility(audio: &Pcm16) -> Result<VoiceTimeline, (String, String)> {
+    let measure = audio.measure_speech();
+    if measure.voiced < MIN_SPEECH {
+        return Err(not_enough_speech(measure));
+    }
+    let voice = human_voice::measure(audio);
+    if !voice.heard() {
+        return Err((no_voice(&voice), NOTHING_HEARD.into()));
+    }
+    Ok(voice.timeline)
+}
+
+/// `Heard “<transcript>”.` — with no full stop of its own after a transcript
+/// that already ends a sentence, which whisper's usually does (PR #1451's hand
+/// test read `Heard “Devbox run agent.”.`).
+fn heard_sentence(transcript: &str) -> String {
+    let ends_a_sentence = transcript.ends_with(['.', '?', '!', '…']);
+    format!(
+        "Heard “{transcript}”{}",
+        if ends_a_sentence { "" } else { "." }
+    )
+}
+
+/// Why a transcriber could not answer.
+///
+/// Split the way [`super::resolver::IntentError`] is, and for the same reason:
+/// something is not set up yet (an instruction) against a backend that is set
+/// up and failed (an error). **They are not the same sentence and must not
+/// render as one.**
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptionError {
+    /// The configured backend cannot run yet: nothing is listening at a
+    /// loopback endpoint, or a keyed service has no key stored.
+    NotConfigured(String),
+    /// The backend ran and did not produce a usable transcript — a timeout, a
+    /// non-2xx reply, an unreadable body.
+    Backend(String),
+}
+
+impl TranscriptionError {
+    pub fn detail(&self) -> &str {
+        match self {
+            TranscriptionError::NotConfigured(detail) | TranscriptionError::Backend(detail) => {
+                detail
+            }
+        }
+    }
+}
+
+impl fmt::Display for TranscriptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+impl std::error::Error for TranscriptionError {}
+
+/// The future a [`Transcriber`] returns.
+///
+/// Boxed rather than an `async fn` in the trait, for
+/// [`super::resolver::ResolveFuture`]'s reason exactly: the backend is chosen
+/// from settings at runtime, so the trait has to be object-safe, and an
+/// `async fn` in a trait is not.
+pub type TranscribeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Transcription, TranscriptionError>> + Send + 'a>>;
+
+/// What a backend answered: the text, and when in the audio it says the text
+/// was spoken, as far as it said ([`Timing`]) — which [`handle_audio`] holds
+/// against the segment's voice before the text is accepted
+/// ([`super::evidence`], issue #1450).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transcription {
+    pub transcript: Transcript,
+    pub timing: Timing,
+    /// Each of [`Timing::segments`]' text as the backend wrote it, in the same
+    /// order, so the transcript can be rebuilt from the segments the audio
+    /// holds ([`evidence::Support::Segments`]).
+    pub pieces: Vec<Transcript>,
+}
+
+impl Transcription {
+    /// The text, verbatim.
+    pub fn text(&self) -> &str {
+        self.transcript.text()
+    }
+
+    /// The transcript made of only the segments at `kept`.
+    fn only(&self, kept: &[usize]) -> Transcript {
+        Transcript::new(join_pieces(
+            kept.iter()
+                .filter_map(|&index| self.pieces.get(index))
+                .map(Transcript::text),
+        ))
+    }
+}
+
+impl From<Transcript> for Transcription {
+    /// Text with no timing, the way a backend that reports none answers.
+    fn from(transcript: Transcript) -> Self {
+        Self {
+            transcript,
+            timing: Timing::default(),
+            pieces: Vec::new(),
+        }
+    }
+}
+
+/// A backend that turns audio into text.
+pub trait Transcriber: Send + Sync {
+    fn transcribe<'a>(&'a self, audio: &'a Pcm16) -> TranscribeFuture<'a>;
+
+    /// Which backend this is, for the surface to name — `local`, `remote`,
+    /// `stub`. It travels on every [`VoiceTranscription`] beside the latency,
+    /// for [`super::resolver::IntentResolver::backend_name`]'s reason: the
+    /// number alone is a complaint and the number with a name is a decision.
+    fn backend_name(&self) -> &'static str;
+}
+
+/// Build the backend the settings name.
+///
+/// `secrets` is taken whichever backend is named even though only
+/// [`TranscriptionBackend::Remote`] reads one —
+/// [`super::resolver::resolver_for`]'s reason: passing the store rather than a
+/// credential is what keeps the value Rust-side, read at the moment it is
+/// needed and never handed around. What the keyless branch does with it is
+/// **drop it**, which is the difference between "no key was found" and "no key
+/// was asked for".
+pub fn transcriber_for(
+    settings: &TranscriptionSettings,
+    secrets: Arc<dyn SecretStore>,
+) -> Box<dyn Transcriber> {
+    let endpoint = settings.endpoint.clone();
+    let model = settings.model.clone();
+    let language = settings.language;
+    match settings.backend {
+        // A refusal rather than a fallback, and never the keyed path: a
+        // keyless backend pointed off this machine has no key to send, so
+        // "try it anyway" IS the upload. See [`RefusedTranscriber`].
+        TranscriptionBackend::Local => match HttpTranscriber::keyless(endpoint, model) {
+            Ok(transcriber) => Box::new(transcriber.speaking(language)),
+            Err(refusal) => Box::new(RefusedTranscriber::new("local", refusal)),
+        },
+        TranscriptionBackend::Remote => {
+            Box::new(HttpTranscriber::keyed(secrets, endpoint, model).speaking(language))
+        }
+    }
+}
+
+/// A backend that answers one sentence and makes no request.
+///
+/// The shape a misconfiguration this module refuses to honour comes back as:
+/// [`TranscriptionOutcome::NotConfigured`], which the surface renders as an
+/// instruction rather than as a failure, carrying the rule that was broken.
+///
+/// It exists because the alternatives are both worse. Falling back to the
+/// loopback preset would silently move the endpoint a user wrote, which is the
+/// fold [`crate::settings::KEYLESS_OFF_MACHINE`] argues against; making
+/// [`transcriber_for`] fallible would push the same decision onto its one
+/// caller, which has no better answer available to it than this sentence.
+///
+/// `name` is the settings token rather than a word of its own, so the surface's
+/// vocabulary — the document, the panel, the report — stays the one set.
+struct RefusedTranscriber {
+    name: &'static str,
+    detail: &'static str,
+}
+
+impl RefusedTranscriber {
+    fn new(name: &'static str, detail: &'static str) -> Self {
+        Self { name, detail }
+    }
+}
+
+impl Transcriber for RefusedTranscriber {
+    fn transcribe<'a>(&'a self, _audio: &'a Pcm16) -> TranscribeFuture<'a> {
+        Box::pin(async move { Err(TranscriptionError::NotConfigured(self.detail.to_string())) })
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.name
+    }
+}
+
+// -- the one HTTP backend --------------------------------------------------
+
+/// Transcribe by posting the utterance to a speech service — on this machine or
+/// hosted, which is the same request either way.
+pub struct HttpTranscriber {
+    /// `None` means **this endpoint takes no credential**, and the keychain is
+    /// never consulted. It is not an absent store or a failed lookup: a keyless
+    /// backend sends no `Authorization` header at all, which is what lets the
+    /// local container — which has no notion of a key — be a first-class
+    /// choice rather than a keyed path that happens to tolerate an empty one.
+    secrets: Option<Arc<dyn SecretStore>>,
+    /// `None` when no client could be built — see [`super::http::client`]. This
+    /// backend reports that rather than falling back to a permissive one.
+    client: Option<reqwest::Client>,
+    endpoint: ServiceUrl,
+    model: ModelId,
+    /// The language each request names — see [`Self::speaking`].
+    language: SpeechLanguage,
+    /// What the surface names this — `local` or `remote`, from the settings
+    /// token, so one vocabulary spans the document, the panel and the report.
+    name: &'static str,
+}
+
+impl HttpTranscriber {
+    /// A service that authenticates with a key of the app's own.
+    pub fn keyed(secrets: Arc<dyn SecretStore>, endpoint: ServiceUrl, model: ModelId) -> Self {
+        Self::build(Some(secrets), endpoint, model, "remote")
+    }
+
+    /// A service that takes no credential — the container on loopback.
+    ///
+    /// **Loopback is a precondition rather than an expectation**, and the
+    /// refusal is why this is fallible where [`Self::keyed`] is not. No
+    /// `Authorization` header is sent on this path, so an endpoint on another
+    /// host is a captured utterance POSTed to a third party with no credential
+    /// and no sign anything was wrong — the module's own invariant, *the audio
+    /// never leaves the machine*, stated as a check instead of as prose.
+    ///
+    /// [`crate::settings::TranscriptionSettings::deserialize`] refuses the same
+    /// pairing at the document and at the IPC seam, which is every route an
+    /// untrusted value arrives by; this is the route Rust arrives by, and the
+    /// two together are what make the invariant hold rather than hold usually.
+    pub fn keyless(endpoint: ServiceUrl, model: ModelId) -> Result<Self, &'static str> {
+        if !endpoint.is_loopback() {
+            return Err(KEYLESS_OFF_MACHINE);
+        }
+        Ok(Self::build(None, endpoint, model, "local"))
+    }
+
+    /// This backend's request body for one utterance: its model and its
+    /// language, in [`multipart_body`]'s shape.
+    fn body(&self, audio: &Pcm16, boundary: &str) -> Vec<u8> {
+        multipart_body(audio, self.model.as_str(), self.language, boundary)
+    }
+
+    /// The same backend, telling the service the speech is in `language`
+    /// (issue #1458). Both constructors start from
+    /// [`SpeechLanguage::default`], English, so a caller that never says
+    /// keeps the pin PR #1451 added.
+    pub fn speaking(mut self, language: SpeechLanguage) -> Self {
+        self.language = language;
+        self
+    }
+
+    fn build(
+        secrets: Option<Arc<dyn SecretStore>>,
+        endpoint: ServiceUrl,
+        model: ModelId,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            secrets,
+            // Built once and reused, and the timeout set per REQUEST rather
+            // than on a builder — `super::remote::RemoteResolver::new` spells
+            // out why: `ClientBuilder::build` is fallible, and the obvious
+            // `.timeout(..).build().unwrap_or_default()` silently yields a
+            // client with no timeout on the failure path.
+            //
+            // The builder carries the REDIRECT policy, which has no per-request
+            // spelling. This backend authenticates with the standard
+            // `Authorization` header, which reqwest DOES strip across an origin
+            // change — so the `x-api-key` leak PRD #802's audit found is not
+            // this one's. What is this one's: a 307 or 308 re-sends the body,
+            // and the body here is the user's voice. Same policy, different
+            // reason, and it applies to the keyless path too: a loopback
+            // endpoint that redirects is still an endpoint sending the audio
+            // somewhere the user did not write.
+            client: super::http::client(),
+            endpoint,
+            model,
+            language: SpeechLanguage::default(),
+            name,
+        }
+    }
+
+    async fn run(&self, audio: &Pcm16) -> Result<Transcription, TranscriptionError> {
+        // A buffer with nothing said in it cannot produce words, and sending one
+        // costs a round trip, a fraction of a cent, and — with a whisper-family
+        // model — a training artefact presented to the user as a sentence they
+        // said. See [`Pcm16::has_speech`].
+        //
+        // **The BACKSTOP rather than the gate**: [`handle_audio`] asks the same
+        // question before it calls any transcriber, so in this app nothing
+        // reaches here. It stays because [`Transcriber::transcribe`] is public
+        // and a caller that went straight to it would otherwise post the audio.
+        // Reported as a BACKEND failure rather than as a not-configured one: the
+        // setup is fine, which is a different thing to do next.
+        //
+        // **The cheap half only.** [`handle_audio`]'s second question, whether
+        // the audio holds a voice ([`eligibility`]), runs a model over the
+        // whole segment; asking it again here would score every utterance the
+        // app sends twice (Qodo on PR #1550). [`handle_audio`] is the one
+        // entry point this app transcribes through, so the voice check is
+        // there and only there — and so is the check of the answer against
+        // that voice ([`super::evidence`]), which needs its measurement.
+        let measure = audio.measure_speech();
+        if measure.voiced < MIN_SPEECH {
+            return Err(TranscriptionError::Backend(not_enough_speech(measure).0));
+        }
+
+        // Read at call time, Rust-side, and dropped with this scope — and on
+        // a blocking thread, because a keychain read is entitled to prompt and
+        // this is an async fn on a shared runtime.
+        //
+        // `None` here is the KEYLESS backend, and the whole branch is skipped:
+        // no keychain call, no prompt, no failure mode. That is the shape the
+        // local container needed and the reason this is an `Option<Arc<…>>`
+        // rather than a store that is asked and forgiven for answering nothing.
+        let secret = match &self.secrets {
+            None => None,
+            Some(store) => {
+                match load_off_runtime(Arc::clone(store), SecretId::VoiceTranscription).await {
+                    Ok(Some(secret)) => Some(secret),
+                    Ok(None) => {
+                        return Err(TranscriptionError::NotConfigured(format!(
+                            "no key is stored for {} — add one in Settings → Voice",
+                            self.endpoint.host()
+                        )));
+                    }
+                    // The keychain itself failed. PRD #802 M4's rule: "I could
+                    // not find out" must not render as "nothing stored", or the
+                    // user retypes a key into a store that cannot hold it.
+                    Err(error) => return Err(TranscriptionError::NotConfigured(error.public())),
+                }
+            }
+        };
+
+        let Some(client) = self.client.as_ref() else {
+            // Fail closed: never a fallback to a client that would re-send the
+            // audio to a redirect target.
+            return Err(TranscriptionError::Backend(
+                "the transcription backend could not start a secure connection".into(),
+            ));
+        };
+
+        let boundary = boundary();
+        let body = self.body(audio, &boundary);
+        let mut request = client
+            .post(self.endpoint.as_str())
+            .timeout(TRANSCRIBE_TIMEOUT)
+            .header("content-type", content_type(&boundary))
+            .body(body);
+        // Attached only where there is one to attach. The local container
+        // tolerates the header, which is exactly why not sending it has to be
+        // structural rather than incidental: a backend that sends an empty
+        // `Bearer` to a service that ignores it works until the day it meets
+        // one that does not.
+        if let Some(secret) = &secret {
+            request = request.header("authorization", format!("Bearer {}", secret.expose()));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| self.transport_error(&error))?;
+
+        let status = response.status();
+        // Bounded BEFORE the bytes become text or JSON, on the success and the
+        // failure path alike — PRD #802's audit. `Response::json` collected the
+        // whole body first, and a request timeout bounds elapsed time rather
+        // than bytes.
+        let body = match super::http::capped_body(response, super::http::MAX_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(super::http::BodyError::TooLarge) => {
+                return Err(TranscriptionError::Backend(format!(
+                    "the transcription backend answered {status} with more than {} bytes",
+                    super::http::MAX_BODY_BYTES
+                )));
+            }
+            Err(super::http::BodyError::Transport) => {
+                return Err(TranscriptionError::Backend(
+                    "the request to the transcription backend failed".into(),
+                ));
+            }
+        };
+        let payload: Value = serde_json::from_slice(&body).map_err(|_| {
+            TranscriptionError::Backend(format!(
+                "the transcription backend answered {status} unreadably"
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(TranscriptionError::Backend(api_error_detail(
+                status, &payload,
+            )));
+        }
+        parse_response(&payload)
+    }
+
+    /// What a transport failure becomes, which depends on **where the endpoint
+    /// points**.
+    ///
+    /// A connection refused by a hosted service and a connection refused by a
+    /// container that is not running are the same `reqwest` error and entirely
+    /// different situations: one is an outage to wait out, the other is a
+    /// command to run. The product owner asked for this specifically — an
+    /// unreachable endpoint must say what to start, not "transcription failed"
+    /// — so a loopback endpoint that does not answer is classified as
+    /// [`TranscriptionError::NotConfigured`] and carries
+    /// [`unreachable_detail`]'s sentence, which the surface renders as an
+    /// instruction rather than an error.
+    fn transport_error(&self, error: &reqwest::Error) -> TranscriptionError {
+        // Keyless AND loopback, not either alone. A keyed endpoint that happens
+        // to be on this machine is a gateway the user runs their own way, and a
+        // remote endpoint that is down is an outage — neither is fixed by
+        // starting the speech container, and telling somebody to run docker at
+        // an outage is worse than saying nothing.
+        if error.is_connect() && self.secrets.is_none() && self.endpoint.is_loopback() {
+            return TranscriptionError::NotConfigured(unreachable_detail(&self.endpoint));
+        }
+        TranscriptionError::Backend(transport_detail(error))
+    }
+}
+
+impl Transcriber for HttpTranscriber {
+    fn transcribe<'a>(&'a self, audio: &'a Pcm16) -> TranscribeFuture<'a> {
+        Box::pin(self.run(audio))
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// What a user is told when nothing answers at a speech endpoint on their own
+/// machine.
+///
+/// **Names the command, not the symptom.** The whole point of the keyless
+/// default is that nobody has to paste a credential to try voice; the cost of
+/// that default is a prerequisite the user has to start, so the one place that
+/// cost is met has to carry the fix. The port comes from the endpoint the user
+/// actually configured rather than from the preset, because a person who moved
+/// it is exactly the person a hardcoded `18000` would mislead.
+pub fn unreachable_detail(endpoint: &ServiceUrl) -> String {
+    let published = endpoint.port().unwrap_or(18000);
+    format!(
+        "nothing is listening at {origin} — start the speech service with \
+         `docker run -d -p {published}:8000 {LOCAL_SPEECH_IMAGE}` and press Voice again, \
+         or pick a hosted service under Settings → Voice",
+        origin = endpoint.origin(),
+    )
+}
+
+/// The multipart separator for one request.
+///
+/// Random rather than fixed, because a boundary that appeared inside the body
+/// would truncate the upload — and the body is a WAV, whose sample bytes are
+/// arbitrary. `getrandom` is already in this workspace's graph for the hook
+/// capability token, so this costs nothing new.
+fn boundary() -> String {
+    let mut bytes = [0u8; 16];
+    // A failure here is a machine with no OS randomness, which is not a state
+    // this process can realistically be in — but the alternative spelling is an
+    // `.expect()` on the audio path, and that is a panic inside a Tauri
+    // command. So it falls back to the zeroes the array was built with. The
+    // consequence of a predictable boundary is a truncated upload IF the audio
+    // happens to contain those exact bytes, which is a bad transcript; it is
+    // not a security property and must not be read as one.
+    let _ = getrandom::fill(&mut bytes);
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("dot-agent-deck-{hex}")
+}
+
+/// The `Content-Type` a [`multipart_body`] is sent with.
+pub fn content_type(boundary: &str) -> String {
+    format!("multipart/form-data; boundary={boundary}")
+}
+
+/// The whole request body: the WAV, the model, the response format, the
+/// language unless it is [`SpeechLanguage::AUTO`], and — where the format
+/// carries timing — which timing to send back, and nothing else.
+///
+/// **Assembled by hand rather than through `reqwest`'s `multipart` feature**,
+/// and that is a dependency decision rather than a preference. Turning the
+/// feature on adds `mime_guess` and a `futures-util` streaming body to a crate
+/// whose reqwest spec is copied verbatim from the root package's — so cargo
+/// would resolve one feature-unified build for both, and the root crate's
+/// `src/version.rs` would start carrying a multipart encoder it has no use for.
+/// What it would buy is the lines below, for a body with a handful of parts, no
+/// nested multipart and no filename this build does not choose itself.
+///
+/// `\r\n` throughout, and not `\n`: RFC 2046 says CRLF, and a server that
+/// tolerates bare LF is not one this can rely on.
+pub fn multipart_body(
+    audio: &Pcm16,
+    model: &str,
+    language: SpeechLanguage,
+    boundary: &str,
+) -> Vec<u8> {
+    let wav = audio.to_wav();
+    let mut body = Vec::with_capacity(wav.len() + 512);
+    let mut part = |header: &str| body.extend_from_slice(header.as_bytes());
+
+    part(&format!("--{boundary}\r\n"));
+    part("content-disposition: form-data; name=\"model\"\r\n\r\n");
+    part(model);
+    part("\r\n");
+
+    // `response_format` is named explicitly rather than left to the default:
+    // the default is a JSON object today, and `parse_response` reads one, so a
+    // server-side default that moved would turn a working build into an
+    // unreadable-answer error. Which object depends on the model — see
+    // [`response_format_for`].
+    part(&format!("--{boundary}\r\n"));
+    part("content-disposition: form-data; name=\"response_format\"\r\n\r\n");
+    part(response_format_for(model));
+    part("\r\n");
+
+    // When each word and each segment was spoken, which [`super::evidence`]
+    // holds against the voice in the audio (issue #1450). Both are named, so
+    // a server that returns only the timing it is asked for still sends the
+    // segments the per-segment no-speech guard reads. Only with
+    // `verbose_json`: no other format carries timing, and OpenAI's API
+    // reference requires it for the field. Measured 2026-10-20 on the local
+    // container: the word timing cost 3-10% of a request's time.
+    if response_format_for(model) == "verbose_json" {
+        for granularity in TIMESTAMP_GRANULARITIES {
+            part(&format!("--{boundary}\r\n"));
+            part("content-disposition: form-data; name=\"timestamp_granularities[]\"\r\n\r\n");
+            part(granularity);
+            part("\r\n");
+        }
+    }
+
+    // Named rather than detected unless the user chose Auto: with no
+    // `language`, Whisper-family models guess it per utterance, and a short
+    // command in an accent is what they guess wrong — "Select the directory …"
+    // spoken with a Serbian accent came back as "Selectajte directory …",
+    // which action grounding then refused. Hence English by default; see
+    // [`SpeechLanguage`].
+    if let Some(code) = language.code() {
+        part(&format!("--{boundary}\r\n"));
+        part("content-disposition: form-data; name=\"language\"\r\n\r\n");
+        part(code);
+        part("\r\n");
+    }
+
+    // The filename is what tells the service the container, and `.wav` is what
+    // `Pcm16::to_wav` produced. It names no user, no path and no session — it
+    // is a constant, which is the point: a filename derived from anything would
+    // be an utterance detail leaving this process.
+    part(&format!("--{boundary}\r\n"));
+    part("content-disposition: form-data; name=\"file\"; filename=\"utterance.wav\"\r\n");
+    part("content-type: audio/wav\r\n\r\n");
+    body.extend_from_slice(&wav);
+    body.extend_from_slice(b"\r\n");
+
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// The timing a `verbose_json` request asks for, in OpenAI's
+/// `timestamp_granularities[]` vocabulary, which the local container shares.
+pub const TIMESTAMP_GRANULARITIES: [&str; 2] = ["word", "segment"];
+
+/// The `response_format` a request asks `model` for.
+///
+/// `verbose_json` by default, because that is where a whisper-family model's
+/// per-segment `no_speech_prob` lives, which [`parse_response`] reads to drop
+/// the training artefacts Whisper produces on non-speech. It is chosen by
+/// what is known NOT to support it rather than by what is known to: a whisper
+/// build is often served under a bare id (`large-v3`, `tiny.en`), so a name
+/// test for "whisper" left the guard off for exactly those (Qodo on PR #1451).
+///
+/// Plain `json` only for OpenAI's `gpt-*` transcription models
+/// (`gpt-4o-transcribe`, `gpt-4o-mini-transcribe`), which refuse
+/// `verbose_json` with a 400; a configured model must not start failing
+/// because of a guard. Both formats carry the same top-level `text`, so a
+/// server that ignores the request still parses, and one that returns no
+/// `segments` simply gets no segment guard.
+pub fn response_format_for(model: &str) -> &'static str {
+    if model.to_ascii_lowercase().starts_with("gpt-") {
+        "json"
+    } else {
+        "verbose_json"
+    }
+}
+
+/// Above this `no_speech_prob`, a whisper segment is the model leaning towards
+/// there having been no speech in that stretch of audio — and its text is
+/// dropped when the model is also unsure of the words ([`LOW_CONFIDENCE`]), or
+/// whatever the words when it is sure ([`CERTAIN_NO_SPEECH`]).
+///
+/// # Why this guard
+///
+/// Whisper models are trained on captioned video, and on non-speech — a quiet
+/// room, a keyboard, a breath — they emit the captions' boilerplate as if it
+/// had been said: *"Thanks for watching"*, *"Go to Beadaholique.com for all of
+/// your beading supply needs!"* (PR #1451's hand test, typed into an agent's
+/// prompt in typing mode). Since issue #1450 most of that audio never gets
+/// here — [`super::human_voice`] refuses a segment with no voice in it before
+/// any backend is called — so this is the second check, for a voice-like sound
+/// the first one passes. **No list of known artefacts is kept**, for the reason
+/// [`super::capture::MIN_SPEECH`] gives: it would be endless and wrong the
+/// first time somebody said one.
+///
+/// `0.6` is openai/whisper's own default `no_speech_threshold`.
+///
+/// # Why two conditions, and why the first one changed
+///
+/// PR #1451 dropped every segment over `0.6` whatever its other numbers, and
+/// that refused real commands: measured 2026-10-04 against the default local
+/// container (`faster-whisper-tiny.en`), "Send it." scored 0.665-0.699,
+/// "Yes." 0.691 and a fast "Stop." 0.705-0.757 (transcribed "step.") — all
+/// with an `avg_logprob` over -1.0. openai/whisper's own rule is the combined one (drop when over `0.6`
+/// AND under `-1.0`), and PR #1451 rejected it for one measurement: whisper-1
+/// answered a quiet room with one burst in it at `no_speech_prob` 0.918 with an
+/// `avg_logprob` of -0.515, which the combined rule keeps. So both apply:
+///
+/// | `no_speech_prob` | dropped when |
+/// | --- | --- |
+/// | over [`CERTAIN_NO_SPEECH`] (0.85) | always |
+/// | over `0.6` | `avg_logprob` under [`LOW_CONFIDENCE`] (-1.0), or absent |
+///
+/// # What it was measured against
+///
+/// Non-speech: whisper-1 scored 0.918-0.976 (2026-10-01); the local model
+/// scored 0.818-0.963 on every sound but a synthetic creak, and those under
+/// 0.85 had an `avg_logprob` of -1.228 or lower — the creak, 0.716 at -0.639,
+/// is kept, and it is a voice-like tone [`super::human_voice`] also passes
+/// (2026-10-04). Speech: 0.089-0.202 on whisper-1 and 0.166-0.377 on the
+/// local model for quiet synthesised sentences (2026-10-01), and up to 0.757
+/// for the local model's short commands (2026-10-04), all of it kept. A real
+/// quiet speaker on a real microphone is the remaining unknown.
+pub const NO_SPEECH_LIMIT: f64 = 0.6;
+
+/// The `avg_logprob` under which a segment over [`NO_SPEECH_LIMIT`] is
+/// dropped — openai/whisper's own `logprob_threshold`.
+pub const LOW_CONFIDENCE: f64 = -1.0;
+
+/// The `no_speech_prob` over which a segment is dropped whatever its
+/// `avg_logprob`. Between every short command measured (0.757 at most) and
+/// every non-speech reply with a confident-looking `avg_logprob` (0.918).
+pub const CERTAIN_NO_SPEECH: f64 = 0.85;
+
+/// The transcript, out of the reply, with the timing the reply gave for it.
+///
+/// A whisper-family `verbose_json` reply also carries `segments`, each with
+/// the model's `no_speech_prob` and `avg_logprob`. Segments [`NO_SPEECH_LIMIT`]
+/// marks as no-speech are dropped; when none is, `text` is taken verbatim, so speech reaches the
+/// pipeline exactly as before. A reply with no `segments` — plain `json`, or a
+/// server that ignored the format — is read from `text` alone.
+///
+/// The [`Timing`] is the kept segments' `start` and `end`, and the `words`
+/// list [`multipart_body`] asks for — OpenAI's shape, a top-level list, or a
+/// list inside each segment — minus the words timed inside a dropped segment.
+/// A segment or word without both times is left out of it rather than
+/// guessed at; what a reply does not time, [`super::evidence`] holds to the
+/// segment's voice as a whole.
+pub fn parse_response(payload: &Value) -> Result<Transcription, TranscriptionError> {
+    let Some(text) = payload["text"].as_str() else {
+        return Err(TranscriptionError::Backend(
+            "the transcription backend answered without a transcript".into(),
+        ));
+    };
+    let Some(segments) = payload["segments"].as_array() else {
+        return Ok(Transcription {
+            transcript: Transcript::new(text.trim()),
+            timing: Timing {
+                segments: Vec::new(),
+                words: timed_words(&payload["words"]),
+            },
+            pieces: Vec::new(),
+        });
+    };
+    let no_speech = |segment: &Value| {
+        let probability = segment["no_speech_prob"].as_f64().unwrap_or(0.0);
+        // An absent `avg_logprob` counts as unsure, so a server that reports
+        // only the probability gets PR #1451's rule rather than none.
+        let confidence = segment["avg_logprob"].as_f64().unwrap_or(f64::NEG_INFINITY);
+        probability > CERTAIN_NO_SPEECH
+            || (probability > NO_SPEECH_LIMIT && confidence < LOW_CONFIDENCE)
+    };
+    let (kept, dropped): (Vec<&Value>, Vec<&Value>) =
+        segments.iter().partition(|segment| !no_speech(segment));
+    let spans = |segments: &[&Value]| -> Vec<Timed> {
+        segments
+            .iter()
+            .filter_map(|segment| {
+                timed(
+                    segment,
+                    evidence::word_count(segment["text"].as_str().unwrap_or("")),
+                )
+            })
+            .collect()
+    };
+    let (kept_spans, dropped_spans) = (spans(&kept), spans(&dropped));
+    let mut words = timed_words(&payload["words"]);
+    if words.is_empty() {
+        words = kept
+            .iter()
+            .flat_map(|segment| timed_words(&segment["words"]))
+            .collect();
+    }
+    let within =
+        |spans: &[Timed], at: f64| spans.iter().any(|span| span.start <= at && at <= span.end);
+    words.retain(|word| {
+        let middle = (word.start + word.end) / 2.0;
+        within(&kept_spans, middle) || !within(&dropped_spans, middle)
+    });
+    // Segment timing is all or nothing: a kept segment with no time would
+    // have no place in a transcript rebuilt from the timed ones, so a reply
+    // with one is judged whole, by its words and their timing.
+    let (segments, pieces) = if kept_spans.len() == kept.len() {
+        let pieces = kept
+            .iter()
+            .map(|segment| Transcript::new(segment["text"].as_str().unwrap_or("")))
+            .collect();
+        (kept_spans, pieces)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let transcript = if dropped.is_empty() {
+        Transcript::new(text.trim())
+    } else {
+        Transcript::new(join_pieces(
+            kept.iter().filter_map(|segment| segment["text"].as_str()),
+        ))
+    };
+    Ok(Transcription {
+        transcript,
+        timing: Timing { segments, words },
+        pieces,
+    })
+}
+
+/// Segments' text joined into one transcript, with a space only where two
+/// segments would otherwise run together ([`needs_separator`]).
+fn join_pieces<'a>(pieces: impl Iterator<Item = &'a str>) -> String {
+    let mut joined = String::new();
+    for piece in pieces {
+        if needs_separator(&joined, piece) {
+            joined.push(' ');
+        }
+        joined.push_str(piece);
+    }
+    joined.trim().to_string()
+}
+
+/// `item`'s `start` and `end` as a [`Timed`] of `words` words, or `None` when
+/// either time is missing.
+fn timed(item: &Value, words: usize) -> Option<Timed> {
+    Some(Timed {
+        start: item["start"].as_f64()?,
+        end: item["end"].as_f64()?,
+        words,
+    })
+}
+
+/// The timed words in a reply's `words` list, one [`Timed`] each. An entry
+/// that is only punctuation — whisper times a lone `.` as a word — is not a
+/// word anybody said, and is left out.
+fn timed_words(list: &Value) -> Vec<Timed> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|word| evidence::word_count(word["word"].as_str().unwrap_or("")) > 0)
+        .filter_map(|word| timed(word, 1))
+        .collect()
+}
+
+/// Whether two retained segments need a space between them once a dropped
+/// segment no longer sits there. Whisper usually starts a segment with its own
+/// space, but not always, and without one the neighbouring words would merge.
+/// No space goes before punctuation the next segment begins with, nor before
+/// an apostrophe, which continues the word before it ("don" + "'t").
+fn needs_separator(before: &str, next: &str) -> bool {
+    let (Some(last), Some(first)) = (before.chars().last(), next.chars().next()) else {
+        return false;
+    };
+    !last.is_whitespace()
+        && !first.is_whitespace()
+        && !matches!(
+            first,
+            ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '…' | '\'' | '’'
+        )
+}
+
+/// What a non-2xx reply becomes.
+///
+/// The API's own `error.message` is quoted for [`super::remote`]'s reason: it
+/// is the difference between "your key is wrong" and "you are rate limited",
+/// which the user must be able to act on. The status is always included so a
+/// reply with no readable body still says something.
+fn api_error_detail(status: reqwest::StatusCode, payload: &Value) -> String {
+    match payload["error"]["message"].as_str() {
+        Some(message) if !message.trim().is_empty() => {
+            format!(
+                "the transcription backend refused ({status}): {}",
+                message.trim()
+            )
+        }
+        _ => format!("the transcription backend refused ({status})"),
+    }
+}
+
+/// What a transport failure becomes.
+///
+/// Classified rather than stringified, because `reqwest`'s own `Display`
+/// carries the URL and a chain of source errors — debugging output, not a
+/// sentence for someone who just spoke.
+fn transport_detail(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        format!(
+            "the transcription backend did not answer within {}s",
+            TRANSCRIBE_TIMEOUT.as_secs()
+        )
+    } else if error.is_connect() {
+        "the transcription backend could not be reached".to_string()
+    } else {
+        "the request to the transcription backend failed".to_string()
+    }
+}
+
+// -- the stub --------------------------------------------------------------
+
+/// A deterministic stand-in for a speech model.
+///
+/// [`super::StubResolver`]'s counterpart, and there for the same reason: every
+/// outcome below this seam is reachable by scripting one of these, so the IPC
+/// layer, the state machine and the rendered sentences are all asserted with no
+/// model, no credential, no microphone and no network hop.
+pub struct StubTranscriber {
+    answer: Result<Transcription, TranscriptionError>,
+}
+
+impl StubTranscriber {
+    pub fn hearing(text: impl Into<String>) -> Self {
+        Self {
+            answer: Ok(Transcript::new(text).into()),
+        }
+    }
+
+    pub fn failing(error: TranscriptionError) -> Self {
+        Self { answer: Err(error) }
+    }
+
+    /// A stand-in that answers with a backend's raw reply, read by the same
+    /// [`parse_response`] the HTTP backend reads its reply with — so a test can
+    /// replay what a real model returned, confidence fields and all.
+    pub fn replying(payload: &Value) -> Self {
+        Self {
+            answer: parse_response(payload),
+        }
+    }
+}
+
+impl Transcriber for StubTranscriber {
+    fn transcribe<'a>(&'a self, _audio: &'a Pcm16) -> TranscribeFuture<'a> {
+        let answer = self.answer.clone();
+        Box::pin(async move { answer })
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "stub"
+    }
+}
+
+// -- the outcome -----------------------------------------------------------
+
+/// What one utterance's transcription ended in, plus what it cost.
+///
+/// Mirrors [`super::VoiceResult`], which carries the intent half: the outcome,
+/// the milliseconds it took and the backend that took them. PRD #802's
+/// mitigation for *slow enough to feel broken* is to surface the number rather
+/// than hide it, and transcription is on the same path as resolution — a user
+/// waiting six seconds is owed the split between the two.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceTranscription {
+    pub outcome: TranscriptionOutcome,
+    /// Milliseconds spent in the backend, or `None` when none was called.
+    pub transcribe_ms: Option<u32>,
+    /// Which backend answered — `local`, `remote`, `stub`. Present even when
+    /// no call was made, because it names what *would* have answered, which is
+    /// what a settings-facing sentence is about.
+    pub backend: &'static str,
+    /// How much audio was captured, in milliseconds.
+    pub audio_ms: u32,
+}
+
+impl VoiceTranscription {
+    /// The sentence to show the user.
+    pub fn sentence(&self) -> &str {
+        self.outcome.sentence()
+    }
+
+    /// The text, when there is some.
+    pub fn transcript(&self) -> Option<&Transcript> {
+        match &self.outcome {
+            TranscriptionOutcome::Heard { transcript, .. } => Some(transcript),
+            _ => None,
+        }
+    }
+}
+
+/// The closed set of situations transcribing one utterance can end in.
+///
+/// Four rather than two, and the two additions are the point: *a prerequisite
+/// is not running* is neither a transcript nor a failure, and neither is
+/// *nothing was said*. Rendering either as an error is the mistake — one
+/// dressed as a failure teaches people the feature is broken, and the other
+/// sends them looking for a fault in a microphone that is working.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum TranscriptionOutcome {
+    /// Speech became text.
+    ///
+    /// The text may still be empty — a user who pressed the button and said
+    /// nothing gets the no-match sentence from downstream, which already knows
+    /// how to phrase it, rather than a failure from here.
+    Heard {
+        transcript: Transcript,
+        sentence: String,
+    },
+    /// The configured backend cannot be used yet — nothing is listening at a
+    /// loopback endpoint, or a keyed service has no key. **Not a failure**: the
+    /// sentence is an instruction naming what to start or what to paste.
+    NotConfigured { detail: String, sentence: String },
+    /// The segment held no speech: the audio gate refused it and no backend
+    /// was called, or the backend's answer held no words once the segments
+    /// the model itself marked as no-speech were dropped ([`NO_SPEECH_LIMIT`]),
+    /// or its words were not in the audio — more than the segment's voice
+    /// could hold, or timed where there was none ([`super::evidence`]).
+    ///
+    /// **Not a failure either, and the distinction is the whole of the fix PRD
+    /// #802's product owner asked for.** A noise ends a segment
+    /// ([`super::Vad::heard_speech`] flips on one frame over the floor) far
+    /// more often than a sentence does, and what arrives here is then thirty
+    /// seconds of a quiet room. Transcribing it is worse than useless:
+    /// whisper-family models emit their captioned-video training artefacts on
+    /// near-silence, so the report said the app had heard "Don't forget to
+    /// subscribe".
+    ///
+    /// **It carries a `detail` and it used to carry none**, on the argument
+    /// that "there is nothing to diagnose — this is the ordinary outcome of a
+    /// quiet room". That argument was wrong in the case that matters. This is
+    /// also what a user sees when they *did* speak and the audio did not clear
+    /// the gate, and then it is the only thing standing between them and a
+    /// feature that looks broken for a reason nobody can name. The `detail` is
+    /// the measurement [`not_enough_speech`] renders, and it is a statement
+    /// about the AUDIO — never about the device, which is the rule that has not
+    /// changed.
+    ///
+    /// **The webview drops it without a word while listening** (PR #1451):
+    /// with voice on, most segments that end here are a keyboard or the room,
+    /// and a sentence about each one is noise. The `sentence` is plain words
+    /// for a surface that does report it; the `detail` stays for diagnosis.
+    Silent { detail: String, sentence: String },
+    /// Speech could not be turned into text.
+    Failed { detail: String, sentence: String },
+}
+
+impl TranscriptionOutcome {
+    pub fn sentence(&self) -> &str {
+        match self {
+            TranscriptionOutcome::Heard { sentence, .. }
+            | TranscriptionOutcome::NotConfigured { sentence, .. }
+            | TranscriptionOutcome::Silent { sentence, .. }
+            | TranscriptionOutcome::Failed { sentence, .. } => sentence,
+        }
+    }
+
+    /// Whether anything downstream has a transcript to work with.
+    pub fn is_heard(&self) -> bool {
+        matches!(self, TranscriptionOutcome::Heard { .. })
+    }
+}
+
+/// Transcribe one utterance and render its situation.
+///
+/// The transcription counterpart of [`super::handle_utterance`], and the
+/// function the IPC layer calls: it times the backend, classifies the error and
+/// produces the sentence, so no surface has to know how to phrase one and two
+/// surfaces cannot phrase the same situation differently.
+pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> VoiceTranscription {
+    let backend = transcriber.backend_name();
+    let audio_ms = audio.duration().as_millis().min(u128::from(u32::MAX)) as u32;
+
+    // The eligibility gate, in front of EVERY backend rather than inside one of
+    // them. It lives here and not in [`HttpTranscriber::run`] because "was
+    // anything said" is a question about the audio and not about a transport:
+    // a stub, a second HTTP backend or whatever replaces them would each have
+    // had to remember to ask it, and the one that forgot would be the one that
+    // reported a model's hallucination as a sentence the user said.
+    //
+    // `transcribe_ms` is `None` for [`VoiceTranscription::transcribe_ms`]'s own
+    // rule — no call was made, and a number here would claim a measurement
+    // nobody took — while `backend` still names what would have answered.
+    //
+    // Since issue #1450 it asks a second question as well — whether what rose
+    // out of the room is a voice at all — for the same reason it sits here:
+    // a backend's own no-speech verdict is missing from some backends and
+    // wrong on others, so the audio is judged before any of them is called.
+    //
+    // On a blocking worker, because the voice check is CPU work over the whole
+    // segment ([`eligibility`]). The copy is at most
+    // [`super::capture::MAX_UTTERANCE`] of 16-bit audio, under a megabyte. A
+    // worker that panics refuses the segment as a failure, never as silence:
+    // "could not check" is not "nothing was said".
+    let checked = audio.clone();
+    let verdict = match tokio::task::spawn_blocking(move || eligibility(&checked)).await {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            // Logged the way this crate logs a blocking task that did not
+            // complete (`lib.rs`'s settings save). A `JoinError` carries the
+            // task's panic message and never the audio, which this module
+            // does not log at any level.
+            eprintln!("desktop voice: the audio check did not complete: {error}");
+            let detail = if error.is_panic() {
+                "the audio check failed unexpectedly".to_string()
+            } else {
+                "the audio check was cancelled".to_string()
+            };
+            return VoiceTranscription {
+                outcome: TranscriptionOutcome::Failed {
+                    sentence: format!("Could not turn that into text ({detail})."),
+                    detail,
+                },
+                transcribe_ms: None,
+                backend,
+                audio_ms,
+            };
+        }
+    };
+    let voice = match verdict {
+        Ok(voice) => voice,
+        Err((detail, sentence)) => {
+            return VoiceTranscription {
+                outcome: TranscriptionOutcome::Silent { detail, sentence },
+                transcribe_ms: None,
+                backend,
+                audio_ms,
+            };
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let answered = transcriber.transcribe(audio).await;
+    let transcribe_ms = Some(millis(started.elapsed()));
+
+    let outcome = match answered {
+        // Nothing with a word in it came back: empty, only punctuation, or
+        // only segments the model itself called no-speech
+        // ([`NO_SPEECH_LIMIT`]). That is the same situation as audio the gate
+        // refused — nobody said anything — so it is the same outcome, and
+        // nothing downstream sees it.
+        Ok(answer) if !answer.transcript.has_words() => TranscriptionOutcome::Silent {
+            detail: "the transcription held no words".into(),
+            sentence: NOTHING_HEARD.into(),
+        },
+        // Words the audio cannot hold, or timed where there was no voice
+        // ([`super::evidence`], issue #1450): the backend invented them. A
+        // segment the audio does not hold is dropped and the ones it holds are
+        // kept, the way the no-speech guard drops a segment; when none is
+        // left, it is the same outcome as a segment with nobody speaking in
+        // it, because that is what it was, and the text goes nowhere — not
+        // typed, not resolved into a command, not quoted in the detail.
+        Ok(answer) => {
+            let words = evidence::word_count(answer.text());
+            let transcript = match evidence::support(words, &answer.timing, &voice) {
+                evidence::Support::All => Ok(answer.transcript),
+                evidence::Support::Segments(kept) => Ok(answer.only(&kept)),
+                evidence::Support::Nothing(why) => Err(why),
+            };
+            match transcript {
+                Ok(transcript) if transcript.has_words() => TranscriptionOutcome::Heard {
+                    sentence: heard_sentence(transcript.text()),
+                    transcript,
+                },
+                Ok(_) => TranscriptionOutcome::Silent {
+                    detail: "the transcription held no words the audio holds".into(),
+                    sentence: NOTHING_HEARD.into(),
+                },
+                Err(why) => TranscriptionOutcome::Silent {
+                    detail: format!("the transcription was not in the audio — {why}"),
+                    sentence: NOTHING_HEARD.into(),
+                },
+            }
+        }
+        Err(TranscriptionError::NotConfigured(detail)) => {
+            let detail = crate::dto::safe_message(detail);
+            TranscriptionOutcome::NotConfigured {
+                sentence: format!("Nothing to listen with — {detail}."),
+                detail,
+            }
+        }
+        Err(TranscriptionError::Backend(detail)) => {
+            let detail = crate::dto::safe_message(detail);
+            // The same wording `VoiceOutcome::transcription_failed` renders, so
+            // a failure reads identically whether it arrives from here or from
+            // the pipeline's own seam.
+            TranscriptionOutcome::Failed {
+                sentence: format!("Could not turn that into text ({detail})."),
+                detail,
+            }
+        }
+    };
+
+    VoiceTranscription {
+        // `None` is a real answer and not a missing one, which is
+        // [`super::VoiceResult::resolve_ms`]'s rule: nothing was transcribed on
+        // the not-configured path, and rendering the microseconds it took to
+        // say so would claim a measurement nobody made.
+        transcribe_ms: match &outcome {
+            TranscriptionOutcome::NotConfigured { .. } => None,
+            _ => transcribe_ms,
+        },
+        outcome,
+        backend,
+        audio_ms,
+    }
+}
+
+fn millis(duration: Duration) -> u32 {
+    duration.as_millis().min(u128::from(u32::MAX)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::{MemorySecretStore, Secret, SecretErrorKind, ThreadRecordingStore};
+    use crate::settings::{
+        HOSTED_SPEECH_MODEL, LOCAL_SPEECH_ENDPOINT, LOCAL_SPEECH_MODEL, TranscriptionBackend,
+    };
+    use crate::voice::capture::SILENCE_RMS;
+    use serde_json::json;
+
+    // Every test here is pure: bytes in, a `Value` in, a `Value` or an outcome
+    // out. PRD #802 M5's rule carried forward — nothing in the merge-blocking
+    // tier needs a credential, a microphone or the network, and the strongest
+    // form of that is a suite that opens no socket at all rather than one that
+    // opens a loopback one.
+
+    /// An utterance: speech with the room a microphone always delivers around
+    /// it, in `samples` output samples exactly — so every duration a caller
+    /// asserts is the one it was written against.
+    ///
+    /// **The room is not decoration.** PRD #802 made the speech rule relative
+    /// to the buffer's own noise floor, so a buffer of nothing but tone has
+    /// nothing to be measured against and is refused by design — see
+    /// `SpeechDetector`.
+    ///
+    /// **And the speech is speech**, since issue #1450: a real (synthesised)
+    /// "go back" from `fixtures/speech/`, 100 ms into a room at 120 and cut or
+    /// padded with room to length. This used to be a 9 000-level square wave
+    /// at 8 kHz, which cleared the audio gate and is not a voice, so
+    /// `human_voice` now refuses it exactly as it should.
+    fn audio(samples: usize) -> Pcm16 {
+        let speech = spoken(
+            include_bytes!("fixtures/speech/go-back-john.pcm"),
+            3_000.0,
+            120.0,
+            1,
+        );
+        // `spoken` leads with 600 ms of room; keep the last 100 ms of it.
+        let mut cut: Vec<f64> = speech.samples()[8_000..]
+            .iter()
+            .map(|&sample| f64::from(sample))
+            .collect();
+        if cut.len() < samples {
+            let pad = room_tone((samples - cut.len()) as f64 / 16_000.0 + 0.001, 120.0, 2);
+            cut.extend(pad);
+        }
+        cut.truncate(samples);
+        pcm(cut)
+    }
+
+    fn store() -> Arc<MemorySecretStore> {
+        Arc::new(MemorySecretStore::new())
+    }
+
+    // -- selection ---------------------------------------------------------
+
+    /// A keyed transcriber pointed somewhere unroutable on purpose: reaching
+    /// it would be a failure of the test's premise, not a flake.
+    fn keyed(secrets: Arc<dyn SecretStore>) -> HttpTranscriber {
+        HttpTranscriber::keyed(
+            secrets,
+            ServiceUrl::parse("https://voice-transcription.invalid/never").expect("valid"),
+            ModelId::parse(HOSTED_SPEECH_MODEL).expect("valid"),
+        )
+    }
+
+    fn stage(backend: TranscriptionBackend) -> TranscriptionSettings {
+        TranscriptionSettings {
+            backend,
+            ..TranscriptionSettings::default()
+        }
+    }
+
+    #[test]
+    fn voice_transcribe_selects_the_backend_the_settings_name() {
+        assert_eq!(
+            transcriber_for(&stage(TranscriptionBackend::Local), store()).backend_name(),
+            "local"
+        );
+        assert_eq!(
+            transcriber_for(&stage(TranscriptionBackend::Remote), store()).backend_name(),
+            "remote"
+        );
+    }
+
+    #[test]
+    fn voice_transcribe_selection_is_total_over_the_settings_enum() {
+        // A variant added to `TranscriptionBackend` without an adapter would be
+        // a settings value the app cannot honour, which `VoiceSettings`' own
+        // docs call a lie in a file the user can read. The `match` is
+        // exhaustive so the compiler catches it; this asserts the set that was
+        // mapped, which the compiler cannot.
+        let names: Vec<&str> = [TranscriptionBackend::Local, TranscriptionBackend::Remote]
+            .into_iter()
+            .map(|backend| transcriber_for(&stage(backend), store()).backend_name())
+            .collect();
+        assert_eq!(names, vec!["local", "remote"]);
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn voice_transcribe_is_object_safe() {
+        // The property the settings choice depends on: the backend is picked at
+        // call time, so it has to be storable behind a `dyn`.
+        let transcriber: Box<dyn Transcriber> =
+            transcriber_for(&stage(TranscriptionBackend::Local), store());
+        assert_eq!(transcriber.backend_name(), "local");
+    }
+
+    /// The module's own invariant, asserted rather than written down: a
+    /// keyless backend pointed off this machine makes **no request at all**.
+    ///
+    /// `TranscriptionBackend::Local` means *no `Authorization` header*, and
+    /// `ServiceUrl` accepts any `https://host` — so the two together are a
+    /// pairing nothing else checks, and the reachable version of it is a user
+    /// picking the keyless backend and then editing the Endpoint field to a
+    /// hosted service. Their captured WAV is then POSTed to a third party with
+    /// no credential on it. `transport_error` gating the docker hint on
+    /// `is_loopback` reads as if it covered this; it runs after the upload.
+    ///
+    /// The store is a recorder for the same reason
+    /// [`voice_transcribe_local_reads_no_secret_at_all`] uses one: the refusal
+    /// must not quietly become the KEYED path, which would send a key to
+    /// somewhere the user picked a keyless backend to avoid.
+    #[tokio::test]
+    async fn voice_transcribe_keyless_refuses_an_endpoint_off_this_machine() {
+        assert!(
+            HttpTranscriber::keyless(
+                ServiceUrl::parse("https://api.openai.com/v1/audio/transcriptions").expect("valid"),
+                ModelId::parse(HOSTED_SPEECH_MODEL).expect("valid"),
+            )
+            .is_err(),
+            "a keyless transcriber may not be built for another host"
+        );
+
+        let recorder = Arc::new(ThreadRecordingStore::new());
+        let settings = TranscriptionSettings {
+            backend: TranscriptionBackend::Local,
+            endpoint: ServiceUrl::parse("https://api.openai.com/v1/audio/transcriptions")
+                .expect("valid"),
+            model: ModelId::parse(HOSTED_SPEECH_MODEL).expect("valid"),
+            language: SpeechLanguage::default(),
+        };
+        let transcriber = transcriber_for(&settings, Arc::clone(&recorder) as Arc<dyn SecretStore>);
+        // Still `local` to the surface: the vocabulary is the settings token,
+        // so the report names the backend the user chose.
+        assert_eq!(transcriber.backend_name(), "local");
+
+        let error = transcriber
+            .transcribe(&audio(16))
+            .await
+            .expect_err("the pairing is refused");
+        assert!(
+            matches!(error, TranscriptionError::NotConfigured(_)),
+            "a misconfiguration is an instruction, not a failure: {error:?}"
+        );
+        assert_eq!(error.detail(), crate::settings::KEYLESS_OFF_MACHINE);
+        assert_eq!(
+            recorder.read_on(),
+            None,
+            "the refusal must not fall back to the keyed path"
+        );
+    }
+
+    // -- the keyless local backend -----------------------------------------
+
+    /// The keyless path is structural, not a lookup that happens to find
+    /// nothing: `transcriber_for` drops the store for a local backend, so this
+    /// records **zero** reads against one that counts them.
+    ///
+    /// It is the difference the module docs claim, asserted rather than argued
+    /// — a backend that asked and forgave an empty answer would pass every
+    /// other test here and still prompt a macOS keychain on every utterance.
+    #[tokio::test]
+    async fn voice_transcribe_local_reads_no_secret_at_all() {
+        let recorder = Arc::new(ThreadRecordingStore::new());
+        let settings = TranscriptionSettings {
+            backend: TranscriptionBackend::Local,
+            endpoint: ServiceUrl::parse("http://127.0.0.1:1/v1/audio/transcriptions")
+                .expect("valid"),
+            ..TranscriptionSettings::default()
+        };
+        let transcriber = transcriber_for(&settings, Arc::clone(&recorder) as Arc<dyn SecretStore>);
+        // The request cannot succeed — nothing is listening on port 1 — but
+        // whether a secret was read is decided before the socket.
+        let _ = transcriber.transcribe(&audio(16_000)).await;
+        assert_eq!(
+            recorder.read_on(),
+            None,
+            "the keyless backend consulted the keychain"
+        );
+    }
+
+    /// The unreachable **local** endpoint is a prerequisite, not a failure —
+    /// the product owner asked for this specifically: it must say what to
+    /// start.
+    ///
+    /// Driven against a port nothing listens on, which is a connect refused on
+    /// loopback and costs no network. This is the one test here that opens a
+    /// socket, and it opens it to a closed port on this machine.
+    #[tokio::test]
+    async fn voice_transcribe_an_unreachable_local_endpoint_says_what_to_start() {
+        let settings = TranscriptionSettings {
+            backend: TranscriptionBackend::Local,
+            // Port 1 on loopback: privileged, unbound, refused immediately.
+            endpoint: ServiceUrl::parse("http://127.0.0.1:1/v1/audio/transcriptions")
+                .expect("valid"),
+            ..TranscriptionSettings::default()
+        };
+        let result =
+            handle_audio(transcriber_for(&settings, store()).as_ref(), &audio(16_000)).await;
+
+        assert!(
+            matches!(&result.outcome, TranscriptionOutcome::NotConfigured { .. }),
+            "an unreachable container rendered as a failure: {:?}",
+            result.outcome
+        );
+        let sentence = result.sentence();
+        assert!(
+            sentence.contains("nothing is listening at http://127.0.0.1:1"),
+            "{sentence}"
+        );
+        assert!(sentence.contains("docker run"), "{sentence}");
+        assert!(sentence.contains(LOCAL_SPEECH_IMAGE), "{sentence}");
+        // The whole point of the classification: it must not read as a break.
+        assert!(
+            !sentence.contains("Could not turn that into text"),
+            "{sentence}"
+        );
+    }
+
+    /// The same sentence, built directly, so the words the owner asked to see
+    /// are pinned rather than inferred — including the PORT coming from the
+    /// user's own endpoint rather than from the preset.
+    #[test]
+    fn voice_transcribe_the_unreachable_sentence_names_the_users_own_port() {
+        let moved =
+            ServiceUrl::parse("http://127.0.0.1:9123/v1/audio/transcriptions").expect("valid");
+        let detail = unreachable_detail(&moved);
+        assert!(
+            detail.contains("nothing is listening at http://127.0.0.1:9123"),
+            "{detail}"
+        );
+        assert!(detail.contains("-p 9123:8000"), "{detail}");
+        assert!(detail.contains("press Voice again"), "{detail}");
+    }
+
+    /// A KEYED endpoint that refuses a connection is an outage or a gateway the
+    /// user runs their own way — never a missing speech container — so it must
+    /// not be told to run docker, even when it is on this machine.
+    ///
+    /// Driven against the same refused loopback port as the test above, so the
+    /// only thing that differs is which backend was chosen.
+    #[tokio::test]
+    async fn voice_transcribe_a_keyed_endpoint_is_never_a_docker_instruction() {
+        let keyed = store();
+        keyed
+            .store(SecretId::VoiceTranscription, &Secret::new("sk-test"))
+            .expect("stores");
+        let settings = TranscriptionSettings {
+            backend: TranscriptionBackend::Remote,
+            endpoint: ServiceUrl::parse("http://127.0.0.1:1/v1/audio/transcriptions")
+                .expect("valid"),
+            ..TranscriptionSettings::default()
+        };
+        let result = handle_audio(
+            transcriber_for(&settings, keyed as Arc<dyn SecretStore>).as_ref(),
+            &audio(16_000),
+        )
+        .await;
+        assert!(
+            !result.sentence().contains("docker run"),
+            "a keyed endpoint was reported as a missing container: {}",
+            result.sentence()
+        );
+        assert!(
+            matches!(&result.outcome, TranscriptionOutcome::Failed { .. }),
+            "{:?}",
+            result.outcome
+        );
+    }
+
+    // -- the outcome rendering ---------------------------------------------
+
+    #[tokio::test]
+    async fn voice_transcribe_reports_what_was_heard() {
+        let result = handle_audio(
+            &StubTranscriber::hearing("show me the tester"),
+            &audio(16_000),
+        )
+        .await;
+        assert!(result.outcome.is_heard());
+        assert_eq!(
+            result.transcript().map(Transcript::text),
+            Some("show me the tester")
+        );
+        assert_eq!(result.backend, "stub");
+        assert_eq!(result.audio_ms, 1_000);
+        assert!(result.transcribe_ms.is_some());
+    }
+
+    /// PR #1451's hand test: whisper ends a sentence with a full stop, and the
+    /// report added one of its own after the closing quote — `Heard “Devbox
+    /// run agent.”.` A transcript that already ends a sentence gets no second
+    /// stop; one that does not still gets one.
+    #[tokio::test]
+    async fn voice_transcribe_adds_no_second_full_stop_after_a_transcript_that_has_one() {
+        for (spoken, sentence) in [
+            ("Devbox run agent.", "Heard “Devbox run agent.”"),
+            ("What can I say?", "Heard “What can I say?”"),
+            ("Stop typing!", "Heard “Stop typing!”"),
+            ("show me the tester", "Heard “show me the tester”."),
+        ] {
+            let result = handle_audio(&StubTranscriber::hearing(spoken), &audio(16_000)).await;
+            assert_eq!(result.sentence(), sentence, "{spoken:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_transcribe_a_backend_failure_is_its_own_outcome() {
+        let result = handle_audio(
+            &StubTranscriber::failing(TranscriptionError::Backend("it timed out".into())),
+            &audio(16_000),
+        )
+        .await;
+        assert!(
+            matches!(&result.outcome, TranscriptionOutcome::Failed { .. }),
+            "{:?}",
+            result.outcome
+        );
+        assert_eq!(
+            result.sentence(),
+            "Could not turn that into text (it timed out)."
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_transcribe_scrubs_a_backend_detail_before_rendering_it() {
+        // A backend's own message reaches a sentence, so it goes through the
+        // same seam every other free-form string does.
+        let result = handle_audio(
+            &StubTranscriber::failing(TranscriptionError::Backend("a\u{1b}[2Jb".into())),
+            &audio(16_000),
+        )
+        .await;
+        assert!(!result.sentence().contains('\u{1b}'), "{result:?}");
+    }
+
+    #[test]
+    fn voice_transcribe_outcome_serializes_the_tokens_the_webview_reads() {
+        let heard = TranscriptionOutcome::Heard {
+            transcript: Transcript::new("go back"),
+            sentence: "Heard “go back”.".into(),
+        };
+        let json = serde_json::to_value(&heard).expect("serializes");
+        assert_eq!(json["kind"], "heard");
+        assert_eq!(json["transcript"], "go back");
+
+        let off = TranscriptionOutcome::NotConfigured {
+            detail: "nothing is listening".into(),
+            sentence: "…".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&off).expect("serializes")["kind"],
+            "not_configured"
+        );
+
+        let failed = TranscriptionOutcome::Failed {
+            detail: "x".into(),
+            sentence: "…".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&failed).expect("serializes")["kind"],
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_transcribe_result_serializes_the_shape_m6_reads() {
+        let result = handle_audio(&StubTranscriber::hearing("go back"), &audio(16_000)).await;
+        let json = serde_json::to_value(&result).expect("serializes");
+        assert_eq!(json["outcome"]["kind"], "heard");
+        assert_eq!(json["outcome"]["transcript"], "go back");
+        assert_eq!(json["backend"], "stub");
+        assert_eq!(json["audioMs"], 1000);
+        assert!(json["transcribeMs"].is_number());
+    }
+
+    // -- the request shape -------------------------------------------------
+
+    fn body(audio: &Pcm16) -> Vec<u8> {
+        multipart_body(
+            audio,
+            HOSTED_SPEECH_MODEL,
+            SpeechLanguage::default(),
+            "TESTBOUNDARY",
+        )
+    }
+
+    fn text_of(body: &[u8]) -> String {
+        String::from_utf8_lossy(body).into_owned()
+    }
+
+    #[test]
+    fn voice_transcribe_request_names_the_model_and_the_response_format() {
+        let rendered = text_of(&body(&audio(8)));
+        assert!(
+            rendered.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("name=\"response_format\"\r\n\r\nverbose_json\r\n"),
+            "{rendered}"
+        );
+    }
+
+    /// Issue #1450: a `verbose_json` request asks for word and segment timing,
+    /// which the answer is held to; a `gpt-*` request, whose plain `json`
+    /// carries no timing, does not.
+    #[test]
+    fn voice_transcribe_request_asks_for_timing_only_where_the_format_carries_it() {
+        let rendered = text_of(&body(&audio(8)));
+        for granularity in ["word", "segment"] {
+            assert!(
+                rendered.contains(&format!(
+                    "name=\"timestamp_granularities[]\"\r\n\r\n{granularity}\r\n"
+                )),
+                "{rendered}"
+            );
+        }
+        let gpt = text_of(&multipart_body(
+            &audio(8),
+            "gpt-4o-transcribe",
+            SpeechLanguage::default(),
+            "TESTBOUNDARY",
+        ));
+        assert!(!gpt.contains("timestamp_granularities"), "{gpt}");
+    }
+
+    /// Reported 2026-10-01 while testing PR #1451: "Select the directory
+    /// dot-agent-deck", spoken with a Serbian accent, came back as
+    /// "Selectajte directory dot-agent-deck" — a Serbian imperative ending
+    /// glued onto an English verb — because a request naming no language
+    /// leaves Whisper-family models to guess it per utterance, and a short
+    /// accented command is exactly what they guess wrong. Action grounding
+    /// then refused it, correctly, since no word of it asks for anything.
+    /// English is still what a request names when nobody chose otherwise
+    /// (issue #1458).
+    #[test]
+    fn voice_transcribe_request_pins_the_language_to_english() {
+        let rendered = text_of(&body(&audio(8)));
+        assert!(
+            rendered.contains("name=\"language\"\r\n\r\nen\r\n"),
+            "{rendered}"
+        );
+        // And a backend built without being told a language is the same.
+        let rendered = text_of(&keyed(store()).body(&audio(8), "b"));
+        assert!(
+            rendered.contains("name=\"language\"\r\n\r\nen\r\n"),
+            "{rendered}"
+        );
+    }
+
+    /// Issue #1458: the language chosen in Settings → Voice is the one the
+    /// request names, from the stored token through the backend to the body.
+    #[test]
+    fn voice_transcribe_request_names_the_chosen_language() {
+        let settings: TranscriptionSettings =
+            serde_json::from_value(serde_json::json!({ "backend": "remote", "language": "sr" }))
+                .expect("parses");
+        let rendered = text_of(
+            &keyed(store())
+                .speaking(settings.language)
+                .body(&audio(8), "b"),
+        );
+        assert!(
+            rendered.contains("name=\"language\"\r\n\r\nsr\r\n"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("name=\"language\"").count(),
+            1,
+            "{rendered}"
+        );
+    }
+
+    /// Issue #1458: Auto-detect sends no `language` part at all, which is how
+    /// the speech services are asked to detect it; every other part is still
+    /// there.
+    #[test]
+    fn voice_transcribe_auto_detect_sends_no_language() {
+        let rendered = text_of(&multipart_body(
+            &audio(8),
+            HOSTED_SPEECH_MODEL,
+            SpeechLanguage::AUTO,
+            "TESTBOUNDARY",
+        ));
+        assert!(!rendered.contains("name=\"language\""), "{rendered}");
+        // model, response_format, the two timestamp granularities, file.
+        assert_eq!(
+            rendered.matches("content-disposition: form-data").count(),
+            5
+        );
+        assert!(rendered.ends_with("\r\n--TESTBOUNDARY--\r\n"), "{rendered}");
+    }
+
+    #[test]
+    fn voice_transcribe_request_carries_a_wav_named_by_a_constant() {
+        let pcm = audio(8);
+        let body = body(&pcm);
+        let rendered = text_of(&body);
+        assert!(
+            rendered.contains("name=\"file\"; filename=\"utterance.wav\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("content-type: audio/wav"), "{rendered}");
+        // The WAV itself is in there verbatim, header and all.
+        let wav = pcm.to_wav();
+        assert!(
+            body.windows(wav.len()).any(|window| window == wav),
+            "the audio did not reach the body"
+        );
+    }
+
+    #[test]
+    fn voice_transcribe_request_is_well_formed_multipart() {
+        let pcm = audio(4);
+        let raw = body(&pcm);
+        let rendered = text_of(&raw);
+        assert!(rendered.starts_with("--TESTBOUNDARY\r\n"), "{rendered}");
+        assert!(rendered.ends_with("\r\n--TESTBOUNDARY--\r\n"), "{rendered}");
+        // Six parts: model, response_format, the two timestamp
+        // granularities, language, file.
+        assert_eq!(
+            rendered.matches("content-disposition: form-data").count(),
+            6
+        );
+
+        // CRLF everywhere — a bare LF is the mistake a hand-written encoder
+        // makes. Asserted on the ENVELOPE with the audio cut out, because a WAV
+        // is arbitrary bytes and a sample that happened to be 0x0A would make
+        // this assertion a coin toss rather than a check.
+        let wav = pcm.to_wav();
+        let at = raw
+            .windows(wav.len())
+            .position(|window| window == wav)
+            .expect("the audio is in the body");
+        let mut envelope = raw[..at].to_vec();
+        envelope.extend_from_slice(&raw[at + wav.len()..]);
+        let envelope = String::from_utf8(envelope).expect("the envelope is text");
+        assert_eq!(
+            envelope.matches('\n').count(),
+            envelope.matches("\r\n").count(),
+            "a bare LF in {envelope:?}"
+        );
+    }
+
+    #[test]
+    fn voice_transcribe_content_type_names_the_boundary_the_body_used() {
+        assert_eq!(
+            content_type("TESTBOUNDARY"),
+            "multipart/form-data; boundary=TESTBOUNDARY"
+        );
+        // And a generated boundary is long enough not to collide with audio by
+        // accident, and is not the same twice.
+        let first = boundary();
+        assert!(first.len() >= 32, "{first}");
+        assert_ne!(first, boundary());
+    }
+
+    #[test]
+    fn voice_transcribe_request_never_carries_the_credential() {
+        // The key travels in a header and nowhere else. A body carrying it
+        // would reach any logging or error path that prints a request.
+        let store = MemorySecretStore::new();
+        store
+            .store(
+                SecretId::VoiceTranscription,
+                &Secret::new("sk-not-a-real-key-0123"),
+            )
+            .expect("stores");
+        let rendered = text_of(&body(&audio(8)));
+        assert!(!rendered.contains("sk-not-a-real-key"), "{rendered}");
+        assert!(!rendered.contains("authorization"), "{rendered}");
+    }
+
+    // -- non-speech the model answered anyway (PR #1451 hand test) ---------
+
+    /// Thirty seconds of a quiet room with a keyboard being typed on in it —
+    /// key presses and releases as 12 ms decaying bursts, in runs of quick
+    /// keystrokes with pauses between — which is what a typing-mode segment
+    /// holds while the user types instead of talking. Deterministic: a fixed
+    /// linear congruential generator, so the gate's verdict below is the same
+    /// on every run.
+    fn typing_on_a_keyboard() -> Pcm16 {
+        let mut seed: u32 = 7;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from((seed >> 8) as i32 % 2_001 - 1_000) / 1_000.0
+        };
+        let rate = 16_000.0;
+        let mut samples: Vec<f64> = (0..30 * 16_000).map(|_| noise() * 90.0).collect();
+        let mut at = 0.5;
+        let mut run = 0;
+        while at < 29.5 {
+            for (offset, level) in [(0.0, 6_000.0), (0.09, 3_600.0)] {
+                let start = ((at + offset) * rate) as usize;
+                for i in 0..(0.012 * rate) as usize {
+                    if let Some(sample) = samples.get_mut(start + i) {
+                        *sample += noise() * level * (-(i as f64) / (0.002 * rate)).exp();
+                    }
+                }
+            }
+            run += 1;
+            // Eight quick keys — a fast typist, 80 ms apart — then a pause to
+            // read what was typed.
+            at += if run % 8 == 0 { 0.9 } else { 0.08 };
+        }
+        Pcm16::new(
+            samples
+                .into_iter()
+                .map(|sample| sample.clamp(-32_768.0, 32_767.0) as i16)
+                .collect(),
+        )
+    }
+
+    /// A whisper-family `verbose_json` reply: the text, and one segment per
+    /// `(text, no_speech_prob, avg_logprob)`.
+    fn verbose(segments: &[(&str, f64, f64)]) -> Value {
+        let text: String = segments.iter().map(|(text, ..)| *text).collect();
+        json!({
+            "text": text.trim(),
+            "segments": segments
+                .iter()
+                .map(|(text, no_speech, logprob)| json!({
+                    "text": text,
+                    "no_speech_prob": no_speech,
+                    "avg_logprob": logprob,
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Scenario: in typing mode the maintainer said the opener and then
+    /// nothing, and the agent's prompt received "Go to Beadaholique.com for all
+    /// of your beading supply needs! Thank you." — a sentence nobody said, the
+    /// known Whisper artefact on non-speech. The audio here is a keyboard being
+    /// typed on, which the audio gate lets through (it is a heuristic, and a
+    /// fast run of keys fills its window); whisper-1 answers such audio with
+    /// its own verdict that there was no speech in it, and that verdict must
+    /// win: nothing is heard, so nothing is typed and no "Heard …" is shown.
+    #[tokio::test]
+    async fn voice_transcribe_text_whisper_itself_marks_as_no_speech_is_never_heard() {
+        let typing = typing_on_a_keyboard();
+        assert!(
+            typing.has_speech(),
+            "the premise: keyboard noise clears the audio gate ({:?})",
+            typing.measure_speech()
+        );
+        let artefact = "Go to Beadaholique.com for all of your beading supply needs! Thank you.";
+        let result = handle_audio(
+            &StubTranscriber::replying(&verbose(&[(&format!(" {artefact}"), 0.93, -0.42)])),
+            &typing,
+        )
+        .await;
+
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+        assert_eq!(result.transcript(), None);
+        assert!(
+            !result.sentence().contains("Beadaholique"),
+            "{}",
+            result.sentence()
+        );
+        assert!(
+            !result.sentence().starts_with("Heard"),
+            "{}",
+            result.sentence()
+        );
+    }
+
+    /// Scenario: what whisper-1 actually returned, measured 2026-10-01, for
+    /// thirty seconds of a quiet room with one 250 ms non-speech burst in it —
+    /// audio the gate passes. The text is nothing but ellipses, and every
+    /// segment but the trailing duplicates carries a no-speech probability of
+    /// 0.918. Neither half may reach the agent: the confident segments are
+    /// no-speech, and what is left holds no word.
+    #[tokio::test]
+    async fn voice_transcribe_the_measured_whisper_reply_to_a_quiet_room_is_not_heard() {
+        let mut segments = vec![(" ...", 0.918, -0.515); 5];
+        segments.push((" ...", 0.348, -0.249));
+        let result = handle_audio(
+            &StubTranscriber::replying(&verbose(&segments)),
+            &audio(16_000),
+        )
+        .await;
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+        assert!(!result.sentence().contains("..."), "{}", result.sentence());
+    }
+
+    /// The control, and the reason the guard is a threshold and not a mute:
+    /// quiet speech measured through both shipping models on 2026-10-01 — the
+    /// same sentence at a peak of 400 and of 250 against a room at 64 —
+    /// scored a no-speech probability of 0.089 and 0.202 on whisper-1 and up
+    /// to 0.377 on the local container's `faster-whisper-tiny.en`. All of it
+    /// is still heard, word for word. The audio is a dictated sentence, the
+    /// same words the reply carries, since issue #1450 holds a reply's words
+    /// to the voice in the segment.
+    #[tokio::test]
+    async fn voice_transcribe_quiet_real_speech_is_still_heard() {
+        let dictated = spoken(
+            include_bytes!("fixtures/speech/dictation-joe.pcm"),
+            800.0,
+            80.0,
+            3,
+        );
+        for no_speech in [0.089, 0.202, 0.377] {
+            let result = handle_audio(
+                &StubTranscriber::replying(&verbose(&[
+                    (" Please add a unit test", no_speech, -0.4),
+                    (" for the parser.", no_speech, -0.4),
+                ])),
+                &dictated,
+            )
+            .await;
+            assert_eq!(
+                result.transcript().map(Transcript::text),
+                Some("Please add a unit test for the parser."),
+                "no_speech_prob {no_speech}: {:?}",
+                result.outcome
+            );
+        }
+    }
+
+    /// A reply that is speech and then an artefact keeps the speech: the guard
+    /// is per segment, because a dictated sentence followed by a long pause is
+    /// exactly where Whisper appends one.
+    #[test]
+    fn voice_transcribe_keeps_the_speech_and_drops_a_trailing_no_speech_segment() {
+        let transcript = parse_response(&verbose(&[
+            (" Add a test for the parser.", 0.05, -0.2),
+            (" Thank you for watching!", 0.88, -0.3),
+        ]))
+        .expect("parses");
+        assert_eq!(transcript.text(), "Add a test for the parser.");
+    }
+
+    /// Scenario: a segment the model leans towards calling no-speech, but
+    /// not past [`CERTAIN_NO_SPEECH`], is dropped only when the model is also
+    /// unsure of its words — the local model's reply to a 1 kHz beep, measured
+    /// 2026-10-04 at 0.818 and -1.228, goes; a reply that reports no
+    /// `avg_logprob` at all is treated as unsure and goes too.
+    #[test]
+    fn voice_transcribe_drops_an_unsure_no_speech_segment_under_the_certain_limit() {
+        // The reply was a one-word exclamation; the numbers are the measured ones.
+        let beep = parse_response(&verbose(&[(" Oh!", 0.818, -1.228)])).expect("parses");
+        assert!(!beep.transcript.has_words(), "{:?}", beep.text());
+        let unreported = parse_response(&json!({
+            "text": "Thank you.",
+            "segments": [{ "text": " Thank you.", "no_speech_prob": 0.7 }],
+        }))
+        .expect("parses");
+        assert!(
+            !unreported.transcript.has_words(),
+            "{:?}",
+            unreported.text()
+        );
+    }
+
+    /// Scenario: a no-speech segment is removed from a verbose reply between
+    /// spoken segments whose text has no boundary spaces. The remaining words
+    /// stay separated, while a segment already starting with space or
+    /// punctuation keeps its original spacing.
+    #[test]
+    fn voice_transcribe_separates_retained_segments_after_dropping_no_speech() {
+        let transcript = parse_response(&verbose(&[
+            ("Open", 0.05, -0.2),
+            ("noise", 0.91, -0.4),
+            ("the", 0.04, -0.2),
+            (" door,", 0.03, -0.2),
+            ("please.", 0.02, -0.2),
+        ]))
+        .expect("parses");
+        assert_eq!(transcript.text(), "Open the door, please.");
+    }
+
+    /// Scenario: a no-speech segment is dropped between a word stem and an apostrophe-led ending. The retained speech reads as one contraction, with no inserted space.
+    #[test]
+    fn voice_transcribe_joins_apostrophe_after_dropped_no_speech() {
+        for ending in ["'t go", "’t go"] {
+            let transcript = parse_response(&verbose(&[
+                ("don", 0.05, -0.2),
+                ("noise", 0.91, -0.4),
+                (ending, 0.04, -0.2),
+            ]))
+            .expect("parses");
+            assert_eq!(transcript.text(), format!("don{ending}"));
+        }
+    }
+
+    /// The request asks for `verbose_json`, which is where a whisper model's
+    /// per-segment confidence lives, from every model but OpenAI's `gpt-*`
+    /// transcription family — `gpt-4o-transcribe` refuses `verbose_json`
+    /// outright, and a configured model must not start failing because of a
+    /// guard.
+    #[test]
+    fn voice_transcribe_asks_a_whisper_model_for_its_confidence() {
+        let boundary = "b";
+        for (model, format) in [
+            ("whisper-1", "verbose_json"),
+            ("Systran/faster-whisper-tiny.en", "verbose_json"),
+            // Qodo on PR #1451: a whisper build served under a bare id, as
+            // local faster-whisper servers often name them, is still asked.
+            ("large-v3", "verbose_json"),
+            ("tiny.en", "verbose_json"),
+            ("gpt-4o-transcribe", "json"),
+            ("gpt-4o-mini-transcribe", "json"),
+        ] {
+            let rendered = text_of(&multipart_body(
+                &audio(8),
+                model,
+                SpeechLanguage::default(),
+                boundary,
+            ));
+            assert!(
+                rendered.contains(&format!("name=\"response_format\"\r\n\r\n{format}\r\n")),
+                "{model}: {rendered}"
+            );
+        }
+    }
+
+    // -- the response shape ------------------------------------------------
+
+    #[test]
+    fn voice_transcribe_parses_a_transcript() {
+        let transcript =
+            parse_response(&json!({"text": "  show me the tester  "})).expect("parses");
+        assert_eq!(transcript.text(), "show me the tester");
+    }
+
+    #[test]
+    fn voice_transcribe_parses_an_empty_transcript_rather_than_failing() {
+        // Silence that reached the model is a no-match downstream, not a
+        // transcription failure — the sentences are different and only the
+        // pipeline can phrase the first one.
+        let transcript = parse_response(&json!({"text": ""})).expect("parses");
+        assert!(transcript.transcript.is_empty());
+    }
+
+    #[test]
+    fn voice_transcribe_reports_a_reply_with_no_transcript() {
+        let error = parse_response(&json!({"duration": 1.2})).expect_err("fails");
+        assert!(error.detail().contains("without a transcript"), "{error}");
+        let error = parse_response(&json!({"text": 7})).expect_err("fails");
+        assert!(error.detail().contains("without a transcript"), "{error}");
+    }
+
+    #[test]
+    fn voice_transcribe_reports_an_api_error_with_its_message() {
+        let detail = api_error_detail(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &json!({"error": {"message": "Incorrect API key provided"}}),
+        );
+        assert!(detail.contains("401"), "{detail}");
+        assert!(detail.contains("Incorrect API key"), "{detail}");
+    }
+
+    #[test]
+    fn voice_transcribe_reports_an_api_error_with_no_readable_body() {
+        let detail = api_error_detail(reqwest::StatusCode::BAD_GATEWAY, &json!({}));
+        assert!(detail.contains("502"), "{detail}");
+    }
+
+    #[test]
+    fn voice_transcribe_transport_failures_carry_no_debugging_output() {
+        // `reqwest::Error`'s own Display carries the URL and a source chain.
+        // What reaches a sentence is this file's wording. A malformed URL
+        // yields `is_builder`, which lands in the catch-all arm — the arm most
+        // likely to leak.
+        let error = reqwest::Client::new()
+            .post("not a url")
+            .build()
+            .expect_err("a builder error");
+        assert_eq!(
+            transport_detail(&error),
+            "the request to the transcription backend failed"
+        );
+    }
+
+    // -- the credential ----------------------------------------------------
+
+    #[tokio::test]
+    async fn voice_transcribe_without_a_key_is_not_configured_and_opens_no_socket() {
+        // The endpoint is unroutable on purpose: reaching it would be a failure
+        // of this test's premise, not a flake.
+        let transcriber = keyed(store());
+        let error = transcriber
+            .transcribe(&audio(16_000))
+            .await
+            .expect_err("fails");
+        assert!(
+            matches!(&error, TranscriptionError::NotConfigured(detail) if detail.contains("no key is stored")),
+            "got {error:?}"
+        );
+        // Named by its HOST, so a user holding several keys knows which one is
+        // wanted — the old wording said "the remote transcription backend".
+        assert!(
+            error.detail().contains("voice-transcription.invalid"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_transcribe_no_key_renders_as_an_instruction_not_a_break() {
+        let transcriber = keyed(store());
+        let result = handle_audio(&transcriber, &audio(16_000)).await;
+        assert!(
+            matches!(&result.outcome, TranscriptionOutcome::NotConfigured { .. }),
+            "{:?}",
+            result.outcome
+        );
+        assert!(result.sentence().contains("Settings"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn voice_transcribe_reports_an_unreachable_keychain_rather_than_a_missing_key() {
+        // PRD #802 M4's rule, one layer up: "I could not find out" must not
+        // render as "nothing stored", or the user retypes their key into a
+        // store that cannot hold it.
+        let store = MemorySecretStore::failing(SecretErrorKind::Unavailable, "test");
+        let transcriber = keyed(Arc::new(store));
+        let error = transcriber
+            .transcribe(&audio(16_000))
+            .await
+            .expect_err("fails");
+        assert!(
+            matches!(&error, TranscriptionError::NotConfigured(_)),
+            "got {error:?}"
+        );
+        assert!(!error.detail().contains("no key is stored"), "{error}");
+    }
+
+    /// Scenario: transcribe one buffer and note which thread the keychain was
+    /// read on. It is not the one the transcriber is running on.
+    ///
+    /// The sibling of `voice_remote_reads_the_keychain_off_the_runtime`, and
+    /// the same regression: `run` read the store inline in its own `async
+    /// fn`, so an unlock prompt parked a shared runtime worker.
+    #[tokio::test]
+    async fn voice_transcribe_reads_the_keychain_off_the_runtime() {
+        let store = Arc::new(ThreadRecordingStore::new());
+        let transcriber = keyed(Arc::clone(&store) as Arc<dyn SecretStore>);
+        let error = transcriber
+            .transcribe(&audio(16_000))
+            .await
+            .expect_err("no key is stored");
+        assert!(
+            matches!(&error, TranscriptionError::NotConfigured(detail) if detail.contains("no key is stored")),
+            "got {error:?}"
+        );
+        assert_ne!(
+            store.read_on().expect("the store was read"),
+            std::thread::current().id(),
+            "the keychain read ran on the runtime thread transcribing the audio"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_transcribe_silence_never_reaches_the_backend() {
+        // Short-circuited BEFORE the credential is read, so a muted microphone
+        // costs neither a keychain prompt nor a round trip. The store here
+        // would panic the assertion below if it were consulted, because a
+        // missing key reports a different sentence.
+        let transcriber = keyed(store());
+        let error = transcriber
+            .transcribe(&Pcm16::new(vec![0; 16_000]))
+            .await
+            .expect_err("fails");
+        // Digital zero, so the refusal is the LEVEL one and it names the bar
+        // it measured against rather than asserting the room was quiet. With
+        // no room at all the rule floors its estimate at `SILENCE_RMS` and the
+        // bar is three times that — the one absolute the relative rule keeps,
+        // and the only thing that stops true silence passing a ratio test.
+        assert!(
+            matches!(&error, TranscriptionError::Backend(detail) if detail.contains("too quiet")),
+            "got {error:?}"
+        );
+        assert_eq!(
+            error.detail(),
+            format!(
+                "too quiet — the loudest moment reached 0 against a room at {SILENCE_RMS}, where \
+                 speech has to reach {}",
+                SILENCE_RMS * 3
+            ),
+            "the refusal does not state the comparison the rule made"
+        );
+        let error = transcriber
+            .transcribe(&Pcm16::new(Vec::new()))
+            .await
+            .expect_err("fails");
+        assert!(error.detail().contains("too quiet"), "{}", error.detail());
+    }
+
+    /// The defect PRD #802's product owner met: a buffer of room tone with one
+    /// impulse in it reached whisper, which answered with a training artefact.
+    ///
+    /// One sample at full scale clears `Pcm16::is_silent` — `all()` needs every
+    /// sample under the floor — which is why the old guard let this through.
+    #[tokio::test]
+    async fn voice_transcribe_near_silence_with_one_loud_sample_is_never_sent() {
+        let mut samples = vec![0i16; 16_000];
+        samples[8_000] = i16::MAX;
+        let audio = Pcm16::new(samples);
+        assert!(
+            !audio.is_silent(),
+            "the fixture must be one the OLD guard passed, or this proves nothing"
+        );
+
+        let error = keyed(store())
+            .transcribe(&audio)
+            .await
+            .expect_err("a room with one tap in it is not an utterance");
+        // The LENGTH branch, not the level one: a full-scale sample puts its
+        // own frame's RMS well over `SPEECH_FLOOR`, so the honest refusal is
+        // that there was 20 ms of it and not that the room was quiet.
+        assert!(
+            error.detail().contains("of speech inside the loudest"),
+            "got {}",
+            error.detail()
+        );
+        assert!(
+            !error.detail().contains("too quiet"),
+            "a tap at full scale reported as too quiet: {}",
+            error.detail()
+        );
+    }
+
+    /// The same buffer through the gate every backend sits behind: no call, no
+    /// latency claimed, and a sentence that says nothing was said rather than
+    /// that something failed.
+    #[tokio::test]
+    async fn voice_transcribe_a_segment_with_no_speech_in_it_is_its_own_outcome() {
+        let mut samples = vec![0i16; 16_000];
+        samples[8_000] = i16::MAX;
+        // A transcriber that would PANIC the assertions below if it were asked,
+        // because "the tester" is neither the sentence nor the kind expected.
+        let result = handle_audio(
+            &StubTranscriber::hearing("Don't forget to subscribe"),
+            &Pcm16::new(samples),
+        )
+        .await;
+
+        assert!(
+            matches!(&result.outcome, TranscriptionOutcome::Silent { .. }),
+            "{:?}",
+            result.outcome
+        );
+        assert!(
+            !result.outcome.is_heard(),
+            "nothing goes on to the resolver"
+        );
+        assert_eq!(result.transcript(), None);
+        // The sentence, were a surface to show it: plain words and something
+        // to do. It used to be "Nothing was said", which tells somebody who
+        // DID speak that they imagined it; then it carried the measurement,
+        // which PR #1451's hand test found unreadable. The measurement is the
+        // detail's job now, and no number reaches the sentence.
+        assert_eq!(result.sentence(), NOTHING_HEARD);
+        assert!(
+            result.sentence().contains("still listening"),
+            "the refusal must not read as a stop: {}",
+            result.sentence()
+        );
+        assert!(
+            !result.sentence().chars().any(|c| c.is_ascii_digit()),
+            "a measurement on screen: {}",
+            result.sentence()
+        );
+        let TranscriptionOutcome::Silent { detail, .. } = &result.outcome else {
+            unreachable!()
+        };
+        assert!(
+            detail.contains("20 ms of speech inside the loudest 200 ms"),
+            "the detail carries no measurement: {detail}"
+        );
+        assert!(
+            !result.sentence().contains("Nothing was said"),
+            "{}",
+            result.sentence()
+        );
+        // Not a failure and not a fault in the user's hardware, which is the
+        // whole reason this is a fourth variant rather than a `Failed`.
+        assert!(
+            !result.sentence().contains("Could not"),
+            "{}",
+            result.sentence()
+        );
+        assert!(
+            !result.sentence().contains("microphone"),
+            "{}",
+            result.sentence()
+        );
+        assert_eq!(result.transcribe_ms, None, "no backend was called");
+        assert_eq!(
+            result.backend, "stub",
+            "it still names what would have answered"
+        );
+        assert_eq!(result.audio_ms, 1_000);
+    }
+
+    /// The other direction, which is what stops the guard above being a mute
+    /// button: a buffer with somebody speaking in it still reaches the backend.
+    #[tokio::test]
+    async fn voice_transcribe_real_speech_still_reaches_the_backend() {
+        let result = handle_audio(
+            &StubTranscriber::hearing("go back"),
+            // The shortest real command among the fixtures: a one-syllable
+            // "Yes." at one and a half times speed. A bare word is a real
+            // command and must not be refused. (This was 200 ms of a square
+            // wave until issue #1450's voice check, which rightly refuses one.)
+            &spoken(
+                include_bytes!("fixtures/speech/yes-kristin.pcm"),
+                3_000.0,
+                120.0,
+                3,
+            ),
+        )
+        .await;
+
+        assert!(result.outcome.is_heard(), "{:?}", result.outcome);
+        assert_eq!(result.transcript().map(Transcript::text), Some("go back"));
+        assert!(result.transcribe_ms.is_some(), "the backend was called");
+    }
+
+    // -- issue #1450: non-speech that clears the audio gate ----------------
+
+    /// The sentence the maintainer found typed into an agent's prompt in
+    /// typing mode, having said nothing (issue #1450, 2026-10-03).
+    const REPORTED_ARTEFACT: &str =
+        "Until then, I'm signing off. I hope you have a wonderful day, and God bless you.";
+
+    /// A deterministic noise source in `[-1, 1]` — the same linear
+    /// congruential generator [`typing_on_a_keyboard`] uses, so every
+    /// fixture below is the same buffer on every run.
+    fn noise(seed: u32) -> impl FnMut() -> f64 {
+        let mut seed = seed;
+        move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from((seed >> 8) as i32 % 2_001 - 1_000) / 1_000.0
+        }
+    }
+
+    /// `seconds` of a room at an RMS of `level`. Uniform noise has an RMS of
+    /// `1/√3` of its amplitude, hence the scale.
+    fn room_tone(seconds: f64, level: f64, seed: u32) -> Vec<f64> {
+        let mut noise = noise(seed);
+        (0..(seconds * 16_000.0) as usize)
+            .map(|_| noise() * level * 3f64.sqrt())
+            .collect()
+    }
+
+    fn pcm(samples: Vec<f64>) -> Pcm16 {
+        Pcm16::new(
+            samples
+                .into_iter()
+                .map(|sample| sample.round().clamp(-32_768.0, 32_767.0) as i16)
+                .collect(),
+        )
+    }
+
+    fn add(base: &mut [f64], sound: &[f64], at_seconds: f64) {
+        let start = (at_seconds * 16_000.0) as usize;
+        for (slot, sample) in base[start..].iter_mut().zip(sound) {
+            *slot += sample;
+        }
+    }
+
+    /// Three seconds of a quiet room with one sound in it, at one second —
+    /// the shape of a segment a non-speech sound opens: the capture starts on
+    /// the sound and ends [`super::super::capture::SILENCE_HOLD`] after it.
+    /// Each sound is one a room produces while nobody speaks, and each clears
+    /// the audio gate (asserted where it is used, so a fixture that stopped
+    /// clearing it would fail loudly rather than prove nothing).
+    fn non_speech() -> Vec<(&'static str, Pcm16)> {
+        let mut sounds: Vec<(&'static str, Vec<f64>)> = Vec::new();
+        let mut n = noise(11);
+        // A 250 ms broadband burst — a bag put down, a door, a rustle. The
+        // case PR #1451 measured whisper-1 answering with an artefact.
+        sounds.push((
+            "a 250 ms burst",
+            (0..4_000).map(|_| n() * 2_500.0 * 3f64.sqrt()).collect(),
+        ));
+        // A breath: 450 ms of noise under a raised-cosine envelope.
+        let breath = 7_200;
+        sounds.push((
+            "a breath",
+            (0..breath)
+                .map(|i| {
+                    let envelope =
+                        0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / breath as f64).cos();
+                    n() * 900.0 * 3f64.sqrt() * envelope
+                })
+                .collect(),
+        ));
+        // A cough-like pair: low-passed decaying noise, twice.
+        let mut cough = Vec::new();
+        for _ in 0..2 {
+            let mut previous = 0.0;
+            for i in 0..2_880 {
+                let x = n() * 5_000.0 * 3f64.sqrt() * (-(i as f64) / 960.0).exp();
+                previous = 0.6 * previous + 0.4 * x;
+                cough.push(previous * 2.0);
+            }
+            cough.extend(std::iter::repeat_n(0.0, 2_400));
+        }
+        sounds.push(("a cough-like pair of bursts", cough));
+        // A knock on a hollow desk: a damped 90 Hz thump with a click on its
+        // front, ringing long enough to fill the gate's window.
+        let mut knock: Vec<f64> = (0..4_800)
+            .map(|i| {
+                let t = i as f64 / 16_000.0;
+                3_500.0 * (-t / 0.08).exp() * (std::f64::consts::TAU * 90.0 * t).sin()
+                    + if i < 40 { n() * 4_000.0 } else { 0.0 }
+            })
+            .collect();
+        knock.extend(knock.clone());
+        sounds.push(("two knocks", knock));
+        // A notification beep: 300 ms of 1 kHz.
+        sounds.push((
+            "a 1 kHz beep",
+            (0..4_800)
+                .map(|i| 3_000.0 * (std::f64::consts::TAU * 1_000.0 * i as f64 / 16_000.0).sin())
+                .collect(),
+        ));
+
+        sounds
+            .into_iter()
+            .enumerate()
+            .map(|(seed, (name, sound))| {
+                let mut room = room_tone(3.0, 70.0, 100 + seed as u32);
+                add(&mut room, &sound, 1.0);
+                (name, pcm(room))
+            })
+            .chain(std::iter::once((
+                "thirty seconds of typing",
+                typing_on_a_keyboard(),
+            )))
+            .collect()
+    }
+
+    /// The two shapes a backend's answer to that audio arrives in when nothing
+    /// in it says "no speech": OpenAI's `gpt-*` transcription models answer
+    /// plain `json` with no segments at all (and so does any server that
+    /// ignores `verbose_json`), and a whisper model can mark its own artefact
+    /// as speech — the reported sentence reached the prompt past the
+    /// per-segment guard, so its `no_speech_prob` was under [`NO_SPEECH_LIMIT`].
+    fn artefact_replies() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "a reply with no segments",
+                json!({ "text": REPORTED_ARTEFACT }),
+            ),
+            (
+                "a whisper reply that calls its artefact speech",
+                verbose(&[(&format!(" {REPORTED_ARTEFACT}"), 0.45, -0.3)]),
+            ),
+        ]
+    }
+
+    /// Scenario: issue #1450 — with typing mode on, the maintainer said
+    /// nothing and "Until then, I'm signing off. I hope you have a wonderful
+    /// day, and God bless you." was typed into the agent's prompt. Here a
+    /// quiet room with one non-speech sound in it (a burst, a breath, a cough,
+    /// a knock, a beep, a keyboard) clears the audio gate, and the backend
+    /// answers with that sentence and no sign that it is not speech. Nothing
+    /// may be heard: no text to type in typing mode and no command outside it.
+    #[tokio::test]
+    async fn voice_transcribe_non_speech_that_clears_the_audio_gate_is_never_heard() {
+        for (sound, audio) in non_speech() {
+            assert!(
+                audio.has_speech(),
+                "the premise: {sound} clears the audio gate ({:?})",
+                audio.measure_speech()
+            );
+            for (shape, reply) in artefact_replies() {
+                let result = handle_audio(&StubTranscriber::replying(&reply), &audio).await;
+                assert!(
+                    !result.outcome.is_heard(),
+                    "{sound}, {shape}: {:?}",
+                    result.outcome
+                );
+                assert_eq!(result.transcript(), None, "{sound}, {shape}");
+                assert!(
+                    !result.sentence().contains("signing off"),
+                    "{sound}, {shape}: {}",
+                    result.sentence()
+                );
+            }
+        }
+    }
+
+    /// One utterance from `fixtures/speech/`: real (synthesised) speech
+    /// scaled so its loudest 20 ms reaches `peak`, inside `room` of room tone
+    /// with 600 ms before it and 900 ms after — what a finished segment holds.
+    fn spoken(fixture: &[u8], peak: f64, room: f64, seed: u32) -> Pcm16 {
+        let speech: Vec<f64> = fixture
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| f64::from(i16::from_le_bytes(*pair)))
+            .collect();
+        let loudest = speech
+            .as_chunks::<320>()
+            .0
+            .iter()
+            .map(|frame| (frame.iter().map(|s| s * s).sum::<f64>() / 320.0).sqrt())
+            .fold(0.0, f64::max);
+        let gain = peak / loudest.max(1.0);
+        let scaled: Vec<f64> = speech.iter().map(|s| s * gain).collect();
+        let mut samples = room_tone(1.5 + scaled.len() as f64 / 16_000.0, room, seed);
+        add(&mut samples, &scaled, 0.6);
+        pcm(samples)
+    }
+
+    /// Every short command fixture, with the text it says. Two voices — a
+    /// male one at normal speed and a female one at one and a half times —
+    /// and the reserved typing-mode phrases among the commands.
+    const COMMANDS: &[(&str, &[u8])] = &[
+        (
+            "Send it.",
+            include_bytes!("fixtures/speech/send-it-john.pcm"),
+        ),
+        (
+            "Send it.",
+            include_bytes!("fixtures/speech/send-it-kristin.pcm"),
+        ),
+        (
+            "Type off.",
+            include_bytes!("fixtures/speech/type-off-john.pcm"),
+        ),
+        (
+            "Type off.",
+            include_bytes!("fixtures/speech/type-off-kristin.pcm"),
+        ),
+        (
+            "Type on.",
+            include_bytes!("fixtures/speech/type-on-john.pcm"),
+        ),
+        (
+            "Type on.",
+            include_bytes!("fixtures/speech/type-on-kristin.pcm"),
+        ),
+        ("Stop.", include_bytes!("fixtures/speech/stop-john.pcm")),
+        ("Stop.", include_bytes!("fixtures/speech/stop-kristin.pcm")),
+        ("Yes.", include_bytes!("fixtures/speech/yes-john.pcm")),
+        ("Yes.", include_bytes!("fixtures/speech/yes-kristin.pcm")),
+        ("Next.", include_bytes!("fixtures/speech/next-john.pcm")),
+        ("Next.", include_bytes!("fixtures/speech/next-kristin.pcm")),
+        (
+            "Go back.",
+            include_bytes!("fixtures/speech/go-back-john.pcm"),
+        ),
+        (
+            "Go back.",
+            include_bytes!("fixtures/speech/go-back-kristin.pcm"),
+        ),
+        (
+            "Please add a unit test for the parser.",
+            include_bytes!("fixtures/speech/dictation-joe.pcm"),
+        ),
+    ];
+
+    /// Scenario: the control for issue #1450's fix — somebody says a short
+    /// command ("send it", "type off", "type on", "stop", "yes", "next", "go
+    /// back") or a dictated sentence, loudly and at the quiet end of what the
+    /// audio gate passes, in a room with tone in it. Every one still reaches
+    /// the backend and is heard word for word, so typing mode still types and
+    /// still stops, and commands still run.
+    #[tokio::test]
+    async fn voice_transcribe_real_short_commands_still_reach_the_backend() {
+        for (seed, (said, fixture)) in COMMANDS.iter().enumerate() {
+            // Loud: a peak of 3 000 over a room at 120. Quiet: a peak of 800
+            // over a room at 80, 20 dB — near the quiet end of what the audio
+            // gate in front of this fix passes for a one-syllable word.
+            for (level, peak, room) in [("loud", 3_000.0, 120.0), ("quiet", 800.0, 80.0)] {
+                let audio = spoken(fixture, peak, room, seed as u32);
+                let result = handle_audio(&StubTranscriber::hearing(*said), &audio).await;
+                assert_eq!(
+                    result.transcript().map(Transcript::text),
+                    Some(*said),
+                    "{said} ({level}): {:?}",
+                    result.outcome
+                );
+                assert!(result.transcribe_ms.is_some(), "{said} ({level})");
+            }
+        }
+    }
+
+    /// Scenario: somebody knocks on the desk or puts a mug down, and a moment
+    /// later says a short command quietly, all in one segment. The loud sound
+    /// must not drown the command: it still reaches the backend and is heard
+    /// (Greptile on PR #1550 — the level is normalised before the voice check,
+    /// and a normalisation taken from the loudest moment of the whole segment
+    /// would turn the command down by the knock's level).
+    #[tokio::test]
+    async fn voice_transcribe_a_quiet_command_after_a_loud_knock_is_still_heard() {
+        let mut n = noise(23);
+        let knock: Vec<f64> = (0..4_800)
+            .map(|i| {
+                let t = i as f64 / 16_000.0;
+                9_000.0 * (-t / 0.08).exp() * (std::f64::consts::TAU * 90.0 * t).sin()
+                    + if i < 40 { n() * 9_000.0 } else { 0.0 }
+            })
+            .collect();
+        for (seed, (said, fixture)) in COMMANDS.iter().enumerate().take(14) {
+            // Quiet, at a peak of 1 200 over a room at 80, and under a knock
+            // at 9 000 — clear of the audio gate, so only the voice check can
+            // refuse it.
+            let command = spoken(fixture, 1_200.0, 80.0, 40 + seed as u32);
+            let mut samples: Vec<f64> = command.samples().iter().map(|&s| f64::from(s)).collect();
+            // Room before the command (`spoken` leads with 600 ms) holds the
+            // knock at 100 ms, so 500 ms separate it from the first word.
+            add(&mut samples, &knock[..1_600.min(knock.len())], 0.1);
+            let audio = pcm(samples);
+            let result = handle_audio(&StubTranscriber::hearing(*said), &audio).await;
+            assert_eq!(
+                result.transcript().map(Transcript::text),
+                Some(*said),
+                "{said} after a knock: {:?}",
+                result.outcome
+            );
+        }
+    }
+
+    /// Scenario: a real short command the local speech model is unsure of.
+    /// Measured 2026-10-04 against the default local container
+    /// (`faster-whisper-tiny.en`): "Send it." came back with a no-speech
+    /// probability of 0.699 and 0.678 and "Yes." with 0.691 — over the 0.6 the
+    /// per-segment guard used alone, so a command somebody really said was
+    /// dropped, while every non-speech sound measured scored an average log
+    /// probability under -1.0 or a no-speech probability over 0.8. The
+    /// command is heard.
+    #[tokio::test]
+    async fn voice_transcribe_a_short_command_the_local_model_doubts_is_still_heard() {
+        let audio = spoken(COMMANDS[0].1, 3_000.0, 120.0, 7);
+        for (said, no_speech, logprob) in [
+            (" Send it.", 0.699, -0.607),
+            (" Send it.", 0.678, -0.935),
+            (" Yes.", 0.691, -0.313),
+        ] {
+            let result = handle_audio(
+                &StubTranscriber::replying(&verbose(&[(said, no_speech, logprob)])),
+                &audio,
+            )
+            .await;
+            assert_eq!(
+                result.transcript().map(Transcript::text),
+                Some(said.trim()),
+                "{said} at no_speech_prob {no_speech}, avg_logprob {logprob}: {:?}",
+                result.outcome
+            );
+        }
+    }
+
+    /// The sentence the maintainer found typed into an agent's prompt in
+    /// typing mode on 2026-10-20, having said nothing, after PR #1550's voice
+    /// check had shipped (issue #1450).
+    const INVENTED_AFTER_THE_VOICE_CHECK: &str = "Then, thank you very much for having me.";
+
+    /// The ways a backend can hand back a sentence the audio does not hold,
+    /// with nothing in the reply that marks it: plain text with no segments
+    /// (OpenAI's `gpt-*` models, or a server that ignores `verbose_json`), and
+    /// a whisper reply whose segment calls the sentence speech.
+    fn invented_replies(sentence: &str) -> Vec<(&'static str, Value)> {
+        vec![
+            ("a reply with no segments", json!({ "text": sentence })),
+            (
+                "a whisper reply that calls it speech",
+                verbose(&[(&format!(" {sentence}"), 0.2, -0.3)]),
+            ),
+        ]
+    }
+
+    /// Scenario: issue #1450 after PR #1550 — a sound with a fraction of a
+    /// second of voice in it clears both checks in front of the backend (here
+    /// a real one-word "Stop." at one and a half times speed), and the backend
+    /// answers with a fluent eight-word sentence: "Then, thank you very much
+    /// for having me." Eight words do not fit in that much voice, so the
+    /// sentence was invented: nothing is heard, nothing is typed in typing
+    /// mode and nothing reaches the Commands model.
+    #[tokio::test]
+    async fn voice_transcribe_an_invented_sentence_from_a_moment_of_voice_is_never_heard() {
+        let audio = spoken(
+            include_bytes!("fixtures/speech/stop-kristin.pcm"),
+            3_000.0,
+            120.0,
+            5,
+        );
+        let voice = human_voice::measure(&audio);
+        assert!(
+            eligibility(&audio).is_ok() && voice.voice < Duration::from_millis(500),
+            "the premise: under half a second of voice that clears both checks ({voice:?})"
+        );
+        for sentence in [INVENTED_AFTER_THE_VOICE_CHECK, REPORTED_ARTEFACT] {
+            for (shape, reply) in invented_replies(sentence) {
+                let result = handle_audio(&StubTranscriber::replying(&reply), &audio).await;
+                assert!(
+                    !result.outcome.is_heard(),
+                    "{sentence:?}, {shape}: {:?}",
+                    result.outcome
+                );
+                assert!(
+                    !result.sentence().contains("thank you")
+                        && !result.sentence().contains("signing off"),
+                    "{shape}: {}",
+                    result.sentence()
+                );
+            }
+        }
+    }
+
+    /// A `verbose_json` reply with timing, the shape the local container
+    /// answered with on 2026-10-20 when asked for word and segment timestamps:
+    /// one segment per `(text, start, end)` with a confident no-speech verdict,
+    /// and a top-level `words` list of `(word, start, end)`.
+    fn timed_reply(segments: &[(&str, f64, f64)], words: &[(&str, f64, f64)]) -> Value {
+        let text: String = segments.iter().map(|(text, ..)| *text).collect();
+        json!({
+            "text": text.trim(),
+            "segments": segments
+                .iter()
+                .map(|(text, start, end)| json!({
+                    "text": text,
+                    "start": start,
+                    "end": end,
+                    "no_speech_prob": 0.05,
+                    "avg_logprob": -0.2,
+                }))
+                .collect::<Vec<_>>(),
+            "words": words
+                .iter()
+                .map(|(word, start, end)| json!({ "word": word, "start": start, "end": end }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Scenario: the user dictates "Please add a unit test for the parser."
+    /// and the local container answers with its own word timing — measured
+    /// 2026-10-20 for this fixture, "Please" starting 0.36 s before the voice
+    /// does. Every word is timed on the voice and eight words fit in it, so
+    /// the sentence is heard word for word.
+    #[tokio::test]
+    async fn voice_transcribe_real_dictation_with_the_local_models_timing_is_heard() {
+        let audio = spoken(COMMANDS[14].1, 3_000.0, 120.0, 4);
+        let reply = timed_reply(
+            &[(" Please add a unit test for the parser.", 0.24, 2.54)],
+            &[
+                (" Please", 0.24, 0.94),
+                (" add", 0.94, 1.16),
+                (" a", 1.16, 1.52),
+                (" unit", 1.52, 1.6),
+                (" test", 1.6, 1.88),
+                (" for", 1.88, 2.06),
+                (" the", 2.06, 2.3),
+                (" parser.", 2.3, 2.54),
+            ],
+        );
+        let result = handle_audio(&StubTranscriber::replying(&reply), &audio).await;
+        assert_eq!(
+            result.transcript().map(Transcript::text),
+            Some("Please add a unit test for the parser."),
+            "{:?}",
+            result.outcome
+        );
+    }
+
+    /// Scenario: the user says "Stop." and the backend adds "Thank you." after
+    /// it, timed over the quiet room that follows the word. Three words would
+    /// fit in the voice, so only the timing gives the addition away: a word
+    /// timed where there was no voice was not said, and nothing is heard.
+    #[tokio::test]
+    async fn voice_transcribe_words_timed_after_the_voice_are_never_heard() {
+        let audio = spoken(
+            include_bytes!("fixtures/speech/stop-john.pcm"),
+            3_000.0,
+            120.0,
+            6,
+        );
+        let timed_on_the_voice =
+            |words: &[(&str, f64, f64)]| timed_reply(&[(" Stop. Thank you.", 0.6, 2.0)], words);
+        let invented = timed_on_the_voice(&[
+            (" Stop.", 0.6, 1.0),
+            (" Thank", 1.7, 1.85),
+            (" you.", 1.85, 2.0),
+        ]);
+        let result = handle_audio(&StubTranscriber::replying(&invented), &audio).await;
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+        let TranscriptionOutcome::Silent { detail, sentence } = &result.outcome else {
+            panic!("{:?}", result.outcome);
+        };
+        assert_eq!(sentence, NOTHING_HEARD);
+        assert!(detail.contains("where no voice was detected"), "{detail}");
+        assert!(
+            !detail.contains("Thank"),
+            "the detail quotes no text: {detail}"
+        );
+
+        // The control: the same reply with "Stop." alone is heard.
+        let said = timed_reply(&[(" Stop.", 0.6, 1.0)], &[(" Stop.", 0.6, 1.0)]);
+        let result = handle_audio(&StubTranscriber::replying(&said), &audio).await;
+        assert_eq!(
+            result.transcript().map(Transcript::text),
+            Some("Stop."),
+            "{:?}",
+            result.outcome
+        );
+    }
+
+    /// Scenario: the user dictates a sentence and stops talking, and the
+    /// backend appends a second segment — "Thank you for watching." — timed
+    /// over the quiet after it, with nothing marking it as no-speech and no
+    /// word timing. The whole reply fits in the sentence's voice, but the
+    /// second segment's words do not fit in the voice inside its own time, so
+    /// that segment is dropped and the dictated sentence alone is heard; a
+    /// reply of only the appended segment is not heard at all.
+    #[tokio::test]
+    async fn voice_transcribe_a_segment_timed_over_quiet_is_dropped_and_the_speech_kept() {
+        let mut samples = room_tone(6.0, 120.0, 8);
+        let dictated = spoken(COMMANDS[14].1, 3_000.0, 0.0, 8);
+        add(
+            &mut samples,
+            &dictated
+                .samples()
+                .iter()
+                .map(|&sample| f64::from(sample))
+                .collect::<Vec<_>>(),
+            0.0,
+        );
+        let audio = pcm(samples);
+        let segments_only = |segments: &[(&str, f64, f64)]| timed_reply(segments, &[]);
+        let invented = segments_only(&[
+            (" Please add a unit test for the parser.", 0.3, 2.6),
+            (" Thank you for watching.", 4.0, 5.5),
+        ]);
+        let result = handle_audio(&StubTranscriber::replying(&invented), &audio).await;
+        assert_eq!(
+            result.transcript().map(Transcript::text),
+            Some("Please add a unit test for the parser."),
+            "{:?}",
+            result.outcome
+        );
+
+        let only_invented = segments_only(&[(" Thank you for watching.", 4.0, 5.5)]);
+        let result = handle_audio(&StubTranscriber::replying(&only_invented), &audio).await;
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+    }
+
+    /// The timing a reply gives is read from where each backend puts it:
+    /// OpenAI's and the local container's top-level `words`, or a list inside
+    /// each segment. A word inside a segment the no-speech guard dropped is
+    /// not held against the voice, a lone punctuation mark is not a word, and
+    /// an entry missing a time is left out rather than guessed at.
+    #[test]
+    fn voice_transcribe_reads_the_timing_a_reply_gives() {
+        let top_level = parse_response(&json!({
+            "text": "Send it.",
+            "segments": [
+                { "text": " Send it.", "start": 0.33, "end": 2.09,
+                  "no_speech_prob": 0.28, "avg_logprob": -0.331 },
+                { "text": " Thank you.", "start": 3.0, "end": 4.0,
+                  "no_speech_prob": 0.95, "avg_logprob": -0.3 },
+            ],
+            "words": [
+                { "word": " Send", "start": 0.33, "end": 1.01 },
+                { "word": " it.", "start": 1.01, "end": 2.09 },
+                { "word": " .", "start": 2.09, "end": 2.09 },
+                { "word": " Thank", "start": 3.0, "end": 3.5 },
+                { "word": " you.", "start": 3.5 },
+            ],
+        }))
+        .expect("parses");
+        assert_eq!(top_level.text(), "Send it.");
+        assert_eq!(
+            top_level.timing,
+            Timing {
+                segments: vec![Timed {
+                    start: 0.33,
+                    end: 2.09,
+                    words: 2
+                }],
+                words: vec![
+                    Timed {
+                        start: 0.33,
+                        end: 1.01,
+                        words: 1
+                    },
+                    Timed {
+                        start: 1.01,
+                        end: 2.09,
+                        words: 1
+                    },
+                ],
+            }
+        );
+
+        let nested = parse_response(&json!({
+            "text": "Yes.",
+            "segments": [{
+                "text": " Yes.", "start": 0.5, "end": 0.9,
+                "no_speech_prob": 0.1, "avg_logprob": -0.2,
+                "words": [{ "word": " Yes.", "start": 0.5, "end": 0.9 }],
+            }],
+        }))
+        .expect("parses");
+        assert_eq!(
+            nested.timing.words,
+            vec![Timed {
+                start: 0.5,
+                end: 0.9,
+                words: 1
+            }]
+        );
+
+        let untimed = parse_response(&json!({ "text": "Yes." })).expect("parses");
+        assert_eq!(untimed.timing, Timing::default());
+    }
+
+    #[test]
+    fn voice_transcribe_silence_serializes_a_kind_the_webview_reads() {
+        let (detail, sentence) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::from_millis(40),
+            peak_rms: 5_000,
+            room_rms: 180,
+        });
+        let silent = TranscriptionOutcome::Silent { detail, sentence };
+        let json = serde_json::to_value(&silent).expect("serializes");
+        assert_eq!(json["kind"], "silent");
+        // `detail` is carried and the webview's union declares it. It used to
+        // be absent on the argument that there was nothing to diagnose — see
+        // `TranscriptionOutcome::Silent` for why that stopped being true.
+        assert_eq!(
+            json["detail"],
+            "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed — the loudest \
+             moment reached 5000 against a room at 180, where speech has to reach 540"
+        );
+        assert_eq!(json["sentence"], NOTHING_HEARD, "{json}");
+    }
+
+    /// The two refusals, pinned as the two different things a user has to DO —
+    /// and the details pinned WHOLE, because the numbers are the point of them.
+    ///
+    /// The branch is on whether any frame counted as speech at all, which is
+    /// what separates "nothing you said rose out of your room" from "that was
+    /// speech and there was not enough of it". It is deliberately not a level
+    /// comparison any more: the bar moves with the room, so `peak_rms` against
+    /// the bar printed beside it is not a question with one answer, and
+    /// `voiced` is the rule's own.
+    ///
+    /// **Both details carry all three numbers**, which is the correction PRD
+    /// #802's product owner bought with a round trip: his refusal was the
+    /// density one, it reported 60 ms and no level, and the fact that decided
+    /// the redesign — that his peak cleared the old absolute floor while two
+    /// thirds of his densest window did not — was not in it. The sentences
+    /// carry none of them since PR #1451 (see [`NOTHING_HEARD`]).
+    #[test]
+    fn voice_transcribe_the_refusal_names_which_of_the_two_causes_it_was() {
+        let (detail, sentence) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::ZERO,
+            peak_rms: 410,
+            room_rms: 180,
+        });
+        assert_eq!(
+            detail,
+            "too quiet — the loudest moment reached 410 against a room at 180, where speech has \
+             to reach 540"
+        );
+        assert_eq!(sentence, TOO_QUIET);
+
+        // PRD #802's own report, as the sentence he would get today.
+        let (detail, sentence) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::from_millis(60),
+            peak_rms: 820,
+            room_rms: 95,
+        });
+        assert_eq!(
+            detail,
+            "only 60 ms of speech inside the loudest 200 ms, where 120 ms is needed — the loudest \
+             moment reached 820 against a room at 95, where speech has to reach 285"
+        );
+        assert_eq!(sentence, NOTHING_HEARD);
+
+        // One frame counted, so it is the LENGTH branch however quiet the peak
+        // was: `voiced` is the rule's own answer and the sentence follows it.
+        let (detail, _) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::from_millis(20),
+            peak_rms: 70,
+            room_rms: 0,
+        });
+        assert!(detail.starts_with("only 20 ms"), "{detail}");
+        // A silent buffer reports the floor as its room rather than nothing,
+        // so the bar never reads as three times zero. `SpeechDetector` clamps
+        // there, which is why no `SpeechMeasure` carries a smaller room.
+        let (detail, _) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::ZERO,
+            peak_rms: 12,
+            room_rms: SILENCE_RMS,
+        });
+        assert!(
+            detail.ends_with(&format!("has to reach {}", SILENCE_RMS * 3)),
+            "{detail}"
+        );
+    }
+
+    /// Neither refusal blames the user's hardware, whichever branch it took.
+    ///
+    /// The rule `TranscriptionOutcome::Silent` exists to keep: the backstop's
+    /// detail used to read "the microphone heard nothing", which sent PRD
+    /// #802's product owner looking for a fault in a device that was working.
+    #[test]
+    fn voice_transcribe_neither_refusal_blames_the_device() {
+        for measure in [
+            SpeechMeasure {
+                voiced: Duration::ZERO,
+                peak_rms: 0,
+                room_rms: 0,
+            },
+            SpeechMeasure {
+                voiced: Duration::from_millis(80),
+                peak_rms: 9_000,
+                room_rms: 1_200,
+            },
+        ] {
+            let (detail, sentence) = not_enough_speech(measure);
+            for text in [&detail, &sentence] {
+                for banned in ["microphone", "Nothing was said", "failed", "error"] {
+                    assert!(!text.contains(banned), "`{banned}` in: {text}");
+                }
+            }
+        }
+    }
+
+    /// Scenario: the built code, on this build's own default settings, posts a
+    /// real utterance to a real speech container on loopback and gets words
+    /// back.
+    ///
+    /// **The one test here that reaches a running service, and it is
+    /// `#[ignore]`d for that reason** — every other test in this module is
+    /// bytes in, bytes out, which is PRD #802 M5's rule and what keeps the
+    /// merge-blocking tier free of sockets. This one exists because a suite of
+    /// stubs passes identically whether or not the local backend can actually
+    /// talk to a container: it asserts the whole seam the settings name, from
+    /// `TranscriptionSettings` through `transcriber_for` to a parsed
+    /// [`Transcript`], with no credential anywhere.
+    ///
+    /// To run it, start the container and hand it an utterance as raw
+    /// 16 kHz mono little-endian i16 — which is exactly what
+    /// [`super::capture`] produces, so no WAV parser is needed here:
+    ///
+    /// ```text
+    /// docker run -d -p 18000:8000 ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu
+    /// espeak-ng -v en-us -w say.wav "show me the tester"
+    /// ffmpeg -i say.wav -ac 1 -ar 16000 -f s16le utterance.pcm
+    /// DAD_LOCAL_SPEECH_PCM=$PWD/utterance.pcm \
+    ///   cargo test -p dot-agent-deck-desktop --lib \
+    ///   voice_transcribe_local_container -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a speech container on loopback; the doc comment has the two commands"]
+    async fn voice_transcribe_local_container_transcribes_a_real_utterance() {
+        let path = std::env::var("DAD_LOCAL_SPEECH_PCM").expect(
+            "set DAD_LOCAL_SPEECH_PCM to raw 16 kHz mono LE i16 audio — see the doc comment",
+        );
+        let raw = std::fs::read(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+        let samples: Vec<i16> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair))
+            .collect();
+        let audio = Pcm16::new(samples);
+        assert!(
+            !audio.is_silent(),
+            "{path} is silence; nothing would be sent"
+        );
+
+        // This build's own defaults, untouched: the keyless local backend at
+        // the preset loopback endpoint, asking for the preset model.
+        let settings = TranscriptionSettings::default();
+        assert_eq!(settings.backend, TranscriptionBackend::Local);
+        let transcriber = transcriber_for(&settings, store());
+        let result = handle_audio(transcriber.as_ref(), &audio).await;
+
+        println!(
+            "backend={} audio={}ms transcribe={:?}ms outcome={:?}",
+            result.backend, result.audio_ms, result.transcribe_ms, result.outcome
+        );
+        let transcript = result
+            .transcript()
+            .unwrap_or_else(|| panic!("no transcript: {}", result.sentence()));
+        assert!(
+            !transcript.text().trim().is_empty(),
+            "the container answered with no words"
+        );
+        assert_eq!(result.backend, "local");
+    }
+
+    #[test]
+    fn voice_transcribe_names_itself_for_the_surface() {
+        assert_eq!(keyed(store()).backend_name(), "remote");
+        assert_eq!(
+            HttpTranscriber::keyless(
+                ServiceUrl::parse(LOCAL_SPEECH_ENDPOINT).expect("valid"),
+                ModelId::parse(LOCAL_SPEECH_MODEL).expect("valid"),
+            )
+            .expect("the preset endpoint is loopback")
+            .backend_name(),
+            "local"
+        );
+    }
+}

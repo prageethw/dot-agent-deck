@@ -7,15 +7,13 @@
 //! (`render_new_pane_form`) and its state (`NewPaneFormState`) are private and
 //! there is no public L1 render seam (only `render_card_to_buffer` is public),
 //! so the dialog is exercised by driving the REAL binary through a PTY — the
-//! same Ctrl+n → dir-picker → new-pane-form flow `tabs/mode/005` uses — and
+//! Ctrl+n → dir-picker → new-pane-form flow — and
 //! asserting on the rendered vt100 grid.
 //!
 //! ## Pinned contract (for the coder)
-//! The dialog's Mode field is a cycler that shows one option at a time
-//! (`◀ name ▶`). The "schedule" option is a built-in authoring mode placed at
-//! the END of the cycle (after the project's workload modes), so cycling Right
-//! to the cap lands on it. It is VISUALLY SEPARATED from the workload modes by
-//! an authoring-session affordance — a hint line marked with `↳` reading
+//! The dialog's Mode field includes project orchestrations and built-in
+//! authoring choices. Selecting `schedule` shows an authoring-session hint
+//! marked with `↳` reading
 //! exactly `↳ authoring (one-off)` (the PRD's "throwaway authoring session"
 //! marker), short enough to stay fully CONTAINED within the new-pane modal
 //! border. RED today: the hint renders the long
@@ -27,12 +25,11 @@ mod common;
 use common::TuiDeck;
 use spec::spec;
 
-/// Scenario: Launch the deck in a fixture whose `.dot-agent-deck.toml` defines
-/// one workload mode (`build`). Open the new-deck dialog (Ctrl+n → Space
+/// Scenario: Launch the deck in a fixture with no project choices. Open the
+/// New Agent dialog (Ctrl+n → Space
 /// confirms the dir → the new-pane form), then cycle the Mode field to the end
 /// of its options so the built-in `schedule` authoring option is selected.
-/// Assert the authoring-session affordance — the `↳`-marked hint that visually
-/// separates `schedule` from the workload modes — renders its FULL text as
+/// Assert the authoring-session affordance — the `↳`-marked hint — renders as
 /// exactly `↳ authoring (one-off)` AND is fully contained within the new-pane
 /// modal border (its tail is followed by padding before the right `│`, not
 /// clipped by it). RED today: the hint is the long
@@ -42,7 +39,7 @@ use spec::spec;
 #[test]
 fn new_pane_007_schedule_authoring_option_visually_separated() {
     let deck = TuiDeck::launch_with_fixture("schedule-mode");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the new-pane form: Ctrl+n → directory picker, Space confirms the
     // current dir (no quiescence wait — the deck repaints on a periodic tick).
@@ -53,7 +50,7 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
     // Saturate the cycler (it caps at the last option), then step back ONE.
     // PRD #220: the built-in "schedule" option is no longer last — the graduated
     // "dispatcher" option sits after it — so saturating alone lands on the wrong
-    // one. Saturate-then-Left is stable against the mode/orchestration counts of
+    // one. Saturate-then-Left is stable against the orchestration counts of
     // whatever fixture this runs on, which is why the Rights are not just counted.
     deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → dispatcher (cap)
     deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
@@ -131,16 +128,13 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
 /// `schedule` authoring option, type the stand-in command `cat` into the Command
 /// field (so the spawn never depends on a real agent binary being on PATH), and
 /// submit it. Assert the authoring session lands as a single-agent DASHBOARD
-/// CARD — the dashboard's `dot-agent-deck — N session(s)` title renders (it shows
-/// only on the Dashboard tab) and no `×` tab-close glyph appears — NOT as a 50/50
-/// mode tab, which would open a second tab whose strip carries a `×` and hide the
-/// dashboard title. RED today: the `schedule` option opens via `render_mode_tab`
-/// as a mode tab, so a `×` appears and the dashboard title is absent.
+/// CARD — the dashboard's `dot-agent-deck — N agent(s)` title renders (it shows
+/// only on the Dashboard tab) and no `×` tab-close glyph appears.
 #[spec("prompt/new-pane/008")]
 #[test]
 fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     let deck = TuiDeck::launch_with_fixture("schedule-mode");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the new-pane form and cycle the Mode field to the built-in
     // `schedule` authoring option (the cycler caps at the last option) —
@@ -161,7 +155,7 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     // ("Unable to spawn claude") and the layout never settles — a dependency on
     // a real agent binary this test never meant to have. `cat` is a real binary
     // that blocks on stdin, so the spawn deterministically succeeds; the
-    // card-vs-mode-tab layout renders independent of WHICH command is spawned,
+    // resulting layout renders independent of WHICH command is spawned,
     // which is exactly what this test asserts. Same drive as
     // `prompt/new-pane/013` in `e2e_new_pane_seed.rs`.
     deck.send_keys(b"\r"); // Mode → Name
@@ -182,9 +176,9 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     // Submitting closes the form; wait for the resulting layout to settle into
     // one of the two observable end-states: a single-agent dashboard card (the
     // dashboard's session-count title renders only on the Dashboard tab) or a
-    // 50/50 mode tab (a second tab whose strip carries a `×` close glyph).
+    // second tab (whose strip carries a `×` close glyph).
     deck.wait_for_absence("[Submit]"); // form closed
-    deck.wait_until_grid("schedule submit settles into a card or a mode tab", |g| {
+    deck.wait_until_grid("schedule submit settles into a card", |g| {
         g.contains("worker-deck \u{2014}") || g.contains("×")
     });
 
@@ -192,37 +186,33 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     assert!(
         grid.contains("worker-deck \u{2014}"),
         "the `schedule` authoring session must open as a single-agent DASHBOARD CARD: the \
-         dashboard's `worker-deck — N session(s)` title renders only on the Dashboard \
+         dashboard's `worker-deck — N agent(s)` title renders only on the Dashboard \
          tab, so its presence is what proves the authoring session stayed a card.\nGrid:\n{grid}"
     );
     assert!(
         !grid.contains("×"),
-        "the `schedule` authoring session must NOT open as a 50/50 mode tab: a mode tab \
-         creates a second tab whose strip carries a `×` close glyph. A `×` on screen means \
-         the authoring agent was (wrongly) routed through `render_mode_tab` instead of \
-         landing as a dashboard card.\nGrid:\n{grid}"
+        "the `schedule` authoring session must NOT open a tab of its own: any second tab \
+         puts a `×` close glyph on the tab strip. A `×` on screen means the authoring \
+         agent was (wrongly) given its own tab instead of landing as a dashboard \
+         card.\nGrid:\n{grid}"
     );
 }
 
-/// Scenario: Launch the deck in a fixture whose `.dot-agent-deck.toml` defines a
-/// workload mode (`build`) PLUS an orchestration (`ci-deployment`), so the
-/// new-deck dialog's Mode field renders a long chip row
-/// (`  Mode: [No mode] [build] [Orch: ci-deployment] [schedule]`) that is wider
-/// than the capped modal. Open the new-pane form (Ctrl+n → Space confirms the
-/// dir), then cycle the Mode field to the end so the built-in `[schedule]` chip
-/// is the selected option, and assert that the `[schedule]` chip renders FULLY
-/// within the modal's vertical borders — it is not clipped off the right edge.
-/// RED today: the chip row overflows the modal's inner width, so the renderer
-/// breaks the chip loop before drawing the trailing `[schedule]` chip, leaving
-/// it absent from every between-the-borders span. The assertion is
-/// approach-agnostic: it passes whether the coder later WRAPS the chip row to a
-/// second line or WINDOWS/scrolls the cycler, as long as the selected
-/// `[schedule]` chip ends up visible inside the modal.
+/// Scenario: Launch the deck with two long orchestration names and shrink the
+/// terminal to 80×24, so the New Agent dialog's Mode chip row is wider than the
+/// modal's 90%-of-terminal cap. Open the new-pane form (Ctrl+n → Space confirms
+/// the dir), cycle the Mode field onto the built-in `[schedule]` option, and
+/// assert that every chip — `[No mode]`, both `[Orch: …]` chips, `[schedule]`
+/// and `[dispatcher]` — renders whole between the modal's borders, the chips
+/// spread over more than one row (PRD #168: the row wraps instead of clipping).
 #[spec("prompt/new-pane/009")]
 #[test]
 fn new_pane_009_schedule_chip_contained_when_row_overflows() {
-    let deck = TuiDeck::launch_with_fixture("mode-chip-overflow");
-    deck.wait_for_string("No active sessions");
+    let mut deck = TuiDeck::launch_with_fixture("mode-chip-overflow");
+    deck.wait_for_string("No active agents");
+    // At 80 columns the modal is capped at 72, well short of the ~102 columns
+    // the single-row chip layout would need.
+    deck.resize(80, 24);
 
     // Open the new-pane form: Ctrl+n → directory picker, Space confirms the
     // current dir → the new-pane form.
@@ -248,29 +238,42 @@ fn new_pane_009_schedule_chip_contained_when_row_overflows() {
 
     let grid = deck.snapshot_grid();
 
-    // The selected `[schedule]` chip must render FULLY between the modal's
-    // vertical borders (`│`, U+2502). Scan every row bounded by a left AND a
-    // right `│` and check whether the bracketed chip lands inside that inner
-    // span — a wrap fix puts the chip on a second content line, a window/scroll
-    // fix keeps it on the Mode line, and both still live between the borders.
-    // The top-border title row carries corner glyphs (`┌ … ┐`), not `│ … │`, so
-    // the title's "schedule mode" (no brackets) is excluded; only the bracketed
-    // chip counts.
+    // Every chip must render FULLY between the modal's vertical borders (`│`,
+    // U+2502), on one of the rows bounded by a left AND a right `│`. The
+    // top-border title row carries corner glyphs (`┌ … ┐`), not `│ … │`, so the
+    // title's "schedule mode" (no brackets) is excluded; only bracketed chips
+    // count.
     let bar = '\u{2502}';
-    let contained = grid
+    let inner_rows: Vec<&str> = grid
         .lines()
-        .any(|line| match (line.find(bar), line.rfind(bar)) {
-            (Some(l), Some(r)) if r > l => line[l + bar.len_utf8()..r].contains("[schedule]"),
-            _ => false,
-        });
-
+        .filter_map(|line| match (line.find(bar), line.rfind(bar)) {
+            (Some(l), Some(r)) if r > l => Some(&line[l + bar.len_utf8()..r]),
+            _ => None,
+        })
+        .collect();
+    let chips = [
+        "[No mode]",
+        "[Orch: ci-deployment-alpha]",
+        "[Orch: ci-deployment-bravo]",
+        "[schedule]",
+        "[dispatcher]",
+    ];
+    for chip in chips {
+        assert!(
+            inner_rows.iter().any(|row| row.contains(chip)),
+            "the Mode chip {chip} must render FULLY within the new-pane modal \
+             border at 80 columns: the chip row is wider than the capped modal, \
+             so it must wrap onto further rows instead of clipping.\nGrid:\n{grid}"
+        );
+    }
+    let chip_rows = inner_rows
+        .iter()
+        .filter(|row| chips.iter().any(|chip| row.contains(chip)))
+        .count();
     assert!(
-        contained,
-        "the selected `[schedule]` chip must render FULLY within the new-pane modal border, \
-         but it is clipped off the right edge. The Mode chip row \
-         (`  Mode: [No mode] [build] [Orch: ci-deployment] [schedule]`) overflows the modal's \
-         inner width, so the renderer drops the trailing `[schedule]` chip and it never appears \
-         between any row's `│ … │` borders.\nGrid:\n{grid}"
+        chip_rows > 1,
+        "at 80 columns the Mode chips cannot share one modal row, so they must \
+         wrap onto more than one.\nGrid:\n{grid}"
     );
 }
 
@@ -295,7 +298,7 @@ fn new_pane_010_issue_dispatch_option_flag_gated() {
     let on = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("schedule-mode");
-    on.wait_for_string("No active sessions");
+    on.wait_for_string("No active agents");
     on.send_keys(b"\x0e"); // Ctrl+n → directory picker
     on.send_keys(b" "); // Space → confirm current dir → new-pane form
     // The Mode field is up at "No mode"; the chip row (all options) paints in the
@@ -312,7 +315,7 @@ fn new_pane_010_issue_dispatch_option_flag_gated() {
 
     // --- experimental OFF (control): the option is hidden; plain schedule stays. ---
     let off = TuiDeck::launch_with_fixture("schedule-mode");
-    off.wait_for_string("No active sessions");
+    off.wait_for_string("No active agents");
     off.send_keys(b"\x0e");
     off.send_keys(b" ");
     off.wait_for_string("No mode");
@@ -329,5 +332,66 @@ fn new_pane_010_issue_dispatch_option_flag_gated() {
         !off_grid.contains(ISSUE_OPTION),
         "with experimental OFF the `{ISSUE_OPTION}` issue-dispatch option must be HIDDEN, but \
          it is present.\nGrid:\n{off_grid}"
+    );
+}
+
+/// Scenario: Open the New Agent form in a project that declares a legacy
+/// `[[modes]]` entry alongside an orchestration. The form remains usable,
+/// warns in the bottom status line, and offers the surviving Mode chips without
+/// a chip for the removed workspace mode.
+#[spec("prompt/new-pane/018")]
+#[test]
+fn new_pane_018_legacy_workspace_modes_warn_and_continue() {
+    let deck = TuiDeck::launch_with_fixture("legacy-workspace-mode");
+    deck.wait_for_string("No active agents");
+
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.send_keys(b" "); // confirm current directory → New Agent form
+    // The bottom status line: the last non-empty row of the grid.
+    let last_status_line = |grid: &str| {
+        grid.lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
+    // Wait for a whole frame, not the first sight of `Mode:`: on a starved
+    // runner a snapshot can land while the deck is still writing the frame that
+    // opens the form, with the modal's top half painted and the bottom rows
+    // still the dashboard's button bar (seen on PR #1480's CI run). The warning
+    // is set in the same handler that opens the form, so a finished frame has
+    // both; a missing warning still fails here, after the harness's timeout.
+    // The assertions below read the frame that matched, not a later snapshot.
+    let matched = std::cell::RefCell::new(String::new());
+    deck.wait_until_grid("the New Agent form with the legacy-modes warning", |grid| {
+        let complete = grid.contains("Mode:")
+            && last_status_line(grid).contains("workspace modes were removed");
+        if complete {
+            *matched.borrow_mut() = grid.to_string();
+        }
+        complete
+    });
+
+    let grid = matched.into_inner();
+    let mode_row = grid
+        .lines()
+        .find(|line| line.contains("Mode:"))
+        .unwrap_or_else(|| panic!("the New Agent form should remain open.\nGrid:\n{grid}"));
+    assert!(mode_row.contains("[No mode]"), "Grid:\n{grid}");
+    assert!(mode_row.contains("[Orch: keep-orch]"), "Grid:\n{grid}");
+    assert!(mode_row.contains("[schedule]"), "Grid:\n{grid}");
+    assert!(mode_row.contains("[dispatcher]"), "Grid:\n{grid}");
+
+    // The centered modal leaves the bottom status line visible. Check that
+    // line directly, so a warning in unrelated content cannot satisfy this.
+    let status_line = last_status_line(&grid);
+    assert!(
+        status_line.contains("workspace modes were removed"),
+        "opening a legacy project should warn in the visible bottom status line.\n\
+         Status line: {status_line:?}\nGrid:\n{grid}"
+    );
+    assert!(
+        !mode_row.contains("legacy-mode-xyz"),
+        "the removed workspace mode must not appear in the Mode chips.\nGrid:\n{grid}"
     );
 }

@@ -93,6 +93,8 @@ fn tool_start(pane_id: &str) -> AgentEvent {
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -100,15 +102,23 @@ fn is_marked(event: &AgentEvent) -> bool {
     event.is_orchestration_orphaned()
 }
 
+/// Issue #413: the instant `card` is built against and rendered at. The card
+/// seams take `now` instead of reading the clock, so the card's `Last:` field is
+/// a pure function of the fixture's own timestamps.
+fn render_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("a valid fixed instant")
+}
+
 /// A card fixture that differs from the healthy one in exactly one field, so
 /// what the assertions attribute to orphaning cannot come from anything else.
 fn card(orphaned: bool) -> SessionState {
-    let now = Utc::now();
+    let now = render_now();
     SessionState {
         session_id: "sess-orphan".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/issue-work".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -121,6 +131,8 @@ fn card(orphaned: bool) -> SessionState {
         display_name: Some("orchestrator".to_string()),
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: orphaned,
         monitored_wait_active: false,
         wait_synthetic_working: false,
@@ -130,6 +142,12 @@ fn card(orphaned: bool) -> SessionState {
         expects_agent_report: false,
         agent_report_activity_seen: false,
         outstanding_delegation: None,
+        subagent_wait: None,
+        output_set_status: false,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: 0,
+        incarnation: Default::default(),
     }
 }
 
@@ -184,7 +202,7 @@ fn orphan_001_daemon_marks_events_from_a_role_pane_it_holds_no_role_for() {
         ORCHESTRATOR_PANE,
         "orchestrator",
         true,
-        OrchestrationIdentity::Instance {
+        OrchestrationIdentity {
             id: "inst-1".to_string(),
             name: "issue-work".to_string(),
         },
@@ -266,6 +284,7 @@ fn orphan_002_card_says_orphaned_and_delegation_unavailable() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         80,
         height,
@@ -285,6 +304,7 @@ fn orphan_002_card_says_orphaned_and_delegation_unavailable() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         80,
         height,
@@ -337,7 +357,7 @@ async fn orphan_003_inner() {
         .expect("stand-in departed agent should spawn");
 
     let mut state = AppState::default();
-    let identity = OrchestrationIdentity::Instance {
+    let identity = OrchestrationIdentity {
         id: "inst-1".to_string(),
         name: "issue-work".to_string(),
     };
@@ -474,7 +494,7 @@ async fn orphan_004_inner() {
         DEPARTED_PANE,
         "reviewer",
         false,
-        OrchestrationIdentity::Instance {
+        OrchestrationIdentity {
             id: "inst-1".to_string(),
             name: "issue-work".to_string(),
         },

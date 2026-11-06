@@ -6,6 +6,9 @@ on:
     paths:
       - 'docs/**'
       - 'site/**'
+      - 'xtask/site/**'
+      - 'src/published_docs.rs'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 concurrency:
@@ -29,22 +32,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: site/package-lock.json
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      - name: Install dependencies
-        working-directory: site
-        run: npm ci
-
+      # Generates the published Markdown, llms.txt/llms-full.txt, images, the
+      # landing page and both targets' redirects from docs/published.toml, and
+      # fails on a broken link (PRD #1419). The same layout feeds the image
+      # below and the Netlify preview.
       - name: Build site
-        working-directory: site
-        run: npm run build
+        run: cargo xtask site site/build/public --nginx-redirects site/build/nginx-redirects.conf
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Build Docker image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -52,4 +53,18 @@ jobs:
           context: .
           file: site/Dockerfile
           load: true
-          tags: ghcr.io/vfarcic/dot-agent-deck-docs:test
+          tags: dot-agent-deck-docs:test
+
+      # The Netlify preview is DEPLOYED by docs-preview.yml, not here. This job
+      # runs the PR's own code -- its workflow, its devbox.json init hook, the
+      # crates `cargo xtask site` compiles -- so it gets no secret, and hands over only the
+      # built static files. docs-preview.yml runs from `main` on
+      # `workflow_run`, holds the Netlify token, and executes nothing from the
+      # PR. Forks get no preview (and upload nothing).
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        with:
+          name: docs-site
+          path: site/build
+          if-no-files-found: error
+          retention-days: 1

@@ -205,7 +205,13 @@ fn deck_commands(path: &Path, suffix: &str) -> Vec<String> {
 /// the PATH the resolver produced, not either writer's quoting, so comparing the
 /// unquoted spelling keeps every assertion here exact on both platforms rather
 /// than encoding one platform's spelling.
+///
+/// The `DOT_AGENT_DECK_BIN` wrapper (PRD #1497) is stripped first, for the
+/// same reason: what is pinned here is the installed path that follows it.
 fn unquoted_command(command: &str) -> String {
+    let command = command
+        .strip_prefix(dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX)
+        .unwrap_or(command);
     for quote in ['\'', '"'] {
         if let Some(rest) = command.strip_prefix(quote)
             && let Some((exe, tail)) = rest.split_once(quote)
@@ -336,6 +342,104 @@ fn claude_auto_install_never_writes_the_build_artifact_it_is_running_from() {
     for command in &commands {
         assert_eq!(command, &expected);
     }
+}
+
+/// Issue #1140, and the arithmetic is the assertion: ten entries beside ten.
+///
+/// A copy of the deck pinned somewhere scratch to drive an isolated sandbox is
+/// outside `target/`, so PRD #381's artifact guard passes it, and it used to be
+/// written into the global config *beside* the install's own rules — the
+/// installer normalises only the rules naming the binary currently installing,
+/// so two paths mean two sets. Resolving the scratch copy to the install is
+/// what makes the second pass a no-op rather than a duplicate: it is the string
+/// already in the file.
+///
+/// Both halves matter. A test asserting only "the scratch path is absent" would
+/// also pass if the second pass had wiped the first's rules.
+#[test]
+fn a_scratch_copy_adds_no_second_set_of_rules_beside_the_install() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+    let scratch = fixture
+        .path()
+        .join("var")
+        .join("tmp")
+        .join("dad-branch")
+        .join(durable_file_name());
+    write_executable(&scratch);
+
+    // The installed deck writes its own set, exactly as the released one does.
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(durable.clone()), &home, None)
+    });
+    let installed_count = deck_commands(&settings, CLAUDE_SUFFIX).len();
+    assert_eq!(
+        installed_count, 10,
+        "one deck rule per hook type is the premise this test counts against"
+    );
+
+    // Then the scratch copy runs against the same config.
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(scratch.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert_eq!(
+        commands.len(),
+        installed_count,
+        "the scratch copy added a second set of rules — issue #1140: {commands:?}"
+    );
+    let expected = format!("{} {CLAUDE_SUFFIX}", durable.display());
+    for command in &commands {
+        assert_eq!(
+            command, &expected,
+            "every surviving rule must still name the install"
+        );
+    }
+}
+
+/// The last-resort pin is **logged**, not silent — "silently" is half of what
+/// issue #1140 is about, and step 3 is the one branch that persists a path the
+/// resolver cannot vouch for.
+///
+/// Note what this test is NOT: it is not a claim that the pin is a good one.
+/// It is the claim that an operator who later finds a `/var/tmp/...` path in
+/// their agent config can find out from the log why it is there, which is
+/// exactly what the field report could not do.
+#[test]
+fn a_last_resort_pin_is_logged_rather_than_silent() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let settings = fixture.settings();
+    // Deliberately no `fixture.durable()`: nothing installed anywhere, which is
+    // what takes the resolver past 2a and 2b to step 3.
+    let scratch = fixture
+        .path()
+        .join("var")
+        .join("tmp")
+        .join("dad-branch")
+        .join(durable_file_name());
+    write_executable(&scratch);
+
+    let logs = fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(scratch.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert!(
+        !commands.is_empty(),
+        "step 3 must write rather than refuse when there is no install to prefer"
+    );
+    assert!(
+        logs.contains("last resort"),
+        "the last-resort pin was not logged:\n{logs}"
+    );
+    assert!(
+        logs.contains(scratch.to_str().expect("scratch path is UTF-8")),
+        "the log must name the path it pinned:\n{logs}"
+    );
 }
 
 /// The same property for Codex's `hooks.json`, which is a separate writer with
@@ -584,10 +688,16 @@ fn self_heal_judges_an_exe_suffixed_pin_by_the_platforms_own_convention() {
 }
 
 /// The safety property that makes self-heal tolerable: a deck rule whose path
-/// EXISTS but differs from what would be written is left alone. PRD #381 Open
-/// Question 3 — the trigger is "the target is missing", never "the target is
-/// not what I would have written", because the second reading is what would let
-/// a startup silently repoint a developer's or a user's deliberate choice.
+/// EXISTS but differs from what would be written is left alone by an automatic
+/// install. PRD #381 Open Question 3 — the trigger is "the target is unusable",
+/// never "the target is not what I would have written", because the second
+/// reading is what would let a startup silently repoint a developer's or a
+/// user's deliberate choice. PRD #1487 keeps that for automatic installs, so two
+/// installs that each resolve to themselves do not take turns rewriting the
+/// file, and adds "one deck entry per event": the hook types with no deck rule
+/// get the kept install's command too, not a second binary's. An explicit
+/// `hooks install` still replaces it (`agent_hook_config`'s
+/// `config_explicit_install_*` tests).
 #[test]
 fn self_heal_leaves_a_different_but_still_valid_deck_path_alone() {
     let fixture = Fixture::new();
@@ -618,12 +728,13 @@ fn self_heal_leaves_a_different_but_still_valid_deck_path_alone() {
 
     let commands = deck_commands(&settings, CLAUDE_SUFFIX);
     assert!(
-        commands.contains(&other_command),
-        "an existing, still-valid deck path was rewritten: {commands:?}"
+        commands.len() > 1 && commands.iter().all(|command| *command == other_command),
+        "an existing, still-valid deck path must be kept, and be the one the other hook types \
+         are installed with: {commands:?}"
     );
     assert!(
-        commands.contains(&format!("{} {CLAUDE_SUFFIX}", durable.display())),
-        "the durable rule was not added alongside it: {commands:?}"
+        !commands.contains(&format!("{} {CLAUDE_SUFFIX}", durable.display())),
+        "a second install's rule was added beside the kept one: {commands:?}"
     );
 }
 

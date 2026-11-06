@@ -1,11 +1,13 @@
 import { ArrowRight, CheckCircle2, CircleDashed, RefreshCw, Send, XCircle } from "lucide-react";
+import { INBOX_WORDS } from "../lib/inboxWords";
 import type { HandoffEdge } from "../types";
 
+/** PRD #1666: the inbox's words, which the TUI uses for the same states (CLAUDE.md rule 22). */
 const STATUS_LABEL: Record<HandoffEdge["status"], string> = {
-  dispatched: "dispatched",
-  delivered: "delivered · working",
-  failed: "FAILED",
-  done: "work-done",
+  delegated: `delegated · ${INBOX_WORDS.queued}`,
+  delivered: `${INBOX_WORDS.delivered} · working`,
+  failed: INBOX_WORDS.notDelivered,
+  done: INBOX_WORDS.workDone,
 };
 
 function StatusIcon({ status }: { status: HandoffEdge["status"] }) {
@@ -16,18 +18,19 @@ function StatusIcon({ status }: { status: HandoffEdge["status"] }) {
 }
 
 /**
- * Live handoff chain (handoff-visibility PRD D2): one row per delegation,
- * newest first, driven entirely by the daemon's handoff events. A failed edge
- * shows its reason inline — the whole point is that a dropped handoff is
- * impossible to miss.
+ * Live delegation chain (handoff-visibility PRD D2): one row per delegation,
+ * newest first, driven entirely by the daemon's inbox notices
+ * (`applyHandoffEvent`). An undelivered edge shows its reason inline — the whole point is that a dropped delegation
+ * is impossible to miss. The UI says "delegation" (issue #1045); the
+ * `Handoff*` identifiers and `handoff-*` classes keep their original names.
  */
 export function HandoffRail({ handoffs }: { handoffs: HandoffEdge[] }) {
   if (!handoffs.length) return null;
   return (
-    <section className="handoff-rail" aria-label="Live handoffs" data-testid="handoff-rail">
+    <section className="handoff-rail" aria-label="Live delegations" data-testid="handoff-rail">
       <header>
-        <span className="section-kicker">HANDOFFS</span>
-        <small>Delegations live from the deck — dispatched → delivered → work-done</small>
+        <span className="section-kicker">DELEGATIONS</span>
+        <small>Delegations live from the daemon — delegated → delivered → work-done</small>
       </header>
       <div className="handoff-list">
         {handoffs.slice(0, 12).map((edge) => (

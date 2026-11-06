@@ -5,8 +5,8 @@
 //!
 //! - `desktop-bundle` hangs off `prepare`, **not** `build`, so it runs
 //!   concurrently with the CLI matrix and adds nothing to the critical path;
-//! - `finalize` — the job that creates the GitHub Release and uploads the five
-//!   CLI assets — does **not** list either desktop job in `needs:`, so a
+//! - `finalize` — the job that creates the GitHub Release and uploads the CLI
+//!   assets — does **not** list either desktop job in `needs:`, so a
 //!   bundler that fails, hangs or is skipped cannot delay or break an ordinary
 //!   release;
 //! - `finalize`'s artifact download is constrained by `pattern:`, because
@@ -32,6 +32,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+thread_local! {
+    // Mutation checks feed the existing guards a changed in-memory workflow.
+    // Each nextest test runs in its own process, and this also isolates them
+    // if the module is run under the standard test harness.
+    static WORKFLOW_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -41,6 +48,9 @@ fn repo_root() -> PathBuf {
 }
 
 fn workflow() -> String {
+    if let Some(text) = WORKFLOW_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return text;
+    }
     let path = repo_root().join(".github/workflows/release.yml");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
@@ -109,6 +119,1109 @@ fn needs(block: &str) -> Vec<String> {
         .collect()
 }
 
+/// Code lines alone, so prose about a safety property cannot satisfy it or
+/// falsely make another job appear to hold a signing secret.
+fn code(block: &str) -> String {
+    block
+        .lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The signing job belongs between the uncredentialed bundle matrix and the
+/// publisher. `finalize` must continue to create the CLI release independently.
+#[test]
+fn desktop_sign_is_between_bundle_and_publish_off_the_cli_path() {
+    let all = jobs(&workflow());
+    let sign_needs = needs(&code(job(&all, "desktop-sign")));
+    let publish_needs = needs(&code(job(&all, "desktop-publish")));
+    let finalize_needs = needs(&code(job(&all, "finalize")));
+
+    assert!(
+        sign_needs.contains(&"desktop-bundle".to_string()),
+        "`desktop-sign` must need `desktop-bundle`, got {sign_needs:?}"
+    );
+    assert!(
+        publish_needs.contains(&"desktop-sign".to_string()),
+        "`desktop-publish` must need `desktop-sign`, got {publish_needs:?}"
+    );
+    for name in [
+        "desktop-bundle",
+        "desktop-sign",
+        "desktop-publish",
+        "attest",
+    ] {
+        assert!(
+            !finalize_needs.contains(&name.to_string()),
+            "`finalize` must not need `{name}`, got {finalize_needs:?}"
+        );
+    }
+}
+
+/// The runner that receives a Developer ID private key must never execute a
+/// checkout of the release repository.
+#[test]
+fn desktop_sign_does_not_check_out_repository_code() {
+    let all = jobs(&workflow());
+    assert!(
+        !checks_out(&code(job(&all, "desktop-sign"))),
+        "`desktop-sign` must download artifacts without `actions/checkout`"
+    );
+}
+
+/// A code-line mention outside the signing job makes a secret available to a
+/// runner that may execute third-party build code. Comments are deliberately
+/// ignored because they can describe the very isolation being guarded here.
+#[test]
+fn apple_signing_secrets_are_named_only_in_desktop_sign() {
+    let workflow = workflow();
+    let all = jobs(&workflow);
+    let sign = code(job(&all, "desktop-sign"));
+    let outside = code(&workflow.replacen(job(&all, "desktop-sign"), "", 1));
+    for secret in [
+        "APPLE_CERTIFICATE",
+        "APPLE_CERTIFICATE_PASSWORD",
+        "APPLE_API_KEY",
+        "APPLE_API_ISSUER",
+        "APPLE_API_KEY_PATH",
+    ] {
+        assert!(
+            sign.contains(secret),
+            "`desktop-sign` does not name `{secret}`"
+        );
+        assert!(
+            !outside.contains(secret),
+            "`{secret}` appears on a code line outside `desktop-sign`"
+        );
+    }
+}
+
+/// Environment-scoped secrets should be readable by the one signing job.
+#[test]
+fn desktop_sign_declares_the_signing_environment() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    let direct = sign
+        .lines()
+        .any(|l| l.trim() == "environment: desktop-signing");
+    let mapping = sign.contains("environment:\n      name: desktop-signing")
+        || sign.contains("environment:\n        name: desktop-signing");
+    assert!(
+        direct || mapping,
+        "`desktop-sign` must declare `environment: desktop-signing` (or a mapping with that name)"
+    );
+}
+
+/// Upload-artifact flattens file modes, so the macOS app must cross the job
+/// boundary inside a ditto archive that the signing job restores.
+#[test]
+fn desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive() {
+    let all = jobs(&workflow());
+    let bundle = code(job(&all, "desktop-bundle"));
+    let sign = code(job(&all, "desktop-sign"));
+    let archive = bundle
+        .lines()
+        .find(|l| l.contains("ditto -c -k --sequesterRsrc --keepParent"));
+    assert!(
+        archive.is_some_and(|l| l.contains(".app") && l.contains(".zip")),
+        "the macOS bundle leg must archive its `.app` as a `.zip` with `ditto -c -k --sequesterRsrc --keepParent`"
+    );
+    assert!(
+        sign.lines()
+            .any(|l| l.contains("ditto -x -k") && l.contains(".zip")),
+        "`desktop-sign` must restore the zipped app with `ditto -x -k`"
+    );
+}
+
+/// Tauri's WebView needs JIT under hardened runtime. The entitlement can be
+/// inlined in the job or carried as a repository plist named by that job.
+#[test]
+fn desktop_codesign_uses_runtime_and_jit_entitlements() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    assert!(
+        sign.contains("codesign")
+            && sign.contains("--options runtime")
+            && sign.contains("--entitlements"),
+        "`desktop-sign` must codesign with `--options runtime` and `--entitlements`"
+    );
+    let inline_jit = sign.contains("com.apple.security.cs.allow-jit");
+    let referenced_jit = [
+        "desktop/src-tauri/Entitlements.plist",
+        "desktop/src-tauri/entitlements.plist",
+    ]
+    .into_iter()
+    .filter(|path| sign.contains(path))
+    .any(|path| {
+        fs::read_to_string(repo_root().join(path))
+            .is_ok_and(|plist| plist.contains("com.apple.security.cs.allow-jit"))
+    });
+    assert!(
+        inline_jit || referenced_jit,
+        "the entitlements used by `desktop-sign` must contain `com.apple.security.cs.allow-jit` inline or in its referenced plist"
+    );
+}
+
+/// An expired certificate is present but unusable; checking only whether the
+/// secret is empty would allow a broken release to reach codesign.
+/// Scenario: The signing job checks both the one-day failure threshold and the
+/// thirty-day warning threshold before it signs an app.
+#[test]
+fn desktop_sign_checks_certificate_expiry() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    assert!(
+        sign.contains("openssl x509")
+            && sign.contains("-enddate")
+            && sign.contains("-checkend 86400")
+            && sign.contains("-checkend 2592000"),
+        "`desktop-sign` must inspect the certificate end date and check both one-day and thirty-day expiry thresholds with `openssl x509 -checkend`"
+    );
+}
+
+/// Scenario: The signing runner validates the downloaded app archive before
+/// the unpack step can write any of its members to disk.
+#[test]
+fn desktop_sign_validates_archive_before_unpacking() {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let validate = named_step(sign, "Validate the app archive before extracting it");
+    let unpack = named_step(sign, "Unpack the app");
+    assert!(
+        sign.find(validate).unwrap() < sign.find(unpack).unwrap(),
+        "archive validation must precede unpacking"
+    );
+    assert!(
+        code(validate).contains("python3 - \"$APP_ARCHIVE\"")
+            && code(unpack).contains("ditto -x -k"),
+        "the validator must check APP_ARCHIVE before ditto extracts it"
+    );
+}
+
+/// Scenario: The Apple intermediate download stays on HTTPS, and the signing
+/// runner checks its pinned SHA-256 before importing it into the keychain.
+#[test]
+fn desktop_sign_pins_apple_intermediate_before_import() {
+    let all = jobs(&workflow());
+    let step = code(named_step(
+        job(&all, "desktop-sign"),
+        "Import the certificate into a throwaway keychain",
+    ));
+    let curl = step
+        .lines()
+        .find(|line| line.trim_start().starts_with("curl ") && line.contains("DeveloperIDG2CA.cer"))
+        .expect("Apple intermediate download");
+    assert!(
+        curl.contains("--proto '=https'") && curl.contains("--proto-redir '=https'"),
+        "Apple intermediate curl must restrict both initial and redirect protocols to HTTPS"
+    );
+    let pin = step
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("G2_SHA256="))
+        .expect("Apple intermediate digest pin");
+    assert!(
+        pin.len() == 64 && pin.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Apple intermediate pin must be a SHA-256 digest"
+    );
+    let hash = step
+        .find("got=$(shasum -a 256")
+        .expect("digest calculation");
+    let compare = step
+        .find("if [ \"$got\" != \"$G2_SHA256\" ]; then")
+        .expect("digest comparison");
+    let failure = step[compare..]
+        .find("exit 1")
+        .expect("digest mismatch fails")
+        + compare;
+    let import = step
+        .find("security import \"$RUNNER_TEMP/DeveloperIDG2CA.cer\"")
+        .expect("intermediate import");
+    assert!(
+        hash < compare && compare < failure && failure < import,
+        "the intermediate must be hashed and rejected on mismatch before security import"
+    );
+}
+
+/// The two notarization steps each call this script instead of `notarytool
+/// submit --wait`, which fails the job on one timed-out status request.
+const NOTARY_POLLER_CALLS: [(&str, &str); 2] = [
+    (
+        "Notarize and staple the app",
+        "bash \"$RUNNER_TEMP/notarize.sh\" \"$RUNNER_TEMP/app-for-notary.zip\" \"the app\"",
+    ),
+    (
+        "Sign, notarize and staple the disk image",
+        "bash \"$RUNNER_TEMP/notarize.sh\" \"$DMG\" \"the disk image\"",
+    ),
+];
+
+/// Issue #1325: `--wait` turned one timed-out status poll into a failed
+/// release while Apple was still processing, and later accepted, the upload.
+/// Scenario: Neither notarization step waits inside notarytool; both submit
+/// through the poller, which is written before either runs, and that poller
+/// polls with `notarytool info` rather than waiting.
+#[test]
+fn desktop_sign_polls_notarization_instead_of_waiting() {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    assert!(
+        !code(sign).contains("--wait"),
+        "`desktop-sign` must not run `notarytool submit --wait`: one failed status poll ends it (issue #1325)"
+    );
+    let poller = named_step(sign, "Write the notarization poller");
+    let poller_code = code(poller);
+    assert!(
+        poller_code.contains("xcrun notarytool submit")
+            && poller_code.contains("xcrun notarytool info")
+            && poller_code.contains("> \"$RUNNER_TEMP/notarize.sh\""),
+        "the poller step must write a script that submits and then polls with `notarytool info`"
+    );
+    for (name, call) in NOTARY_POLLER_CALLS {
+        let step = named_step(sign, name);
+        assert!(
+            code(step).lines().any(|line| line.trim() == call),
+            "`{name}` must notarize through the poller: {call}"
+        );
+        assert!(
+            sign.find(poller).unwrap() < sign.find(step).unwrap(),
+            "the poller must be written before `{name}` runs"
+        );
+    }
+}
+
+/// Scenario: Every third-party action executed beside the signing key is held
+/// for manual review by the final matching Renovate rule.
+#[test]
+fn desktop_sign_actions_are_held_for_manual_review() {
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json"),
+    )
+    .expect("parse renovate.json");
+    let rule = config["packageRules"]
+        .as_array()
+        .and_then(|rules| rules.last())
+        .expect("last Renovate package rule");
+    let contains = |field: &str, value: &str| {
+        rule[field]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|item| item.as_str() == Some(value)))
+    };
+    assert!(
+        contains("matchManagers", "github-actions")
+            && contains("matchFileNames", ".github/workflows/release.yml")
+            && rule["automerge"] == false
+            && rule["groupName"].is_null()
+            && contains("labels", "manual-review"),
+        "the last Renovate rule must hold release workflow actions for manual review"
+    );
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let actions: Vec<&str> = sign
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- uses: "))
+        .filter_map(|reference| reference.split_once('@').map(|(name, _)| name))
+        .collect();
+    assert!(!actions.is_empty(), "desktop-sign must name its actions");
+    for action in actions {
+        assert!(
+            contains("matchPackageNames", action),
+            "desktop-sign action {action} is missing from the manual-review rule"
+        );
+    }
+}
+
+/// The quarantine bypass and unsigned macOS wording belong only to an
+/// unsigned macOS artifact. The note must read the signing job's actual output.
+#[test]
+fn desktop_note_offers_quarantine_bypass_only_when_unsigned() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    let note = note_step(job(&all, "desktop-publish"));
+    assert!(
+        sign.contains("signed:"),
+        "`desktop-sign` must expose a `signed` job output"
+    );
+    assert!(
+        note.contains("SIGNED: ${{ needs.desktop-sign.outputs.signed }}"),
+        "the release-note step must read `needs.desktop-sign.outputs.signed` into `SIGNED`"
+    );
+    let condition = note.find("if [ \"$SIGNED\" = \"false\" ]; then").unwrap_or_else(|| {
+        panic!("the release-note step must open an unsigned-only branch with `if [ \"$SIGNED\" = \"false\" ]; then`")
+    });
+    let branch = note[condition..]
+        .split("\n          fi")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        branch.contains("xattr -dr com.apple.quarantine") && branch.contains("unsigned"),
+        "the unsigned-only branch must contain both the quarantine workaround and unsigned macOS wording"
+    );
+}
+
+/// Replace one known line in the real workflow, failing if the workflow has
+/// changed enough that the mutation no longer represents the intended edit.
+fn replace_once(text: &str, from: &str, to: &str) -> String {
+    assert!(text.contains(from), "mutation target absent: {from}");
+    text.replacen(from, to, 1)
+}
+
+/// Scenario: Each signing guard rejects the specific unsafe workflow edit it
+/// protects against. A comment naming a secret remains harmless because it
+/// gives no job access to that secret.
+#[test]
+fn desktop_sign_guards_reject_unsafe_workflow_mutations() {
+    let original = workflow();
+    let xattr_line = original
+        .lines()
+        .find(|line| line.contains("xattr -dr com.apple.quarantine"))
+        .expect("unsigned note contains xattr");
+    let without_xattr = replace_once(&original, &format!("{xattr_line}\n"), "");
+    let xattr_outside = replace_once(
+        &without_xattr,
+        "            } >> \"$NOTE\"\n          fi\n",
+        &format!("            }} >> \"$NOTE\"\n          fi\n{xattr_line} >> \"$NOTE\"\n"),
+    );
+    let archive_line = original
+        .lines()
+        .find(|line| line.contains("ditto -c -k --sequesterRsrc --keepParent"))
+        .expect("macOS app archive command");
+    let all = jobs(&original);
+    let sign = job(&all, "desktop-sign");
+    let validator = named_step(sign, "Validate the app archive before extracting it");
+
+    let cases = [
+        (
+            "secret in desktop-bundle",
+            replace_once(
+                &original,
+                "  desktop-bundle:\n",
+                "  desktop-bundle:\n    env:\n      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}\n",
+            ),
+            Some("apple_signing_secrets_are_named_only_in_desktop_sign"),
+        ),
+        (
+            "secret name in a bundle comment",
+            replace_once(
+                &original,
+                "  desktop-bundle:\n",
+                "  desktop-bundle:\n    # APPLE_CERTIFICATE stays in desktop-sign only.\n",
+            ),
+            None,
+        ),
+        (
+            "checkout in desktop-sign",
+            replace_once(
+                &original,
+                "  desktop-sign:\n",
+                "  desktop-sign:\n    steps:\n      - uses: actions/checkout@pinned\n",
+            ),
+            Some("desktop_sign_does_not_check_out_repository_code"),
+        ),
+        (
+            "missing signing environment",
+            replace_once(&original, "    environment: desktop-signing\n", ""),
+            Some("desktop_sign_declares_the_signing_environment"),
+        ),
+        (
+            "publisher does not need signer",
+            replace_once(
+                &original,
+                "    needs: [prepare, finalize, desktop-bundle, desktop-sign]",
+                "    needs: [prepare, finalize, desktop-bundle]",
+            ),
+            Some("desktop_sign_is_between_bundle_and_publish_off_the_cli_path"),
+        ),
+        (
+            "finalize needs signer",
+            replace_once(
+                &original,
+                "    needs: [prepare, build]",
+                "    needs: [prepare, build, desktop-sign]",
+            ),
+            Some("desktop_sign_is_between_bundle_and_publish_off_the_cli_path"),
+        ),
+        (
+            "missing hardened runtime",
+            original.replace("--options runtime", ""),
+            Some("desktop_codesign_uses_runtime_and_jit_entitlements"),
+        ),
+        (
+            "missing JIT entitlement",
+            original.replace(
+                "com.apple.security.cs.allow-jit",
+                "com.apple.security.cs.no-jit",
+            ),
+            Some("desktop_codesign_uses_runtime_and_jit_entitlements"),
+        ),
+        (
+            "raw app artifact",
+            replace_once(
+                &original,
+                archive_line,
+                "          cp -R \"$APP\" dist-desktop-app/Agent-Deck.app",
+            ),
+            Some("desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive"),
+        ),
+        (
+            "missing one-day certificate check",
+            replace_once(&original, "-checkend 86400", ""),
+            Some("desktop_sign_checks_certificate_expiry"),
+        ),
+        (
+            "missing thirty-day certificate check",
+            replace_once(&original, "-checkend 2592000", ""),
+            Some("desktop_sign_checks_certificate_expiry"),
+        ),
+        (
+            "missing archive validator",
+            replace_once(&original, validator, ""),
+            Some("desktop_sign_validates_archive_before_unpacking"),
+        ),
+        (
+            "redirect protocol unrestricted",
+            replace_once(
+                &original,
+                "--proto-redir '=https' -fsSL --retry 3",
+                "-fsSL --retry 3",
+            ),
+            Some("desktop_sign_pins_apple_intermediate_before_import"),
+        ),
+        (
+            "missing intermediate digest comparison",
+            replace_once(
+                &original,
+                "if [ \"$got\" != \"$G2_SHA256\" ]; then",
+                "if false; then",
+            ),
+            Some("desktop_sign_pins_apple_intermediate_before_import"),
+        ),
+        (
+            "new unreviewed signing action",
+            replace_once(
+                &original,
+                "  desktop-sign:\n",
+                "  desktop-sign:\n    steps:\n      - uses: actions/cache@pinned\n",
+            ),
+            Some("desktop_sign_actions_are_held_for_manual_review"),
+        ),
+        (
+            "quarantine workaround outside unsigned branch",
+            xattr_outside,
+            Some("desktop_note_offers_quarantine_bypass_only_when_unsigned"),
+        ),
+        (
+            "disk image notarization waits again",
+            replace_once(
+                &original,
+                NOTARY_POLLER_CALLS[1].1,
+                "xcrun notarytool submit \"$DMG\" --wait --timeout 75m --output-format json",
+            ),
+            Some("desktop_sign_polls_notarization_instead_of_waiting"),
+        ),
+        (
+            "app notarization bypasses the poller",
+            replace_once(
+                &original,
+                NOTARY_POLLER_CALLS[0].1,
+                "xcrun notarytool submit \"$RUNNER_TEMP/app-for-notary.zip\" --output-format json",
+            ),
+            Some("desktop_sign_polls_notarization_instead_of_waiting"),
+        ),
+    ];
+
+    let guards: [(&str, fn()); 12] = [
+        (
+            "desktop_sign_is_between_bundle_and_publish_off_the_cli_path",
+            desktop_sign_is_between_bundle_and_publish_off_the_cli_path,
+        ),
+        (
+            "desktop_sign_does_not_check_out_repository_code",
+            desktop_sign_does_not_check_out_repository_code,
+        ),
+        (
+            "apple_signing_secrets_are_named_only_in_desktop_sign",
+            apple_signing_secrets_are_named_only_in_desktop_sign,
+        ),
+        (
+            "desktop_sign_declares_the_signing_environment",
+            desktop_sign_declares_the_signing_environment,
+        ),
+        (
+            "desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive",
+            desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive,
+        ),
+        (
+            "desktop_codesign_uses_runtime_and_jit_entitlements",
+            desktop_codesign_uses_runtime_and_jit_entitlements,
+        ),
+        (
+            "desktop_sign_checks_certificate_expiry",
+            desktop_sign_checks_certificate_expiry,
+        ),
+        (
+            "desktop_note_offers_quarantine_bypass_only_when_unsigned",
+            desktop_note_offers_quarantine_bypass_only_when_unsigned,
+        ),
+        (
+            "desktop_sign_validates_archive_before_unpacking",
+            desktop_sign_validates_archive_before_unpacking,
+        ),
+        (
+            "desktop_sign_pins_apple_intermediate_before_import",
+            desktop_sign_pins_apple_intermediate_before_import,
+        ),
+        (
+            "desktop_sign_actions_are_held_for_manual_review",
+            desktop_sign_actions_are_held_for_manual_review,
+        ),
+        (
+            "desktop_sign_polls_notarization_instead_of_waiting",
+            desktop_sign_polls_notarization_instead_of_waiting,
+        ),
+    ];
+    for (label, mutated, expected) in cases {
+        WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(mutated));
+        let failed: Vec<&str> = guards
+            .iter()
+            .filter_map(|(name, guard)| std::panic::catch_unwind(guard).is_err().then_some(*name))
+            .collect();
+        WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let mut expected = expected.into_iter().collect::<Vec<_>>();
+        if label == "checkout in desktop-sign" {
+            expected.push("desktop_sign_actions_are_held_for_manual_review");
+        }
+        assert_eq!(failed, expected, "{label}");
+    }
+}
+
+/// Return the complete named step, including its run block, from a job.
+fn named_step<'a>(block: &'a str, name: &str) -> &'a str {
+    let header = format!("      - name: {name}\n");
+    let start = block
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing step: {name}"));
+    let rest = &block[start + header.len()..];
+    let end = rest
+        .find("\n      - ")
+        .map_or(block.len(), |pos| start + header.len() + pos + 1);
+    &block[start..end]
+}
+
+/// Lift an actual shell body out of the workflow so runtime tests cannot
+/// pass against a copy that differs from the release step.
+// These runtime fixtures execute macOS Bash steps with a Unix-only PATH.
+// Windows can find the unusable WSL bash stub, so keep the fixtures on Unix.
+#[cfg(unix)]
+fn step_script(name: &str) -> String {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let step = named_step(sign, name);
+    let mut lines = step.lines();
+    let run = lines
+        .find(|line| line.trim() == "run: |")
+        .unwrap_or_else(|| panic!("{name} has no run block"));
+    let indent = run.len() - run.trim_start().len();
+    lines
+        .take_while(|line| line.trim().is_empty() || line.len() - line.trim_start().len() > indent)
+        .map(|line| {
+            line.strip_prefix(" ".repeat(indent + 2).as_str())
+                .unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(unix)]
+fn signing_classifier_script() -> String {
+    let script = step_script("Classify the signing credentials");
+    assert!(script.contains("mode=signed") && script.contains("mode=unsigned"));
+    script
+}
+
+/// Scenario: The release workflow's credential classifier chooses unsigned
+/// only when all five values are absent and signed only when all are present.
+/// Partial and empty credentials fail without printing values or executing a
+/// shell command embedded in a value.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_classifier_handles_real_shell_inputs() {
+    use std::process::Command;
+    if Command::new("bash").arg("--version").output().is_err() {
+        println!("SKIP: bash is unavailable");
+        return;
+    }
+    let script = signing_classifier_script();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output_path = dir.path().join("github-output");
+    let names = [
+        "APPLE_CERTIFICATE",
+        "APPLE_CERTIFICATE_PASSWORD",
+        "APPLE_API_KEY",
+        "APPLE_API_ISSUER",
+        "APPLE_API_KEY_PATH",
+    ];
+    let values = [
+        "certificate-marker-48c1",
+        "password-marker-c88a",
+        "api-key-marker-750f",
+        "issuer-marker-e344",
+        "api-path-marker-a059",
+    ];
+    let run = |provided: &[(&str, &str)]| {
+        let _ = fs::remove_file(&output_path);
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GITHUB_OUTPUT", &output_path);
+        for &(name, value) in provided {
+            cmd.env(name, value);
+        }
+        let result = cmd.output().expect("run classifier with bash");
+        let written = fs::read_to_string(&output_path).unwrap_or_default();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        (result.status, written, log)
+    };
+
+    let (status, written, _) = run(&[]);
+    assert!(status.success(), "all absent should choose unsigned");
+    assert_eq!(written, "mode=unsigned\n");
+
+    let all = names.into_iter().zip(values).collect::<Vec<_>>();
+    let (status, written, _) = run(&all);
+    assert!(status.success(), "all present should choose signed");
+    assert_eq!(written, "mode=signed\n");
+
+    for (missing, name) in names.iter().enumerate() {
+        let partial = all
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pair)| (index != missing).then_some(*pair))
+            .collect::<Vec<_>>();
+        let (status, written, log) = run(&partial);
+        assert!(!status.success(), "missing {name} should fail");
+        assert!(written.is_empty(), "partial input must not select a mode");
+        for value in values {
+            assert!(
+                !log.contains(value) && !written.contains(value),
+                "the error for missing {} exposed a credential value",
+                name
+            );
+        }
+    }
+
+    let mut empty = all.clone();
+    empty[0].1 = "";
+    let (status, written, log) = run(&empty);
+    assert!(!status.success(), "a set-but-empty value should fail");
+    assert!(
+        written.is_empty(),
+        "empty credential must not select a mode"
+    );
+    for value in values {
+        assert!(
+            !log.contains(value),
+            "empty-value error exposed a credential value"
+        );
+    }
+
+    let marker = dir.path().join("unexpected-command-execution");
+    let injection = format!("$(touch {})", marker.display());
+    let mut injected = all.clone();
+    injected[0].1 = &injection;
+    let (status, written, _) = run(&injected);
+    assert!(
+        status.success(),
+        "a nonempty literal value should count as present"
+    );
+    assert_eq!(written, "mode=signed\n");
+    assert!(
+        !marker.exists(),
+        "classifier executed a command inside a value"
+    );
+}
+
+/// Scenario: The release workflow's real archive validator accepts ordinary,
+/// framework-style and AppleDouble app zips. It rejects metadata for another
+/// app, disguised AppleDouble directories, symlinks inside metadata, and unsafe paths, links, modes or archives.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_archive_validator_handles_real_zip_inputs() {
+    use std::process::Command;
+    for tool in ["bash", "python3"] {
+        if Command::new(tool).arg("--version").output().is_err() {
+            println!("SKIP: {tool} is unavailable");
+            return;
+        }
+    }
+    let script = step_script("Validate the app archive before extracting it");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let make_zips = r#"
+import pathlib, stat, sys, zipfile
+root = pathlib.Path(sys.argv[1])
+app = 'Agent Deck.app/'
+base = app + 'Contents/'
+
+def add(z, name, data=b'', mode=None):
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    if mode is not None:
+        info.external_attr = mode << 16
+    z.writestr(info, data)
+
+def zip_case(name, extra):
+    with zipfile.ZipFile(root / (name + '.zip'), 'w') as z:
+        add(z, base + 'MacOS/Agent Deck', b'bin', stat.S_IFREG | 0o755)
+        extra(z)
+
+zip_case('benign', lambda z: None)
+def framework(z):
+    prefix = base + 'Frameworks/Widget.framework/Versions/'
+    add(z, prefix + 'A/Widget', b'framework', stat.S_IFREG | 0o644)
+    add(z, prefix + 'Current', b'A', stat.S_IFLNK | 0o777)
+    add(z, base + 'Frameworks/Widget.framework/Widget', b'Versions/Current/Widget', stat.S_IFLNK | 0o777)
+zip_case('framework', framework)
+zip_case('appledouble-nested', lambda z: add(z, '__MACOSX/Agent Deck.app/Contents/._Info.plist', b'metadata'))
+zip_case('appledouble-app-root', lambda z: add(z, '__MACOSX/._Agent Deck.app', b'metadata'))
+zip_case('appledouble-app-root-dir', lambda z: add(z, '__MACOSX/._Agent Deck.app/', mode=stat.S_IFDIR | 0o755))
+zip_case('appledouble-app-root-child', lambda z: add(z, '__MACOSX/._Agent Deck.app/x', b'x'))
+zip_case('appledouble-other-root', lambda z: add(z, '__MACOSX/._Other.app', b'metadata'))
+zip_case('macosx-other-app', lambda z: add(z, '__MACOSX/Other.app/x', b'x'))
+zip_case('macosx-symlink', lambda z: add(z, '__MACOSX/Agent Deck.app/Contents/._Alias', b'Info.plist', stat.S_IFLNK | 0o777))
+zip_case('dotdot', lambda z: add(z, app + '../escape', b'x'))
+zip_case('absolute', lambda z: add(z, '/etc/x', b'x'))
+zip_case('second-top', lambda z: add(z, 'Other.app/Contents/x', b'x'))
+zip_case('absolute-link', lambda z: add(z, base + 'bad-link', b'/etc', stat.S_IFLNK | 0o777))
+def escaping_chain(z):
+    add(z, base + 'first', b'second', stat.S_IFLNK | 0o777)
+    add(z, base + 'second', b'../../../outside', stat.S_IFLNK | 0o777)
+zip_case('escaping-chain', escaping_chain)
+def beneath_link(z):
+    add(z, base + 'pivot', b'MacOS', stat.S_IFLNK | 0o777)
+    add(z, base + 'pivot/evil', b'x')
+zip_case('beneath-link', beneath_link)
+def duplicate(z):
+    add(z, base + 'Readme', b'a')
+    add(z, base + 'README', b'b')
+zip_case('casefold-duplicate', duplicate)
+zip_case('fifo', lambda z: add(z, base + 'pipe', b'', stat.S_IFIFO | 0o644))
+(root / 'nonzip.zip').write_bytes(b'not a zip file')
+"#;
+    let generated = Command::new("python3")
+        .arg("-c")
+        .arg(make_zips)
+        .arg(dir.path())
+        .output()
+        .expect("generate zip fixtures");
+    assert!(
+        generated.status.success(),
+        "zip fixture generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let cases = [
+        ("benign", true),
+        ("framework", true),
+        ("appledouble-nested", true),
+        ("appledouble-app-root", true),
+        ("appledouble-app-root-dir", false),
+        ("appledouble-app-root-child", false),
+        ("appledouble-other-root", false),
+        ("macosx-other-app", false),
+        ("macosx-symlink", false),
+        ("dotdot", false),
+        ("absolute", false),
+        ("second-top", false),
+        ("absolute-link", false),
+        ("escaping-chain", false),
+        ("beneath-link", false),
+        ("casefold-duplicate", false),
+        ("fifo", false),
+        ("nonzip", false),
+    ];
+    for (name, accepted) in cases {
+        let result = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("APP_ARCHIVE", dir.path().join(format!("{name}.zip")))
+            .output()
+            .expect("run archive validator");
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            result.status.success(),
+            accepted,
+            "{name}: unexpected exit status {:?}; log:\n{log}",
+            result.status.code()
+        );
+        let marker = if accepted {
+            "app archive OK:"
+        } else {
+            "::error::"
+        };
+        assert!(
+            log.contains(marker),
+            "{name}: missing {marker:?}; log:\n{log}"
+        );
+    }
+}
+
+/// The submission id the stubbed `xcrun` hands back from `notarytool submit`.
+#[cfg(unix)]
+const STUB_SUBMISSION_ID: &str = "9d0a17b7-6528-4123-92d0-f0f8e4391817";
+
+/// Stands in for `xcrun notarytool` on a Linux host. Each `info` call answers
+/// with the next line of `responses` (the last line repeats): `timeout` fails
+/// the request the way run 36209188544's did, `garbage` exits 0 with output
+/// that is not JSON, and anything else is reported as the status.
+#[cfg(unix)]
+const STUB_XCRUN: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/calls"
+[ "$1" = notarytool ] || exit 64
+case "$2" in
+  submit)
+    case "$(cat "$STUB_DIR/submit")" in
+      ok) printf '{"id":"%s","message":"Successfully uploaded file"}\n' "$STUB_ID" ;;
+      no-id) printf '{"message":"Successfully uploaded file"}\n' ;;
+      *) echo 'Error: upload failed' >&2; exit 1 ;;
+    esac
+    ;;
+  info)
+    n=$(( $(cat "$STUB_DIR/polls" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$STUB_DIR/polls"
+    line=$(sed -n "${n}p" "$STUB_DIR/responses")
+    [ -n "$line" ] || line=$(tail -n 1 "$STUB_DIR/responses")
+    case "$line" in
+      timeout)
+        echo 'Error: Error Domain=NSURLErrorDomain Code=-1001 "The request timed out."' >&2
+        exit 69
+        ;;
+      garbage) echo 'not json' ;;
+      *) printf '{"id":"%s","status":"%s"}\n' "$3" "$line" ;;
+    esac
+    ;;
+  log) echo "notary log for $3" ;;
+  *) exit 64 ;;
+esac
+"#;
+
+#[cfg(unix)]
+struct NotaryRun {
+    ok: bool,
+    log: String,
+    calls: Vec<String>,
+}
+
+/// Write the real poller with the workflow's own step, then run it against the
+/// stubbed `xcrun`, the way both notarization steps call it. `None` when bash
+/// or python3 cannot run here.
+#[cfg(unix)]
+fn run_notarization(submit: &str, responses: &[&str], deadline_secs: u32) -> Option<NotaryRun> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let usable = Command::new("bash")
+        .args(["-c", "command -v python3"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !usable {
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner_temp = dir.path().join("runner-temp");
+    let stub_dir = dir.path().join("stub");
+    let bin = dir.path().join("bin");
+    for d in [&runner_temp, &stub_dir, &bin] {
+        fs::create_dir_all(d).expect("create fixture directory");
+    }
+    let written = Command::new("bash")
+        .arg("-c")
+        .arg(step_script("Write the notarization poller"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RUNNER_TEMP", &runner_temp)
+        .output()
+        .expect("run the poller-writing step");
+    assert!(
+        written.status.success(),
+        "writing the poller failed: {}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    let xcrun = bin.join("xcrun");
+    fs::write(&xcrun, STUB_XCRUN).expect("write stub xcrun");
+    fs::set_permissions(&xcrun, fs::Permissions::from_mode(0o755)).expect("chmod stub xcrun");
+    fs::write(stub_dir.join("submit"), submit).expect("seed submit outcome");
+    fs::write(stub_dir.join("responses"), responses.join("\n") + "\n").expect("seed responses");
+    let out = Command::new("bash")
+        .arg(runner_temp.join("notarize.sh"))
+        .arg(dir.path().join("app-for-notary.zip"))
+        .arg("the app")
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("RUNNER_TEMP", &runner_temp)
+        .env("STUB_DIR", &stub_dir)
+        .env("STUB_ID", STUB_SUBMISSION_ID)
+        .env("APPLE_API_KEY", "key-id-marker-51d0")
+        .env("APPLE_API_ISSUER", "issuer-marker-0c7e")
+        .env("NOTARY_POLL_SECS", "0")
+        .env("NOTARY_DEADLINE_SECS", deadline_secs.to_string())
+        .output()
+        .expect("run the poller");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !log.contains("key-id-marker-51d0") && !log.contains("issuer-marker-0c7e"),
+        "the poller printed a credential value:\n{log}"
+    );
+    let calls = fs::read_to_string(stub_dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    Some(NotaryRun {
+        ok: out.status.success(),
+        log,
+        calls,
+    })
+}
+
+#[cfg(unix)]
+fn count_calls(run: &NotaryRun, verb: &str) -> usize {
+    let prefix = format!("notarytool {verb} ");
+    run.calls.iter().filter(|c| c.starts_with(&prefix)).count()
+}
+
+/// Scenario: The real notarization poller, run against a stubbed xcrun, keeps
+/// polling through a timed-out request and an unparseable answer and passes
+/// once Apple reports Accepted. Invalid and Rejected fail with the notary log,
+/// no verdict by the deadline fails naming the submission, and a failed upload
+/// fails without polling.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_notarization_poller_retries_until_a_verdict() {
+    let Some(run) = run_notarization(
+        "ok",
+        &["timeout", "In Progress", "garbage", "Accepted"],
+        600,
+    ) else {
+        println!("SKIP: bash or python3 is unavailable");
+        return;
+    };
+    assert!(
+        run.ok,
+        "transient failures then Accepted must pass:\n{}",
+        run.log
+    );
+    assert_eq!(count_calls(&run, "submit"), 1, "{:?}", run.calls);
+    assert_eq!(count_calls(&run, "info"), 4, "{:?}", run.calls);
+    assert_eq!(count_calls(&run, "log"), 0, "{:?}", run.calls);
+    assert!(
+        run.calls.iter().all(|c| !c.contains("--wait")),
+        "{:?}",
+        run.calls
+    );
+    assert!(
+        run.calls
+            .iter()
+            .filter(|c| c.starts_with("notarytool info "))
+            .all(|c| c.starts_with(&format!("notarytool info {STUB_SUBMISSION_ID} "))),
+        "every poll must ask about the submitted id: {:?}",
+        run.calls
+    );
+    assert!(!run.log.contains("::error::"), "{}", run.log);
+
+    for verdict in ["Invalid", "Rejected"] {
+        let run = run_notarization("ok", &["timeout", verdict], 600).expect("tools checked above");
+        assert!(!run.ok, "{verdict} must fail:\n{}", run.log);
+        assert!(
+            run.log.contains(&format!("returned status '{verdict}'"))
+                && run.log.contains(STUB_SUBMISSION_ID)
+                && run
+                    .log
+                    .contains(&format!("notary log for {STUB_SUBMISSION_ID}")),
+            "{verdict} must name the submission and print its notary log:\n{}",
+            run.log
+        );
+        assert_eq!(count_calls(&run, "info"), 2, "{:?}", run.calls);
+    }
+
+    let run = run_notarization("ok", &["In Progress"], 0).expect("tools checked above");
+    assert!(
+        !run.ok,
+        "no verdict by the deadline must fail:\n{}",
+        run.log
+    );
+    assert!(
+        run.log.contains("::error::no notarization verdict")
+            && run
+                .log
+                .contains(&format!("xcrun notarytool info {STUB_SUBMISSION_ID}")),
+        "the deadline failure must name the submission and how to check it:\n{}",
+        run.log
+    );
+    assert_eq!(count_calls(&run, "log"), 0, "{:?}", run.calls);
+
+    for submit in ["fail", "no-id"] {
+        let run = run_notarization(submit, &["Accepted"], 600).expect("tools checked above");
+        assert!(!run.ok, "submit outcome {submit} must fail:\n{}", run.log);
+        assert!(run.log.contains("::error::"), "{}", run.log);
+        assert_eq!(
+            count_calls(&run, "info"),
+            0,
+            "{submit}: nothing to poll without a submission id: {:?}",
+            run.calls
+        );
+    }
+}
+
+/// Scenario: A workflow whose poller treats a failed status request as a
+/// verdict, the pre-#1325 behaviour, fails the retry test above.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_notarization_poller_mutation_without_retry_is_caught() {
+    let original = workflow();
+    let mutated = replace_once(
+        &original,
+        "              status=$(field \"$work/info.json\" status)\n            fi\n",
+        "              status=$(field \"$work/info.json\" status)\n            else\n              exit 1\n            fi\n",
+    );
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(mutated));
+    let run = run_notarization("ok", &["timeout", "Accepted"], 600);
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    let Some(run) = run else {
+        println!("SKIP: bash or python3 is unavailable");
+        return;
+    };
+    assert!(
+        !run.ok,
+        "a poller that stops on a failed request must not pass the transient-failure case:\n{}",
+        run.log
+    );
+    let control =
+        run_notarization("ok", &["timeout", "Accepted"], 600).expect("tools checked above");
+    assert!(
+        control.ok,
+        "the unmutated poller must pass:\n{}",
+        control.log
+    );
+}
+
 #[test]
 fn finalize_does_not_wait_on_the_desktop_jobs() {
     let all = jobs(&workflow());
@@ -120,7 +1233,7 @@ fn finalize_does_not_wait_on_the_desktop_jobs() {
             "`finalize` lists `{forbidden}` in needs: {finalize:?}.\n\
              This is the single property that keeps a desktop bundler failure \
              off the CLI release: `finalize` creates the GitHub Release and \
-             uploads the five CLI assets, so making it wait on a Tauri bundle \
+             uploads the CLI assets, so making it wait on a Tauri bundle \
              means a broken bundler delays — or blocks — an ordinary tag. PRD \
              #740 Decision 4."
         );
@@ -481,6 +1594,216 @@ fn note_step(block: &str) -> String {
         .join("\n")
 }
 
+/// Scenario: Re-running either desktop producer replaces its earlier artifact
+/// instead of failing when the same artifact name already exists in the run.
+#[test]
+fn desktop_uploads_replace_artifacts_on_rerun() {
+    let all = jobs(&workflow());
+    for name in ["desktop-bundle", "desktop-sign"] {
+        let uploads: Vec<String> = steps(job(&all, name))
+            .into_iter()
+            .map(|step| step_code(&step))
+            .filter(|step| step.contains("actions/upload-artifact@"))
+            .collect();
+        assert!(
+            !uploads.is_empty(),
+            "{name} has no artifact uploads to guard"
+        );
+        for upload in uploads {
+            assert!(
+                upload.lines().any(|line| line.trim() == "overwrite: true"),
+                "{name} upload must set `overwrite: true`: {upload}"
+            );
+        }
+    }
+}
+
+/// Scenario: A desktop publish retry rewrites its bounded alpha note instead
+/// of leaving the previous attempt's signing and platform claims in the body.
+#[test]
+fn desktop_note_is_replaced_on_every_run() {
+    let all = jobs(&workflow());
+    let note = note_step(job(&all, "desktop-publish"));
+    assert!(
+        !note.lines().any(|line| line.contains("exit 0")),
+        "the note step must not exit early when an alpha marker is present"
+    );
+    for line in [
+        "MARKER=\"<!-- desktop-alpha -->\"",
+        "END_MARKER=\"<!-- /desktop-alpha -->\"",
+        "printf \"%s\\n\" \"$MARKER\"",
+        "printf \"\\n%s\\n\" \"$END_MARKER\"",
+    ] {
+        assert!(note.contains(line), "the note step must write `{line}`");
+    }
+}
+
+/// Scenario: Removing an upload overwrite or restoring the marker's early
+/// exit makes the corresponding release workflow guard fail.
+#[test]
+fn desktop_rerun_guards_reject_workflow_mutations() {
+    let original = workflow();
+    let sign = job(&jobs(&original), "desktop-sign").to_string();
+    let sign_upload = steps(&sign)
+        .into_iter()
+        .find(|step| step.contains("actions/upload-artifact@"))
+        .expect("desktop-sign upload");
+    let without_overwrite = replace_once(&sign_upload, "          overwrite: true", "");
+    let missing_overwrite = replace_once(&original, &sign_upload, &without_overwrite);
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(missing_overwrite));
+    let upload_failed =
+        std::panic::catch_unwind(desktop_uploads_replace_artifacts_on_rerun).is_err();
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    assert!(
+        upload_failed,
+        "removing desktop-sign overwrite was accepted"
+    );
+
+    let early_exit = replace_once(
+        &original,
+        "          END_MARKER=\"<!-- /desktop-alpha -->\"",
+        "          END_MARKER=\"<!-- /desktop-alpha -->\"\n          case *\"$MARKER\"*) exit 0 ;;",
+    );
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(early_exit));
+    let note_failed = std::panic::catch_unwind(desktop_note_is_replaced_on_every_run).is_err();
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    assert!(note_failed, "restoring the marker early exit was accepted");
+}
+
+#[cfg(unix)]
+fn desktop_note_splice_script() -> String {
+    let all = jobs(&workflow());
+    let step = named_step(
+        job(&all, "desktop-publish"),
+        "Note the unsigned alpha, or the signed macOS build, in the release body",
+    );
+    let mut lines = step.lines().skip_while(|line| !line.contains("<<'SPLICE'"));
+    assert!(
+        lines.next().is_some(),
+        "the desktop note has no SPLICE heredoc"
+    );
+    let body: Vec<&str> = lines.take_while(|line| line.trim() != "SPLICE").collect();
+    assert!(!body.is_empty(), "the SPLICE heredoc is empty");
+    let indent = body
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .expect("nonempty SPLICE heredoc");
+    body.iter()
+        .map(|line| &line[indent..])
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(unix)]
+fn run_desktop_note_splice(body: &str) -> (String, String) {
+    use std::process::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body_path = dir.path().join("body.md");
+    let prefix_path = dir.path().join("prefix.md");
+    let suffix_path = dir.path().join("suffix.md");
+    let script_path = dir.path().join("splice.py");
+    fs::write(&body_path, body).expect("write release body");
+    fs::write(&script_path, desktop_note_splice_script()).expect("write extracted SPLICE");
+    let output = Command::new("python3")
+        .arg(&script_path)
+        .arg(&body_path)
+        .arg("<!-- desktop-alpha -->")
+        .arg("<!-- /desktop-alpha -->")
+        .arg(&prefix_path)
+        .arg(&suffix_path)
+        .output()
+        .expect("run SPLICE under python3");
+    assert!(
+        output.status.success(),
+        "SPLICE exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        fs::read_to_string(&prefix_path).expect("read SPLICE prefix"),
+        fs::read_to_string(&suffix_path).expect("read SPLICE suffix"),
+    )
+}
+
+/// Scenario: The release workflow's actual Python splice preserves changelog
+/// text (including trailing spaces) and human suffixes (including indented code)
+/// while replacing alpha notes. An inline quoted marker stays in the changelog,
+/// and a second run preserves both sides byte for byte.
+#[cfg(unix)]
+#[test]
+fn desktop_note_splice_replaces_old_notes_and_is_idempotent() {
+    use std::process::Command;
+    if Command::new("python3").arg("--version").output().is_err() {
+        println!("SKIP: the desktop note splice test needs `python3` on PATH");
+        return;
+    }
+    const START: &str = "<!-- desktop-alpha -->";
+    const END: &str = "<!-- /desktop-alpha -->";
+    let changelog = "# Release notes\nA changelog entry with exact punctuation.";
+    let suffix = "A human addendum with exact punctuation.";
+    let quoted = "# Release notes\nThe changelog quotes `<!-- desktop-alpha -->` inline.";
+    let spaced_prefix = "# Release notes\nA changelog line with trailing spaces.   ";
+    let indented_suffix = "    command --flag\n    continued  ";
+    let cases = [
+        ("changelog only", changelog.to_string(), changelog, ""),
+        (
+            "legacy note",
+            format!("{changelog}\n\n{START}\nold unsigned note"),
+            changelog,
+            "",
+        ),
+        (
+            "bounded note with suffix",
+            format!("{changelog}\n\n{START}\nold unsigned note\n{END}\n\n{suffix}\n"),
+            changelog,
+            suffix,
+        ),
+        (
+            "indented suffix and spaced prefix",
+            format!(
+                "{spaced_prefix}\n \t\n{START}\nold unsigned note\n{END}\n \t\n\n{indented_suffix}\n \t\n"
+            ),
+            spaced_prefix,
+            indented_suffix,
+        ),
+        ("inline quote", quoted.to_string(), quoted, ""),
+    ];
+    for (label, body, expected_prefix, expected_suffix) in cases {
+        let (prefix, kept_suffix) = run_desktop_note_splice(&body);
+        assert_eq!(
+            (prefix.as_str(), kept_suffix.as_str()),
+            (expected_prefix, expected_suffix),
+            "{label}: surrounding text changed"
+        );
+        let mut rendered = format!("{prefix}\n\n{START}\nnew signed note\n{END}\n");
+        if !kept_suffix.is_empty() {
+            rendered.push_str(&format!("\n{kept_suffix}\n"));
+        }
+        assert_eq!(
+            rendered.lines().filter(|line| *line == START).count(),
+            1,
+            "{label}: START line count"
+        );
+        assert_eq!(
+            rendered.lines().filter(|line| *line == END).count(),
+            1,
+            "{label}: END line count"
+        );
+        assert!(
+            !rendered.contains("old unsigned note"),
+            "{label}: stale note"
+        );
+        let (again_prefix, again_suffix) = run_desktop_note_splice(&rendered);
+        assert_eq!(again_prefix, prefix, "{label}: second run changed prefix");
+        assert_eq!(
+            again_suffix, kept_suffix,
+            "{label}: second run changed suffix"
+        );
+    }
+}
+
 /// The release-body note is the only installation instruction this project
 /// publishes for the desktop bundles -- PRD #740 Decision 11 ships the alpha
 /// unadvertised, so there is no `docs/` page to correct it. Two properties of
@@ -528,6 +1851,51 @@ fn the_alpha_note_does_not_leave_a_user_with_only_a_terminal_command() {
          with `no-debsig`, so `dpkg -i` verifies no package signature and \
          issues no warning. PRD #757 Decisions 3 and 7."
     );
+}
+
+/// The note has to establish that a download is genuine BEFORE it tells anyone
+/// how to get past Gatekeeper, because the bundles are unsigned and provenance
+/// is the only thing that says where the file came from. Read top-down, the
+/// note used to hand over both override routes first, so a reader had
+/// bypassed the protection before reaching the check that would justify it
+/// (#1153). Nothing about the text changes when the order does, which is why
+/// a presence check cannot hold this.
+///
+/// The command also has to prove what the note says it proves. `--repo` pins
+/// the repository but not the workflow, so an attestation from ANY workflow
+/// in it passes; only `--signer-workflow` makes "produced by this repository's
+/// release workflow" true. Measured on v0.41.0's `.dmg` and `.deb`: exit 0
+/// naming `release.yml`, exit 1 naming `ci.yml`.
+#[test]
+fn the_alpha_note_verifies_provenance_before_it_overrides_gatekeeper() {
+    let all = jobs(&workflow());
+    let code = note_step(job(&all, "desktop-publish"));
+
+    let verify = code.find("gh attestation verify").unwrap_or_else(|| {
+        panic!("the release note no longer carries a `gh attestation verify` command:\n{code}")
+    });
+    // Up to the `printf` escape that ends the rendered line, so a flag
+    // elsewhere in the same format string cannot satisfy the check.
+    let command = code[verify..].split("\\n").next().unwrap_or_default();
+    assert!(
+        command.contains("--signer-workflow") && command.contains("/.github/workflows/release.yml"),
+        "the release note's verify command does not pin the signing workflow: \
+         `{command}`. `--repo` alone accepts an attestation from any workflow in \
+         the repository, while the note tells the user it proves the file came \
+         from the release workflow. #1153."
+    );
+    for route in ["System Settings", "com.apple.quarantine"] {
+        if let Some(at) = code.find(route) {
+            assert!(
+                verify < at,
+                "the release note offers the `{route}` Gatekeeper override before \
+                 the `gh attestation verify` command. The bundles are unsigned, so \
+                 verifying provenance is the prerequisite for overriding the \
+                 warning, and a reader following the note top-down must reach it \
+                 first. #1153."
+            );
+        }
+    }
 }
 
 /// The code portion of `line` -- everything before an unquoted `#` that opens a
@@ -706,5 +2074,934 @@ fn gh_calls_in_checkoutless_jobs_name_their_repository() {
          still there, the `gh` token match above has stopped seeing them -- \
          perhaps a call is now split across a line continuation -- and the loop \
          it feeds has become a no-op that passes on nothing."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1219: the release body is clamped to GitHub's 125,000-character cap.
+// ---------------------------------------------------------------------------
+//
+// v0.41.1 shipped 131,299 characters of notes. GitHub silently truncated the
+// body to exactly 125,000, ending mid-sentence, and then rejected
+// `desktop-publish`'s append with `HTTP 422: body is too long` -- so the .dmg
+// and .deb went out with no Gatekeeper instructions and no provenance command.
+// `prepare` now clamps the body itself, on an entry boundary, reserving room
+// for the note that job appends afterwards.
+//
+// Nothing else covers this. `release.yml` fires only on a tag, so the clamp
+// runs in no PR and its first execution is a real release -- the same argument
+// this module's header makes for the wiring assertions, and the reason
+// Greptile asked for coverage on PR #1221. These tests close that by lifting
+// the heredoc out of the workflow and running it, which is exactly what
+// `junit_strip` does with `scripts/junit-strip-output.py` (CLAUDE.md rule 5
+// names it as an accepted exception, on the same ground: the safety property
+// is a runtime assertion and nothing else).
+
+/// The Python source inside `prepare`'s `<<'CLAMP'` heredoc, dedented so it
+/// can be fed to an interpreter.
+///
+/// Extracted rather than duplicated. A copy of the script in this file would
+/// pass forever while the workflow's own copy rotted, which is the failure
+/// mode a linkage check exists to prevent.
+fn clamp_script() -> String {
+    let text = workflow();
+    let mut lines = text.lines().skip_while(|l| !l.contains("<<'CLAMP'"));
+    assert!(
+        lines.next().is_some(),
+        "`prepare` no longer contains a `<<'CLAMP'` heredoc. If the clamp moved \
+         or was replaced, move these tests with it -- do not delete them: the \
+         125,000-character cap is still there and still silent."
+    );
+    let body: Vec<&str> = lines.take_while(|l| l.trim() != "CLAMP").collect();
+    assert!(!body.is_empty(), "the CLAMP heredoc is empty");
+    let indent = body
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .expect("the heredoc has at least one non-blank line");
+    body.iter()
+        .map(|l| if l.len() >= indent { &l[indent..] } else { "" })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Run the extracted clamp over `body`, returning what it left on disk.
+///
+/// `None` means `python3` is absent and the caller should print `SKIP:` and
+/// return, matching `junit_strip`.
+fn run_clamp(body: &str) -> Option<String> {
+    use std::process::Command;
+    Command::new("python3").arg("--version").output().ok()?;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("release-body.md");
+    fs::write(&path, body).expect("write body");
+    let script = dir.path().join("clamp.py");
+    fs::write(&script, clamp_script()).expect("write script");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&path)
+        .output()
+        .expect("run the clamp");
+    assert!(
+        out.status.success(),
+        "the clamp exited {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Normalize CRLF, because on Windows we would otherwise be measuring the
+    // TEST HARNESS rather than the clamp. Python's text mode translates each
+    // `\n` it writes into `\r\n` there, so the readback carries one extra
+    // character per line -- 562 of them on the dense fixture, which is what
+    // turned `build-windows` red on the first push of this PR with
+    // `clamped body is 122562 chars, over the 122000 budget`.
+    //
+    // The clamp itself was correct and the number it enforces is the right
+    // one: `prepare` runs on `ubuntu-latest`, Python writes LF there with no
+    // translation, and the artifact travels to `finalize` byte for byte -- so
+    // the length GitHub applies its 125,000-character cap to is the LF length,
+    // which is exactly what the clamp counted. Measuring the CRLF form would
+    // assert against a body that is never published.
+    //
+    // Normalizing rather than gating the test on `cfg(unix)`: every other
+    // assertion here (entries kept whole, the giant entry dropped, the pointer
+    // appended) is platform-independent and worth running everywhere. This
+    // crate already treats CRLF as a known Windows hazard rather than a reason
+    // to skip -- see `skill_frontmatter`'s `a_crlf_checkout_parses_the_same_as_lf`.
+    Some(
+        fs::read_to_string(&path)
+            .expect("read back")
+            .replace("\r\n", "\n"),
+    )
+}
+
+/// The two constants the clamp is parameterised by, read from its own source
+/// so a test can never assert against a number the workflow has since changed.
+fn clamp_limits() -> (usize, usize) {
+    let script = clamp_script();
+    let line = script
+        .lines()
+        .find(|l| l.starts_with("LIMIT, RESERVE ="))
+        .expect("the clamp declares `LIMIT, RESERVE = ...`");
+    let mut nums = line
+        .split('=')
+        .nth(1)
+        .expect("an assignment")
+        .split(',')
+        .map(|n| n.trim().parse::<usize>().expect("an integer"));
+    (nums.next().unwrap(), nums.next().unwrap())
+}
+
+/// A body of `entries` changelog entries, each spanning several physical
+/// lines, in the shape `assemble-changelog.sh` actually produces.
+///
+/// The multi-line entry is the whole point: a clamp that cut on `\n` would
+/// land *inside* one of these and publish half of it, which is the defect
+/// [`an_oversized_body_is_cut_between_entries_never_inside_one`] exists to
+/// catch. CLAUDE.md rule 10 means real entries are long unwrapped single
+/// lines with continuations, so this mirrors that rather than a wrapped
+/// paragraph.
+fn synthetic_body(entries: usize) -> String {
+    let mut s = String::from("## What's changed\n\n");
+    for i in 0..entries {
+        s.push_str(&format!(
+            "- **entry-{i:04}-open** {}\n  continuation one for entry {i:04}\n  \
+             continuation two for entry {i:04} entry-{i:04}-close\n",
+            "padding ".repeat(60)
+        ));
+    }
+    s
+}
+
+/// A body whose entry boundaries are SPARSE: three ordinary entries, then one
+/// enormous entry whose continuation lines run past the budget on their own.
+///
+/// This is the shape that exposes the bug, and a dense fixture does not --
+/// found by mutation-testing this very file. With entries packed every few
+/// hundred characters, `rfind("\n- **")` always lands close to the budget, so
+/// the sparse branch is never taken and a test built on that fixture passes
+/// against the broken clamp as happily as against the fixed one. Here the last
+/// boundary sits a few hundred characters into a ~130,000-character body, which
+/// is precisely when the old code abandoned it for `rfind("\n")` and cut
+/// through the middle of the giant entry.
+///
+/// Not a contrived shape, either: one release note carrying a long rationale --
+/// which CLAUDE.md rule 10 writes as a single unwrapped line -- produces it.
+fn synthetic_sparse_body(limit: usize) -> String {
+    let mut s = String::from("## What's changed\n\n");
+    for i in 0..3 {
+        s.push_str(&format!(
+            "- **entry-{i:04}-open** short one\n  continuation entry-{i:04}-close\n"
+        ));
+    }
+    s.push_str("- **entry-9999-open** the entry that dwarfs the budget\n");
+    while s.chars().count() < limit + 5_000 {
+        s.push_str("  a continuation line inside the giant entry, nowhere near its end\n");
+    }
+    s.push_str("  entry-9999-close\n");
+    s
+}
+
+/// Every `- **` entry the clamp keeps must be kept WHOLE.
+///
+/// This is the finding Greptile raised on PR #1221, and it was real: the first
+/// implementation dropped to `rfind("\n")` whenever the last entry boundary
+/// fell in the first half of the budget, on the theory that an early boundary
+/// wasted room. An entry spans several lines, so that cut landed inside one --
+/// reintroducing the mid-sentence truncation the clamp was written to prevent,
+/// committed by us rather than by GitHub.
+///
+/// The assertion is over the *pairing*: an entry contributes an `-open` marker
+/// and, three lines later, a `-close` one. Counting them separately is what
+/// makes a split detectable at all -- a length check passes just as happily on
+/// a body cut through the middle of an entry.
+#[test]
+fn an_oversized_body_is_cut_between_entries_never_inside_one() {
+    let (limit, reserve) = clamp_limits();
+    // Sized so the cut lands mid-entry unless the clamp seeks a boundary.
+    let body = synthetic_body(400);
+    assert!(
+        body.chars().count() > limit,
+        "the fixture must exceed the cap to exercise the clamp"
+    );
+    let Some(out) = run_clamp(&body) else {
+        eprintln!("SKIP: the release-body clamp test needs `python3` on PATH");
+        return;
+    };
+
+    assert!(
+        out.chars().count() <= limit - reserve,
+        "clamped body is {} chars, over the {} budget",
+        out.chars().count(),
+        limit - reserve
+    );
+    let opened = out.matches("-open**").count();
+    let closed = out.matches("-close").count();
+    assert_eq!(
+        opened, closed,
+        "the clamp cut INSIDE an entry: {opened} entries start in the output \
+         but {closed} finish. The cut must land on a `\\n- **` boundary, so \
+         that every entry published is published whole."
+    );
+    assert!(opened > 0, "the clamp kept no entries at all");
+    assert!(
+        out.contains("CHANGELOG.md"),
+        "a truncated body must point at the full text"
+    );
+}
+
+/// A body that already fits is left byte-identical.
+///
+/// The clamp runs on every release, almost all of which are far under the cap,
+/// so the common path is the one where it must do nothing -- no pointer
+/// appended, no trailing whitespace stripped, no entry dropped.
+#[test]
+fn a_body_under_the_cap_is_left_exactly_as_it_was() {
+    let body = synthetic_body(3);
+    let Some(out) = run_clamp(&body) else {
+        eprintln!("SKIP: the release-body clamp test needs `python3` on PATH");
+        return;
+    };
+    assert_eq!(
+        out, body,
+        "the clamp modified a body that was already under the cap"
+    );
+}
+
+/// `RESERVE` must cover the note `desktop-publish` appends after the release
+/// exists.
+///
+/// This is the half of v0.41.1 that actually cost users something: the body
+/// was already at the cap, so the append was rejected with `HTTP 422` and the
+/// desktop bundles shipped with no install instructions and no
+/// `gh attestation verify` command. Clamping to the cap alone would not have
+/// prevented that -- only clamping to the cap *minus room for this note* does.
+///
+/// The two live in different jobs with nothing between them, which is exactly
+/// the shape this module exists to guard: the note is prose and will be edited
+/// again, and there is no reason its author would think to look at a Python
+/// constant in `prepare`.
+///
+/// Measured over the raw `printf` arguments, which OVERSTATES the rendered
+/// length (`\n` is two characters here and one on the wire, `\`` is two and
+/// one), so the check errs toward demanding more headroom than is strictly
+/// needed. It is a floor, not an equality.
+#[test]
+fn the_reserve_covers_the_note_desktop_publish_appends() {
+    let all = jobs(&workflow());
+    let note = note_step(job(&all, "desktop-publish"));
+    let printed: usize = note
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("printf"))
+        .map(str::len)
+        .sum();
+    assert!(
+        printed > 0,
+        "found no `printf` lines in the alpha-note step"
+    );
+
+    let (_, reserve) = clamp_limits();
+    assert!(
+        reserve >= printed,
+        "`desktop-publish`'s alpha note is ~{printed} characters but `prepare` \
+         reserves only {reserve} for it. A clamped release body would be \
+         accepted and the note that follows it rejected with `HTTP 422: body \
+         is too long` -- the v0.41.1 failure exactly. Raise RESERVE in the \
+         CLAMP heredoc in `.github/workflows/release.yml`."
+    );
+}
+
+/// The sparse case, which is the one Greptile actually reported.
+///
+/// When no entry boundary falls in the latter part of the budget, the clamp
+/// must still cut at the boundary it *did* find, however early -- keeping less
+/// rather than publishing a fragment. The old code preferred a whole physical
+/// line here, which is not a unit of anything: entries span several lines, so
+/// that cut landed inside one.
+///
+/// [`an_oversized_body_is_cut_between_entries_never_inside_one`] does NOT
+/// cover this. Its fixture is dense, so the branch below is never reached and
+/// the broken clamp passes it. Keep both.
+#[test]
+fn a_sparse_body_is_cut_at_the_early_boundary_not_at_a_line() {
+    let (limit, _) = clamp_limits();
+    let body = synthetic_sparse_body(limit);
+    let Some(out) = run_clamp(&body) else {
+        eprintln!("SKIP: the release-body clamp test needs `python3` on PATH");
+        return;
+    };
+
+    let opened = out.matches("-open**").count();
+    let closed = out.matches("-close").count();
+    assert_eq!(
+        opened, closed,
+        "the clamp cut INSIDE an entry when boundaries were sparse: {opened} \
+         entries start in the output but {closed} finish. Cutting at the last \
+         `\\n- **` however early it falls keeps less text; cutting at an \
+         arbitrary `\\n` publishes half an entry. Keep less."
+    );
+    assert!(
+        !out.contains("entry-9999-open"),
+        "the giant entry was opened but cannot be finished -- it must be \
+         dropped whole, not truncated"
+    );
+    assert!(opened > 0, "the clamp kept no entries at all");
+}
+
+/// A body with no newline at all still gets clamped, rather than losing one
+/// character and being published over the cap.
+///
+/// `rfind` returns -1 on no match, and `src[:-1]` is not a clamp: it drops a
+/// single character and reports success. Measured on the unguarded version, a
+/// 131,299-character body came back **131,311** -- longer than it started,
+/// because the appended pointer outweighs the removed character -- whereupon
+/// GitHub truncates it silently and the clamp has caused the exact failure it
+/// exists to prevent, having printed a reassuring line on the way.
+///
+/// `assemble-changelog.sh` does not produce such a body. That is not the
+/// point: this whole step exists because the cap was reached by a release
+/// nobody predicted, and a guard whose own failure mode is silent is worse
+/// than no guard.
+#[test]
+fn a_body_with_no_line_breaks_is_still_clamped() {
+    let (limit, reserve) = clamp_limits();
+    let body = "x".repeat(limit + 6_000);
+    let Some(out) = run_clamp(&body) else {
+        eprintln!("SKIP: the release-body clamp test needs `python3` on PATH");
+        return;
+    };
+    assert!(
+        out.chars().count() <= limit - reserve,
+        "a body with no newline came back {} chars, over the {} budget -- the \
+         `rfind` miss fell through to a negative index instead of clamping",
+        out.chars().count(),
+        limit - reserve
+    );
+    assert!(
+        out.chars().count() < body.chars().count(),
+        "the clamp returned a body no shorter than it received"
+    );
+}
+
+/// The step blocks of a job, split on the `      - ` step markers.
+///
+/// Comments written *above* a step belong to the preceding step's block, since
+/// the `- ` line is what opens a new one. That is harmless for the callers
+/// below, which read only `uses:`/`name:`/`path:` code lines -- but it is worth
+/// knowing before writing a check here that greps a step for prose.
+fn steps(block: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+    for line in block.lines() {
+        if line.starts_with("      - ") {
+            if let Some(body) = current.take() {
+                out.push(body.join("\n"));
+            }
+            current = Some(vec![line.to_string()]);
+            continue;
+        }
+        if let Some(body) = current.as_mut() {
+            body.push(line.to_string());
+        }
+    }
+    if let Some(body) = current.take() {
+        out.push(body.join("\n"));
+    }
+    out
+}
+
+/// The code lines of `step`, with trailing shell comments removed.
+fn step_code(step: &str) -> String {
+    step.lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The `name:` of the `actions/upload-artifact` step in `block` whose `path:`
+/// is exactly `path`, together with whether it declares
+/// `if-no-files-found: error`.
+///
+/// Keyed on the PATH rather than on the artifact name, so the name itself stays
+/// an output of the check rather than an input to it. That is the whole point:
+/// the assertions below then compare the producer's chosen name against the
+/// consumer's, and a rename done in one place and not the other fails instead
+/// of passing twice over a hardcoded literal.
+fn uploaded_as(block: &str, path: &str) -> Option<(String, bool)> {
+    steps(block).into_iter().find_map(|step| {
+        let code = step_code(&step);
+        if !code.contains("actions/upload-artifact@") {
+            return None;
+        }
+        if !code.lines().any(|l| l.trim() == format!("path: {path}")) {
+            return None;
+        }
+        let name = code
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("name: ").map(str::to_string))?;
+        let strict = code.lines().any(|l| l.trim() == "if-no-files-found: error");
+        Some((name, strict))
+    })
+}
+
+/// Whether `block` has an `actions/download-artifact` step pulling exactly the
+/// artifact `name` (as `name:`, not as a `pattern:`).
+fn downloads_artifact(block: &str, name: &str) -> bool {
+    steps(block).iter().any(|step| {
+        let code = step_code(step);
+        code.contains("actions/download-artifact@")
+            && code.lines().any(|l| l.trim() == format!("name: {name}"))
+    })
+}
+
+/// Issue #1152: a full release published eight assets and the subject
+/// collection used to match six of them. The two it missed were the checksum
+/// manifests -- which is the worst pair to miss, because a manifest is a list
+/// of hashes a user leans on to validate everything else, so an unattested one
+/// is precisely the file worth swapping.
+///
+/// **Neither manifest is reachable from `attest` by default, and that is what
+/// this guards.** `checksums.txt` is written inside `finalize` and
+/// `checksums-desktop-alpha.txt` inside `desktop-publish`; `attest` has no
+/// checkout and neither generates them, so each has to travel as an artifact of
+/// its own. The obvious-looking alternative -- re-running `shasum` in `attest`
+/// -- is the one outcome that must not happen: it would mint provenance over
+/// bytes that are very probably identical to the published ones and provably
+/// nothing, and an attestation over a file that differs from the published one
+/// is worse than no attestation at all. So the absence of `shasum` from this
+/// job is asserted too.
+///
+/// Nothing else can catch a regression here. `release.yml` fires only on a tag,
+/// never on a pull request, and a dropped subject is invisible in the run: the
+/// action succeeds over whatever list it is handed. The symptom is a `404` from
+/// `gh attestation verify`, weeks later, on a release that has already shipped.
+#[test]
+fn both_checksum_manifests_are_attested_subjects() {
+    let all = jobs(&workflow());
+    let attest = job(&all, "attest");
+    // Comments stripped for both substring checks below, so a comment ABOUT the
+    // wiring cannot stand in for the wiring -- the same reason `note_step`'s
+    // callers strip them. The attest job is full of prose naming these files.
+    let attest_code = step_code(attest);
+
+    let cases = [
+        ("finalize", "dist/checksums.txt"),
+        (
+            "desktop-publish",
+            "dist-desktop/checksums-desktop-alpha.txt",
+        ),
+    ];
+
+    for (producer, path) in cases {
+        let (artifact, strict) = uploaded_as(job(&all, producer), path).unwrap_or_else(|| {
+            panic!(
+                "`{producer}` no longer uploads `{path}` as an artifact. It is written in that \
+                 job and published from there, and `attest` has no checkout -- so without this \
+                 hand-off the manifest is unreachable from the job that attests, and the only \
+                 way to attest it would be to regenerate it, which attests bytes the release \
+                 does not carry. #1152."
+            )
+        });
+
+        // The two `pattern:` downloads that already exist would sweep a
+        // carelessly named manifest artifact into a directory it must not reach:
+        // `dot-agent-deck-*` is what `finalize` selects on and feeds to
+        // `task checksums`' own `shasum -a 256 dot-agent-deck-*`, and
+        // `desktop-bundle-*` is what `desktop-publish` re-uploads wholesale with
+        // `gh release upload dist-desktop/*`.
+        for reserved in ["dot-agent-deck-", "desktop-bundle-"] {
+            assert!(
+                !artifact.starts_with(reserved),
+                "`{producer}` uploads `{path}` as artifact `{artifact}`, which matches the \
+                 `{reserved}*` download pattern already in this workflow. A re-run of that job \
+                 alone would then pull a previous attempt's manifest back into its own working \
+                 directory. Same rule as `desktop-bundle`'s artifact name."
+            );
+        }
+
+        assert!(
+            strict,
+            "`{producer}`'s upload of `{path}` does not declare `if-no-files-found: error`. \
+             Without it a missing manifest produces a warning and no artifact, and for the \
+             desktop half -- whose download in `attest` is deliberately tolerated -- that is a \
+             silently unattested asset rather than a failed release."
+        );
+
+        assert!(
+            downloads_artifact(attest, &artifact),
+            "`attest` does not download the `{artifact}` artifact that `{producer}` uploads. The \
+             producer and the consumer have to name the same artifact; renaming one alone drops \
+             `{path}` from the subject list without failing anything."
+        );
+
+        // Deliberately NOT a `contains(path)` check on the job. That is what
+        // this test carried on its first push, and Greptile was right to call
+        // it: `dist/checksums.txt` also appears in the collector's own
+        // `[ ! -f ... ]` guard, so deleting the line that appends it to
+        // `subjects` left the substring in place and the assertion green while
+        // the asset silently stopped being attested. Whether a path reaches the
+        // EMITTED list is a question about what the script does, so it is
+        // answered by running the script -- see the four tests below.
+    }
+
+    assert!(
+        !attest_code.contains("shasum"),
+        "`attest` runs `shasum`. The manifests must travel from the jobs that published them, \
+         not be regenerated here: an attestation over a file that differs from the published one \
+         is worse than none, and a second `shasum` run in a different job is a claim about bytes \
+         nobody checked. #1152."
+    );
+}
+
+/// The index of the first step in `steps` whose code (comments stripped)
+/// satisfies `pred`, or a panic naming `what` when none does.
+fn step_index(steps: &[String], what: &str, pred: impl Fn(&str) -> bool) -> usize {
+    steps
+        .iter()
+        .position(|s| pred(&step_code(s)))
+        .unwrap_or_else(|| panic!("no step {what}"))
+}
+
+/// Each manifest's artifact upload sits IMMEDIATELY after the step that
+/// publishes it, and in `finalize` before the steps that write more files into
+/// `dist/`.
+///
+/// This is what makes "the attested bytes are the published bytes" true, and
+/// [`both_checksum_manifests_are_attested_subjects`] cannot see it: that test
+/// pins WHICH artifact carries each manifest, not WHEN it is uploaded. Both of
+/// these edits would leave it green while attesting a file the release may not
+/// carry:
+///
+/// - moving the upload above the publish step, so a step inserted between the
+///   two could rewrite the manifest after it travelled and before it shipped;
+/// - moving `finalize`'s upload below `task homebrew-formula` /
+///   `task scoop-manifest`, which write `dist/<name>.rb` and `dist/<name>.json`
+///   into the directory the manifest lives in.
+///
+/// Asserted as adjacency rather than mere precedence, because the property the
+/// upload steps' comments claim is "nothing between the publish and the
+/// upload", and precedence alone would let a writer slip in between.
+#[test]
+fn manifest_uploads_directly_follow_the_steps_that_publish_them() {
+    let all = jobs(&workflow());
+
+    let finalize = steps(job(&all, "finalize"));
+    let generate = step_index(&finalize, "runs `task checksums`", |c| {
+        c.contains("run: task checksums")
+    });
+    let publish = step_index(&finalize, "creates the GitHub release", |c| {
+        c.contains("softprops/action-gh-release@")
+    });
+    let upload = step_index(&finalize, "uploads `dist/checksums.txt`", |c| {
+        c.contains("actions/upload-artifact@")
+            && c.lines().any(|l| l.trim() == "path: dist/checksums.txt")
+    });
+    let formula = step_index(&finalize, "runs `task homebrew-formula`", |c| {
+        c.contains("task homebrew-formula")
+    });
+    assert!(
+        generate < publish,
+        "`finalize` publishes the release before `task checksums` has written the manifest"
+    );
+    assert_eq!(
+        upload,
+        publish + 1,
+        "`finalize`'s `release-checksums` upload is no longer the step directly after the \
+         release step (upload at {upload}, release at {publish}). What travels to `attest` must \
+         be the file the release carried, with nothing in between able to rewrite it. #1152."
+    );
+    assert!(
+        upload < formula,
+        "`finalize` uploads `dist/checksums.txt` after `task homebrew-formula`, which writes into \
+         `dist/` as well. #1152."
+    );
+
+    let desktop = steps(job(&all, "desktop-publish"));
+    let generate = step_index(&desktop, "writes `checksums-desktop-alpha.txt`", |c| {
+        c.contains("> checksums-desktop-alpha.txt")
+    });
+    let publish = step_index(&desktop, "runs `gh release upload`", |c| {
+        c.contains("gh release upload")
+    });
+    let upload = step_index(
+        &desktop,
+        "uploads `dist-desktop/checksums-desktop-alpha.txt`",
+        |c| {
+            c.contains("actions/upload-artifact@")
+                && c.lines()
+                    .any(|l| l.trim() == "path: dist-desktop/checksums-desktop-alpha.txt")
+        },
+    );
+    let note = step_index(&desktop, "appends the alpha note", |c| {
+        c.contains("gh release edit")
+    });
+    assert!(
+        generate < publish,
+        "`desktop-publish` uploads the release assets before the desktop manifest is written"
+    );
+    assert_eq!(
+        upload,
+        publish + 1,
+        "`desktop-publish`'s `release-checksums-desktop` upload is no longer the step directly \
+         after `gh release upload` (upload at {upload}, release upload at {publish}). #1152."
+    );
+    assert!(
+        upload < note,
+        "`desktop-publish` appends the note claiming the manifest carries provenance before it \
+         hands the manifest to `attest`. `attest` refuses a missing manifest exactly when this job \
+         succeeded, which is only sound if the artifact exists whenever the claim does. #1152."
+    );
+}
+
+/// The shell body of `attest`'s "Collect the subjects to attest" step.
+///
+/// Extracted the way [`clamp_script`] extracts the release-body clamp, and for
+/// the same reason: the thing worth asserting about this step is what it *does*
+/// with a given set of files on disk, and no substring check over its source
+/// can answer that. Greptile's P2 on #1227 is the worked example — the path a
+/// subject must reach the emitted list by also appears in the guard that checks
+/// the file exists, so a check for the path passes with the append deleted.
+fn subjects_script() -> String {
+    let all = jobs(&workflow());
+    let step = steps(job(&all, "attest"))
+        .into_iter()
+        // The step HEADER carries the name, so the line reads
+        // `- name: Collect the subjects to attest` once trimmed -- matching on
+        // the bare `name:` form finds nothing.
+        .find(|s| {
+            s.lines()
+                .any(|l| l.trim() == "- name: Collect the subjects to attest")
+        })
+        .expect("`attest` has a `Collect the subjects to attest` step");
+    let mut lines = step.lines().skip_while(|l| l.trim() != "run: |");
+    lines.next().expect("the step has a `run: |` block");
+    let body: Vec<&str> = lines.collect();
+    assert!(!body.is_empty(), "the collect step's `run:` block is empty");
+    let indent = body
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .expect("the block has at least one non-blank line");
+    body.iter()
+        .map(|l| if l.len() >= indent { &l[indent..] } else { "" })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What [`run_subjects`] observed: whether the collector succeeded, the
+/// subject list it wrote to `GITHUB_OUTPUT`, and its stdout/stderr for when an
+/// assertion needs to say more than pass or fail.
+struct SubjectsRun {
+    ok: bool,
+    subjects: Vec<String>,
+    stdout: String,
+    stderr: String,
+}
+
+impl SubjectsRun {
+    /// A one-line-per-stream dump for a panic message, so a failure on a box
+    /// nobody can reproduce locally (this suite's own reason for existing —
+    /// see [`run_subjects`]'s doc comment) still says what actually happened
+    /// rather than just that it did.
+    fn diagnostics(&self) -> String {
+        format!(
+            "exit ok: {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.ok, self.stdout, self.stderr
+        )
+    }
+}
+
+/// What the collector does when `dist/` and `dist-desktop/` hold exactly
+/// `files` and `desktop-publish` reported `desktop_result`.
+///
+/// Returns the exit status and the subject list it wrote to `GITHUB_OUTPUT` —
+/// the actual list handed to `actions/attest-build-provenance`, parsed out of
+/// the `paths<<SUBJECTS_EOF` heredoc rather than inferred. `None` means `bash`
+/// is absent and the caller should print `SKIP:` and return, the same tolerance
+/// `verify_pr_stream` and `junit_strip` take.
+///
+/// The `GITHUB_OUTPUT` path is normalised to forward slashes before being
+/// handed to bash as an environment value. On a native Windows runner
+/// `tempfile::tempdir()` returns a backslash path, and forward slashes are
+/// accepted by both Win32 and every POSIX-emulation layer MSYS ships, so
+/// normalising removes a possible source of trouble without removing anything
+/// Unix relies on.
+///
+/// The presence check requires `--version` to EXIT SUCCESSFULLY, not merely to
+/// spawn -- `.output().ok()` alone only catches "no such program", and on a
+/// native Windows runner there IS a program named `bash` on PATH even with no
+/// usable shell behind it: `C:\Windows\System32\bash.exe`, the WSL launcher
+/// stub, which spawns fine and then exits nonzero printing "Windows Subsystem
+/// for Linux has no installed distributions." Measured on `build-windows` in
+/// PR #1227: that is exactly what every one of this module's `run_subjects`
+/// calls hit, because the runner's PATH puts System32 ahead of Git for
+/// Windows' `bash.exe`. `verify_pr_stream`'s `tool_present` helper already
+/// checks `.status.success()` for this reason, which is why ITS bash-invoking
+/// tests reported PASS on the same runner -- they detected the same broken
+/// `bash` and skipped, silently and correctly, while this module's weaker
+/// check let three tests attempt to run a shell that cannot run anything.
+fn run_subjects(files: &[&str], desktop_result: &str) -> Option<SubjectsRun> {
+    use std::process::Command;
+    let usable = Command::new("bash")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !usable {
+        return None;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    for sub in ["dist", "dist-desktop"] {
+        fs::create_dir_all(dir.path().join(sub)).expect("create the artifact directory");
+    }
+    for f in files {
+        fs::write(dir.path().join(f), b"fixture\n").unwrap_or_else(|e| panic!("write {f}: {e}"));
+    }
+    let out_path = dir.path().join("github-output");
+    fs::write(&out_path, "").expect("seed GITHUB_OUTPUT");
+    let out_path_arg = out_path.to_string_lossy().replace('\\', "/");
+
+    // A FILE, not `-c "<script>"` — the same choice `run_clamp` and
+    // `verify_pr_stream`'s `scan.sh` invocation already make, and not by
+    // accident. `-c` hands the whole multi-line, quote-heavy script through
+    // as a single argv element, which on Windows means Rust's `Command` has
+    // to re-encode it into ONE `CreateProcess` command-line string that MSYS
+    // bash then has to decode back into the same bytes -- a round trip this
+    // codebase has never previously asked of a script this size, unlike every
+    // other cross-platform harness test here. A file sidesteps the whole
+    // question: bash opens and reads it directly, so there is nothing for
+    // argv-quoting to get wrong. (This was the first suspect when
+    // `a_full_release_attests_every_asset_it_publishes` and its siblings failed
+    // on `build-windows` in PR #1227, but the log showed the real cause: the
+    // WSL launcher stub answering to `bash`, which the presence check above
+    // now screens out. The file is kept because it removes the question.)
+    //
+    // Invoked with the flags GitHub Actions itself uses for `shell: bash` --
+    // `bash --noprofile --norc -eo pipefail {0}` -- so the harness runs the
+    // step the way the runner does. The script sets `-eu` on its own, but
+    // `pipefail` comes only from the runner, and the collector has pipelines
+    // (`find ... | sort`) whose behaviour it changes.
+    let script_path = dir.path().join("collect-subjects.sh");
+    fs::write(&script_path, subjects_script()).expect("write the collector script");
+    let out = Command::new("bash")
+        .args(["--noprofile", "--norc", "-eo", "pipefail"])
+        .arg(&script_path)
+        .current_dir(dir.path())
+        .env("GITHUB_OUTPUT", &out_path_arg)
+        .env("DESKTOP_PUBLISH_RESULT", desktop_result)
+        .output()
+        .expect("run the subject collector");
+
+    let emitted = fs::read_to_string(&out_path).expect("read back GITHUB_OUTPUT");
+    let subjects: Vec<String> = emitted
+        .lines()
+        .skip_while(|l| l.trim() != "paths<<SUBJECTS_EOF")
+        .skip(1)
+        .take_while(|l| l.trim() != "SUBJECTS_EOF")
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Some(SubjectsRun {
+        ok: out.status.success(),
+        subjects,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// The ten assets a full release publishes are the ten subjects attested: the
+/// eight of issue #1152 plus PRD #1859's two Linux collector binaries.
+///
+/// This is the assertion issue #1152 is actually about. The subject collection
+/// matched six of them, and the two it missed were the checksum manifests — the
+/// files a user reads to validate all the others, so the ones most worth
+/// swapping.
+#[test]
+fn a_full_release_attests_every_asset_it_publishes() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/dot-agent-deck-linux-arm64",
+        "dist/dot-agent-deck-darwin-amd64",
+        "dist/dot-agent-deck-darwin-arm64",
+        "dist/dot-agent-deck-collector-linux-amd64",
+        "dist/dot-agent-deck-collector-linux-arm64",
+        "dist/checksums.txt",
+        "dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb",
+        "dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg",
+        "dist-desktop/checksums-desktop-alpha.txt",
+    ];
+    let Some(run) = run_subjects(&files, "success") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        run.ok,
+        "the collector failed on a complete set of artifacts\n{}",
+        run.diagnostics()
+    );
+
+    let mut want: Vec<String> = files.iter().map(|f| (*f).to_string()).collect();
+    want.sort();
+    let mut got = run.subjects.clone();
+    got.sort();
+    assert_eq!(
+        got,
+        want,
+        "the attested set is not the published set. Every file a full release uploads must be a \
+         subject -- #1152 is what happens when two of them are not.\n{}",
+        run.diagnostics()
+    );
+}
+
+/// A wholly failed desktop matrix still attests the CLI assets **and the CLI
+/// manifest**.
+///
+/// The CLI half must never be hostage to the desktop half: `needs:` on a matrix
+/// job resolves to the aggregate, which is the defect Greptile's P1 found in
+/// `desktop-publish` on #768 and which this job's `if:` gate exists to avoid.
+/// #1152 adds a second way to get it wrong — treating the desktop manifest as
+/// required unconditionally — so the case is pinned rather than reasoned about.
+#[test]
+fn a_wholly_failed_desktop_matrix_still_attests_the_cli_assets() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/dot-agent-deck-darwin-arm64",
+        "dist/checksums.txt",
+    ];
+    let Some(run) = run_subjects(&files, "failure") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        run.ok,
+        "a failed desktop matrix made the collector fail, discarding the CLI binaries' \
+         attestations. That is the #768 defect, one job over.\n{}",
+        run.diagnostics()
+    );
+    assert!(
+        run.subjects.contains(&"dist/checksums.txt".to_string()),
+        "the CLI manifest is missing from {:?}. It is published on every release, desktop or \
+         not.\n{}",
+        run.subjects,
+        run.diagnostics()
+    );
+    assert_eq!(
+        run.subjects.len(),
+        3,
+        "unexpected subjects: {:?}\n{}",
+        run.subjects,
+        run.diagnostics()
+    );
+}
+
+/// A CLI manifest that did not arrive fails the collection rather than being
+/// quietly dropped.
+///
+/// `finalize` cannot succeed without publishing `checksums.txt`, and `attest`
+/// runs only when `finalize` succeeded — so its absence here is broken wiring,
+/// and the alternative to failing is a release whose manifest silently carries
+/// no provenance. The symptom of that is a `404` weeks later, which is what
+/// #1152 was filed about.
+#[test]
+fn a_missing_cli_manifest_fails_the_collection() {
+    let Some(run) = run_subjects(&["dist/dot-agent-deck-linux-amd64"], "skipped") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        !run.ok,
+        "the collector accepted a run with no `dist/checksums.txt` and emitted {:?}\n{}",
+        run.subjects,
+        run.diagnostics()
+    );
+}
+
+/// A desktop manifest that did not arrive fails the collection **when
+/// `desktop-publish` succeeded**, and only then.
+///
+/// Greptile's P1 on #1227, and the asymmetry is the whole finding. That job
+/// publishes the manifest, uploads it as an artifact, and only then appends the
+/// release note saying every asset here carries provenance — in that order,
+/// under `bash -e`. So `success` means the claim is on the release: attesting
+/// around a missing manifest would leave a published security claim false while
+/// the run stayed green. Any other result means no desktop asset reached the
+/// release and no claim was made, so the CLI assets must still be attested.
+#[test]
+fn a_missing_desktop_manifest_fails_only_when_its_claim_was_published() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/checksums.txt",
+        "dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb",
+    ];
+    let Some(claimed) = run_subjects(&files, "success") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        !claimed.ok,
+        "`desktop-publish` succeeded -- so the release body already says \
+         `checksums-desktop-alpha.txt` carries provenance -- and the collector attested without \
+         it anyway. A green run must not leave that claim false.\n{}",
+        claimed.diagnostics()
+    );
+
+    let unclaimed = run_subjects(&files, "failure").expect("bash was there a moment ago");
+    assert!(
+        unclaimed.ok,
+        "`desktop-publish` did not succeed, so nothing desktop reached the release and there is \
+         no manifest to expect. Failing here would discard the CLI binaries' attestations for a \
+         bundler's failure -- the #768 defect again.\n{}",
+        unclaimed.diagnostics()
+    );
+    assert!(
+        unclaimed
+            .subjects
+            .contains(&"dist/checksums.txt".to_string()),
+        "the CLI assets were not attested: {:?}\n{}",
+        unclaimed.subjects,
+        unclaimed.diagnostics()
     );
 }

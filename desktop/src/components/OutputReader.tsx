@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDownToLine, BookOpenText, Copy, X } from "lucide-react";
-import type { AgentSession, DeckActionResult, DeckPrompt } from "../types";
+import { statusLabel, type AgentSession } from "../types";
 import { getTerminal, stripAnsi, terminalSnapshotText } from "../lib/terminalRegistry";
-import { AgentComposer } from "./AgentComposer";
+import { blockedReasonText } from "../lib/blockedReason";
+import { writeClipboardText } from "../lib/clipboard";
+import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 
 /** How often the reader re-snapshots the live terminal buffer while open. */
 const REFRESH_MS = 700;
@@ -11,8 +13,6 @@ const PIN_SLACK = 48;
 
 interface OutputReaderProps {
   agent: AgentSession;
-  prompts: DeckPrompt[];
-  onSubmit: (agentId: string, text: string) => Promise<DeckActionResult>;
   onClose: () => void;
 }
 
@@ -21,8 +21,16 @@ interface OutputReaderProps {
  * live xterm buffer snapshot (repaints already resolved), soft-wrapped lines
  * re-joined so the column reflows at reading width. Live-tails while pinned to
  * the bottom; scrolling up pauses the tail until "Jump to latest".
+ *
+ * Read-only, which is what its construction always said it was: a snapshot
+ * `<pre>`, "Copy all", and a live-tail pin, with no terminal of its own. It
+ * carried an `AgentComposer` until issue #1042, which was this surface's ONLY
+ * send path rather than a duplicate of one — and a second, independent input
+ * box floating in a reading overlay is exactly the parallel-input surface that
+ * issue exists to collapse. The send path is the tile's terminal, one Escape
+ * away.
  */
-export function OutputReader({ agent, prompts, onSubmit, onClose }: OutputReaderProps) {
+export function OutputReader({ agent, onClose }: OutputReaderProps) {
   const [text, setText] = useState("");
   const [pinned, setPinned] = useState(true);
   const [copied, setCopied] = useState(false);
@@ -33,16 +41,25 @@ export function OutputReader({ agent, prompts, onSubmit, onClose }: OutputReader
   // without re-arming on every snapshot update.
   const transcriptRef = useRef(agent.transcript);
   transcriptRef.current = agent.transcript;
+  /* On the overlay stack (issue #1709), so the window behind is fenced as
+     `aria-modal` claims, and voice's "close" closes the reader rather than
+     reporting nothing to close, while a dialog drawn over it closes first. */
+  const panel = useInertBackground<HTMLDivElement>(true, OVERLAY_LAYER.reader, onClose);
 
   useEffect(() => {
     const snapshot = () => {
-      const terminal = getTerminal(agent.id);
+      /* By the composite identity: two decks' same-id agents can both have a
+         live xterm since PRD #1105's cross-deck pane, and a bare-id lookup
+         would snapshot whichever mounted last under either agent's heading.
+         And by its daemon process (G-fix7), so a restarted deck's agent with
+         the same id is never read from the previous process's xterm. */
+      const terminal = getTerminal(agent.daemonId, agent.id, agent.incarnation);
       setText(terminal ? terminalSnapshotText(terminal) : stripAnsi(transcriptRef.current));
     };
     snapshot();
     const timer = window.setInterval(snapshot, REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [agent.id]);
+  }, [agent.daemonId, agent.id, agent.incarnation]);
 
   // Follow new output only while the reader is pinned to the bottom.
   useEffect(() => {
@@ -71,21 +88,27 @@ export function OutputReader({ agent, prompts, onSubmit, onClose }: OutputReader
   }, []);
 
   const copyAll = useCallback(() => {
-    void navigator.clipboard?.writeText(text).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_500);
-    });
+    // Issue #1403: the same clipboard path as the terminal's copy chord.
+    void writeClipboardText(text).then(
+      () => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1_500);
+      },
+      () => undefined,
+    );
   }, [text]);
 
   return (
     <div className="reader-overlay" data-testid={`reader-${agent.id}`} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <div className="reader-panel" role="dialog" aria-modal="true" aria-label={`${agent.role} output reader`}>
+      <div ref={panel} tabIndex={-1} className="reader-panel" role="dialog" aria-modal="true" aria-label={`${agent.role} output reader`}>
         <header className="reader-head">
           <div className="reader-title">
             <BookOpenText size={15} aria-hidden="true" />
             <div>
               <strong>{agent.role}</strong>
-              <span className={`status-label status-${agent.status}`}>{agent.status}</span>
+              <span className={`status-label status-${agent.status}`}>{statusLabel(agent.status)}</span>
+              {/* Issue #714: the reason, where the status is. */}
+              {agent.status === "blocked" && <span className="agent-blocked-reason">{blockedReasonText(agent.blocked)}</span>}
             </div>
           </div>
           <div className="reader-controls">
@@ -106,8 +129,6 @@ export function OutputReader({ agent, prompts, onSubmit, onClose }: OutputReader
             <ArrowDownToLine size={13} aria-hidden="true" /> Jump to latest
           </button>
         )}
-
-        <AgentComposer agent={agent} prompts={prompts} onSubmit={onSubmit} />
       </div>
     </div>
   );

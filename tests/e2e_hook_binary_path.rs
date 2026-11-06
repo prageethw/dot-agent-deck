@@ -10,6 +10,10 @@
 //! The file is shared because the seeding, launching and JSON-walking fixtures
 //! are exactly the ones those defects need.
 //!
+//! It also carries `hooks/install/021` and `022` (PRD #91): the note the TUI
+//! shows when that same startup install changed the hooks or could not update
+//! them, which needs the same seeded HOME.
+//!
 //! Every test here drives the real `dot-agent-deck` binary through the PTY
 //! harness, which under `cargo test-e2e` genuinely IS a `target/debug`
 //! artifact. For the two durability tests that is precisely what makes them the
@@ -103,7 +107,16 @@ fn deck_commands(path: &Path, suffix: &str) -> Vec<String> {
     let mut all = Vec::new();
     collect_commands(&doc, &mut all);
     all.retain(|command| command.trim_end().ends_with(suffix));
-    all
+    // The `DOT_AGENT_DECK_BIN` wrapper (PRD #1497) is stripped: what these
+    // tests pin is the installed path that follows it.
+    all.into_iter()
+        .map(|command| {
+            command
+                .strip_prefix(dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX)
+                .map(str::to_string)
+                .unwrap_or(command)
+        })
+        .collect()
 }
 
 /// The value of `const BINARY_PATH = "…";` in the generated OpenCode plugin.
@@ -113,6 +126,17 @@ fn opencode_binary_path(js: &str) -> Option<String> {
     let rest = js.split_once("const BINARY_PATH = ")?.1;
     let literal = rest.split_once(";\n")?.0;
     serde_json::from_str::<String>(literal).ok()
+}
+
+/// The OpenCode server module under each config root the deck may write it
+/// to for this file's HOME: the XDG root (`XDG_CONFIG_HOME` is pinned to
+/// `~/.config` by [`launch_with_home`]) and the legacy `~/.opencode`.
+fn opencode_plugin_files(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".config").join("opencode"),
+        home.join(".opencode"),
+    ]
+    .map(|root| root.join("plugin").join("dot-agent-deck.js"))
 }
 
 /// Every directory on `path_value` that actually holds a `dot-agent-deck`. Used
@@ -201,6 +225,10 @@ fn seed_agent_homes(home: &Path, stub_bin: &Path) -> String {
 /// never leaves a 50 ms idle window, so quiescence times out here (measured).
 fn launch_with_home(home: &Path, path_value: &str) -> TuiDeck {
     let deck = TuiDeck::builder()
+        // This file's subject is a deck running as a cargo build artifact, the
+        // one the resolver refuses to pin (`hooks/install/005`), so it opts out
+        // of the harness's contained link.
+        .launching_the_cargo_artifact()
         .with_env("HOME", home.to_str().expect("HOME path is UTF-8"))
         .with_env(
             "XDG_CONFIG_HOME",
@@ -210,7 +238,7 @@ fn launch_with_home(home: &Path, path_value: &str) -> TuiDeck {
         )
         .with_env("PATH", path_value)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck
 }
 
@@ -298,30 +326,35 @@ fn install_004_durable_path_is_written_not_the_build_artifact() {
     // The OpenCode integration is a GENERATED JAVASCRIPT file, not JSON — the
     // shape difference PRD #381 blames for it being the last of the three to be
     // noticed, so it is checked through its own parse rather than the JSON one.
-    let plugin = home
-        .join(".opencode")
-        .join("plugin")
-        .join("dot-agent-deck.js");
-    match read_if_present(&plugin) {
-        None => problems.push(format!(
-            "OpenCode plugin: absent at {} — `~/.opencode/` was seeded, so the installer \
-             should have written",
-            plugin.display()
-        )),
-        Some(body) => {
-            match opencode_binary_path(&body) {
-                Some(binary_path) if binary_path == durable => {}
-                Some(binary_path) => problems.push(format!(
-                    "OpenCode plugin: BINARY_PATH is `{binary_path}`, not the durable \
-                     executable `{durable}`"
-                )),
-                None => problems.push(format!(
-                    "OpenCode plugin: no `const BINARY_PATH = \"…\";` in {}",
-                    plugin.display()
-                )),
-            }
-            problems.extend(build_artifact_problems("OpenCode plugin", &body));
+    // PRD #2050: the module may sit in either root. The first install on a
+    // legacy-only HOME writes `~/.opencode` and creates the XDG root for the
+    // TUI half; a later install moves the module there and removes the legacy
+    // copy. Every copy present is checked, and at least one must exist.
+    let plugins = opencode_plugin_files(&home);
+    let present: Vec<(PathBuf, String)> = plugins
+        .iter()
+        .filter_map(|plugin| read_if_present(plugin).map(|body| (plugin.clone(), body)))
+        .collect();
+    if present.is_empty() {
+        problems.push(format!(
+            "OpenCode plugin: absent at {plugins:?} — `~/.opencode/` was seeded, so the \
+             installer should have written"
+        ));
+    }
+    for (plugin, body) in &present {
+        match opencode_binary_path(body) {
+            Some(binary_path) if binary_path == durable => {}
+            Some(binary_path) => problems.push(format!(
+                "OpenCode plugin {}: BINARY_PATH is `{binary_path}`, not the durable \
+                 executable `{durable}`",
+                plugin.display()
+            )),
+            None => problems.push(format!(
+                "OpenCode plugin: no `const BINARY_PATH = \"…\";` in {}",
+                plugin.display()
+            )),
         }
+        problems.extend(build_artifact_problems("OpenCode plugin", body));
     }
 
     assert_no_problems(&problems);
@@ -386,17 +419,15 @@ fn install_005_refuses_to_write_when_no_durable_path_exists() {
         ));
     }
 
-    let plugin = home
-        .join(".opencode")
-        .join("plugin")
-        .join("dot-agent-deck.js");
-    if let Some(body) = read_if_present(&plugin) {
-        problems.push(format!(
-            "OpenCode plugin: written at {} with no durable path available; BINARY_PATH = \
-             {:?}",
-            plugin.display(),
-            opencode_binary_path(&body)
-        ));
+    for plugin in opencode_plugin_files(&home) {
+        if let Some(body) = read_if_present(&plugin) {
+            problems.push(format!(
+                "OpenCode plugin: written at {} with no durable path available; \
+                 BINARY_PATH = {:?}",
+                plugin.display(),
+                opencode_binary_path(&body)
+            ));
+        }
     }
 
     assert_no_problems(&problems);
@@ -429,17 +460,10 @@ fn read_json(path: &Path) -> Value {
         .unwrap_or_else(|e| panic!("parse {} as JSON: {e}\n{body}", path.display()))
 }
 
-/// Scenario: Seed `~/.codex/hooks.json` before launch with, under one installed
-/// event and one the deck no longer installs, a rule holding the deck's own
-/// command next to a user handler that carries no string `command` under the
-/// user's `matcher`, plus a second deck-owned rule pinning a different, still
-/// valid, seeded `dot-agent-deck`. Launch the real deck so its unattended
-/// startup install runs, and the user's handler, their `matcher` and the foreign
-/// valid pin must all survive unchanged while the deck refreshes only its own
-/// command.
+/// Scenario: Launch the real deck over Codex rules containing duplicate valid deck installations and a user handler. Startup consolidates the installed event to one deck command without changing the user handler index, and keeps the retired-event user handler.
 #[spec("hooks/install/006")]
 #[test]
-fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
+fn install_006_startup_consolidates_deck_pins_and_keeps_user_handler_indices() {
     let sandbox = harness_tempdir().expect("harness tempdir for the isolated HOME");
     let home = sandbox.path().join("home");
     let stub_bin = sandbox.path().join("stubbin");
@@ -451,13 +475,18 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
     write_executable(&durable_path, STUB_BODY);
     let durable = durable_path.to_str().expect("durable path is UTF-8");
     let ours = format!("{durable} {CODEX_SUFFIX}");
+    // What the install refreshes `ours` to: the same install behind the
+    // `DOT_AGENT_DECK_BIN` wrapper (PRD #1497). `ours` is seeded in the plain
+    // form an older release wrote, so the refresh in place is also the
+    // migration.
+    let ours_now = format!(
+        "{}{ours}",
+        dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX
+    );
 
     // A SECOND, genuinely different install: absolute, present, executable, and
-    // not under `target/`, so `pin_is_repairable` says the deck could have
-    // written it and `command_is_replaceable` must leave it alone. Sharing the
-    // `dot-agent-deck` basename is the point — that is what makes it a sibling
-    // rather than an unrelated user hook, and the pre-#730 code repointed it on
-    // every launch.
+    // not under `target/`. It must be consolidated on an installed event.
+    // Sharing the deck basename distinguishes it from an unrelated user hook.
     let foreign_path = home.join(".other").join("bin").join("dot-agent-deck");
     write_executable(&foreign_path, STUB_BODY);
     let foreign = format!(
@@ -513,20 +542,24 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
     // `SessionStart` rule can only have been written by this launch.
     let wrote = event_rules(&doc, "SessionStart")
         .iter()
-        .any(|rule| commands_in(rule).contains(&ours));
+        .any(|rule| commands_in(rule).contains(&ours_now));
     if !wrote {
         problems.push(format!(
             "~/.codex/hooks.json: no `SessionStart` rule names the durable binary `{durable}`, \
              so the startup install did not run and this test proves nothing\n{doc:#}"
         ));
     }
-    // And it must have ADDED its refreshed rule beside the two seeded ones
-    // rather than replacing the array: two survivors plus one fresh rule.
+    // And it must have refreshed its command IN PLACE rather than appending a
+    // rule beside the seeded ones; a redundant deck-only group can disappear.
+    // Before issue #1034 this expected three, because the install removed its
+    // own command from the shared rule and re-added it at the end — which is
+    // precisely what re-keyed the user's handler from `…:0:1` to `…:0:0` and
+    // silently untrusted it.
     let installed = event_rules(&doc, "PreToolUse");
-    if installed.len() != 3 {
+    if installed.len() != 1 {
         problems.push(format!(
-            "PreToolUse: expected the user's rule, the foreign pin's rule and one fresh deck \
-             rule, got {}\n{installed:#?}",
+            "PreToolUse: expected exactly one refreshed deck rule with the user's handler, got \
+             {}\n{installed:#?}",
             installed.len()
         ));
     }
@@ -557,25 +590,49 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
                          rule: {rule:#}"
                     ));
                 }
-                if handlers
-                    .iter()
-                    .any(|h| h.get("command").and_then(Value::as_str) == Some(ours.as_str()))
-                {
+                // Issue #1034 splits the two events here, and the split is the
+                // point rather than an exemption. Under an INSTALLED event the
+                // deck refreshes its command where it already sits, so it is
+                // still in the user's rule, at the index it always had, and the
+                // user's handler still follows it at `…:0:1`. Under a RETIRED
+                // event there is nothing to refresh it with — the sweep's job is
+                // removal — so the old expectation stands unchanged there.
+                let deck_handler_index = handlers.iter().position(|h| {
+                    let command = h.get("command").and_then(Value::as_str);
+                    command == Some(ours.as_str()) || command == Some(ours_now.as_str())
+                });
+                let sibling_index = handlers.iter().position(|h| h == &sibling);
+                if event == "PreToolUse" {
+                    if deck_handler_index != Some(0) {
+                        problems.push(format!(
+                            "{event}: the deck's command must be refreshed at the index it \
+                             already occupied, not moved out of the user's rule — moving it \
+                             re-keys every handler after it and untrusts them \
+                             (got {deck_handler_index:?}): {rule:#}"
+                        ));
+                    }
+                    if sibling_index != Some(1) {
+                        problems.push(format!(
+                            "{event}: the user's handler must keep the index Codex keyed its \
+                             trust record to (got {sibling_index:?}): {rule:#}"
+                        ));
+                    }
+                } else if deck_handler_index.is_some() {
                     problems.push(format!(
-                        "{event}: the deck's stale command was left inside the user's rule \
-                         rather than refreshed into its own: {rule:#}"
+                        "{event}: this event is no longer installed, so the deck's stale \
+                         command must be swept out of the user's rule: {rule:#}"
                     ));
                 }
             }
         }
 
-        // Issue #730's other half: a deck pin naming a DIFFERENT, still-usable
-        // install is not the deck's to repoint, so it is left exactly as it was
-        // and the launching deck's rule is added beside it.
-        if !rules.contains(&foreign_rule) {
+        // Consolidate the duplicate on installed events. The retired-event
+        // sweep still leaves the other installation's existing retired rule.
+        if (event == "PreToolUse" && rules.contains(&foreign_rule))
+            || (event == "SessionEnd" && !rules.contains(&foreign_rule))
+        {
             problems.push(format!(
-                "{event}: the deck-owned rule pinning the still-valid second install \
-                 `{foreign}` was repointed or removed\n{doc:#}"
+                "{event}: the still-valid second deck pin `{foreign}` violated the consolidation policy\n{doc:#}"
             ));
         }
     }
@@ -591,4 +648,105 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
     }
 
     assert_no_problems(&problems);
+}
+
+/// A HOME with only `~/.claude/` seeded and a durable executable at
+/// `~/.local/bin/dot-agent-deck`, and a PATH with no agent on it, so Claude
+/// Code is the one agent the startup install finds (PRD #91).
+fn seed_claude_only_home(home: &Path) -> &'static str {
+    std::fs::create_dir_all(home.join(".claude")).expect("seed ~/.claude");
+    write_executable(
+        &home.join(".local").join("bin").join("dot-agent-deck"),
+        STUB_BODY,
+    );
+    "/usr/bin:/bin"
+}
+
+/// [`launch_with_home`] in a terminal wide enough for the startup note's whole
+/// line, waiting for the first painted dashboard.
+fn launch_wide_with_home(home: &Path, path_value: &str) -> TuiDeck {
+    let deck = TuiDeck::builder()
+        .launching_the_cargo_artifact()
+        .with_pty_size(220, 30)
+        .with_env("HOME", home.to_str().expect("HOME path is UTF-8"))
+        .with_env(
+            "XDG_CONFIG_HOME",
+            home.join(".config")
+                .to_str()
+                .expect("XDG config path is UTF-8"),
+        )
+        .with_env("PATH", path_value)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    deck
+}
+
+/// The status line the TUI shows when its startup install changed hooks.
+const CHANGED_NOTE: &str = "Installed or repaired the deck's hooks for Claude Code.";
+
+/// Scenario: Launch the real deck into a HOME where Claude Code is installed
+/// but has none of the deck's hooks. The deck installs them, and the status
+/// line says "Installed or repaired the deck's hooks for Claude Code." as the
+/// dashboard appears. Launching again over the now-current hooks shows no note.
+#[spec("hooks/install/021")]
+#[test]
+fn install_021_the_tui_says_when_its_startup_install_changed_hooks() {
+    let sandbox = harness_tempdir().expect("harness tempdir for the isolated HOME");
+    let home = sandbox.path().join("home");
+    let path_value = seed_claude_only_home(&home);
+
+    let first = launch_wide_with_home(&home, path_value);
+    first.wait_for_string(CHANGED_NOTE);
+    let settings = home.join(".claude").join("settings.json");
+    assert!(
+        !deck_commands(&settings, CLAUDE_SUFFIX).is_empty(),
+        "the note claims an install, so ~/.claude/settings.json must hold the deck's rules"
+    );
+    drop(first);
+
+    let before = std::fs::read(&settings).expect("read the installed settings");
+    let second = launch_wide_with_home(&home, path_value);
+    let grid = second.snapshot_grid();
+    assert!(
+        !grid.contains("hooks for Claude Code") && !grid.contains("could not be updated"),
+        "hooks that were already current must not be announced again:\n{grid}"
+    );
+    assert_eq!(
+        std::fs::read(&settings).expect("read the settings again"),
+        before,
+        "a start over current hooks must leave the settings file as it was"
+    );
+}
+
+/// Scenario: Launch the real deck into a HOME whose `~/.claude/settings.json`
+/// is not valid JSON (a trailing comma). The deck leaves the file byte for
+/// byte as it was, installs nothing, and the status line says
+/// "Claude Code's hooks could not be updated: … is not valid JSON …" instead
+/// of announcing an install.
+#[spec("hooks/install/022")]
+#[test]
+fn install_022_the_tui_says_why_it_left_a_malformed_settings_file_alone() {
+    let sandbox = harness_tempdir().expect("harness tempdir for the isolated HOME");
+    let home = sandbox.path().join("home");
+    let path_value = seed_claude_only_home(&home);
+    let settings = home.join(".claude").join("settings.json");
+    let malformed = b"{\n  \"model\": \"opus\",\n  \"env\": {\"KEEP\": \"me\"},\n}\n";
+    std::fs::write(&settings, malformed).expect("seed the malformed settings");
+
+    let deck = launch_wide_with_home(&home, path_value);
+    deck.wait_for_string("Claude Code's hooks could not be updated:");
+    let grid = deck.snapshot_grid();
+    assert!(
+        grid.contains("is not valid JSON"),
+        "the note must give the specific reason, not only that something failed:\n{grid}"
+    );
+    assert!(
+        !grid.contains(CHANGED_NOTE),
+        "a refused install must not be announced as an install:\n{grid}"
+    );
+    assert_eq!(
+        std::fs::read(&settings).expect("read the settings back"),
+        malformed,
+        "the malformed settings file must be left byte for byte as it was"
+    );
 }

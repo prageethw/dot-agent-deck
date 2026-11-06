@@ -7,6 +7,8 @@ The bundled Pi orchestrator extension for dot-agent-deck (PRD #201). It makes a 
 
 Both paths route over the daemon socket using the pane env vars the daemon already injects (`DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID` / `DOT_AGENT_DECK_VIA_DAEMON`). The extension reads them via the CLI; it does not set them.
 
+**Which `dot-agent-deck` it runs (issue #1385).** The deck exports its own absolute executable path to every agent it spawns as `DOT_AGENT_DECK_EXE`, and the extension execs that path (`resolveDeckBin`). A bare `dot-agent-deck` would be looked up in Pi's own `PATH`, which can reach a different install than the deck that spawned the pane. When the variable is absent — an older deck — the extension falls back to the bare name, exactly as before.
+
 This directory contains the **entire** JS/TS toolchain for the extension and is kept off the Rust critical path (`cargo`/`nextest` never touch it). Bundling into the binary (`include_str!`) and materialization into Pi's extension dir are later milestones (M3.1/M3.2).
 
 ## Layout
@@ -31,16 +33,20 @@ The pure/glue split mirrors the Rust side's pure `agent_event_type_from_state` s
 
 ```bash
 cd pi-extension
-npm install     # installs tsx (the only dependency)
-npm test        # node --import tsx --test test/*.test.ts
+npm ci             # installs the dev dependencies below
+npm test           # node --import tsx --test test/*.test.ts
+npm run typecheck  # tsc --noEmit over src/ and test/
 ```
 
 The tests import only the import-free `src/orchestrator.ts`, so they need **no running `pi`** and none of the Pi packages installed.
 
 ## Dependencies
 
-- **`tsx`** (dev) — the only installed dependency; lets Node's built-in test runner execute the TypeScript tests.
-- **`@earendil-works/pi-coding-agent`** and **`typebox`** — imported by `src/index.ts` for types and tool schemas. These are **not** listed as dependencies here because Pi resolves them from its own installation when it loads the extension (via jiti). Optional local type-checking (`npm run typecheck`) therefore requires Pi installed alongside.
+All of them are dev dependencies, which `package-lock.json` pins; Pi installs none of them when it loads the extension.
+
+- **`tsx`** — lets Node's built-in test runner execute the TypeScript tests.
+- **`typescript`** and **`@types/node`** — `npm run typecheck`. CI runs it in `ci.yml`'s `test` job, which the required `build` check aggregates, and in `.rwx/ci.yml`'s task of the same name (issue #1708).
+- **`@earendil-works/pi-coding-agent`** and **`typebox`** — imported by `src/index.ts` for types and tool schemas, and installed here only so the typecheck can resolve them. At runtime Pi resolves both from its own installation when it loads the extension (via jiti). `typebox` is pinned to the version `@earendil-works/pi-coding-agent` itself pins, so the two share one copy. It moves only together with `@earendil-works/pi-coding-agent` (issue #1949): `renovate.json` proposes no `typebox` update of its own here, and `pi_extension_typebox_is_the_copy_pi_resolves` in `tests/pi_extension_lockstep.rs` fails while `package-lock.json` resolves any `typebox` other than the pinned one, so when a pi-coding-agent bump moves its `typebox`, set ours to the same version in that PR and run `npm install`.
 
 ## Pi extension API used (Pi 0.80.6)
 

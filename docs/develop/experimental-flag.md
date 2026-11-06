@@ -67,6 +67,8 @@ The startup log line names the file it read (below), so "which `.dot-agent-deck.
 
 Both the TUI and the background daemon call `init_and_watch` and each independently resolves the flag from the same `.dot-agent-deck.toml`. As of fork issue #303's Phase 1 investigation, that is a weaker guarantee than it sounds: every consumer of the flag (`show_experimental_footer`, `show_issue_dispatch_authoring`, `show_command_entry_lock`) lives in `src/ui.rs`, so the value the daemon installs into its own process-global state is currently read by nothing. Treat "both processes resolve the same algorithm" as true and "the two processes therefore agree on anything" as not yet a meaningful guarantee — it would need a real daemon-side (or pane-scoped) consumer to become one.
 
+The desktop app is the exception: it reads its own environment and no project file — see [The desktop app](#the-desktop-app).
+
 On startup each process logs a single line naming the resolved value **and the path it came from** — `experimental flag: ON (from /path/to/.dot-agent-deck.toml)` — which surfaces only when file logging is enabled (`DOT_AGENT_DECK_LOG`). The path is in that line precisely so a wrong-file mismatch is diagnosable from the log without resorting to `lsof` on a running deck.
 
 Two ways to check the resolution on demand, without touching `DOT_AGENT_DECK_LOG` at all:
@@ -75,6 +77,24 @@ Two ways to check the resolution on demand, without touching `DOT_AGENT_DECK_LOG
 - **The missing-config startup warning** (fork issue #303 Phase 2): when the ancestor walk finds no `.dot-agent-deck.toml` anywhere above the launch directory, the TUI prints a warning to stderr before the alternate screen takes over. Unlike the log line above, this needs neither `DOT_AGENT_DECK_LOG` nor a restart to see, and stays completely silent once a config is found.
 
 > **One flag for everything.** There is exactly one experimental toggle. If two unrelated experimental surfaces are in flight at once, they are shown or hidden together — there are no per-feature toggles.
+
+## The desktop app
+
+The desktop app reads the flag **from its own process environment only**, and differently from the TUI and the daemon:
+
+- `DOT_AGENT_DECK_EXPERIMENTAL=1` (or `true`) turns it on, and wins, exactly as above.
+- `DOT_AGENT_DECK_FEATURES_CONFIG=/full/path/to/.dot-agent-deck.toml` names one file whose `[features]` table is read, with the same guards as every other features read (a regular file, at most 64 KiB; a file that does not parse leaves the flag off).
+- **There is no walk.** The app does not look for a `.dot-agent-deck.toml` in or above its working directory. That walk is a client-side project guess, which PRD #819 removed from the desktop and linkage-check rule 12 (`xtask/linkage-check/src/desktop_project_boundary.rs`) refuses in `desktop/src-tauri/src`: the project an agent runs in lives on the daemon's filesystem — another machine, for a remote deck — and an app launched from Finder or a desktop launcher has `/` as its working directory anyway. The entry point is `features::init_from_process_env`, which takes no directory.
+- **It is read once, at startup.** The app resolves the flag when it starts and the window asks for its surfaces once, so there is no live reload: set or unset a variable, then restart the app. The startup log line names the file, or says no file variable was set.
+
+With the flag off the desktop shows the agent overview (with its full-window agent pane) and Settings; the rail reads **Dashboard** and **Settings**. With it on, the rail also carries Daemons, Projects, Prompts, Orchestrations and Agent Profiles, and the dashboard's **Open daemons** buttons come back.
+
+**Getting a variable to a packaged app.** A GUI app does not inherit your shell's environment, so exporting the variable in a terminal and then double-clicking the app does nothing. Two routes; **neither was verified on macOS for this change** — they are the platform's documented mechanisms, not something this repository tests:
+
+- **macOS:** `launchctl setenv DOT_AGENT_DECK_EXPERIMENTAL 1`, then quit and relaunch the app. The setting lasts until you log out or `launchctl unsetenv DOT_AGENT_DECK_EXPERIMENTAL`.
+- **Any platform, from a terminal:** run the app's own executable with the variable set, for example `DOT_AGENT_DECK_EXPERIMENTAL=1 "/Applications/Agent Deck.app/Contents/MacOS/<executable>"` on macOS (the bundle's executable name is whatever `Contents/MacOS/` holds), or the installed binary on Linux. A development build started with `pnpm tauri dev` inherits the shell it was started from, so the variable can simply be exported there.
+
+The fixture preview (`pnpm dev`, and the vitest and Playwright suites) has no process environment to read: it shows the gated surfaces when the URL carries `?experimental=1` (or `true`), for example `http://localhost:1420/?fixture=1&experimental=1`.
 
 ## Why surfaces are gated
 
@@ -86,6 +106,14 @@ This lets work-in-progress code merge to `main` without exposing unfinished UI d
 |---|---|---|---|
 | `show_experimental_footer()` | The experimental dashboard footer | #139 | — |
 | `show_issue_dispatch_authoring()` | The new-pane `schedule: issues` modal authoring option (PRD #120 creation UX) | #120 | `graduate-issue-dispatch` |
+| `show_desktop_deck()` | The desktop app's deck — the multi-pane terminal screen: its rail entry, the dashboard's **Open daemons** buttons, a requested deck view (shown as the overview instead), and voice's `open_deck` (offered `callable: false` and refused at dispatch) | #1198 | `graduate-desktop-deck` |
+| `show_desktop_projects()` | The desktop app's Projects panel: its rail entry and command-palette entry | #1198 | `graduate-desktop-projects` |
+| `show_desktop_prompts()` | The desktop app's Prompts library: its rail entry and command-palette entry | #1198 | `graduate-desktop-prompts` |
+| `show_desktop_orchestrations()` | The desktop app's Orchestrations editor: its rail entry and command-palette entry | #1198 | `graduate-desktop-workflows` |
+| `show_desktop_agent_profiles()` | The desktop app's Agent Profiles form: its rail entry and command-palette entry | #1198 | `graduate-desktop-agent-profiles` |
+| `show_desktop_agent_details()` | The desktop agent screen's (tile and pane) **Diff**, **Checks**, **Delegations** and **Artifacts** tabs and its **ATT**, **MODEL** and **USAGE** fields, which a live daemon supplies nothing for. With the flag off Terminal is the only tab, and a stored tab naming one of the four falls back to it (`shownPanelTab`) | #1400 | PRD #1399 decides per tab and field |
+
+> **The six `show_desktop_*` wrappers reach the webview as one DTO field each.** The desktop crate's `desktop_features` command returns them as `DesktopFeatures` (`showDeck`, `showProjects`, `showPrompts`, `showOrchestrations`, `showAgentProfiles`, `showAgentDetails`); the webview reads it once into `DeckRuntimeState.desktopFeatures`, and every TypeScript gate reads `desktopFeaturesOf(runtime).show<Surface>`, so `grep -rn 'show_desktop_deck\|showDeck' desktop/` finds every site of one surface. A missing or refused answer reads as all hidden. Two things are deliberately not gated: the panels' in-deck doors (the run graph's **Edit loop**, the empty deck's **Configure agents**, and the Projects ↔ Orchestrations cross-links inside those panels), because each sits inside a surface that is itself hidden and all six fields follow the one flag; and the voice rows' own vocabulary, which stays in `commands.toml` — only whether `open_deck` is offered changes.
 
 ## Graduated
 

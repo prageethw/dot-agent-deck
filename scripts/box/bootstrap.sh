@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# Bring an Ubuntu box up to the dot-agent-deck dev box's capabilities — PRD #1279.
+#
+# Knows nothing about any cloud: scripts/box/inmotion.sh ships this directory
+# to the box and runs it, but any Ubuntu 26.04 host with passwordless sudo
+# works. Re-running it brings the box up to date; every step checks what is
+# already there before changing anything.
+#
+#   bash bootstrap.sh                        # the box itself
+#   bash bootstrap.sh --repo URL [--dir D]   # also clone URL (default dir ~/code/<name>) and devbox install it
+#   bash bootstrap.sh --use-vals             # also export USE_VALS=true, so devbox loads .env.vals.yaml
+#   bash bootstrap.sh --relay                # also export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 (the local relay)
+#
+# Layers, each assuming the one before:
+#   1. apt: docker (Docker's repo), auditd, build-essential, nodejs/npm (runtime for npm-distributed agents)
+#   2. system: sysctl tuning, 8 GB swap, linger, the mem-sampler timer
+#   3. nix + devbox, then `devbox global` from devbox-global.json
+#   4. PATH (and, with --use-vals, USE_VALS; with --relay, OTEL_EXPORTER_OTLP_ENDPOINT)
+#      for non-interactive shells and systemd --user,
+#      so the deck daemon finds every agent and every agent inherits the same environment
+#   5. agents (claude, opencode 2.x, codex, pi, devin; a pinned opencode 1.x off PATH for tests), sem, dot-agent-deck, `hooks install`
+#   6. the optional repo
+#   7. which agents still need logging in
+#
+# Nothing secret is installed. Logging the agents in is left to the operator.
+#
+# --use-vals is for a box whose operator can read the secrets .env.vals.yaml
+# points at: it makes every devbox shell, and every agent the deck starts, run
+# that file through `vals`, which fails without access. It sticks: a re-run
+# without the flag keeps it while the marked block it wrote is in ~/.bashrc. To
+# turn it off, delete that block and re-run. Either way a deck daemon that is
+# already running keeps the environment it started with, and so does the
+# successor of an in-app daemon restart: its agents see the change only once it
+# is stopped and a new one is started from a fresh login (`dot-agent-deck
+# connect` from your machine does that), not from a shell opened before the run.
+#
+# --relay is for a box whose operator runs a local OpenTelemetry relay: a
+# collector listening on 127.0.0.1:4318 that forwards to Honeycomb with its own
+# key. It makes the relay the endpoint that every shell reading ~/.bashrc, and
+# every agent the deck starts, inherits by default; devbox.json's init_hook
+# keeps an endpoint the shell already has, so a vals shell inherits the relay
+# instead of the endpoint .env.vals.yaml names. A later setting still wins: an
+# OTEL_EXPORTER_OTLP_ENDPOINT in the repository's .env (the init_hook sources it
+# last) or an export further down ~/.bashrc. It neither installs nor checks the
+# relay; that is the box's own setup. It works with or without --use-vals, and
+# it sticks and reaches a running daemon exactly as --use-vals does, through its
+# own marked block. Turning it off (delete the block and re-run) drops the
+# endpoint from ~/.bashrc and environment.d, and unsets it in the running
+# systemd --user manager only while its value there is still the relay address
+# above; an endpoint with any other value is left alone.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL=""
+REPO_DIR=""
+USE_VALS_FLAG=0
+RELAY_FLAG=0
+RELAY_ENDPOINT=http://127.0.0.1:4318
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) REPO_URL="${2:?}"; shift 2 ;;
+    --dir)  REPO_DIR="${2:?}"; shift 2 ;;
+    --use-vals) USE_VALS_FLAG=1; shift ;;
+    --relay)    RELAY_FLAG=1; shift ;;
+    -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "bootstrap.sh: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+step() { echo; echo "==> $*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+sudo -n true 2>/dev/null || { echo "bootstrap.sh: needs passwordless sudo" >&2; exit 1; }
+export DEBIAN_FRONTEND=noninteractive
+ME="$(id -un)"
+
+# Write $2 to root-owned file $1 only when the content differs; succeed with
+# status 0 when it changed and 1 when it did not, so callers can react.
+put_root_file() {
+  local path="$1" content="$2"
+  if [ -f "$path" ] && [ "$(sudo cat "$path")" = "$content" ]; then return 1; fi
+  printf '%s\n' "$content" | sudo tee "$path" >/dev/null
+}
+
+# -------- 1. apt --------------------------------------------------------------
+
+step "apt packages"
+codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+sudo install -d -m 0755 /etc/apt/keyrings
+if [ ! -s /etc/apt/keyrings/docker.asc ]; then
+  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  sudo chmod a+r /etc/apt/keyrings/docker.asc
+fi
+put_root_file /etc/apt/sources.list.d/docker.list \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" || true
+APT_PACKAGES=(build-essential auditd nodejs npm xz-utils ca-certificates curl git
+              docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+missing=()
+for p in "${APT_PACKAGES[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+if [ ${#missing[@]} -gt 0 ]; then
+  sudo apt-get update -q
+  sudo apt-get install -y -q --no-install-recommends "${missing[@]}"
+else
+  echo "all present"
+fi
+id -nG "$ME" | tr ' ' '\n' | grep -qx docker || sudo usermod -aG docker "$ME"
+sudo systemctl enable --now docker auditd >/dev/null 2>&1
+
+# -------- 2. system settings -------------------------------------------------
+
+step "system settings"
+if put_root_file /etc/sysctl.d/90-dad-box.conf "$(printf '%s\n' \
+    '# dot-agent-deck dev box (PRD #1279): the dev box'"'"'s values.' \
+    'vm.swappiness = 10' 'vm.dirty_ratio = 10' 'vm.dirty_background_ratio = 5')"; then
+  sudo sysctl --system >/dev/null
+fi
+if ! swapon --show=NAME --noheadings | grep -qx /swap.img; then
+  [ -f /swap.img ] || { sudo fallocate -l 8G /swap.img; sudo chmod 600 /swap.img; sudo mkswap /swap.img >/dev/null; }
+  sudo swapon /swap.img
+  grep -q '^/swap.img ' /etc/fstab || echo '/swap.img none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+fi
+[ -e "/var/lib/systemd/linger/$ME" ] || sudo loginctl enable-linger "$ME"
+
+changed=0
+sudo install -m 0755 "$HERE/system/mem-sampler.sh" /usr/local/bin/mem-sampler.sh
+for u in mem-sampler.service mem-sampler.timer; do
+  cmp -s "$HERE/system/$u" "/etc/systemd/system/$u" || { sudo install -m 0644 "$HERE/system/$u" "/etc/systemd/system/$u"; changed=1; }
+done
+[ "$changed" -eq 1 ] && sudo systemctl daemon-reload
+sudo systemctl enable --now mem-sampler.timer >/dev/null 2>&1
+echo "sysctl, swap, linger, mem-sampler: done"
+
+# -------- 3. nix + devbox ----------------------------------------------------
+
+step "nix and devbox"
+if [ ! -d /nix/store ]; then
+  curl -fsSL https://nixos.org/nix/install | sh -s -- --daemon --yes
+fi
+# shellcheck source=/dev/null
+[ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+if ! have devbox; then
+  curl -fsSL https://get.jetify.com/devbox | bash -s -- -f
+fi
+GLOBAL_DIR="$HOME/.local/share/devbox/global/default"
+mkdir -p "$GLOBAL_DIR"
+cmp -s "$HERE/devbox-global.json" "$GLOBAL_DIR/devbox.json" || cp "$HERE/devbox-global.json" "$GLOBAL_DIR/devbox.json"
+devbox global install
+DEVBOX_BIN="$GLOBAL_DIR/.devbox/nix/profile/default/bin"
+# mosh's client starts mosh-server over a non-interactive ssh session.
+[ -x "$DEVBOX_BIN/mosh-server" ] && sudo ln -sfn "$DEVBOX_BIN/mosh-server" /usr/local/bin/mosh-server
+if have rustup || [ -x "$DEVBOX_BIN/rustup" ]; then
+  PATH="$DEVBOX_BIN:$PATH" rustup default >/dev/null 2>&1 || PATH="$DEVBOX_BIN:$PATH" rustup default stable
+fi
+
+# -------- 4. PATH ------------------------------------------------------------
+
+step "PATH for interactive, non-interactive and systemd --user processes"
+# The deck daemon is started over a non-interactive ssh session and every agent
+# inherits its PATH. Ubuntu's .bashrc returns early for non-interactive shells,
+# so this block goes at the TOP of it, before that guard.
+# Every block is found by these exact lines and nothing else.
+PATH_OPEN='# >>> dad-box PATH (scripts/box/bootstrap.sh) >>>'
+PATH_CLOSE='# <<< dad-box PATH <<<'
+VALS_OPEN='# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>'
+VALS_CLOSE='# <<< dad-box USE_VALS <<<'
+RELAY_OPEN='# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>'
+RELAY_CLOSE='# <<< dad-box RELAY <<<'
+PATH_BLOCK="$PATH_OPEN
+$(cat <<'EOF'
+for d in /nix/var/nix/profiles/default/bin "$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin" "$HOME/.opencode/bin" "$HOME/.local/bin"; do
+  case ":$PATH:" in *":$d:"*) ;; *) [ -d "$d" ] && PATH="$d:$PATH" ;; esac
+done
+export PATH
+EOF
+)
+$PATH_CLOSE"
+touch "$HOME/.bashrc"
+# The option blocks below are found by their markers, everything from an
+# opening marker to its close is replaced, and they are written back after the
+# PATH block's close, so check every marker before this layer writes anything,
+# whichever flags were given. A block left open, a stray close, a close of
+# another kind or a second PATH block stops the run here, because skipping to
+# the end of the file would drop whatever follows the marker. So does a line
+# that starts like a marker (in any case, with spaces or tabs around its `#` and
+# arrows) but is not exactly one of the six above, trailing whitespace or a CRLF
+# ending included, since the rewrite would read it as ordinary text.
+if ! awk -v file="$HOME/.bashrc" \
+    -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" '
+  function fail(msg) { print "bootstrap.sh: " file ": " msg > "/dev/stderr"; bad = 1; exit 1 }
+  BEGIN {
+    kind[po] = "PATH"; kind[vo] = "USE_VALS"; kind[ro] = "RELAY"; opens[po] = opens[vo] = opens[ro] = 1
+    kind[pc] = "PATH"; kind[vc] = "USE_VALS"; kind[rc] = "RELAY"
+  }
+  tolower($0) ~ /^[ \t]*#[ \t]*(>>>|<<<)[ \t]*dad-box/ {
+    if (!($0 in kind)) {
+      why = ""; if ($0 ~ /[ \t\r]$/) why = " (it ends in whitespace or a carriage return)"
+      shown = $0; gsub(/\r/, "\\r", shown)
+      fail("line " NR " looks like a dad-box marker but is not one this script writes" why ": " shown)
+    }
+    k = kind[$0]
+    if ($0 in opens) {
+      if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker before line " NR)
+      if (k == "PATH" && path_at) fail("line " NR " opens a second dad-box PATH block; the first opened on line " path_at)
+      if (k == "PATH") path_at = NR
+      open = k; at = NR; next
+    }
+    if (open == "") fail("line " NR " closes a dad-box " k " block that no marker opened")
+    if (k != open) fail("the dad-box " open " block opened on line " at " is closed by a dad-box " k " marker on line " NR)
+    open = ""
+  }
+  END {
+    if (bad) exit 1
+    if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker")
+  }
+' "$HOME/.bashrc"; then
+  echo "bootstrap.sh: left $HOME/.bashrc unchanged; fix or delete that block by hand, then re-run" >&2
+  exit 1
+fi
+if ! grep -qxF "$PATH_OPEN" "$HOME/.bashrc"; then
+  # A copy that fails part-way is removed and ~/.bashrc is left as it was.
+  if ! { printf '%s\n\n' "$PATH_BLOCK" && cat "$HOME/.bashrc"; } > "$HOME/.bashrc.dad-box"; then
+    rm -f "$HOME/.bashrc.dad-box"
+    echo "bootstrap.sh: could not add the dad-box PATH block to $HOME/.bashrc and left it unchanged; fix the cause above, then re-run" >&2
+    exit 1
+  fi
+  mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
+fi
+# USE_VALS gets the same placement for the same reason: the daemon's environment
+# is every agent's, and devbox.json's init_hook loads .env.vals.yaml only when
+# it is set. So does OTEL_EXPORTER_OTLP_ENDPOINT with --relay: the init_hook
+# keeps an endpoint the shell already has, so a vals shell inherits the local
+# relay rather than the direct endpoint unless a later setting overrides it
+# (the repository's .env, or an export further down ~/.bashrc). Each sits in its
+# own marked block right after the PATH block, and they are rewritten in place.
+OPTION_BLOCKS=()
+if [ "$USE_VALS_FLAG" = 1 ] || grep -qxF "$VALS_OPEN" "$HOME/.bashrc"; then
+  USE_VALS_FLAG=1
+  OPTION_BLOCKS+=("$VALS_OPEN
+export USE_VALS=true
+$VALS_CLOSE")
+fi
+if [ "$RELAY_FLAG" = 1 ] || grep -qxF "$RELAY_OPEN" "$HOME/.bashrc"; then
+  RELAY_FLAG=1
+  OPTION_BLOCKS+=("$RELAY_OPEN
+export OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT
+$RELAY_CLOSE")
+fi
+if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
+  # Drops any earlier copy of the blocks and the blank lines around them, then
+  # writes them back after the PATH block, so a re-run leaves the file unchanged.
+  # The markers were checked at the top of this layer, so every opening marker
+  # here has its own close and there is exactly one PATH close to write after.
+  # A rewrite that fails part-way leaves the blocks in ~/.bashrc as they were
+  # and removes its partial copy; a PATH block this run added just above stays,
+  # so the file is not always byte-identical.
+  if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" \
+      -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" '
+    $0 == vo || $0 == ro { open = 1; next }
+    $0 == vc || $0 == rc { open = 0; next }
+    open { next }
+    gap && /^$/ { next }
+    gap { print ""; gap = 0 }
+    { print }
+    $0 == pc { print ""; print block; gap = 1 }
+  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"; then
+    rm -f "$HOME/.bashrc.dad-box"
+    echo "bootstrap.sh: could not rewrite the dad-box blocks in $HOME/.bashrc and left them as they were (a dad-box PATH block added by this run stays); fix the cause above, then re-run" >&2
+    exit 1
+  fi
+  mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
+fi
+# shellcheck disable=SC2016  # written literally, expanded by the interactive shell
+grep -qF 'devbox global shellenv' "$HOME/.bashrc" || \
+  printf '\n# dad-box: devbox global tools in interactive shells\neval "$(devbox global shellenv)"\n' >> "$HOME/.bashrc"
+mkdir -p "$HOME/.config/environment.d"
+# Named to sort LAST: Ubuntu's /usr/lib/environment.d/99-environment.conf resets
+# PATH from /etc/environment, and files are applied in name order.
+rm -f "$HOME/.config/environment.d/10-dad-box.conf"
+cat > "$HOME/.config/environment.d/999-dad-box.conf" <<'EOF'
+PATH=${HOME}/.local/bin:${HOME}/.opencode/bin:${HOME}/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:${PATH}
+EOF
+[ "$USE_VALS_FLAG" = 1 ] && echo 'USE_VALS=true' >> "$HOME/.config/environment.d/999-dad-box.conf"
+[ "$RELAY_FLAG" = 1 ] && echo "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" >> "$HOME/.config/environment.d/999-dad-box.conf"
+# The user manager reads environment.d only when it starts, and linger started
+# it before this file existed: apply the same PATH to the running manager too.
+systemctl --user set-environment "PATH=$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" || echo "  warning: could not update the running systemd --user manager (applies at next login)"
+if [ "$USE_VALS_FLAG" = 1 ]; then
+  systemctl --user set-environment USE_VALS=true || echo "  warning: could not set USE_VALS in the running systemd --user manager (applies at next login)"
+else
+  systemctl --user unset-environment USE_VALS || true
+fi
+if [ "$RELAY_FLAG" = 1 ]; then
+  systemctl --user set-environment "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" || echo "  warning: could not set OTEL_EXPORTER_OTLP_ENDPOINT in the running systemd --user manager (applies at next login)"
+elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OTEL_EXPORTER_OTLP_ENDPOINT=//p')" = "$RELAY_ENDPOINT" ]; then
+  # Off: clear only the value this script writes, never an endpoint the
+  # operator set in the manager some other way.
+  systemctl --user unset-environment OTEL_EXPORTER_OTLP_ENDPOINT || true
+fi
+# shellcheck source=/dev/null
+eval "$(awk -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" '$0 == po { on = 1 } on { print } $0 == pc { on = 0 }' "$HOME/.bashrc")"
+
+# -------- 5. agents and the deck --------------------------------------------
+
+step "agents"
+[ -x "$HOME/.local/bin/claude" ]    || curl -fsSL https://claude.ai/install.sh | bash
+# OpenCode 2.x on PATH (PRD #2050): this repo's agents run OpenCode 2.
+# Installed from npm, pinned to the release the deck's OpenCode 2 support was
+# measured on, so npm checks each tarball against the registry's integrity
+# hash (no unverified `curl | bash`). `@opencode/cli`'s postinstall puts the
+# platform binary from its pinned optional dependency in place and runs it
+# `--version`. It goes under its own prefix, and ~/.opencode/bin/opencode —
+# already on PATH — becomes a link to it. 2.x prints `opencode v2.2.5`, 1.x
+# prints `1.19.5`. The link is made only when there is no binary there, the
+# one there positively reports 1.x, or it is already this link: a 2.x
+# installed some other way is left alone, and a binary that answers nothing
+# readable is reported, not replaced, since a broken 2.x cannot be told from
+# anything else that way.
+OPENCODE_2_VERSION=2.2.5
+OPENCODE_2_DIR="$HOME/.local/share/dot-agent-deck/opencode-2"
+OPENCODE_2_BIN="$OPENCODE_2_DIR/node_modules/.bin/opencode"
+OC_BIN="$HOME/.opencode/bin/opencode"
+oc_major() { "$OC_BIN" --version 2>/dev/null | head -n1 | sed 's/^opencode //; s/^v//; s/\..*//'; }
+oc2_version() { "$OPENCODE_2_BIN" --version 2>/dev/null | head -n1 | sed 's/^opencode //; s/^v//'; }
+install_opencode_2() {
+  if [ "$(oc2_version)" != "$OPENCODE_2_VERSION" ]; then
+    mkdir -p "$OPENCODE_2_DIR"
+    npm install --prefix "$OPENCODE_2_DIR" --no-fund --no-audit --no-save "@opencode/cli@$OPENCODE_2_VERSION"
+    # As for 1.x below: an npm that holds install scripts back leaves the
+    # package's placeholder; the user's `ignore-scripts` policy is honoured
+    # and reported, not overridden.
+    if [ "$(oc2_version)" != "$OPENCODE_2_VERSION" ]; then
+      if [ "$(npm config get ignore-scripts 2>/dev/null)" = true ]; then
+        echo "  warning: npm's ignore-scripts is set, so @opencode/cli's postinstall did not run; to finish the OpenCode $OPENCODE_2_VERSION install, run it yourself: (cd $OPENCODE_2_DIR/node_modules/@opencode/cli && node ./postinstall.mjs)"
+      else
+        (cd "$OPENCODE_2_DIR/node_modules/@opencode/cli" && node ./postinstall.mjs)
+      fi
+    fi
+  fi
+  if [ "$(oc2_version)" = "$OPENCODE_2_VERSION" ]; then
+    mkdir -p "$(dirname "$OC_BIN")"
+    ln -sfn "$OPENCODE_2_BIN" "$OC_BIN"
+  else
+    echo "  warning: $OPENCODE_2_BIN is not OpenCode $OPENCODE_2_VERSION; $OC_BIN left as it is"
+  fi
+}
+if [ ! -e "$OC_BIN" ] || [ "$(readlink "$OC_BIN" 2>/dev/null)" = "$OPENCODE_2_BIN" ] \
+   || [ "$(oc_major)" = 0 ] || [ "$(oc_major)" = 1 ]; then
+  install_opencode_2
+elif ! [ "$(oc_major)" -ge 2 ] 2>/dev/null; then
+  echo "  warning: $OC_BIN does not report a version; left as it is (to replace it with OpenCode $OPENCODE_2_VERSION, remove it and run this script again)"
+fi
+# OpenCode 1.x, pinned and kept OFF PATH, for the lane-2 tests that keep the
+# deck's OpenCode 1 support verifiable (PRD #2050). The binary they run is
+#   ~/.local/share/dot-agent-deck/opencode-1/bin/opencode
+# (select it with DOT_AGENT_DECK_OPENCODE_TEST_BIN): a stable link into npm's
+# layout under that prefix, which no PATH includes.
+OPENCODE_1_VERSION=1.19.5
+OPENCODE_1_DIR="$HOME/.local/share/dot-agent-deck/opencode-1"
+oc1_version() { "$OPENCODE_1_DIR/bin/opencode" --version 2>/dev/null | head -n1; }
+if [ "$(oc1_version)" != "$OPENCODE_1_VERSION" ]; then
+  mkdir -p "$OPENCODE_1_DIR/bin"
+  npm install --prefix "$OPENCODE_1_DIR" --no-fund --no-audit --no-save "opencode-ai@$OPENCODE_1_VERSION"
+  ln -sfn ../node_modules/.bin/opencode "$OPENCODE_1_DIR/bin/opencode"
+  # The package's postinstall puts the platform binary in place. An npm that
+  # holds install scripts back leaves its placeholder; when that is the
+  # user's `ignore-scripts` policy it is honoured and reported, not overridden.
+  if [ "$(oc1_version)" != "$OPENCODE_1_VERSION" ]; then
+    if [ "$(npm config get ignore-scripts 2>/dev/null)" = true ]; then
+      echo "  warning: npm's ignore-scripts is set, so opencode-ai's postinstall did not run; to finish the OpenCode $OPENCODE_1_VERSION install, run it yourself: (cd $OPENCODE_1_DIR/node_modules/opencode-ai && node ./postinstall.mjs)"
+    else
+      (cd "$OPENCODE_1_DIR/node_modules/opencode-ai" && node ./postinstall.mjs)
+    fi
+  fi
+  [ "$(oc1_version)" = "$OPENCODE_1_VERSION" ] ||
+    echo "  warning: $OPENCODE_1_DIR/bin/opencode is not OpenCode $OPENCODE_1_VERSION; the OpenCode 1.x lane-2 tests will skip"
+fi
+npm_missing=()
+have codex || npm_missing+=(@openai/codex)
+have pi    || npm_missing+=(@earendil-works/pi-coding-agent)
+[ ${#npm_missing[@]} -eq 0 ] || sudo npm install -g --no-fund --no-audit "${npm_missing[@]}"
+# An installed Codex older than the repo's minimum (require-codex-version.sh,
+# beside this script) is upgraded, not only a missing one: `codex-big` needs it
+# for its model. The upgrade replaces the root-global npm install; if the Codex
+# on PATH is still too old afterwards, a user-local copy shadows it, and that is
+# reported rather than passed over.
+hash -r
+if have codex && ! "$HERE/require-codex-version.sh" 2>/dev/null; then
+  sudo npm install -g --no-fund --no-audit @openai/codex@latest
+  hash -r
+  "$HERE/require-codex-version.sh" ||
+    echo "  warning: the Codex on PATH ($(command -v codex)) is still too old after upgrading the global install; upgrade that copy"
+fi
+# Devin's installer ends by running `devin setup`, an interactive login, which
+# fails without a terminal. The install itself is complete by then, so feed it
+# no input and judge by whether the binary landed.
+if ! have devin; then
+  bash -c "$(curl -fsSL https://cli.devin.ai/install.sh)" </dev/null || [ -x "$HOME/.local/bin/devin" ]
+fi
+have sem   || curl -fsSL https://storage.googleapis.com/sem-cli-releases/get.sh | bash
+hash -r
+
+step "dot-agent-deck"
+if [ ! -x "$HOME/.local/bin/dot-agent-deck" ]; then
+  case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; esac
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL -o "$HOME/.local/bin/.dot-agent-deck.part" \
+    "https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-linux-$arch"
+  chmod +x "$HOME/.local/bin/.dot-agent-deck.part"
+  mv "$HOME/.local/bin/.dot-agent-deck.part" "$HOME/.local/bin/dot-agent-deck"
+fi
+# `hooks install` defaults to Claude Code alone (so does `remote add`); install
+# for every agent the deck ingests hooks from. Pi needs no step: the deck
+# materializes its extension each time it spawns a Pi pane.
+for agent in claude-code opencode codex devin; do
+  "$HOME/.local/bin/dot-agent-deck" hooks install --agent "$agent" | sed "s/^/  [$agent] /"
+done
+
+# -------- 6. the repo ---------------------------------------------------------
+
+if [ -n "$REPO_URL" ]; then
+  step "repo $REPO_URL"
+  REPO_DIR="${REPO_DIR:-$HOME/code/$(basename "$REPO_URL" .git)}"
+  [ -d "$REPO_DIR/.git" ] || git clone "$REPO_URL" "$REPO_DIR"
+  (cd "$REPO_DIR" && devbox install)
+  # This repo's own orphan reaper (CLAUDE.md rule 14's neighbour, docs/develop/orphan-reaper.md).
+  [ -x "$REPO_DIR/scripts/install-reaper-timer.sh" ] && "$REPO_DIR/scripts/install-reaper-timer.sh"
+fi
+
+# -------- 7. what is left for the operator -----------------------------------
+
+step "versions"
+for c in dot-agent-deck claude opencode codex pi devin sem docker node devbox git gh; do
+  v=MISSING
+  if have "$c"; then
+    case "$c" in sem|devbox) v="$("$c" version 2>/dev/null | head -n1)" ;; *) v="$("$c" --version 2>/dev/null | head -n1)" ;; esac
+  fi
+  printf '  %-15s %s\n' "$c" "${v:-installed}"
+done
+
+step "log these in (run each on the box)"
+todo=0
+check() { if ! eval "$2" >/dev/null 2>&1; then printf '  %-10s %s\n' "$1" "$3"; todo=1; fi; }
+# shellcheck disable=SC2016  # each test is eval'd inside check()
+check claude   '[ -s ~/.claude/.credentials.json ] || [ -n "${ANTHROPIC_API_KEY:-}" ]' 'claude   (then /login)'
+check codex    '[ -s ~/.codex/auth.json ]'                    'codex login'
+check opencode '[ -s ~/.local/share/opencode/auth.json ]'     'opencode auth login'
+check pi       '[ -s ~/.pi/agent/auth.json ]'                 'pi   (then /login)'
+check devin    '[ -s ~/.local/share/devin/credentials.toml ]' 'devin   (follow its login prompt)'
+check gh       'gh auth status'                               'gh auth login && gh auth setup-git'
+[ "$todo" -eq 0 ] && echo "  nothing — every agent is logged in"
+if [ "$USE_VALS_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
+  echo; echo "Note: a deck daemon is already running; its agents get USE_VALS only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
+fi
+if [ "$RELAY_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
+  echo; echo "Note: a deck daemon is already running; its agents send through the relay only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
+fi
+if ! id -nG | tr ' ' '\n' | grep -qx docker; then
+  echo; echo "Note: log out and back in (or reconnect) for the docker group to apply."
+fi

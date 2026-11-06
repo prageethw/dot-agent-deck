@@ -1,0 +1,492 @@
+# Voice Control
+
+The desktop app can be driven by voice: open screens and agents, switch daemons, fill in and submit the New agent dialog, stop agents (after you confirm on screen), type or dictate into an agent, interrupt the agent, clear its prompt or take back what you just dictated, answer the question an agent is waiting on, and hear a short spoken summary of each turn an agent finishes. The TUI has no voice control.
+
+Voice needs two services, set in **Settings → Voice**: **Speech** turns your audio into text, and **Commands** turns that text into one of the app's commands. Read [What is sent where](#what-is-sent-where) before turning it on. Voice understands English: what you say is always transcribed as English, whatever your accent.
+
+## Turn on voice control
+
+With the default settings, speech runs in a container on your machine and commands go to OpenAI, so you need Docker and an OpenAI API key.
+
+1. **Start the local speech service.** It listens on port 18000 by default:
+
+   ```bash
+   docker run -d -p 18000:8000 ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu
+   ```
+
+   The first thing you say downloads its speech model, so the first answer takes longer.
+2. **Store the Commands key.** Open **Settings → Voice**. Under **Commands** (default **OpenAI-compatible API**), paste your OpenAI API key into **Commands key for api.openai.com** and press **Save**. The panel then reads "A key is stored in your OS keychain."
+3. **Turn voice on.** Press **Voice off** at the bottom of the window. It changes to **Voice on**, and the app listens continuously until you turn it off. Your operating system may ask the first time whether the app may use the microphone; allow it.
+4. **Check it worked:** say "what can I say?". A list of every command opens, split into **On this screen** and **On another screen**. Close it with **Close**.
+
+To turn voice off, press the button again or say "voice off". The microphone is released when voice is off. Voice is off whenever the app starts.
+
+To avoid the Docker step, choose **OpenAI — needs an OpenAI API key** under **Speech** and store a Speech key; your audio then goes to OpenAI. To avoid an OpenAI key for Commands, choose **Anthropic API** and store an Anthropic key, or point **Endpoint** at an OpenAI-compatible server on this machine, which needs no key.
+
+## Using it
+
+What the app did with each thing you said appears beside the Voice button and stays until the next one. The app keeps listening while it works out what you just said, so you can go on talking. You can pause in the middle of a command: when what you have said so far does not make a whole command, such as "set the command to be", the app waits about two seconds for the rest before saying it found nothing, and joins what you say next onto it. A command that is already complete runs without that wait. While it works out what you meant, the row shows the words it heard, for example *Heard “open settings”*; the answer then replaces them, and when the answer quotes your words itself (*Heard: “…” — no matching action.*) they are shown only once. When a command can be reversed, an **Undo** button is shown beside it for ten seconds. While voice is on, the text in that row at the bottom of the window is larger, so you can read it from where you sit, and a long message wraps onto more lines instead of being cut off; it returns to its usual size when you turn voice off.
+
+Sounds that are not speech, such as typing on the keyboard, a breath, a cough, a knock on the desk, a notification sound or other noise in the room, are ignored: nothing is typed or run for them, and what is shown beside the Voice button stays as it was. Speech from somewhere else is still speech, though: another person talking, or a television or video playing near the microphone, is heard as if you had said it.
+
+The Speech service sometimes answers a sound with words nobody said, such as a whole sentence for a cough or a laugh. The desktop app's voice control drops words that could not have come from the sound: more words than it would take to say them in that time, or words the Speech service places where nobody was speaking. When that leaves nothing, it is ignored like any other noise: nothing is typed or run, and the row beside the Voice button stays as it was. With a Speech model that reports when each word was spoken, words it adds in the quiet after you stopped, such as "Thank you.", are dropped, and what you said is usually still typed or run. A short sound can still come back as one or two words, such as "Mm" or "All right", because that much could have been said in it. More is caught with a Speech model that reports when each word was spoken, such as the default model on this machine or `whisper-1`; with OpenAI's `gpt-4o` transcription models, only the number of words is checked.
+
+What you can do by voice, by screen:
+
+| Where | You can |
+| --- | --- |
+| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog, a confirmation, an upgrade dialog, an agent's output Reader, a daemon's Host figures); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
+| Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; [open a daemon's Host figures](#checking-a-daemons-machine); open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); [open an agent's pull request](#pull-requests); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
+| New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
+| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [answer the question the agent is waiting on](#answering-an-agents-question); [open its pull request, or another agent's](#pull-requests) |
+| A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
+
+"Close" closes only what is in front. With a confirmation or an upgrade dialog open, it closes that dialog the way **Cancel** or `Esc` does and leaves everything behind it as it was. With an agent's output **Reader** open, it closes the Reader, unless a confirmation or Settings is open over it, which closes first. While an upgrade is running, the dialog stays open and the app says why; when the dialog is asking whether to restart and stop running agents, "close" answers **Keep current daemon**, so nothing is stopped.
+
+Say a daemon's name the way you would say it. The app picks the daemon you meant from the ones the **Daemon** selector lists, even when the transcription spells it differently: "Select mini PC, demon" reaches a daemon named `minipc`, and "Switch to InMotionDeck" one named `inmotion`. The same goes for directories, Mode chips and orchestrations. With **Send on-screen names** set to **Off**, the app cannot pick a daemon, directory, mode, agent or orchestration from what you say: a command that needs one is refused, and the app says why; say its number (see [Choosing by number](#choosing-by-number)) or click it instead.
+
+You do not have to learn particular words for a command: the app goes by what your sentence means; see [How voice understands you](#how-voice-understands-you). To open an agent, ask for it and name it the way you think of it, for example "open tester" or "show me the tester"; see [Naming an agent](#naming-an-agent). While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). The dashboard shows every daemon and agent whether voice is on or off, and you can scroll it by voice; see [Scrolling the dashboard](#scrolling-the-dashboard). In the New agent dialog and on the Daemons screen, a list too long for the window is shown a page at a time, so everything you can choose is on screen; see [Long lists are shown in pages](#long-lists-are-shown-in-pages). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
+
+A command that names an agent, such as "stop the planner" or "close the review orchestration", runs nothing, and the app says why, if you switch daemons or that agent is replaced by a new one under the same name while the app is still working out what you said (which the app can tell only when the daemon reports when each agent started). Say it again to act on the agent that is there now.
+
+**Typing into an agent.** Open its [pane](dashboard.md#the-agent-pane) and start by asking to type; the rest of the sentence is the text. "Type", "write", "say" or "dictate" at the start, as in "type run the tests", are recognised straight away. Other openings ("tell it to …") work too: the app types only when it judges that your sentence starts by asking to type, and the words it types are taken from what the Speech service heard, so they are always your own. After typing, a five-second countdown runs on screen and then the prompt is sent. Speaking again stops the countdown; another "type …" adds its words to the prompt and starts the countdown again, and otherwise the prompt waits for you to send it. To send, say "send", "send it", "submit", "submit it", "enter", "press enter", "go ahead", "end", "that is the end", "finished" or "the prompt is finished" as the whole utterance, which sends at once, or press `Enter` yourself. Other words that ask only to send it, such as "transmit the current prompt", work too after the short check described in [How voice understands you](#how-voice-understands-you). Said inside a longer sentence, such as "go ahead and close it", none of them sends anything. While the agent is waiting on a question, nothing is typed into its prompt and none of them presses `Enter`; see [Answering an agent's question](#answering-an-agents-question). To dictate a longer prompt without starting every sentence with "type", use [typing mode](#typing-mode).
+
+Nothing is typed or sent, and the app says why, if a confirmation is open, if the pane is showing another tab instead of the agent's terminal, or if the pane on screen is no longer the one you were looking at when you spoke — for example because you opened another agent while the app was still working out what you said. Once the words are typed, the send is called off, and the app says so, if before it happens you close the pane, open another screen or agent, switch daemons, or a confirmation opens: the words stay in the agent's prompt, unsent. It is also called off if the agent in the pane is replaced by a new one. Telling a replacement apart needs a daemon that reports when each agent started; with one that does not, the app cannot tell a replacement from the original agent.
+
+**While voice is on, the app keeps the computer from going to sleep from inactivity**, because speaking produces no keyboard or mouse input. The display can still turn off. On Linux this goes through systemd-logind; a desktop environment whose power manager ignores logind may still suspend.
+
+## How voice understands you
+
+Say what you want the way you would say it to a person. The app goes by what your sentence means, not by particular words, so "destroy the tester" and "get rid of the tester agent" ask to stop the tester just as "stop the tester" does (and, as with every stop, open the confirmation you answer by hand), "throw away this draft" discards the New agent form, and "narrate future agent updates aloud" turns [reading](#reading) on. Most phrases this page gives for a command are examples, not a list you have to learn. Where only the listed words work, the section says so: in [typing mode](#typing-mode), for instance, only the phrases it lists act as commands, because everything else you say is typed.
+
+**Before a command runs, the app checks that your words ask for it.** If the app judges that they do not, nothing happens, and the row beside the Voice button says what the app would have done, often with a way of saying it that works: *Heard: “…” — nothing in that asks to stop an agent, so nothing was done; try “stop tester”.* Say it again in plainer words.
+
+**Some actions need to be asked for on their own.** Sending the agent's prompt, discarding the New agent form, starting or stopping typing mode, interrupting the agent, clearing its prompt, scratching what you last dictated, turning reading on or off and silencing the app's speech each run only when the app judges that your whole sentence is that one request, and so does closing what is on top or going back to the Daemons screen while the New agent dialog is open, which would leave the form. A sentence that also says something else, such as "send it, the meeting is at noon", is refused: *Heard: “…” — asking to send the agent's prompt needs to be said on its own, like “send it”, so nothing was done.* Say the request by itself. In [typing mode](#typing-mode), its own phrases work as that section describes, including "send it" as a separate last sentence. Typing into an agent is the other way round: start by asking to type, and the rest of the sentence is what is typed.
+
+**The app checks your request separately from the names on screen.** Agent labels, folder names, orchestration titles and daemon names are chosen by whoever started those agents or made those folders, and could be written to look like an instruction. The check that decides whether your words ask for a command is given your words and not those names, and a command the Commands service works out runs when that check judges that your words ask for it. Like any judgement of what a sentence means, it can be wrong, so voice can misunderstand you: check what happened after you speak. That is also why stopping an agent or closing an orchestration still waits for you to confirm by hand, and why typing into an agent shows a countdown you can stop.
+
+**The check runs while the command is worked out.** The app asks for it at the same moment as it asks the Commands service which command you mean, so with the default Commands service it adds little or no wait. What the app works out on this machine (see [What is sent where](#what-is-sent-where)), such as "send it", a number, or "reading on", runs without it. If the Commands service is slow to answer or cannot be reached, the command is refused rather than run: *Heard: “…” — could not check that this asks to stop an agent (…), so nothing was done.* Nothing happened; say it again once the service answers.
+
+## Naming an agent
+
+You do not have to say an agent's exact name. Say what you know about it:
+
+| You can name it by | For example |
+| --- | --- |
+| Its name or role, as the screen shows it | "open tester", "show me the orchestrator" |
+| Its mode | "select dispatcher agent", "go to the dispatcher" |
+| Its agent type | "switch to the Codex agent", "open the OpenCode one" |
+| Its directory | "open the agent in billing" |
+| Its orchestration's title and its role | "open prd-1401 coder", "show the reviewer in the PRD 1487 orchestration" |
+| The daemon it is on | "open the Codex agent on the local daemon" |
+| What it was last asked to do | "show me the one fixing the scroll" |
+| When it started | "open the newest agent", "open the oldest one" |
+| What it is doing now | "show me the one that's stuck" |
+
+You can combine them, as in "the newest reviewer". A name the screen shows wins: "open tester" opens the agent called tester even if another agent runs in a mode called tester. A directory is named by its own name, not its full path.
+
+An agent that is part of an orchestration is called by the orchestration's title, the heading its group has on the dashboard, followed by its own name, for example "prd-1401 coder". That is the name the app uses when it lists agents for you to choose from, in the command palette's **Focus** entries, when it tells you an agent is on another page, and in what it tells you about a question the agent is waiting on, and it is the name [Reading](#how-agents-are-named) speaks. Every run of an orchestration has the same roles, so say the title when several orchestrations are running: "open prd-1401 coder". The role alone still works while only one agent on the screen has it; when several do, the app asks which one you meant rather than picking one. An agent that is not part of an orchestration is called by its own name.
+
+"Select", "go to" and "switch to" open an agent when you name an agent. When you name a daemon, as in "select the build box daemon", they switch which daemon the app shows instead.
+
+If what you said fits more than one agent, for example "open the Claude agent" with two Claude Code agents running, the app lists them for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things). "When it started" needs a daemon that reports when each agent started; if one of the agents you meant has no start time, the app lists them instead of guessing.
+
+Voice reaches the agents of the daemon the app shows. With **All daemons** selected, it reaches the agents on this machine; to name an agent on another daemon, switch to that daemon first, or say the agent's number on the dashboard (see [Choosing by number](#choosing-by-number)). Naming another daemon in a command for an agent, such as "the Codex agent on build box" while the agents voice can reach are on this machine, opens nothing, and the app says that no agent matches.
+
+## Filtering the dashboard
+
+To show only some agents on the [dashboard](dashboard.md#filter-the-dashboard), say which ones, from the dashboard or the Daemons screen:
+
+| You can filter by | For example |
+| --- | --- |
+| Kind | "show me all orchestration agents", "show only the dispatchers" |
+| Status | "show me all working agents", "show only agents waiting for input" |
+| Agent type | "show Codex agents" |
+| Daemon | "show the agents on build box" |
+| A name or other words | "filter by billing" |
+
+The app opens the dashboard with that filter set, exactly as if you had chosen it in the dashboard's filter, and says what it filtered by, for example *Filtering the agent dashboard. Status: Working.* A new filter replaces the one before it. A part the app did not catch is left out, and the app says so; when it catches none, the filter is left as it was.
+
+**Going back to everything is always one step.** Say "show everything", "show all agents", "clear the filter", "remove the filter" or "reset", from any screen: the filter is cleared and the whole dashboard is shown, opening it if you were somewhere else. With no filter set, "show everything" just opens the dashboard, as it always has. "Show the dashboard" opens the dashboard and keeps the filter as it is.
+
+Naming one agent still opens that agent: "open tester" and "see only the tester" open the tester's pane rather than filtering the dashboard.
+
+While the dashboard is filtered, the numbers count only the rows it shows, so "one" opens the first row on screen.
+
+## Answering an agent's question
+
+When an agent stops to ask you something — a permission prompt such as "Allow this command?", a menu of options, or a form of several questions — its row on the dashboard shows **needs input**, and "show only agents waiting for input" lists it (see [Session statuses](../session-management.md#session-statuses)). Open that agent's [pane](dashboard.md#the-agent-pane) and answer it by voice, saying what you would say to a person:
+
+- **By its number:** the number the agent shows beside the option, said any way you like: "2", "two", "second", "option two", "number two", "the second one", or "the last one". Where the agent shows no numbers, as in OpenCode's permission prompt, count the options from the left. If the agent may or may not show an option, the app doesn't guess the numbers of the options after it: say those by name. Claude Code's command prompt is one: it may show **Yes, and switch to auto mode** before **No**, so say "no" rather than a number; "1" for **Yes** still works.
+- **By its words:** the option's label, such as "No" or "Allow once", or a part of it that only that option has, such as "proceed" for Codex's "Yes, proceed" or "always" for OpenCode's "Allow always". Case, punctuation and words such as "um", "please" or "do it" around the answer do not matter, so "um, yes please" is "Yes", and on a menu or a form a small slip of the speech service, such as one letter off in a longer word, is still understood. On a permission prompt the app does not correct slips in an option's words, so a misheard "alloy" is not matched to "Allow once"; if you meant it, say it again.
+- **By what you mean:** "go ahead" or "allow it" allows a permission prompt once; "don't" denies it; "always allow" chooses the agent's "always" option, after you confirm it (below).
+- **A form of several questions:** answer the questions one at a time, by number or by words, in the order the agent asks them: a number or part of a label goes to the first question you have not answered yet. The agent shows only the question it is on, so after each answer the row names the next question with its options numbered, for example *So far — Colour: Green. Still to answer: Size (1 “Small”, 2 “Large”).* You can also answer in any order, or several in one sentence, such as "red for colour and large for size". On a question that takes several answers, name them together: "one and three", or "small and large". Answering a question again replaces your earlier answer.
+
+When the agent shows an option whose label starts with another's, the whole label wins: on Claude Code's prompt with **Yes**, **Yes, and switch to auto mode** and **No**, "yes" is **Yes**. When what you say is how several options begin and just one of them allows once, that one is chosen: on Codex's prompt, "yes" is **Yes, proceed**, not **Yes, and don't ask again …**, and the countdown names it, so you can cancel if you meant the other. Otherwise, when what you say fits more than one option and is not the whole label of any of them, nothing is chosen, and the row says which options it could be, with their numbers where you can say them: on Claude Code's prompt, *“yes and” could be 2 “Yes, and always allow access to … from this project” or “Yes, and switch to auto mode” — say more of its words. Nothing was chosen.* Say the number, or more of the label.
+- **An option that asks for your own words**, such as Claude Code's "Type something.": choose it, and the row asks you to *Say the words for “Type something.”*; what you say next is taken as your answer, word for word. The one exception is a way of switching [typing mode](#typing-mode) on or off said on its own, such as "type on" or "talking off", which switches typing mode instead.
+
+**With [reading](#reading) on, you hear the question before you answer it.** When an agent asks for permission, the app says so at once, with the numbers you can answer with, for example "The coder is asking for permission: Bash: cargo publish. Say 1 for Yes, or say No.", or "Asking for permission: Bash: cargo publish. Say 1 for Yes, or say No." when that agent's pane is open, so you know what to say without watching the screen. Options that have to be answered in the pane are left out, which is why a number can be skipped, and an option whose number depends on what the agent shows is said by name only. For a form, you hear the first question's options. Open that agent's pane if it is not open already, and answer once the app has finished speaking. While the app is speaking only "stop" and "quiet" are heard, so an answer said over it is not taken: say it again when the app is quiet, or say "stop" first. Speaking still stops an answer's countdown, and "cancel" still calls off an answer that is being sent. You normally hear each prompt once, but now and then the app may say a prompt a second time or not say it at all, so when an agent's row shows **needs input** and you have not heard why, open its pane to see what it is asking. Once you have answered a prompt by voice the app does not say it any more, even if it was still waiting to be said; the agent's other news and other agents' speech are still said. Answering does not change reading: the agent's next turn is read as usual.
+
+![The pane of the Codex agent Desktop implementation, with Codex asking whether to run npm install --save-dev msw, its three options listed in the pane, and at the bottom of the window the voice row after "go ahead" was heard: “Yes, proceed” (allow once) — npm install --save-dev msw — sending in 5 s, with a Cancel button](/img/voice-question-desktop.png)
+
+Once every question has an answer, the row shows it with a five-second countdown that names the option it will send, as the agent labels it, for example *“Yes” (allow once) — touch notes.txt — sending in 5 s. Say “cancel” to stop.* When the app hears you start speaking, the countdown stops — *stopped because you spoke. Say the answer again to send it.* — before it works out what you said, and nothing is sent until you give a complete answer again, which starts a new countdown. Speech that starts in the very last moment may come too late to stop it. Press **Cancel** to call it off without speaking. When the countdown ends, the row shows *sending…* until the deck has answered the agent, and **Cancel** still works until then; then the row says what it sent: *Allowed: touch notes.txt*, *Denied: touch notes.txt*, or *Answered: Colour → Red; Sizes → Small, Large*. If you cancel after the answer already reached the agent, the row says so: *Too late to cancel — Allowed: touch notes.txt*. Always read the countdown: the app picks the option it thinks your words chose, and it can pick wrongly — for example "Yes" for something you said about something else. What the countdown shows is exactly what will be sent, and speaking or **Cancel** stops it.
+
+**Always allow.** Choosing an "always" option opens a confirmation, **Always allow?**, that says what it will always allow, for example *This will always allow access to /work/proj for the rest of this session. Confirm?* Press **Confirm**, or say "confirm" or "always allow" again, and the countdown starts. "Yes", "sure" or "OK" does not confirm it: the confirmation stays open and the row says *Say “confirm” to always allow, or “cancel”.* Press **Cancel**, close the confirmation, or say "cancel" or "no", and nothing is sent. The deck grants exactly what the confirmation names; when it cannot say what an agent's "always" option would grant, or the grant is too long to show in full, that option has to be chosen in the pane.
+
+Anything you say that is not about the question, such as "open settings", is handled as an ordinary command. The exception is anything that would type or press keys in the agent's pane, because in the agent's question a key can choose an option: `Enter` chooses whichever option is highlighted, and a typed number or letter can choose one too. So while a question is waiting, voice neither types into that pane nor presses `Enter` there. "Type run the tests" types nothing and the row says what you can say instead, for example *Nothing was typed — … is waiting on a question. Answer it by saying an option or its number — 1 “Yes”, 3 “No” — or use the keyboard.* A send phrase the app does not take as an answer, such as "send it" or "enter", presses nothing, and neither does the countdown after something you typed before the question arrived; the row says *Nothing was pressed — … is waiting on a question.* followed by the same advice. "Interrupt", "clear the prompt" and "scratch that" press nothing either. When you cannot answer by voice from where you are, the row says what to do instead.
+
+**[Typing mode](#typing-mode) does not get in the way.** With typing mode on, saying one of the options — its number, its words or a part of them — answers the question as it does with typing mode off, with the same countdown; what you mean in other words, such as "go ahead", is understood only with typing mode off, because in typing mode nothing you say is sent to the Commands service; anything else is not typed, and the row lists the options as above. Typing mode stays on, and once the question has been answered, what you say is typed into the prompt again. "Type on", "talking on" and the other ways of switching typing mode, said on its own, always switch it, even while a question is waiting, unless one of the options you can answer by voice is labelled with exactly those words. You can answer only the agent whose pane is on screen with its terminal showing — not from the dashboard, and not while the pane shows another tab such as its diff — so that you can see what you are approving; there, what you say is an ordinary command. Answering in the pane with the keyboard works as it always has.
+
+Nothing is sent, and the row says why, when:
+
+- the question was answered, for example with the keyboard, or changed before the answer went: *That question was answered or changed before I could send it — nothing was sent.*
+- you close the pane, open another agent or screen, switch the pane to another tab, switch daemons, turn voice off, a confirmation opens, the agent in the pane is replaced, or the pane stops taking input, for example because its deck stops answering, while the countdown runs. If one of these happens once the answer is already being sent, the app cancels it if it still can, and the row says whether the cancel was in time or came too late;
+- what you said does not match an option: *I couldn't match that to the options: 1 “Yes”, 3 “No”.*, listing what you can say with the numbers to say;
+- what you said fits several options: *“…” could be 1 “…” or 2 “…” — say its number or more of its words. Nothing was chosen.*
+- you said a number the question has no option for: *There is no option 4, so nothing was chosen. The options are …*
+- you said a number that may belong to a different option depending on what the agent shows: *On screen “No” may be 3 or 4 — say “No”. Nothing was chosen.*
+- the app could not tie the option it heard to the words you said: *Heard: “…” — I couldn't tell which option that chooses, so nothing was chosen.* Say the answer again, for example with the option's number;
+- you have already started answering in the pane with the keyboard, on an agent the deck answers by pressing keys (Codex, Devin): *… 's prompt was typed into after it asked, so the deck won't type the answer there — finish it by keyboard.* The deck does not press keys into a prompt you may have moved on, and if it had started a form when you typed, it stops and leaves the rest to you;
+- the option you chose cannot be answered by voice: *“Chat about this” has to be answered by keyboard.*
+- the agent's questions cannot be answered by voice at all: *… 's questions have to be answered by keyboard.*
+- the daemon is older than the app and cannot answer questions: *This deck cannot answer questions by voice — update the deck to use it. Nothing was sent.*
+- another answer to the same agent is still being sent, for example from a second window: *Another answer to … is still being sent — nothing was sent.* Wait for that one to finish, then look at the pane before answering again.
+
+Two outcomes are not "nothing was sent":
+
+- the answer reached OpenCode but OpenCode did not take it: *Couldn't send the answer: the agent did not take it (…) and is asking again.* The question shows again; answer it again, by voice or in the pane.
+- the answer may have reached the agent, but the deck could not confirm it in time: *The answer may have been sent, but … did not confirm it — check … before answering again.* Look at the pane before you answer again, so that you do not answer twice.
+
+### Which questions each agent can answer by voice
+
+| Agent | By voice | By keyboard only |
+| --- | --- | --- |
+| Claude Code 2.1.136 or newer | Permission prompts: **Yes**, the "always" option, **No**. Multiple-choice questions and forms, including questions with several answers and **Type something.** Plan approval: **Yes, auto-accept edits** and **Yes, manually approve edits**. | **Yes, and switch to auto mode**; **Chat about this**; a question with more than 16 options, or a form of more than eight questions, which makes the whole form keyboard-only; plan approval's **Tell Claude what to change**; forms from MCP servers; the folder-trust question when Claude Code starts. |
+| Codex | Command approvals: **Yes, proceed**, the "don't ask again" option, **No**. Multiple-choice questions and forms in Plan mode, one answer per question. | **None of the above**; a question with more than nine options, or a form of more than eight questions, which makes the whole form keyboard-only; the folder-trust question when Codex starts. |
+| OpenCode | Permission prompts: **Allow once**, **Allow always**, **Reject**. Question menus and forms, including questions with several answers and **Type your own answer**. On OpenCode 2, forms in its full interface (`opencode`). | A question with more than 16 options, or a form of more than eight questions, which makes the whole form keyboard-only. On OpenCode 2: every form in `opencode mini`, and a form with a question that appears only after another is answered, a hidden field or a field OpenCode fills in from elsewhere. |
+| Pi | Pi asks no questions of its own. The dialogs other Pi extensions show: a choice from a list, a yes-or-no confirmation, and a box to type into. | A list of more than 16 choices. Other extension dialogs, such as an editor or a custom screen. |
+| Devin | Permission prompts: **Allow once** and deny. **Untested**: built from Devin's documentation and not yet tried with a running Devin. | Every other permission option. |
+
+- **Claude Code older than 2.1.136:** the deck does not know its questions. Its row still shows **needs input**; answer in the pane. After upgrading Claude Code, run `dot-agent-deck hooks install` (or restart the daemon), then restart Claude Code.
+- **Codex:** its questions reach the deck through the deck's hooks, which have to be installed and trusted ([Codex events not showing](../troubleshooting.md#codex-events-not-showing)). This version of the deck adds one more Codex hook; it is installed and trusted with the others when the daemon starts or when you run `dot-agent-deck hooks install --agent codex`. Restart Codex sessions that were already running.
+- **Pi:** answering rests on behaviour Pi does not document, checked with Pi 0.87.1. A later Pi release may stop it working; its dialogs then have to be answered in the pane.
+- **The labels the app shows for Claude Code's and Codex's permission prompts, and the keys the deck presses to answer Codex,** were checked against Claude Code 2.1.289 and Codex 0.160.0, and Claude Code's **Yes, and switch to auto mode** against 2.1.296. If a newer release changes those prompts, check the pane before the countdown ends.
+- **Claude Code's command prompts and auto mode:** in its default and accept-edits modes, Claude Code may or may not show **Yes, and switch to auto mode** before **No**, and the app cannot tell which, so it doesn't guess the number of **No**: say "no". Saying a number for **No** chooses nothing, and the row tells you to say it by name; the options the app reads out or lists name **No** without a number.
+
+## Filtering directories
+
+While the New agent dialog shows a directory, say "filter" followed by what to look for, such as "filter docs" or "filter by api". The app puts that text in the **Filter** box, exactly as if you had typed it, and the list shows only the directories whose names contain it, in upper or lower case. Longer requests work too: "show only those starting with letter D" sets the filter to `d`, which, as when you type it, also keeps names that have a `d` anywhere else. The app says what it applied, for example *Filtering by “d”.* It uses only words you said: if what you asked for is not in your words, the filter is left as it was and the app says so. Say "clear filter" to empty the box and show every directory again.
+
+## Setting the command
+
+Once the New agent dialog has a daemon and a directory chosen, say "set the command to" followed by the command, such as "set the command to devbox run agent" or "make the command npm run dev". The app puts exactly the words you said in the **Command** field, as if you had typed them, and says what it set, for example *Command: “devbox run agent”.* Only the full stop at the end of your sentence and any quotes around the command are left out. If what would go in the field is not what you said, the field is left as it was and the app says so. The command must be what you said word for word, so "set the command to ./run.sh" sets `./run.sh`, never `run.sh`, and a command containing an invisible character, such as a direction override or a zero-width space, is refused. Setting the command starts nothing, even when the command contains words like "run", and a sentence that mentions the command never starts the agent, such as "set the command to bash and start it": check the form, then say "start it" on its own or press **Create agent**. Saying "use claude" (or another agent) still fills in that agent's usual command instead.
+
+## Choosing by number
+
+While voice is on, the lists you can choose from by voice show a number before each item: the agents on the dashboard, the agent tiles on the Daemons screen, the daemons, directories and modes in the New agent dialog, and the entries of the **Daemon** selector while its menu is open, **All daemons** included. With voice off, they look as they always do.
+
+Each list is numbered from 1. When several lists are visible together, as in the New agent dialog, each has its own numbers: the daemons 1, 2…, the directories 1, 2… (with `..` for the folder above as 1), and the modes 1, 2…. On the dashboard the agents of every daemon are one list, numbered top to bottom, and a number stays with its row wherever the dashboard is scrolled. While an agent's pane, the New agent dialog or the **Daemon** menu is open, only what is in front is numbered. A list shown in pages is numbered from 1 on every page; see [Long lists are shown in pages](#long-lists-are-shown-in-pages).
+
+![The agent dashboard with voice on: each agent row starts with a number, 1 to 6, counting on from one daemon's agents to the next](/img/voice-numbers-desktop.png)
+
+- **Say the list and the number**: "directory 3", "select directory 13", "daemon 1", "choose mode 2", "agent 3" or "open agent 3". "Folder" works for directory, "deck" for daemon, and you can start with "select", "choose", "pick", "open", "enter", "go to" or "switch to". The item showing that number in that list is chosen as if you had clicked it: an agent opens, a daemon or mode is chosen, a directory opens (`..` goes up).
+- **Say the number on its own**: "three", "3", "number three", "the third one" or "the last one". When only one list on screen shows that number, its item is chosen straight away. When several do, for example directory 3 and mode 3, the app asks which one you meant, listing them as "Directory 3: scratch" and "Mode 3: Review".
+- Numbers above nine work the same way, in words or digits: "twelve", "number twenty-three", "the twelfth", "23", and past ninety-nine "one hundred thirty-four", "a hundred and five", "the hundredth" or "134". The dashboard numbers up to 1,000 agents; on a larger fleet, the agents after the thousandth have no number and are opened by name.
+- **Press the number key**, such as `3`, on a list that shows numbers. It chooses from the list you are in: with the directories selected, `3` opens directory 3; with a mode selected, `3` chooses mode 3. On the Daemons screen the `1`–`4` keys already select the tile with that number. A digit typed into a text field, such as the directory **Filter**, **Name** or **Command**, is just typed.
+
+The numbers follow the list. When it changes, for example a directory opens, you filter it or an agent finishes, the numbers change straight away. If the list changed while you were saying a number, nothing is chosen and the app says so, because the number may now belong to another item; say it again. A number that no item shows chooses nothing, and the app says so. Naming the wrong list chooses nothing either: "select daemon 13" while only a directory shows 13 leaves everything as it is, and the app tells you that 13 is a directory. The Mode chips can be chosen by number once a directory is chosen; until then a number names only a daemon or a directory.
+
+If the number you said could also be an item's name, for example "one" with an agent called `orchestrator-1`, or "folder 13" with a directory called `folder-13` that shows another number, the app does not guess: it asks which one you meant, as described below. "Directory 13" always means the directory showing 13.
+
+A spoken number, with or without its list, is worked out on your computer and is not sent to the Commands service. Anything else, such as "open number three", is a command like any other.
+
+## Scrolling the dashboard
+
+The dashboard looks the same with voice on as with voice off: nothing is left out, and when it is taller than the window, it scrolls, with a scrollbar on the right edge that shows how much more there is and where you are. Voice only adds the numbers. You can scroll with the mouse, the trackpad or the keyboard as usual, or by voice:
+
+- **"scroll down"** or **"scroll up"** moves the dashboard about one window. "Scroll down a bit", "go down", "page down", "go up" and "page up" work too, and so do "next page" and "previous page".
+- **"scroll to the top"** or **"scroll to the bottom"** goes to the first or the last daemon.
+- When the dashboard is already at the top or the bottom, or fits the window, nothing moves and the app says so.
+- **Saying the number of a row you have scrolled past**, such as "open agent 12" or "twelve", opens that agent as usual and scrolls its row back into view behind the pane, so it is in front of you when you close the pane.
+
+Scrolling by voice works on the dashboard itself, not while the New agent dialog or an agent's pane is open over it.
+
+## Pull requests
+
+When an agent has a [pull request badge](dashboard.md#pull-requests), you can open its pull request [inside the app](dashboard.md#read-a-pull-request-in-the-app) by voice, from the dashboard or from an agent's pane:
+
+- **On the dashboard**, name the agent: **"open the PR for the coder"**, **"open the coder's PR"** or **"show the pull request for the reviewer"**. Name it the way you would to open its pane, by its name, its role or what it is doing, or by the number beside it on the dashboard: **"open the PR for agent 3"** or **"open agent 3's pull request"**. If you say **"open the PR"** without naming one and there is more than one agent, the app asks which agent you mean; answer with its name or its number (see [Choosing by number](#choosing-by-number)). With a single agent on the dashboard, it opens that agent's.
+- **On an agent's pane**, **"open the PR"** or **"show the pull request"** opens that agent's pull request. Name another agent, such as **"open the reviewer's pull request"**, to open that agent's instead.
+
+When the agent has no pull request, nothing opens and the app says so. When no agent matches the name you said, nothing opens and the app says that too.
+
+While the pull request page is open:
+
+- **"scroll down"**, **"scroll up"**, **"scroll to the top"** and **"scroll to the bottom"** scroll the page, as they scroll the dashboard.
+- **"open it in the browser"** opens the page you are on in your system browser and closes it in the app.
+- **"close"**, **"close the PR"** or **"close the pull request"** closes the page and returns to the screen under it. It only closes the page in the app; nothing happens to the pull request on GitHub.
+
+Typing into the agent does not work while the page is open over its pane: close the page first.
+
+## Checking a daemon's machine
+
+On the dashboard, say **"show host"**, **"open host info"** or **"show resource usage"** to open a daemon's **Host** figures: the same free disk space, load and memory its **Host** button beside the daemon's name shows ([Session Management → Check the machine a deck runs on](../session-management.md#check-the-machine-a-deck-runs-on)). Reading the button aloud works too: "Host", "Host warning" or "Host critical". So do "disk space" and "how is the machine doing?".
+
+- With one daemon on the dashboard, its figures open.
+- With several, name the one you mean, for example "show host for build box". If you do not, nothing opens and the app asks which one.
+- A daemon that is not connected has no figures, and the app says so instead.
+
+To close the figures, say **"close"**, **"close it"**, **"close host"** (the name of the figures' **X** button), **"close resource usage"** or **"hide resource usage"**. If something else is open over the dashboard, such as Settings, an agent's pane or the list of commands, "close" closes that first, and the figures on the next "close". While a confirmation is open, such as the one for stopping an agent, "close" closes the confirmation, as **Cancel** does, and leaves the figures open behind it. Their **X**, `Esc` or a click elsewhere also closes them. The app does not read the figures aloud.
+
+## Long lists are shown in pages
+
+While voice is on, a list that does not fit in the window is shown a page at a time instead of scrolling, so everything you can choose by voice is on screen. This applies to the directories and the modes in the New agent dialog and the agent tiles on the Daemons screen. The dashboard is not split into pages; it scrolls (see [Scrolling the dashboard](#scrolling-the-dashboard)). A list that fits is shown whole, as before. With voice off, every list scrolls as it always has. The daemons in the New agent dialog are never split into pages: every daemon that can take a new agent is always shown in full.
+
+![The New agent dialog with voice on: the daemons, the directories and the modes are each numbered from 1, the directories fill the dialog in five columns, and "Page 1 of 3" shows beside the Directory heading](/img/voice-pages-desktop.png)
+
+- **Each page fills the space the list has.** Directories and modes are laid out in as many columns as fit, and a short list uses only the columns it needs, so a few long directory names are shown whole. A name that is cut short shows in full when you hover over it. The Daemons screen shows four tiles per page, the four the `1`–`4` keys select.
+- **"Page 2 of 3"** shows beside a list that has pages: next to the **Directory** heading or under **Mode** in the New agent dialog, and above the tiles on the Daemons screen.
+- **Say "next page" or "previous page"** to turn it ("go to the next page" and "go back a page" work too). On the last page, the first page, or a screen with no pages, nothing moves and the app says why. In the New agent dialog, the directories turn until you choose one, and then the modes do.
+- **Numbers start at 1 on every page** and refer to the page showing. Turning the page changes the numbers, so a number you began to say before the page turned chooses nothing and the app asks you to say it again.
+- **Voice works only on the page showing.** Naming something on another page, such as "open docs", chooses nothing; the app tells you where it is, for example *“docs” is on page 3: say “next page”*. Clicking, the keyboard and the **Filter** box work as usual: moving the selection with the arrow keys or `j` and `k` turns to the page it lands on.
+
+## When a command matches several things
+
+If what you said names more than one thing on screen, for example "open the agent" with several agents on the dashboard, the app does not guess. A dialog opens in the middle of the screen, over whatever is there (an agent's pane or the New agent dialog included), asking which one you meant. It lists the matches as a numbered list, with a **Cancel** button and a countdown, and waits for you to choose. The row at the bottom keeps showing what the app heard.
+
+![The agent dashboard with voice on and "open the agent" heard: a dialog in the middle of the screen asks "Which agent?", lists 1. Plan / architecture and 2. Desktop implementation, and shows a 20 s countdown and a Cancel button, while the row at the bottom says what was heard](/img/voice-choice-desktop.png)
+
+- **Say the number**: "two", "2", "number two", "option two", "the second one" or "the last one", on its own.
+- **Say the name** of one of the listed entries on its own, such as "Desktop implementation". A sentence that only contains a listed name, such as "stop Planner", is not an answer: the list closes and that sentence runs as a new command.
+- **Press its number** on the keyboard, such as `2`. A number that is not on the list does nothing.
+- **Click** an entry, or reach it with `Tab` and press `Enter`.
+
+The dialog takes the keyboard while it is open, starting on the first entry, so the keys you press go to it rather than to an agent's terminal. When it closes, the keyboard goes back to where it was.
+
+If an entry's name is itself a number or a way of cancelling, for example an agent called "two" or "cancel", saying just that name chooses nothing: the list closes and the app says why. Say the command again, then say "number" and the entry's position, such as "number one", or click the entry.
+
+The command you first gave then runs with the entry you chose; what you said is not sent to the Commands service again. Choosing does not skip a confirmation: if the command stops an agent or closes an orchestration, the confirmation still opens, and you answer it by hand.
+
+To choose nothing, say "cancel", "cancel that", "never mind", "none", "none of them", "neither" or "no" on its own, press **Cancel**, press `Escape`, or click outside the dialog. `Escape` closes only the dialog: a pane or the New agent dialog behind it stays open. The dialog also closes on its own when its countdown reaches zero after 20 seconds, and when you turn voice off; nothing runs.
+
+If you say something else while the list is open, the list closes and what you said is treated as a new command. A number that is not on the list, a name that matches more than one entry, or on its own the name of something on screen that is not on the list, closes the list without running anything; say the command again, more specifically.
+
+Nothing runs, and the app says why, if what the list was about changed after it appeared: you moved to another screen, the New agent dialog opened, closed or changed, the directory it showed moved, a daemon's address changed, or the agent, daemon or orchestration you chose is no longer there. The same goes if you switch daemons, or if the agent you chose was replaced by a new one under the same name after you gave the command (which the app can tell only when the daemon reports when each agent started).
+
+A list is not offered while a confirmation is open, or when more than nine things match; the app then says what matched, and you say the command again, more specifically. Some refusals are never turned into a list, for example "switch to build, not staging", where choosing between the two would let you pick the daemon you just ruled out.
+
+## Typing mode
+
+When you want to dictate a longer prompt, you do not have to start every sentence with "type". Open the agent's pane and say "type on" (or "typing on", "start typing", "dictation on", "start dictation", "keep typing", "talking on", "start talking", "speaking on", "start speaking", "dictate on", "writing on", "start writing"). Say it on its own: "I was talking on the phone" does not start typing mode. From then on, everything you say is typed into that agent's prompt, word for word, until you stop.
+
+While typing mode is on:
+
+![An agent's pane with typing mode on: "Typing to Desktop implementation" at the top edge of the window, and at the bottom of the window the Voice on button, a Stop typing button and the reminder "Typing to Desktop implementation. Say “type off” to stop, “send it” to send."](/img/voice-typing-mode-desktop.png)
+
+- **Typing to** *agent* is shown at the top edge of the window, beside **Reading aloud** when [reading](#reading) is on, and beside the Voice button, with a reminder of what to say to stop and to send, and a **Stop typing** button.
+- Nothing is sent to the agent until you say "send it" (or "send", "submit", "submit it", "enter", "press enter", "go ahead", "end", "that is the end", "finished", "the prompt is finished") on its own, or press `Enter` yourself. After a send, typing mode stays on, so you can dictate the next prompt the same way.
+- You can also end what you say with "send it", "send", "submit" or "press enter" as a separate last sentence, for example "What's the weather over there? Send it." Everything before it is typed and then sent; the last sentence itself is not typed. The other send phrases ("enter", "go ahead", "finished", "end" and the rest) send only when said on their own, so "Fix the tests. Go ahead." is typed in full and not sent.
+- After "send it", the app waits a moment for your words to finish arriving before it presses `Enter`. If you type into the prompt yourself during that moment, or press `Enter` yourself, the app does not press `Enter` and the row says it cancelled the send because the prompt was changed. Clicking in the pane or switching to another window does not count as typing.
+- If you stop talking for four seconds with words typed but not yet sent, “send it” to send is highlighted as a reminder. It never sends anything itself; the highlight goes away when you speak again, send, or stop typing.
+- Only a handful of things you can say still act as commands, and only when you say them on their own (or, for the four send phrases above, as a separate last sentence): "type off" (or "typing off", "stop typing", "dictation off", "stop dictation", "done typing", "talking off", "stop talking", "speaking off", "stop speaking", "dictate off", "writing off", "stop writing"), the send phrases above, "voice off" (or "turn off the voice", "turn voice off", "stop listening", "stop voice control", "stop voice", "mute", "mic off"), and the [interrupt, clear and scratch](#interrupt-clear-and-scratch-that) phrases below. Said inside a longer sentence, such as "tell the reviewer to send it when the tests pass" or "stop the build when the tests fail", they are typed like anything else. Other commands, such as opening a screen, do not work until you stop typing.
+- If you speak for 30 seconds without a pause, what you said is still typed, and the app tells you it reached the limit.
+- While the agent is waiting on a question, saying one of its options answers it, and nothing you say is typed until the question has been answered; see [Answering an agent's question](#answering-an-agents-question).
+
+Typing mode ends, and **nothing is sent** when it does, if you:
+
+- say "type off" (or one of the other ways to stop listed above), which leaves voice on, or say "voice off", which also turns voice off. "Stop talking" ends typing mode and leaves voice on; to turn the microphone off, say "voice off" or "stop listening";
+- press **Stop typing** (you can also reach it with `Tab`), which leaves voice on, or press the Voice button, which turns voice off;
+- close the pane (for example with `Escape`), switch the pane to another tab such as **Diff** or **Checks**, open another screen, open another agent, or switch daemons;
+- or a confirmation opens, for example to stop an agent.
+
+It also ends if the agent stops accepting input, for example because it exited, or if it is replaced by a new agent in the same pane (which the app can tell only when the daemon reports when each agent started). Something you said just before typing mode ended that the app was still working out is not typed or sent, but words it had already handed to the agent can still appear in the prompt after typing mode ends; they are not sent. If the agent you were typing to is still there, whatever you dictated stays in its prompt, where you can edit it or send it yourself; a replacement agent starts with an empty prompt. The app says why typing mode ended. Typing mode never moves to another agent on its own: to dictate to a different agent, open its pane and say "type on" again. If the agent on screen cannot take input, "type on" is refused with the reason.
+
+If the app mishears "type off", the words are typed into the prompt instead of stopping typing mode. They are not sent: say "scratch that" to remove them, then say "type off" again or press **Stop typing**.
+
+A bare "type on" or "type off" always switches typing mode, so it cannot be used to type the single word "on" or "off". Say "type the word on" instead.
+
+### Interrupt, clear and scratch that
+
+In typing mode you can also act on the agent's prompt, by saying one of these on its own:
+
+| Say | What happens |
+| --- | --- |
+| "interrupt" (or "interrupt it", "interrupt that", "stop", "stop it", "stop that") | The agent stops what it is working on. It keeps running, with its session, and takes your next prompt as usual. |
+| "clear the prompt" (or "clear prompt", "clear it", "clear all", "clear everything", "delete everything") | Everything in the agent's unsent prompt is deleted. Nothing is sent. |
+| "scratch that" (or "scratch it", "scratch the last part", "scratch the last sentence", "scratch the last prompt", "delete that", "undo that") | The words typed for the last thing you said are deleted, and the rest of the prompt stays. Say it again to remove what you said before that. |
+
+The row beside the Voice button says what happened, for example *Interrupted Desktop implementation.* or *Removed “run the tests” from Desktop implementation's prompt.* Said inside a longer sentence, such as "we should work on the scratch feature", these phrases are typed like anything else.
+
+**They work only in typing mode**, so a word you say to the app itself is never taken as one of them. With typing mode off, "interrupt", "clear the prompt", "scratch that" and the other phrases above run nothing, and the app tells you to say "typing on" first. A bare "stop" with typing mode off never interrupts the agent.
+
+**Interrupt** is sent only while the agent is shown as **running**, meaning it reports that it is thinking, working or compacting; otherwise nothing is sent and the app says the agent is not working on anything. If the agent stops on its own before the interrupt goes out, the app sends no further keys and the row says so. For OpenCode, whose interrupt is two key presses a moment apart, the first press may already have been sent when it stops. If the agent starts something new before the interrupt goes out — you sent it a prompt, or it was seen to stop and start working again while the interrupt waited behind earlier input — nothing is sent, so the interrupt meant for the earlier work never stops the new work; say "interrupt" again if you want to stop that too. If the interrupt is called off before any key is sent, the prompt is unchanged, so "scratch that" still removes what you last dictated and a later clear can still be undone. After an interrupt, another "interrupt" is refused rather than sent until the agent has started something new — you sent it a prompt, by voice or with **Enter**, or it was seen to stop and then start working again — and never within three seconds of the last one, because on an agent that has already stopped the same key opens one of its menus instead. Interrupt asks for no confirmation, since the agent and its session are kept. An agent interrupted before it has written anything may put the prompt back in its input box, where you can edit it or send it again.
+
+**Clear the prompt** offers **Undo** for ten seconds when everything in the prompt was dictated by voice since the app saw it sent or cleared. Undo types those words back, one dictation at a time, without sending them, and "scratch that" afterwards removes the last of them as before; anything else that was in the prompt is not restored. If you typed into the prompt yourself, clicked in the agent's terminal, interrupted the agent, or the app has not yet seen this prompt sent or cleared, the app does not know everything the prompt held, so no Undo is offered and the row says the clear cannot be undone and that some of the prompt may remain. A clear reaches a prompt of up to about 16 lines; in Claude Code, whose prompt wraps, up to about 1,280 characters of plain English text, and fewer with accented letters or characters such as Chinese or Japanese. A longer prompt may not be cleared completely, so for one you dictated the row says some of it may remain and no Undo is offered, and a longer prompt you typed yourself may need clearing from the keyboard. If you type into the prompt while it is being cleared, which can happen in Claude Code, where the clear is pressed in two parts a second apart, the clear stops before its next part, so your new words are not deleted, and the row says it stopped because the prompt was changed; if you had said "send it" while that clear was still running, the send is cancelled rather than pressing **Enter** on a half-cleared prompt, and the row says so. If the clear is called off before any of it is pressed, for example because you stopped typing mode while it waited, the prompt is unchanged and "scratch that" still removes what you last dictated. Once the prompt has changed after the clear, for example because you typed or sent something or clicked in the agent's terminal, Undo types nothing and the row says the prompt was changed after it was cleared; if you start typing while Undo is still putting the words back, it stops there. Pressing **Stop typing** leaves Undo in place, and it still works as long as the prompt is unchanged; saying anything, "typing off" included, replaces the row and its Undo.
+
+**Scratch that** removes only words the app typed into this prompt, most recent first, and only while it can be sure they are still at the end of it. It removes nothing, and says why, once you have typed into the prompt on the keyboard or clicked in the agent's terminal, since a click may move the prompt's cursor (switching windows, moving the mouse over the pane or scrolling does not count), or the prompt was sent or cleared, or the agent was interrupted or replaced — including when that happens after you said "scratch that" but before the app got to remove the words. It also refuses a dictation longer than 800 characters, one with characters a single delete might not remove whole, such as emoji, and one that arrived so soon after other input — earlier dictations, or your own typing — that together it came to over 800 characters, which the agent may have taken as a single paste. Edit the prompt yourself in those cases, or say "clear the prompt". If "scratch that" is called off before it removes anything, for example because you stopped typing mode while it waited, the words stay and saying "scratch that" again removes them.
+
+**One at a time.** While one of these is still waiting or running for an agent, for example a clear waiting for words still being typed, another is refused with *… already has a voice command pending — wait for it to finish, then say it again.* Stopping typing mode ("typing off", **Stop typing** or turning voice off) calls off a command that has not started and sends no further keys for one part-way, such as a clear in Claude Code, which is pressed in two parts a second apart; keys already sent stay sent.
+
+As with every command in a pane, nothing is pressed, and the app says why, if a confirmation is open, the pane on screen changed, the agent in it was replaced while the app was working out what you said, or the agent is waiting on a [question](#answering-an-agents-question).
+
+**Which agents support them.** Claude Code, Codex, OpenCode and Pi support all three. **Devin does not support any of them:** the app has no checked keys for interrupting Devin or for deleting text in its prompt, so each is refused with, for example, *Devin has no voice key to interrupt its turn.* The same refusal names an agent the app does not recognise, such as one started with a custom command, and any agent running under a daemon older than these commands; update that daemon to use them there.
+
+## Reading
+
+Reading lets you hear what your agents did without looking at them. While it is on, the app speaks a one-or-two-sentence summary of each turn any agent on the daemon you are viewing finishes, for example "Tester: all 42 tests pass, nothing changed." It also speaks, as soon as they happen, a permission prompt ("The coder is asking for permission: Bash: cargo publish."), an error that stops an agent ("The coder stopped with an error.") and a usage limit ("The coder hit a usage limit and stopped."). With **All daemons** selected, it reads the agents of every daemon shown. It reads on every screen, so you can follow a whole orchestration from the dashboard, and narrows to one agent while that agent's pane is open (see [What is read where](#what-is-read-where)). The app never reads an agent's terminal or its full reply aloud, and the agents themselves are not changed in any way.
+
+### What is read where
+
+- **On the dashboard**, and on any screen with no agent pane open, every agent on the daemon you are viewing is read.
+- **In an agent's pane**, whether you opened it on the deck or over the dashboard, only that agent is read: its turn summaries, permission prompts, errors and usage limits. Nothing about any other agent is said, not even a permission prompt or an error; their cards show **Needs Input**, **Error** or **Blocked** when you go back to the dashboard. Whatever the app still had to say about other agents when you opened the pane is dropped, even mid-sentence.
+- **Back on the dashboard**, every agent is read again from that moment. What the other agents did while the pane was open is not read out afterwards.
+
+### How agents are named
+
+Inside an agent's pane, a sentence about that agent is said on its own, without a name: "All 42 tests pass.", "Asking for permission: Bash: cargo publish."
+
+Everywhere else, each sentence starts with the agent's name: "Tester: all 42 tests pass." An agent that is part of an orchestration is named by the orchestration's title, the heading its group has on the dashboard, followed by the agent's name: "Prd-1401 coder: all 42 tests pass." That title is the **Name** the orchestration was started with, or the orchestration's own name when it was started without one. Give each orchestration you run a distinct name, otherwise two of them name their agents the same way.
+
+### Turn it on
+
+![Settings → Voice scrolled to reading: Reading set to Off with one sentence saying what it sends where, and Speech source set to Auto with its description](/img/settings-voice-reading-desktop.png)
+
+Reading has one switch, **Reading** in **Settings → Voice**, and it is off until you turn it on. Read [What is sent where](#what-is-sent-where) first: with reading on, the agents' replies leave your machine. Turn it on either way:
+
+- set **Reading** to **On** in **Settings → Voice**; or
+- with voice on, say "reading on" (or "start reading", "reading mode on", "read to me") on its own, on any screen.
+
+The app says "Reading on.", and **Reading aloud** is shown at the top edge of the window on every screen for as long as reading is on. The first time you turn it on, the app also says and shows where each turn's reply goes, for example "Each finished turn's reply is sent to api.openai.com to be summarised.", or, when your Commands service runs on this machine, that replies stay on this machine.
+
+From then on, each turn an agent finishes is summarised and spoken. Nothing that happened before you turned reading on is read. An agent that starts while reading is on is read from then on, and one that exits stops being read, after its last summary. When you switch to another daemon, reading follows it: the agents of the daemon you now view are read instead, and whatever the app still had to say about the agents of the daemon you left is dropped, even mid-sentence. Opening or closing an agent's pane, Settings or another screen does not stop reading; an agent's pane only narrows what is said to that agent while it is open.
+
+The summary is written by the model you set under **Commands**, from the agent's final reply for the turn. If the model does not answer within about ten seconds, or its answer cannot be used, the app says a plain sentence instead, such as "Tester: turn finished." A turn that ends with no reply to read, for example one that ends on a tool call without a final message, is still announced: "Coder: no reply to read.", or "No reply to read." with that agent's pane open. A turn you interrupt is not announced.
+
+When several turns of one agent end while the app is still speaking, that agent's latest summary replaces its own summary that was still waiting, so you hear where it is now rather than a backlog. One agent's summary never replaces another agent's, and a permission prompt or error is never dropped that way. The same goes for turns that end while an agent's summary is still being written: when it is done, only the last of them is summarised next.
+
+### Stop the speech, or reading
+
+- Say "quiet" (or "be quiet", "silence", "hush", "shush") to cut off what the app is saying and drop anything waiting to be said. Reading stays on, and the next turn is read as usual. A bare "stop" (or "stop it", "stop that") does the same while the app is speaking, and while reading is on outside typing mode; in typing mode, when the app is not speaking, "stop" still [interrupts the agent](#interrupt-clear-and-scratch-that).
+- **While the app is speaking, only "stop" and "quiet" are heard.** Everything else you say is ignored, and the row beside the Voice button says only “stop” or “quiet” works while the app is speaking. This keeps the microphone from acting on the app's own voice. To give another command, say "stop" first, then the command. "Voice off" waits the same way, or press the Voice button.
+- To turn reading off, say "reading off" (or "stop reading", "reading mode off", "done reading") on any screen, or set **Reading** to **Off** in **Settings → Voice**. Either way, what the app is saying is cut off, nothing more is sent, and the app says "Reading off."
+
+Turning voice off turns the microphone off and leaves reading on: the app keeps reading your agents until you turn **Reading** off.
+
+The reading switches work in typing mode too, so a bare "reading on" or "reading off" said in typing mode switches reading rather than being typed. While reading is on or the app is speaking, the same goes for the "quiet" phrases.
+
+### Where the voice comes from
+
+**Speech source** in **Settings → Voice** chooses the voice:
+
+| Choice | Voice |
+| --- | --- |
+| **Auto** (default) | The Commands service's text-to-speech when it has one, otherwise this computer's voice. An **OpenAI-compatible API** has one; the **Anthropic API** does not. If the service's speech fails, the computer's voice says the sentence instead. A sentence the service may no longer be sent, because **Reading** was turned off or the Commands service changed in Settings, is not said at all. |
+| **Provider** | Only the Commands service's text-to-speech. With the Anthropic API, nothing can speak, and the app says to choose Auto or System. |
+| **System** | Only this computer's voice. Nothing is sent to be spoken. |
+
+The service's voice uses the Commands server and key, with OpenAI's `gpt-4o-mini-tts` model and its `alloy` voice. Another OpenAI-compatible server, such as one on this computer, must also offer OpenAI's speech endpoint next to the chat one: for a Commands endpoint of `http://localhost:8080/v1/chat/completions`, that is `http://localhost:8080/v1/audio/speech`. With a server that does not, or a Commands endpoint that does not end in `/chat/completions`, **Auto** uses this computer's voice.
+
+**On Linux, the computer's voice is not always available.** It works when the system's WebKitGTK was built with speech synthesis and a speech engine is installed. Without one, the app says it could not speak because this system has no speech voice, or says nothing at all. Use an OpenAI-compatible Commands service with **Speech source** set to **Auto** or **Provider** instead.
+
+### Which agents can be read
+
+Reading reads every agent on the daemon you are viewing, or only the agent whose pane is open. Turn summaries work for Claude Code, Codex, OpenCode and Pi. For OpenCode, a turn is announced only once the deck knows the session it ran in is the agent's main session rather than a subagent's; the deck usually learns that as the turn starts, and a turn that ends before it has is not announced. Devin reports its turns the same way Claude Code does, so reading is expected to work for it, but it has not been checked. Permission prompts, errors and usage limits are announced when the agent reports them, which is when its row on the dashboard shows **needs input**, **failed** or **blocked**; [Session management](../session-management.md) says which agents report which. Pi asks no permission questions of its own; a dialog another Pi extension shows is announced as one, as "Asking for permission.", and can be [answered by voice](#answering-an-agents-question).
+
+A daemon lets at most 32 agents be read at once, counting every open window of the app that reads it. On a daemon with more agents than that, the agents past the limit are not read, and the app says once for that daemon: "Reading is not available: this deck is already reporting as many agents' turns as it can." It tries those agents again for about two minutes, and again whenever an agent it reads on that daemon exits.
+
+Reading needs a daemon that reports finished turns. Under an older one, the app says once for that daemon, not once for each of its agents: "Reading is not available: this deck's daemon is too old to report finished turns. Update dot-agent-deck on that machine." That machine is the one the daemon runs on. The agents of the other daemons you view are still read. A Pi agent whose deck is older than reading keeps its status and card as before; only its turns cannot be read.
+
+## Settings → Voice
+
+![Settings → Voice with the default services: Speech on this machine, through a local speech container, Language set to English, and Commands through an OpenAI-compatible API, each with its Endpoint and Model, the sentences saying what Commands sends, then Send on-screen names set to On and Max tokens](/img/settings-voice-desktop.png)
+
+| Row | What it sets | Default |
+| --- | --- | --- |
+| **Speech** | Where speech is turned into text. **On this machine — speech container, no key** uses a local container and sends no key; its endpoint must be on this machine. **OpenAI — needs an OpenAI API key** sends your audio to OpenAI. | On this machine |
+| **Commands** | Where the text is turned into a command. **OpenAI-compatible API — needs that provider's API key**, or **Anthropic API — needs an Anthropic API key**. | OpenAI-compatible API |
+| **Endpoint**, **Model** | The URL and model of each service. Choosing a service fills in its usual values; change them to use another provider or a local server. An endpoint must be `https`, or `http` to this machine (`localhost`, `127.x.x.x`, `::1`). | See below |
+| **Language** | The language you speak, which the Speech service is told. Every command, typing mode's "type off" and "send it" included, is English, so choose another language to dictate prompts in it, knowing that commands may then be misheard; the panel says so. **Auto-detect** lets the Speech service work out the language each time you speak, and a short command can then be heard as another language. A model whose name ends in `.en`, such as the default `Systran/faster-whisper-tiny.en`, understands English only, whatever this row says; the panel says so too, and a multilingual model such as `Systran/faster-whisper-small` or OpenAI's `whisper-1` is the one to choose for another language. Changing the Speech service keeps the language. | English |
+| **Max tokens** | The longest answer the Commands model may give, 64 to 32768. A model that reasons spends part of this on its reasoning; raise it if answers come back cut off. | 4096 |
+| **Send on-screen names** | **On** sends the names on screen with each command, so commands such as "open the tester" find the agent, daemon or folder you name. **Off** keeps those names on this computer, and commands that need one are refused (see [What is sent where](#what-is-sent-where)). | On |
+| **Reading** | Whether the app reads your agents' turns aloud ([Reading](#reading)). Saying "reading on" or "reading off" also switches it. | Off |
+| **Speech source** | Where reading's voice comes from: **Auto**, **Provider** or **System** (see [Where the voice comes from](#where-the-voice-comes-from)). | Auto |
+| **Speech key for** / **Commands key for** *host* | The API key for a service that needs one: paste it and press **Save**, then **Replace** or **Forget** it later. Shown for the OpenAI speech service, and for a Commands endpoint that is not on this machine. | None |
+
+The values each choice fills in:
+
+| Choice | Endpoint | Model |
+| --- | --- | --- |
+| Speech, on this machine | `http://127.0.0.1:18000/v1/audio/transcriptions` | `Systran/faster-whisper-tiny.en` |
+| Speech, OpenAI | `https://api.openai.com/v1/audio/transcriptions` | `whisper-1` |
+| Commands, OpenAI-compatible API | `https://api.openai.com/v1/chat/completions` | `gpt-5-mini` |
+| Commands, Anthropic API | `https://api.anthropic.com/v1/messages` | `claude-haiku-4-5` |
+
+These are stored in the `[voice]` table of the [settings file](settings.md#the-settings-file): `[voice.transcription]` with `backend` (`"local"` or `"remote"`), `endpoint`, `model` and `language` (`"auto"`, or a two-letter language code such as `"en"`, `"de"` or `"sr"`; one the panel does not offer means English); `[voice.intent]` with `backend` (`"openai_compatible"` or `"anthropic"`), `endpoint`, `model` and `max_tokens`; `labels` (`"shared"` or `"withheld"`: **Send on-screen names** On or Off); `reading` (`"off"` or `"on"`); `reading_notice` (`"pending"` or `"shown"`: whether the app has said where replies go, the first time reading was turned on); and `speech` (`"auto"`, `"provider"` or `"system"`). An endpoint or model left out takes the chosen backend's value above. A `"local"` speech backend with an endpoint off this machine is refused, and the app then treats the whole file as unreadable.
+
+Keys are stored in your operating system's credential store (the macOS Keychain, or the Secret Service on Linux), not in the settings file: one key for **Speech** and one for **Commands**. The panel says whether a key is stored, or that the credential store could not be reached.
+
+## What is sent where
+
+- **To the Speech service:** your audio, the model name and the [language](#settings--voice) (English unless you chose another; nothing with **Auto-detect**). With the default local container, it stays on this machine. The OpenAI speech option also sends your Speech key.
+- **To the Commands service, for each utterance it decides:** the words it heard, the app's fixed instructions and answer format, the model name and token limit, and the app's list of commands (each command's id, description, parameter names and kinds, whether it can run on the current screen, and the hint shown when it cannot). When the endpoint is not on this machine, the request also carries your Commands API key.
+- **To the Commands service, with each utterance it decides:** two more requests, sent at the same time, to [check that your words ask for the command](#how-voice-understands-you). Each carries the words it heard, the app's fixed instructions and answer format, the model name and token limit, the app's own description of each of its commands, which screen you are on and whether the New agent dialog is closed, open, showing a folder list or showing its form, with your Commands API key when the endpoint is not on this machine. They carry no on-screen names, whether **Send on-screen names** is on or off; your words can still contain any name you said.
+- **To the Commands service, while the pane on screen has a [question waiting](#answering-an-agents-question):** what you said, when it was not decided on this machine (below) and typing mode is off, and the question itself — each question's text and heading, each option's words, description and what an "always" option covers, the tool the question is about with its detail (for example the command the agent wants to run), and the answer you have given so far. This is sent whether **Send on-screen names** is on or off, because the question cannot be answered without it.
+- **Decided on this machine, sending nothing:** while a question is waiting, an utterance that names an option by its number, its words or a part of them, that fits several options or names a number no option has, the words for an option that asks for your own words, or "cancel" or "confirm" while the answer's countdown or confirmation is showing; an utterance that starts with the word "type", "write", "say" or "dictate" followed by words to type; one that is, in its entirety, "end", "send", "send it", "submit", "enter" or "press enter" (case, punctuation and a word such as "okay" or "please" before or after it ignored); in an agent's pane with no question waiting, one that is in its entirety one of the other send phrases, such as "go ahead" or "finished"; while the New agent dialog is open, one that is in its entirety a way of closing it, such as "close", "cancel" or "close new agent"; in an agent's pane with typing mode off, one that is in its entirety an [interrupt, clear or scratch phrase](#interrupt-clear-and-scratch-that) other than a bare "stop", which is answered by asking you to say "typing on" first; while a [numbered list](#when-a-command-matches-several-things) is open, a number, a listed name or a way of cancelling it; while the lists on screen show [numbers](#choosing-by-number), a number on its own or after the list's name, such as "three" or "select directory 13"; "type on" and "type off" themselves; the [reading](#reading) switches, such as "reading on" and "reading off"; while reading is on or the app is speaking, "quiet" and the other ways of silencing it; and anything said while the app is speaking, which is dropped unless it is "stop" or "quiet". While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all: it is typed into the agent, matched to the options of a question the agent is waiting on, or, for the few phrases that still work (interrupt, clear the prompt and scratch that among them), handled on this machine. So with typing mode on, a question is answered only by an option's number or words, not by "go ahead" or "sure". Everything else goes to the Commands service, including "go ahead" said outside an agent's pane (with the New agent dialog open, it starts the agent) or while a question is waiting there. Silence sends nothing.
+- **With Send on-screen names on**, each request that works out the command also sends the names on screen: each agent on the selected daemon with its name, role, CLI name, status and running tool, its mode, its agent type, the name of its directory (with the directory above it when two agents' directories share a name), its orchestration's title, and the order the agents started in; the name of the daemon those agents are on; each daemon's name, and for a remote daemon with no name its ssh user, host and any non-default port instead; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. The app adds no full filesystem path, id, prompt text or tool argument of its own, but a name is whatever it was set to, and can itself be a path. When you name an agent by what it was last asked to do, the app compares your words with that agent's prompt on this machine; the prompt itself is not sent. Your words are sent as heard either way, and can themselves contain a name, a path or anything else you said.
+- **With Reading on** (see [Reading](#reading)), each turn any agent on the daemon you are viewing finishes sends to the Commands service that agent's final reply for the turn (at most 4,000 characters: a longer reply is sent as its beginning and its end) and the app's fixed instructions, with the Commands key when the endpoint is not on this machine. The agent's name is not sent: the app adds it to the sentence itself. A turn with no reply sends nothing. Permission prompts, errors and usage limits are spoken without asking the model. No reply is sent while **Reading** is off.
+- **To the speech service, when the voice comes from the Commands service** (see [Where the voice comes from](#where-the-voice-comes-from)): every sentence the app speaks, including summaries, permission prompts with up to 120 characters of what the agent wants to do, and error announcements, with the Commands key; a sentence about another agent than the one whose pane is open includes that agent's name. With the computer's voice, those sentences stay on this computer. Nothing is sent to be spoken while **Reading** is off.
+- **With Send on-screen names off**, none of those names is sent, and commands that need an agent, daemon, directory, mode, agent type or orchestration are refused, with the reason; choose by number or click instead. Your words are still sent as heard. Reading sends no names to the Commands service, and the provider's speech service still hears the names in the sentences it speaks.
+
+The panel says this in one sentence beside the **Commands** setting, and what reading sends in one sentence under **Reading**; this list is the full detail.
+
+## When it does not work
+
+What went wrong is shown beside the Voice button.
+
+| What you see | Cause | What to do |
+| --- | --- | --- |
+| "nothing is listening at http://127.0.0.1:18000 — start the speech service with `docker run …`" | The local speech container is not running, or listens on another port. | Run the `docker run` command it shows, then press **Voice** again. |
+| "no key is stored for *host* — add one in Settings → Voice" | The service needs a key and none is stored. | Store one in **Settings → Voice**. |
+| The credential store could not be reached | No keychain or Secret Service is available (for example a Linux session with no Secret Service provider), or it is locked. | Unlock it, or install and start a Secret Service provider such as GNOME Keyring; or use services on this machine, which need no key. |
+| A command is refused as not available here | It works on another screen. | Say "what can I say?" to see where each command works. |
+| "nothing in that asks to …, so nothing was done" | The app did not judge that your words ask for the action it was about to run. | Say what you want more plainly, or use the phrasing the row suggests. |
+| "asking to … needs to be said on its own, like “…”, so nothing was done" | The app runs that action only when it judges that your whole sentence asks for it alone. | Say the request by itself, such as "send it" or "discard". |
+| "could not check that this asks to … (…), so nothing was done" | The Commands service was slow to answer, could not be reached, or gave an answer the app could not read. Nothing ran. | Check the Commands settings and your connection, then say it again. |
+| Commands that name agents or directories never work | **Send on-screen names** is **Off**. | Set it to **On**, or say the number or click instead. |
+| "Open the agent on build box" opens nothing with **All daemons** selected | Voice reaches the agents of the daemon the app shows, and under **All daemons** that is this machine. | Switch to that daemon first, or say the agent's number on the dashboard. |
+| A command runs nothing and says the agent, daemon, screen or list changed | What it was about changed while the app was working out what you said, or after a numbered list appeared. | Say the command again. |
+| "yes" to an agent waiting on a question finds no matching action | The deck does not know that question: the agent or its version is not covered, or its hooks are missing. | Check [which questions each agent can answer](#which-questions-each-agent-can-answer-by-voice), and answer in the pane. |
+| An answer to a question is refused with "has to be answered by keyboard" | That option, or that agent's questions, cannot be answered by voice. | Answer in the pane. |
+| An answer says it "may have been sent" | The deck could not confirm in time that the agent got it. | Check the pane; answer there only if the agent is still asking. |
+| A spoken number chooses nothing and says the numbers on screen changed | The list changed while you were saying it. | Look at the new numbers and say it again. |
+| "no daemon matches …" | None of the configured daemons is called what was heard, for example a nickname. | Say the daemon's name as the **Daemon** selector shows it, or open the selector and say its number. |
+| "Select daemon 13" chooses nothing and says no daemon shows 13 | The number belongs to another list, such as the directories. | Say that list's name with the number, for example "directory 13". |
+| A name is refused with "is on page 2: say “next page”" | The item is on another page of a list shown in pages. | Turn to that page and say it again, or narrow a directory list with "filter …". |
+| "type off" was typed into the prompt instead of stopping typing mode | The app misheard it. | Nothing was sent: say "scratch that" to remove the words, then "type off" again. |
+| "Interrupt", "clear the prompt" or "scratch that" runs nothing and says to say “typing on” first | Typing mode is off, and these work only in typing mode. | Say "typing on", then the command again. |
+| "*Agent* is not working on anything" after "interrupt" | The agent is not shown as **running**, so there is nothing to interrupt. | If the agent is in fact busy, interrupt it from the keyboard in its pane. |
+| "*Agent* was just interrupted — wait a moment before interrupting it again" | You said "interrupt" again within three seconds of the last one. | Wait for the agent to stop, then say it again if it is still working. |
+| "*Agent* was already interrupted and has not started a new turn since" | The agent was interrupted and has not been sent anything since, so it may already have stopped even if it still shows as **running**. | Send it a prompt first, or interrupt it from the keyboard in its pane if it really is still working. |
+| "Stopped interrupting *Agent* — … is not working on anything anymore" | The agent stopped on its own before the interrupt went out, so the app sent no further keys. For OpenCode, whose interrupt is two presses, the first may already have been sent. | Nothing to do. |
+| "Stopped interrupting *Agent* — … started something new before the interrupt could be sent" | The agent began new work while the interrupt was still waiting to go out, so the app sent nothing. | Say "interrupt" again if you want to stop the new work. |
+| "*Agent* already has a voice command pending" | An interrupt, clear, scratch or Undo for that agent has not finished yet. | Wait for it to finish, then say the command again. |
+| "*Agent* has no voice key to …" | The agent is Devin, an agent the app does not recognise, or one under a daemon older than these commands. | Use the keyboard in the pane, or update the daemon. |
+| "Nothing to scratch — …" or "Cannot scratch that — …" | The prompt changed since the last dictation (the reason is given), or the dictation is too long, has characters that cannot be removed safely, or arrived too soon after other input, earlier dictations or your own typing, to be told apart. | Edit the prompt by hand, or say "clear the prompt". |
+| Commands are misheard, or come back in another language, since you changed **Language** | Commands are English, and the Speech service now expects another language, or works it out each time with **Auto-detect**. | Set **Language** back to **English** in **Settings → Voice** while you give commands. |
+| Speech in another language comes back in English, or as nonsense | The Speech model understands English only: its name ends in `.en`, as the default local model's does. | Choose a multilingual model in **Settings → Voice**, such as `Systran/faster-whisper-small`. |
+| A command you paused in the middle of was answered in two halves | You paused for longer than the app waits for the rest, which is a few seconds. | Say the whole command again, with a shorter pause. |
+| Words you did not say were typed into the prompt in typing mode | Speech from somewhere else, such as another person or a video playing, was heard as yours, or a short sound came back as a word or two. | Nothing was sent: delete the words. Turn typing mode off while others are talking near the microphone. If it happened in a quiet room, report the text you saw and the Speech model you use. |
+| You dictated quickly and nothing was typed, with nothing shown | The app could not match that many words to how long you spoke, and dropped them as if they were noise. | Say it again at a steadier pace, and report it with the Speech model you use. |
+| You said something and nothing happened, with nothing shown | The app took it for noise rather than speech, usually because it was very short or quiet. | Say it again a little louder or closer to the microphone. |
+| Answers are cut off or not understood with a reasoning model | **Max tokens** is too low for its reasoning. | Raise **Max tokens**. |
+| "Reading is already on." after "reading on", or "Reading is not on." after "reading off" | **Reading** was already in the state you asked for. | Nothing to do. |
+| "Reading is not available: this deck's daemon is too old to report finished turns. Update dot-agent-deck on that machine." | The daemon you are viewing predates reading. It is said once for that daemon. | Update dot-agent-deck on the machine the daemon runs on. |
+| "Reading is not available: the deck did not answer" | The daemon could not be reached. | Check the daemon is running (see [Daemons](daemons.md)), then turn **Reading** off and on again. |
+| "Reading is not available: this deck is already reporting as many agents' turns as it can." | The daemon you are viewing already reports the turns of as many agents as it allows, counting every app window reading it. The agents already being read go on. | Close another app window that reads the same daemon, or stop agents you no longer need, then turn **Reading** off and on again. |
+| "Reading could not start for *agent*." | The app could not ask that agent's daemon for its turns. The other agents are still read. | Turn **Reading** off and on again. |
+| The app keeps reading after you turned voice off | Voice off turns the microphone off; **Reading** is a separate switch. | Say "reading off" before turning voice off, or set **Reading** to **Off** in **Settings → Voice**. |
+| Everything you say is ignored with "only “stop” or “quiet” works while the app is speaking" | The app was speaking when you spoke. | Say "stop" or "quiet", then the command. |
+| "Could not speak: this system has no speech voice" | The computer's voice is not available, which happens on Linux without a speech engine. | Set **Speech source** to **Auto** or **Provider** with an OpenAI-compatible Commands service. |
+| "Could not speak: the Commands connection has no text-to-speech…" | **Speech source** is **Provider** with the Anthropic API. | Set **Speech source** to **Auto** or **System**. |
+| "*Agent*: no reply to read." (or "No reply to read." with its pane open) | The turn ended without a written reply, for example because you interrupted it. | Nothing to do; the next turn with a reply is summarised. |
+| "no microphone was found on this machine", or "the microphone would not open (…)" | No input device, or the app may not use it. | Connect a microphone and check it is the system's input device; on macOS, allow the app under System Settings → Privacy & Security → Microphone. Then press **Voice** again. |

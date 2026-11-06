@@ -1,24 +1,409 @@
-#![cfg(feature = "e2e")]
-
-//! PTY-attached coverage for what the orchestrator is TOLD when a worker reports
-//! `work-done` (issues #448 and #433).
-//!
-//! The fast-tier suite (`tests/work_done_reporting.rs`) pins the daemon's
-//! decisions against in-process PTYs. This one covers the boundary that suite
-//! cannot see, and that this change specifically moved: the REAL `dot-agent-deck
-//! work-done` binary, over the daemon's real hook socket, into the real TUI's
-//! rendered orchestration surface.
-//!
-//! Rendering is the point, not incidental. The old feedback was one short
-//! sentence; the unsolicited label is a long paragraph carrying a framed report,
-//! and a long daemon-injected line lands on the vt100 grid hard-wrapped at
-//! whatever column a role pane happens to be — which is exactly how
-//! `scheduler/idle-worker/011` fails today. So the assertions read the PANE
-//! COLUMN and squeeze whitespace out of both sides (see [`pane_column_text`]), and
-//! the test proves the label genuinely reaches a user's screen rather than merely
-//! reaching a PTY.
+#![cfg(all(feature = "e2e", unix))]
 
 mod common;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
+#[path = "support/inbox_route.rs"]
+mod route;
+
+use inbox::Endpoint;
+use serde_json::{Value, json};
+use spec::spec;
+use std::io::{BufRead, Write};
+use std::path::Path;
+
+/// Scenario: Run the real work-done CLI from an uncommissioned synthetic worker. One bound Untrusted report is fetched and rendered in the orchestrator pane, labelled as a note that completes no task, with no commissioned summary file.
+#[spec("orchestration/work-done/004")]
+#[test]
+fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui() {
+    route::worker_report(4);
+}
+
+/// Scenario: Send an unsolicited worker report larger than the inline budget through the real CLI. The orchestrator fetches its framed head and saved-copy path from the inbox; that saved file holds the entire Untrusted-fenced report.
+#[spec("orchestration/work-done/009")]
+#[test]
+fn work_done_009_a_cut_unsolicited_report_names_its_saved_full_copy_in_the_attached_tui() {
+    route::worker_report(9);
+}
+
+/// Scenario: Delegate a task and pass a worker-owned summary file to the real work-done CLI. The source survives byte for byte, a separately framed report copy is saved, and one bound report is fetched and rendered in the orchestrator pane.
+#[spec("orchestration/work-done/012")]
+#[test]
+fn work_done_012_task_file_at_the_summary_path_survives_in_the_attached_tui() {
+    route::worker_report(12);
+}
+
+// PRD #1666 part 3, round 5: the real CLI's task-scoped `work-done`, against
+// the real daemon (`/033`–`/036`, `/040`) and against a stub
+// (`inbox/protocol/029`).
+
+/// The directory the daemon's work-done seams read, under its HOME
+/// (`DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR`).
+const SEAMS: &str = "work-done-seams";
+
+/// A daemon whose work-done seams the test can pause and fail.
+fn seamed_daemon() -> common::DaemonProc {
+    inbox::daemon_unbound(&[("DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR", SEAMS)])
+}
+
+fn seam(daemon: &impl Endpoint, file: &str) -> std::path::PathBuf {
+    let dir = daemon.home().join(SEAMS);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(file)
+}
+
+/// A team whose worker has fetched and acknowledged one delegated task; the
+/// task's id, as the worker's instructions name it.
+fn delegated(daemon: &impl Endpoint) -> (inbox::Pane, inbox::Pane, String) {
+    let (orch, worker) = route::team(daemon, false);
+    let id = route::delegate(daemon, &orch, route::TASK, false);
+    let block = route::fetched(daemon, &worker, &id, route::TASK, "the orchestrator");
+    let task_id = footer_task_id(daemon, &block);
+    assert_eq!(task_id, id, "the footer names the delegated message's id");
+    (orch, worker, task_id)
+}
+
+/// The id after `--task-id ` in the delegated message, or else in the task
+/// file the deck wrote for the worker.
+fn footer_task_id(daemon: &impl Endpoint, block: &str) -> String {
+    let find = |text: &str| {
+        text.split("--task-id ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(|id| id.trim_matches(['`', '\'', '"']).to_string())
+    };
+    find(block)
+        .or_else(|| {
+            std::fs::read_to_string(route::task_file(daemon))
+                .ok()
+                .and_then(|text| find(&text))
+        })
+        .unwrap_or_else(|| panic!("no `--task-id` in the delegated task: {block}"))
+}
+
+fn work_done(daemon: &impl Endpoint, worker: &inbox::Pane, args: &[&str]) -> std::process::Output {
+    let mut argv = vec!["work-done"];
+    argv.extend_from_slice(args);
+    route::cli_output(daemon, worker, daemon.cwd(), &argv)
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// A plain delegate to the worker is refused because it still owes a task.
+fn refused_as_busy(daemon: &impl Endpoint, orch: &inbox::Pane) {
+    let mut req = inbox::request(orch, "delegate");
+    req["task"] = json!("FOLLOW-UP-WHILE-OWED");
+    req["to"] = json!(["coder"]);
+    req["timestamp"] = json!(chrono::Utc::now());
+    let reply = inbox::hook(daemon, req);
+    assert!(
+        reply["busy"]
+            .as_array()
+            .is_some_and(|busy| busy.iter().any(|w| w["role"] == "coder")),
+        "the worker still owes its task, so a plain delegate is refused as busy: {reply}"
+    );
+}
+
+/// Scenario: Delegate a task to a synthetic worker, which fetches it and runs the real `work-done` CLI with the `--task-id` its instructions name. The CLI prints that it reported that task, the orchestrator's inbox lists one report carrying that task id, and a plain follow-up delegate to the same worker is accepted.
+#[spec("orchestration/work-done/033")]
+#[test]
+fn work_done_033_the_real_cli_reports_the_task_its_instructions_name() {
+    let daemon = inbox::daemon_unbound(&[]);
+    let (orch, worker, id) = delegated(&daemon);
+    let out = work_done(
+        &daemon,
+        &worker,
+        &["--task-id", &id, "--task", route::REPORT],
+    );
+    assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!("Reported task {id} to the orchestrator.\n")
+    );
+    let reports = route::count(&daemon, &orch, 1);
+    assert_eq!(reports[0]["provenance"]["kind"], "task", "{}", reports[0]);
+    assert_eq!(reports[0]["provenance"]["task_id"], id.as_str());
+    route::delegate(&daemon, &orch, "FOLLOW-UP-AFTER-THE-REPORT", false);
+}
+
+/// Scenario: Delegate a task, then run the real `work-done` CLI without `--task-id`. The CLI says the report went to the orchestrator as a note that completes no task, the orchestrator's copy is labelled that way, and a plain follow-up delegate to the same worker is refused as busy because the task is still owed.
+#[spec("orchestration/work-done/034")]
+#[test]
+fn work_done_034_a_report_without_a_task_id_is_a_note_and_the_task_stays_owed() {
+    let daemon = inbox::daemon_unbound(&[]);
+    let (orch, worker, _) = delegated(&daemon);
+    let out = work_done(&daemon, &worker, &["--task", route::REPORT]);
+    assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("as a note that completes no task"),
+        "{}",
+        text(&out.stdout)
+    );
+    let reports = route::count(&daemon, &orch, 1);
+    assert_eq!(
+        reports[0]["provenance"]["kind"], "uncorrelated",
+        "{}",
+        reports[0]
+    );
+    let block = inbox::fetch(&daemon, &orch, true).to_string();
+    assert!(block.contains(route::NOTE_LABEL), "{block}");
+    refused_as_busy(&daemon, &orch);
+}
+
+/// Scenario: Run the same real `work-done --task-id` command twice, as a worker retrying after a lost answer would. The orchestrator receives exactly one report, and the second run exits successfully saying the task was already reported and nothing new was sent.
+#[spec("orchestration/work-done/035")]
+#[test]
+fn work_done_035_a_repeated_report_is_answered_once_and_delivered_once() {
+    let daemon = inbox::daemon_unbound(&[]);
+    let (orch, worker, id) = delegated(&daemon);
+    let args = ["--task-id", id.as_str(), "--task", route::REPORT];
+    let first = work_done(&daemon, &worker, &args);
+    assert!(first.status.success(), "stderr: {}", text(&first.stderr));
+    route::count(&daemon, &orch, 1);
+    let second = work_done(&daemon, &worker, &args);
+    assert!(second.status.success(), "stderr: {}", text(&second.stderr));
+    assert_eq!(
+        text(&second.stdout),
+        format!("Task {id} was already reported; nothing new was sent.\n")
+    );
+    // The repeat was answered after the first report was listed, so a second
+    // copy would already be listed too.
+    route::count(&daemon, &orch, 1);
+}
+
+/// Scenario: With the deck's report save made to fail through its test seam, run the real `work-done --task-id`. The CLI exits 1 with the save-failed sentence, the orchestrator receives nothing, and a plain follow-up delegate is refused as busy because the task is still open; the same command run again once the fault is spent reports the task.
+#[spec("orchestration/work-done/036")]
+#[test]
+fn work_done_036_a_failed_save_reports_nothing_and_keeps_the_task_open() {
+    let daemon = seamed_daemon();
+    let (orch, worker, id) = delegated(&daemon);
+    std::fs::write(seam(&daemon, "work-done-fail-save.fault"), b"").unwrap();
+    let args = ["--task-id", id.as_str(), "--task", route::REPORT];
+    let failed = work_done(&daemon, &worker, &args);
+    assert_eq!(
+        failed.status.code(),
+        Some(1),
+        "stdout: {}",
+        text(&failed.stdout)
+    );
+    assert!(
+        text(&failed.stderr).contains("the deck could not save this report"),
+        "{}",
+        text(&failed.stderr)
+    );
+    assert!(text(&failed.stdout).is_empty(), "{}", text(&failed.stdout));
+    assert!(route::messages(&daemon, &orch).is_empty());
+    refused_as_busy(&daemon, &orch);
+    let retried = work_done(&daemon, &worker, &args);
+    assert!(
+        retried.status.success(),
+        "stderr: {}",
+        text(&retried.stderr)
+    );
+    route::count(&daemon, &orch, 1);
+}
+
+fn wait_for(path: &Path) {
+    assert!(
+        common::wait_until(common::load_scaled(inbox::WAIT), || path.exists()),
+        "the daemon never reached {}",
+        path.display()
+    );
+}
+
+/// Scenario: Pause the deck after it saved a worker's report and again once the report is committed, then run the real `work-done --task-id`. While paused the CLI has printed nothing and is still running, and at the second pause the orchestrator's inbox already lists the report with that task id; released, the CLI prints one `Reported task …` line. For a second task, a save failure injected while the save is paused makes the CLI exit 1 with the save-failed sentence only.
+#[spec("orchestration/work-done/040")]
+#[test]
+fn work_done_040_the_answer_follows_the_saved_and_committed_report() {
+    let daemon = seamed_daemon();
+    let (orch, worker, id) = delegated(&daemon);
+    std::fs::write(seam(&daemon, "work-done-saved.armed"), b"").unwrap();
+    std::fs::write(seam(&daemon, "work-done-committed.armed"), b"").unwrap();
+    let mut child = route::cli_command(
+        &daemon,
+        &worker,
+        daemon.cwd(),
+        &["work-done", "--task-id", &id, "--task", route::REPORT],
+    )
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    wait_for(&seam(&daemon, "work-done-saved.reached"));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the CLI answered before the commit"
+    );
+    std::fs::write(seam(&daemon, "work-done-saved.release"), b"").unwrap();
+    wait_for(&seam(&daemon, "work-done-committed.reached"));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the CLI answered before the daemon wrote its answer"
+    );
+    let listed = route::messages(&daemon, &orch);
+    assert_eq!(listed.len(), 1, "committed before the answer: {listed:?}");
+    assert_eq!(listed[0]["provenance"]["task_id"], id.as_str());
+    std::fs::write(seam(&daemon, "work-done-committed.release"), b"").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!("Reported task {id} to the orchestrator.\n")
+    );
+    assert!(text(&out.stderr).is_empty(), "{}", text(&out.stderr));
+
+    // A second task, whose save fails while paused.
+    let second = route::delegate(&daemon, &orch, "ROUTE-SECOND-TASK", false);
+    route::fetched(
+        &daemon,
+        &worker,
+        &second,
+        "ROUTE-SECOND-TASK",
+        "the orchestrator",
+    );
+    std::fs::write(seam(&daemon, "work-done-saved.armed"), b"").unwrap();
+    let _ = std::fs::remove_file(seam(&daemon, "work-done-saved.reached"));
+    let _ = std::fs::remove_file(seam(&daemon, "work-done-saved.release"));
+    let child = route::cli_command(
+        &daemon,
+        &worker,
+        daemon.cwd(),
+        &["work-done", "--task-id", &second, "--task", "SECOND-REPORT"],
+    )
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    wait_for(&seam(&daemon, "work-done-saved.reached"));
+    std::fs::write(seam(&daemon, "work-done-fail-save.fault"), b"").unwrap();
+    std::fs::write(seam(&daemon, "work-done-saved.release"), b"").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stdout).is_empty(), "{}", text(&out.stdout));
+    let stderr = text(&out.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("the deck could not save this report"),
+        "{stderr}"
+    );
+    assert_eq!(
+        route::messages(&daemon, &orch).len(),
+        1,
+        "nothing new was posted"
+    );
+}
+
+/// The real CLI run against a stub hook socket at `socket`.
+fn cli_against(socket: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(common::contained_deck_binary())
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env("DOT_AGENT_DECK_SOCKET", socket)
+        .env("DOT_AGENT_DECK_PANE_ID", "stub-pane")
+        .output()
+        .unwrap()
+}
+
+fn read_line(reader: &mut impl BufRead) -> Option<String> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(n) if n > 0 => Some(line),
+        _ => None,
+    }
+}
+
+/// Scenario: Run the real `work-done --task-id` binary against a stub hook socket. A stub that reads the capability question and never answers gets no report, and the CLI exits 1 saying the daemon did not confirm it supports task reports; a stub that confirms version 1 receives the report on that same connection, opens no second one, and its accepted answer makes the CLI print `Reported task …` and exit 0.
+#[spec("inbox/protocol/029")]
+#[test]
+fn protocol_029_the_real_cli_asks_first_and_reports_on_the_confirming_connection() {
+    let dir = common::harness_tempdir().unwrap();
+    let args = ["work-done", "--task-id", "m-029", "--task", "STUB-REPORT"];
+
+    // A daemon that never answers the question.
+    let socket = dir.path().join("silent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let stub = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        std::iter::from_fn(|| read_line(&mut reader)).collect::<Vec<_>>()
+    });
+    let out = cli_against(&socket, dir.path(), &args);
+    let lines = stub.join().unwrap();
+    assert_eq!(out.status.code(), Some(1), "stdout: {}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("did not confirm"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(lines.len(), 1, "only the question: {lines:?}");
+    assert!(lines[0].contains("\"hook_capabilities\""), "{lines:?}");
+
+    // A daemon that confirms.
+    let socket = dir.path().join("confirming.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let stub = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        let question = read_line(&mut reader).unwrap();
+        writer
+            .write_all(b"{\"task_scoped_completion\":1}\n")
+            .unwrap();
+        let report = read_line(&mut reader).unwrap();
+        writer
+            .write_all(
+                b"{\"disposition\":\"accepted\",\"task_id\":\"m-029\",\"destination\":\"inbox\"}\n",
+            )
+            .unwrap();
+        let rest: Vec<String> = std::iter::from_fn(|| read_line(&mut reader)).collect();
+        listener.set_nonblocking(true).unwrap();
+        let second = listener.accept().is_ok();
+        (question, report, rest, second)
+    });
+    let out = cli_against(&socket, dir.path(), &args);
+    let (question, report, rest, second) = stub.join().unwrap();
+    assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "Reported task m-029 to the orchestrator.\n"
+    );
+    assert!(question.contains("\"hook_capabilities\""), "{question}");
+    let report: Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["message_type"], "work_done_task", "{report}");
+    assert_eq!(
+        report["mode"],
+        json!({"kind":"task","task_id":"m-029"}),
+        "{report}"
+    );
+    assert_eq!(report["report"], "STUB-REPORT");
+    assert!(rest.is_empty(), "nothing after the report: {rest:?}");
+    assert!(!second, "the CLI opened a second connection");
+}
+
+// ---------------------------------------------------------------------------
+// SYNC-MERGE 2026-11-05 (rulings 30/32/34): everything below is the FORK's
+// delegation-status e2e block (`status/observing/009,010,018,022,023`,
+// #755/#803/#817), RE-POINTED at upstream's mechanism: the real `delegate` and
+// `work-done` CLIs run with the deck built `.impersonating_pane_signals()` (a
+// harness-launched CLI has no per-spawn capability token), `work-done` names the
+// delegated message by `--task-id` (read from the worker's inbox, because
+// upstream retires a delegation only for a task-scoped report; see
+// `work_done_034` above), and daemon notices are read from the orchestrator's
+// inbox, where the deck now posts them, not from its PTY. The fork's
+// `--subject` flag, registration-generation / boot-id env and the subject
+// mismatch assertions are gone with the identity layer, and the PTY-text helpers
+// they used (`squeeze`, `pane_column_text`, `pane_contains`,
+// `wait_for_pane_string`) went with them. The pure card-rendering helpers are
+// unchanged. Needs the carried #755/#803 `DelegationArmed/Retired`
+// broadcasts and the `Idle (delegated)` / `Observing` card statuses.
+// ---------------------------------------------------------------------------
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -26,94 +411,9 @@ use std::time::Duration;
 
 use common::{TuiDeck, commit_fixture};
 use dot_agent_deck::daemon_protocol::TabMembership;
-use dot_agent_deck::state::work_done_file_name;
-use spec::spec;
 
-/// The `orch-deck` fixture's non-start `cat` role — the worker whose completion
-/// this test issues. (Its `orchestrator` sibling is identified by membership, not
-/// by name, in [`orchestration_ids`].)
+/// The `orch-deck` fixture's non-start `cat` role.
 const WORKER_ROLE: &str = "worker";
-
-/// The #448 label, spelled out here rather than imported from `src/` so a silent
-/// rewording of the daemon's template fails this test instead of following it.
-const UNSOLICITED_NEEDLE: &str = "you have no outstanding delegation to that worker";
-
-/// The daemon's provenance clause — an orchestrator agent could write prose about
-/// a worker, but not a verbatim self-identification as a daemon report.
-const DAEMON_CLAUSE: &str = "dot-agent-deck daemon report, not a message from a person or an agent";
-
-/// The happy-path pointer. Its ABSENCE is the assertion: nothing was delegated,
-/// so no summary file was written, so there is nothing to point at. The exact
-/// filename carries a per-pane digest (upstream #331 + fork #76) that depends on
-/// the worker pane id discovered at test time, so the needle is built in the
-/// test body via [`work_done_file_name`] rather than hardcoded here.
-fn pointer_needle(worker_pane_id: &str) -> String {
-    format!(
-        "Read .dot-agent-deck/{} for their full report.",
-        work_done_file_name(WORKER_ROLE, worker_pane_id)
-    )
-}
-
-/// Opening marker of the untrusted-report frame the inlined report sits inside.
-const REPORT_FRAME_NEEDLE: &str = "[UNTRUSTED-WORKER-REPORT:";
-
-/// A token unique to this test's report, so its appearance on the grid proves the
-/// daemon inlined THIS report. `[a-z0-9-]` only, so it survives the whitespace
-/// collapse and the frame-breaking filter unchanged.
-const SENTINEL: &str = "e2e-unsolicited-report-4b7d";
-
-/// Drop every whitespace run, so a needle that straddles the pane's wrap column
-/// still matches text that is fully on screen.
-fn squeeze(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-/// The embedded pane column's text, rows joined in order — the orchestration
-/// surface as the user reads it.
-///
-/// Slicing the column is load-bearing, not tidiness. An orchestration tab renders
-/// the role CARDS to the left of the pane on the same grid rows, so joining whole
-/// rows splices card text and card borders into the middle of every wrapped pane
-/// line: `…no outstanding delegat` + `┃Launch an agent to get started┃` +
-/// `ion to that worker…`. A needle longer than the pane is wide then matches
-/// nothing even though every character of it is on screen, which is precisely how
-/// `scheduler/idle-worker/011` fails today (issue #460) — the daemon's long line
-/// is plainly rendered in its dump and the assertion still cannot see it.
-///
-/// The pane's left border column is found from its `┌<title>` header row and is
-/// constant down the box, so every row is cut at the same column and the trailing
-/// border is trimmed. Char-indexed throughout: box-drawing glyphs are multibyte.
-fn pane_column_text(grid: &str) -> String {
-    let Some(left) = grid
-        .lines()
-        .find(|line| line.contains('┌'))
-        .and_then(|line| line.chars().position(|c| c == '┌'))
-    else {
-        return String::new();
-    };
-    grid.lines()
-        .filter_map(|line| {
-            let row: Vec<char> = line.chars().collect();
-            if row.len() <= left + 1 {
-                return None;
-            }
-            // Stops at the pane's RIGHT border on content rows; on the
-            // header/footer rows it yields box glyphs, which are harmless because
-            // no needle contains them.
-            let interior: String = row[left + 1..].iter().take_while(|c| **c != '│').collect();
-            Some(interior)
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn pane_contains(deck: &TuiDeck, needle: &str) -> bool {
-    squeeze(&pane_column_text(&deck.snapshot_grid())).contains(&squeeze(needle))
-}
-
-fn wait_for_pane_string(deck: &TuiDeck, needle: &str, timeout: Duration) -> bool {
-    common::wait_until(timeout, || pane_contains(deck, needle))
-}
 
 /// The production new-pane flow: `Ctrl+n` → confirm dir → Right selects the
 /// `[Orch: demo-orch]` chip → Enter → Enter. This is the only path that registers
@@ -184,532 +484,91 @@ fn orchestration_ids(deck: &TuiDeck) -> (String, String, String) {
         .expect("the ready poll stores all three ids")
 }
 
-/// The orchestrator PTY's own scrollback, straight from the daemon — the bytes it
-/// wrote, before any rendering is involved.
-fn orchestrator_pty(deck: &TuiDeck, orchestrator_agent_id: &str) -> String {
-    String::from_utf8_lossy(&common::pane_snapshot_on(
-        deck.attach_socket_path(),
-        orchestrator_agent_id,
-    ))
-    .into_owned()
-}
-
-/// Scenario: Launch the real TUI and its lazy daemon, open the two-role `orch-deck` fixture, and run the REAL `dot-agent-deck work-done` binary from the live `worker` pane without anything ever having been delegated to it — the shape of a worker a person tasked directly. The rendered orchestration surface must visibly carry the daemon's unsolicited label and the worker's own report inside its untrusted-report markers, must NOT carry the pointer to a summary file, and no `work-done-worker-<pane digest>.md` may appear on disk.
-#[spec("orchestration/work-done/004")]
-#[test]
-fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui() {
-    let deck = TuiDeck::builder()
-        .with_pty_size(120, 40)
-        // Both delegation watches off: this test is about what an UNDELEGATED
-        // completion renders as, and a detector firing into the same pane would
-        // be noise competing for the surface under assertion.
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
-        .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
-    open_orchestration(&deck);
-    deck.wait_for_string(WORKER_ROLE);
-
-    let (worker_pane, orchestrator_agent, _orchestrator_pane) = orchestration_ids(&deck);
-    let summary_file_name = work_done_file_name(WORKER_ROLE, &worker_pane);
-    let summary_path = deck
-        .workdir()
-        .join(".dot-agent-deck")
-        .join(&summary_file_name);
-    let pointer_needle_text = pointer_needle(&worker_pane);
-
-    // Fork issue #513: this CLI invocation is a NEW subprocess launched from
-    // the test harness's own process, not the worker pane's real spawned
-    // child — so it never inherited the `DOT_AGENT_DECK_REGISTRATION_GENERATION`
-    // / `DOT_AGENT_DECK_DAEMON_BOOT_ID` env vars a real spawn injects
-    // (`src/spawn.rs`). Without them the signal defaults to `generation: 0`
-    // / `daemon_boot_id: ""`, which `handle_work_done`'s fork-#358 fail-closed
-    // guard never matches, and the report is silently refused before the
-    // labelling logic under test ever runs. Query the daemon's own
-    // `ListAgents` for the values it just assigned this pane and set them
-    // explicitly, so this subprocess constructs the same legitimate signal a
-    // real spawned worker would have.
-    let worker_record = common::agent_records_on(deck.attach_socket_path())
+/// Every notice the deck has posted to `orchestrator_pane`'s inbox, joined: the
+/// daemon no longer types its feedback into the orchestrator's PTY, it posts it
+/// (PRD #1666), so this is where "the orchestrator was told ..." is observed.
+fn orchestrator_inbox_text(deck: &TuiDeck, orchestrator_pane: &str) -> String {
+    inbox_view::messages(deck.attach_socket_path(), orchestrator_pane)
         .into_iter()
-        .find(|r| r.pane_id_env.as_deref() == Some(worker_pane.as_str()))
-        .expect("the worker pane must still be present in ListAgents");
-    let worker_boot_id = worker_record
-        .daemon_boot_id
-        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
-    let worker_generation = worker_record
-        .registration_generation
-        .expect("the worker pane must carry a registration_generation once registered as an orchestration role (fork issue #513)");
-
-    // The REAL CLI, as the footer tells a worker to run it, against the deck's
-    // own daemon. Nothing was delegated, so the daemon owes this pane nothing.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .arg("work-done")
-        .arg("--task")
-        .arg(format!("A person asked me to do this. {SENTINEL}"))
-        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-        .env("DOT_AGENT_DECK_PANE_ID", &worker_pane)
-        .env(
-            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
-            worker_generation.to_string(),
-        )
-        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", &worker_boot_id)
-        .env("HOME", deck.home_dir())
-        .current_dir(deck.workdir())
-        .output()
-        .expect("run the real `dot-agent-deck work-done` CLI");
-    assert!(
-        output.status.success(),
-        "`work-done` exited {:?}\nstdout: {}\nstderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // First: did the DAEMON compose and write the label into the orchestrator's
-    // PTY at all? Asserted before the grid so a daemon-side failure is never
-    // reported as a rendering failure.
-    let wrote = common::wait_until(Duration::from_secs(20), || {
-        squeeze(&orchestrator_pty(&deck, &orchestrator_agent))
-            .contains(&squeeze(UNSOLICITED_NEEDLE))
-    });
-    assert!(
-        wrote,
-        "the daemon never wrote the unsolicited label into the orchestrator's PTY — an \
-         uncommissioned completion still reads to the orchestrator as delegated work coming \
-         back\nOrchestrator PTY:\n{}",
-        orchestrator_pty(&deck, &orchestrator_agent)
-    );
-
-    // Then: does it reach the user's screen? A long daemon-injected line has to
-    // survive the orchestration surface's wrapping to be worth anything.
-    //
-    // EVERY POSITIVE NEEDLE BELOW WAITS. The daemon composes one message and the
-    // TUI renders whatever of it has arrived, so a grid sampled the instant the
-    // FIRST needle appears can legitimately be mid-message — the label drawn and
-    // the framed report not yet. Issue #818's sibling symptom: on a contended
-    // runner this test failed at the report-frame assertion having PASSED the two
-    // above it, which is that partial render and not a missing report. These were
-    // instantaneous `pane_contains` checks; each is now a bounded wait, which
-    // asserts exactly the same thing (the needle must become visible) without
-    // pinning WHEN inside the message's own render. The budget is `load_scaled`
-    // for the reason issue #709 gives: a fast box still fails fast.
-    //
-    // THE WINDOW IS MEASURED, not inferred. Polling from the instant the PTY
-    // wait above returned, for how long each later needle stayed ABSENT: under a
-    // 96-way CPU load on 16 cores, `SENTINEL` — the last thing painted — was
-    // still absent for a further 27.6ms and 37.4ms in 2 of 5 runs, while
-    // `DAEMON_CLAUSE` and `REPORT_FRAME_NEEDLE` were already there. Read those
-    // two figures only as "a real window exists, of order tens of ms": the
-    // sub-millisecond numbers the same probe reported for the other needles are
-    // dominated by the cost of three sequential `snapshot_grid` calls, so this
-    // measures presence and absence rather than paint latency. A single-shot read
-    // evaluates its predicate roughly one snapshot after that instant, so in
-    // those 2 runs it would have read `SENTINEL` as absent — and a 4-vCPU runner
-    // inside a full tier starves the render loop far harder than a loaded 16-core
-    // box, which is what `e2e-deterministic` hit: the captured grid showed the
-    // framing painted and cut off immediately before the sentinel.
-    //
-    // NOT reproduced as a local red on the old code: 0 of 8 solo runs under the
-    // same load, consistent with a ~2-in-5 window that only fires when the check
-    // lands inside it. The justification is the measured window plus that CI
-    // grid, not a local red-to-green.
-    let visible_timeout = common::load_scaled(Duration::from_secs(20));
-    assert!(
-        wait_for_pane_string(&deck, UNSOLICITED_NEEDLE, visible_timeout),
-        "the unsolicited label reached the orchestrator's PTY but never became visible in the \
-         rendered orchestration surface\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-    // Fork issue #513: DAEMON_CLAUSE and the untrusted-report frame both sit
-    // LATER than UNSOLICITED_NEEDLE inside the one composed, one-shot
-    // `write_all` payload (`compose_work_done_feedback`'s `head` then
-    // `tail` in `src/state.rs`) — the daemon never writes them separately,
-    // so there is no product-side staggering here. But rendering this
-    // payload onto the grid is NOT atomic from this test's point of view:
-    // the daemon's write reaches `cat`'s stdin as one pane-write, `cat`
-    // echoes it, and a background thread reads THAT output off the PTY and
-    // feeds it into the vt100 parser this file reads via
-    // `deck.snapshot_grid()`) across however many `read()`s that takes —
-    // under heavy CI parallelism, a fully-appeared *prefix* of the message
-    // (enough for `wait_for_pane_string` above to see UNSOLICITED_NEEDLE)
-    // does not guarantee the *rest* of the same message has been read and
-    // parsed yet. A bare, non-retrying `pane_contains` immediately after
-    // that wait was exactly this false assumption, and is what made CI run
-    // 34551298486 fail at 124.638s on this exact assertion while its own
-    // panic-message grid dump (a SECOND, slightly later `snapshot_grid()`
-    // call) showed the content already present — proof the content was
-    // still arriving, not missing. Every positive needle check here now
-    // waits like UNSOLICITED_NEEDLE's already does; only the ABSENCE
-    // checks below stay one-shot, since nothing here makes an absent
-    // pointer/file start existing over time.
-    assert!(
-        wait_for_pane_string(&deck, DAEMON_CLAUSE, visible_timeout),
-        "the label must identify itself as a daemon report, not as a message from a person or an \
-         agent\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        wait_for_pane_string(&deck, REPORT_FRAME_NEEDLE, visible_timeout)
-            && wait_for_pane_string(&deck, SENTINEL, visible_timeout),
-        "the worker's own report must still reach the orchestrator, framed as untrusted \
-         data\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-    // Deliberately NOT a wait: this is a negative check, and polling for an
-    // absence would pass on the first frame that has not painted it yet —
-    // vacuously, and most easily on exactly the starved runner this test keeps
-    // failing on. It is sound as a single read because the three waits above
-    // have just proved this write finished painting.
-    assert!(
-        !pane_contains(&deck, &pointer_needle_text),
-        "the orchestrator was pointed at a summary file that was never written — the #433 \
-         defect, reached through #448's path\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        !summary_path.exists(),
-        "an uncommissioned completion wrote {} — the role-keyed path is the record of \
-         COMMISSIONED work and must not be overwritten by a report nobody asked for",
-        summary_path.display()
-    );
+        .filter_map(|message| message.text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
-
-// --- PRD #586 M4: `--subject` echo + mismatch warning (Problem 2) ---------
-//
-// `--subject` has existed on both `delegate` and `work-done` since PRD #586
-// M4 landed in PR #593. The two tests below exercise the real CLI end to
-// end: `run_delegate_cli_with_subject`/`run_work_done_cli_with_subject`
-// invoke the actual subprocess argument, so a regression that dropped the
-// flag would fail here on a clap "unrecognized argument" runtime error
-// rather than a compile error.
-
-/// Subject the orchestrator states when arming the delegation below — PRD
-/// #586 M4's `--subject` flag on `dot-agent-deck delegate`.
-const DELEGATED_SUBJECT: &str = "#589";
-
-/// Subject the worker echoes back on a MISMATCHED report, deliberately
-/// different from [`DELEGATED_SUBJECT`] — Problem 2's exact observed shape: a
-/// worker's agent session has drifted to a stale task and reports on it
-/// coherently, just under the wrong subject.
-const REPORTED_SUBJECT: &str = "#544";
-
-/// The mismatch-warning needle this test expects the daemon's notification to
-/// carry when the delegated and reported subjects disagree. Spelled out here
-/// rather than imported from `src/`, matching [`UNSOLICITED_NEEDLE`]'s
-/// convention above: a silent rewording of the daemon's template fails this
-/// test instead of following it.
-const SUBJECT_MISMATCH_NEEDLE: &str = "SUBJECT MISMATCH";
 
 /// Run the real `dot-agent-deck delegate` CLI as a subprocess against the
-/// deck's own hook socket, from `caller_pane`'s identity — the caller-identity
-/// technique `e2e_dispatcher_mode.rs`'s `run_delegate_to` already uses,
-/// reimplemented locally because integration tests cannot import one
-/// another's helpers across a compiled-test-binary boundary.
-///
-/// Issue #567: this subprocess is launched from the test harness's own
-/// process, not `caller_pane`'s real spawned child, so it never inherits the
-/// `DOT_AGENT_DECK_REGISTRATION_GENERATION` / `DOT_AGENT_DECK_DAEMON_BOOT_ID`
-/// env vars a real spawn injects — same fork-#358-style gap
-/// `run_work_done_cli_with_subject` below already closes for the worker side.
-/// Query the daemon's own `ListAgents` for the values it assigned
-/// `caller_pane`, the same technique `worker_fail_closed_identity` uses.
-fn run_delegate_cli_with_subject(
+/// deck's own hook socket, from `caller_pane`'s identity (the technique
+/// `e2e_dispatcher_mode.rs`'s `run_delegate_to` uses, reimplemented locally
+/// because integration tests cannot import one another's helpers). The
+/// subprocess is launched from the harness, not from `caller_pane`'s own child,
+/// so it carries no per-spawn capability token: the deck is built
+/// `.impersonating_pane_signals()` (see [`launch_deck_with_orchestration`]) so
+/// the daemon judges the call on its pane id alone.
+fn run_delegate_cli(
     deck: &TuiDeck,
     caller_pane: &str,
     to: &str,
     task: &str,
-    subject: &str,
 ) -> std::process::Output {
-    let caller_record = common::agent_records_on(deck.attach_socket_path())
-        .into_iter()
-        .find(|r| r.pane_id_env.as_deref() == Some(caller_pane))
-        .expect("the caller pane must still be present in ListAgents");
-    let caller_generation = caller_record
-        .registration_generation
-        .expect("the caller pane must carry a registration_generation once registered");
-    let caller_boot_id = caller_record
-        .daemon_boot_id
-        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
-    std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    std::process::Command::new(common::contained_deck_binary())
         .arg("delegate")
         .arg("--to")
         .arg(to)
         .arg("--task")
         .arg(task)
-        .arg("--subject")
-        .arg(subject)
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", caller_pane)
-        .env(
-            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
-            caller_generation.to_string(),
-        )
-        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", caller_boot_id)
         .output()
         .expect("run the real `dot-agent-deck delegate` CLI")
 }
 
-/// Run the real `dot-agent-deck work-done` CLI as a subprocess, carrying the
-/// fork-#358 fail-closed identity (`generation` + `daemon_boot_id`) the same
-/// way `work_done_004`'s inline invocation above does, plus PRD #586 M4's
-/// `--subject` flag.
-fn run_work_done_cli_with_subject(
+/// Run the real `dot-agent-deck work-done` CLI as a subprocess for the task
+/// `task_id` (the id of the delegated message, see [`delegated_task_id`]).
+/// Upstream retires a delegation only for a task-scoped report; a report with
+/// no task id is a note and the task stays owed.
+fn run_work_done_cli(
     deck: &TuiDeck,
     worker_pane: &str,
-    worker_generation: u64,
-    worker_boot_id: &str,
-    task: &str,
-    subject: &str,
+    task_id: &str,
+    report: &str,
 ) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    std::process::Command::new(common::contained_deck_binary())
         .arg("work-done")
+        .arg("--task-id")
+        .arg(task_id)
         .arg("--task")
-        .arg(task)
-        .arg("--subject")
-        .arg(subject)
+        .arg(report)
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", worker_pane)
-        .env(
-            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
-            worker_generation.to_string(),
-        )
-        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", worker_boot_id)
         .env("HOME", deck.home_dir())
         .current_dir(deck.workdir())
         .output()
         .expect("run the real `dot-agent-deck work-done` CLI")
 }
 
-/// Look up the currently-registered worker pane's fork-#358 identity
-/// (`registration_generation` + `daemon_boot_id`) plus its real `cwd`, exactly
-/// as `work_done_004`'s inline lookup above does for the identity half —
-/// needed by both `006` and `007` to construct a legitimate `work-done`
-/// signal for a real CLI subprocess that never inherited a real spawn's
-/// environment, and by `006` alone to know where the daemon actually wrote
-/// its summary file: `open_orchestration` provisions an isolated clone in a
-/// sibling directory of `deck.workdir()` (`resolve_workspace_path`,
-/// `src/ui.rs`), so the worker pane's real `cwd` — and therefore the base
-/// `write_work_done_summary` writes under — is never `deck.workdir()` itself.
-///
-/// Both callers invoke this immediately after a real `delegate` CLI call, and
-/// the `orch-deck` fixture sets no `clear` override on either role so it
-/// defaults to `true` — a delegate RESPAWNS the worker pane, exactly the race
-/// `wait_for_delegate_pointer` in `e2e_dispatcher_mode.rs` documents: the
-/// agent id that existed when the delegate was sent is dead by the time the
-/// respawn completes, and the registry briefly holds both the old and the new
-/// agent for one pane with `ListAgents` order unspecified (fork issue #513).
-/// So this re-resolves on every poll rather than caching, and only accepts a
-/// record once ALL THREE fields are populated — a mid-respawn record might
-/// carry some but not others.
-fn worker_fail_closed_identity(deck: &TuiDeck, worker_pane: &str) -> (u64, String, PathBuf) {
-    let identity = RefCell::new(None);
-    let found = common::wait_until(Duration::from_secs(30), || {
-        let Some(record) = common::agent_records_on(deck.attach_socket_path())
+/// The id of the task the orchestrator delegated to `worker_pane`: the id of
+/// the message in that pane's inbox. Re-resolved on every poll because the
+/// `orch-deck` fixture sets no `clear` override, so it defaults to `true` and a
+/// delegate RESPAWNS the worker pane; the message is bound to the replacement.
+fn delegated_task_id(deck: &TuiDeck, worker_pane: &str) -> String {
+    let id = RefCell::new(None);
+    let found = common::wait_until(common::load_scaled(Duration::from_secs(30)), || {
+        match inbox_view::messages(deck.attach_socket_path(), worker_pane)
             .into_iter()
-            .find(|r| r.pane_id_env.as_deref() == Some(worker_pane))
-        else {
-            return false;
-        };
-        let (Some(boot_id), Some(generation), Some(cwd)) = (
-            record.daemon_boot_id,
-            record.registration_generation,
-            record.cwd,
-        ) else {
-            return false;
-        };
-        *identity.borrow_mut() = Some((generation, boot_id, PathBuf::from(cwd)));
-        true
+            .next()
+        {
+            Some(message) => {
+                *id.borrow_mut() = Some(message.id.to_string());
+                true
+            }
+            None => false,
+        }
     });
     assert!(
         found,
-        "the worker pane must eventually reappear in ListAgents with a daemon_boot_id, \
-         registration_generation and cwd, post-respawn (fork issue #513)"
+        "the delegated task never reached the worker pane's inbox; inbox = {:?}",
+        inbox_view::messages(deck.attach_socket_path(), worker_pane)
     );
-    identity.into_inner().expect("wait_until returned true")
-}
-
-/// Scenario: Launch the real TUI and its lazy daemon, open the two-role `orch-deck` fixture, then run the REAL `dot-agent-deck delegate` CLI from the orchestrator's identity stating subject `#589`, followed by the REAL `dot-agent-deck work-done` CLI from the worker's identity echoing back a DIFFERENT subject `#544` — Problem 2's exact observed shape, a coherent report on the wrong subject. The rendered orchestration surface must visibly carry a subject-mismatch warning naming both subjects, and must still carry the ordinary completion pointer to the worker's summary file (a mismatch warning augments the notification; it does not replace or suppress it).
-#[spec("orchestration/work-done/007")]
-#[test]
-fn work_done_007_subject_mismatch_produces_a_visible_warning_in_the_attached_tui() {
-    let deck = TuiDeck::builder()
-        .with_pty_size(120, 40)
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
-        .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
-    open_orchestration(&deck);
-    deck.wait_for_string(WORKER_ROLE);
-
-    let (worker_pane, orchestrator_agent, orchestrator_pane) = orchestration_ids(&deck);
-    let summary_file_name = work_done_file_name(WORKER_ROLE, &worker_pane);
-    let pointer_needle_text = pointer_needle(&worker_pane);
-
-    let delegate_output = run_delegate_cli_with_subject(
-        &deck,
-        &orchestrator_pane,
-        WORKER_ROLE,
-        "Do the thing under test for orchestration/work-done/007.",
-        DELEGATED_SUBJECT,
-    );
-    assert!(
-        delegate_output.status.success(),
-        "`delegate --subject {DELEGATED_SUBJECT}` exited {:?} — expected `--subject` to be \
-         accepted by the `Delegate` CLI\nstdout: {}\nstderr: {}",
-        delegate_output.status.code(),
-        String::from_utf8_lossy(&delegate_output.stdout),
-        String::from_utf8_lossy(&delegate_output.stderr)
-    );
-
-    // The worker pane's REAL cwd, not `deck.workdir()`: `open_orchestration`
-    // provisions an isolated clone in a sibling directory
-    // (`resolve_workspace_path`, `src/ui.rs`), and that resolved path — not
-    // `deck.workdir()` — is what `write_work_done_summary` actually writes
-    // under.
-    let (worker_generation, worker_boot_id, worker_cwd) =
-        worker_fail_closed_identity(&deck, &worker_pane);
-    let summary_path = worker_cwd.join(".dot-agent-deck").join(&summary_file_name);
-
-    const SENTINEL: &str = "e2e-subject-mismatch-report-9c31";
-    let work_done_output = run_work_done_cli_with_subject(
-        &deck,
-        &worker_pane,
-        worker_generation,
-        &worker_boot_id,
-        &format!("Finished the delegated task. {SENTINEL}"),
-        REPORTED_SUBJECT,
-    );
-    assert!(
-        work_done_output.status.success(),
-        "`work-done --subject {REPORTED_SUBJECT}` exited {:?} — expected `--subject` to be \
-         accepted by the `WorkDone` CLI\nstdout: {}\nstderr: {}",
-        work_done_output.status.code(),
-        String::from_utf8_lossy(&work_done_output.stdout),
-        String::from_utf8_lossy(&work_done_output.stderr)
-    );
-
-    // First: did the DAEMON compose and write the mismatch warning into the
-    // orchestrator's PTY at all? Asserted before the grid, same discipline as
-    // `work_done_004` above, so a daemon-side failure is never reported as a
-    // rendering failure.
-    let wrote = common::wait_until(Duration::from_secs(20), || {
-        let pty = squeeze(&orchestrator_pty(&deck, &orchestrator_agent));
-        pty.contains(&squeeze(SUBJECT_MISMATCH_NEEDLE))
-            && pty.contains(&squeeze(DELEGATED_SUBJECT))
-            && pty.contains(&squeeze(REPORTED_SUBJECT))
-    });
-    assert!(
-        wrote,
-        "the daemon never wrote a subject-mismatch warning into the orchestrator's PTY for a \
-         delegate stating {DELEGATED_SUBJECT} against a work-done echoing {REPORTED_SUBJECT} \
-         — Problem 2's exact observed shape (a coherent report, wrong subject) reaches the \
-         orchestrator with no flag at all\nOrchestrator PTY:\n{}",
-        orchestrator_pty(&deck, &orchestrator_agent)
-    );
-
-    // Then: does it reach the user's screen, naming both subjects?
-    assert!(
-        wait_for_pane_string(&deck, SUBJECT_MISMATCH_NEEDLE, Duration::from_secs(20)),
-        "the mismatch warning reached the orchestrator's PTY but never became visible in the \
-         rendered orchestration surface\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        pane_contains(&deck, DELEGATED_SUBJECT) && pane_contains(&deck, REPORTED_SUBJECT),
-        "the mismatch warning must name BOTH subjects — what was delegated and what was \
-         reported — or the orchestrator cannot tell which task actually got done\nFinal \
-         grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // A mismatch warning augments the notification; it must never replace or
-    // suppress the ordinary report the daemon exposes as ground truth (PRD
-    // #586's Decisions table: the daemon exposes ground truth, it doesn't
-    // withhold it).
-    assert!(
-        wait_for_pane_string(&deck, &pointer_needle_text, Duration::from_secs(20)),
-        "a subject mismatch must not suppress the ordinary completion pointer\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        std::fs::read_to_string(&summary_path)
-            .map(|contents| contents.contains(SENTINEL))
-            .unwrap_or(false),
-        "the summary file the orchestrator was pointed at must hold THIS worker's actual \
-         report content even though its subject did not match. Path: {}",
-        summary_path.display()
-    );
-}
-
-/// Scenario: The regression guard for `006`. Same setup, but the REAL `dot-agent-deck delegate` and `dot-agent-deck work-done` CLIs both state the SAME subject `#589`. The rendered orchestration surface must still carry the ordinary completion pointer, and must NOT carry any subject-mismatch warning — guarding against a coder implementation that fires the warning unconditionally or too eagerly.
-#[spec("orchestration/work-done/008")]
-#[test]
-fn work_done_008_matching_subjects_produce_no_mismatch_warning() {
-    let deck = TuiDeck::builder()
-        .with_pty_size(120, 40)
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
-        .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
-    open_orchestration(&deck);
-    deck.wait_for_string(WORKER_ROLE);
-
-    let (worker_pane, _orchestrator_agent, orchestrator_pane) = orchestration_ids(&deck);
-    let pointer_needle_text = pointer_needle(&worker_pane);
-
-    const SAME_SUBJECT: &str = "#589";
-
-    let delegate_output = run_delegate_cli_with_subject(
-        &deck,
-        &orchestrator_pane,
-        WORKER_ROLE,
-        "Do the thing under test for orchestration/work-done/008.",
-        SAME_SUBJECT,
-    );
-    assert!(
-        delegate_output.status.success(),
-        "`delegate --subject {SAME_SUBJECT}` exited {:?} — expected `--subject` to be \
-         accepted by the `Delegate` CLI\nstdout: {}\nstderr: {}",
-        delegate_output.status.code(),
-        String::from_utf8_lossy(&delegate_output.stdout),
-        String::from_utf8_lossy(&delegate_output.stderr)
-    );
-
-    let (worker_generation, worker_boot_id, _worker_cwd) =
-        worker_fail_closed_identity(&deck, &worker_pane);
-
-    const SENTINEL: &str = "e2e-subject-match-report-71ae";
-    let work_done_output = run_work_done_cli_with_subject(
-        &deck,
-        &worker_pane,
-        worker_generation,
-        &worker_boot_id,
-        &format!("Finished the delegated task. {SENTINEL}"),
-        SAME_SUBJECT,
-    );
-    assert!(
-        work_done_output.status.success(),
-        "`work-done --subject {SAME_SUBJECT}` exited {:?} — expected `--subject` to be \
-         accepted by the `WorkDone` CLI\nstdout: {}\nstderr: {}",
-        work_done_output.status.code(),
-        String::from_utf8_lossy(&work_done_output.stdout),
-        String::from_utf8_lossy(&work_done_output.stderr)
-    );
-
-    assert!(
-        wait_for_pane_string(&deck, &pointer_needle_text, Duration::from_secs(20)),
-        "a matching-subject completion must still receive the ordinary completion pointer\n\
-         Final grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        !pane_contains(&deck, SUBJECT_MISMATCH_NEEDLE),
-        "matching subjects must NOT produce a mismatch warning — a coder implementation that \
-         fires the warning unconditionally or too eagerly would still pass every assertion in \
-         `orchestration/work-done/007` and only this regression guard would catch it\nFinal \
-         grid:\n{}",
-        deck.snapshot_grid()
-    );
+    id.into_inner().expect("wait_until returned true")
 }
 
 // --- Issue #803: an orchestrator with a delegation outstanding reads ---------
@@ -858,8 +717,9 @@ fn launch_deck_with_orchestration() -> TuiDeck {
         .with_pty_size(160, 45)
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "600000")
         .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
+        .impersonating_pane_signals()
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_orchestration(&deck);
     deck.wait_for_string(WORKER_ROLE);
     deck
@@ -939,12 +799,11 @@ fn agent_id_on_pane(deck: &TuiDeck, pane: &str) -> Option<String> {
 /// Run the real `delegate` CLI from the orchestrator to the worker and wait
 /// until the daemon holds the resulting outstanding delegation.
 fn delegate_and_wait_until_armed(deck: &TuiDeck, orchestrator_pane: &str, worker_pane: &str) {
-    let output = run_delegate_cli_with_subject(
+    let output = run_delegate_cli(
         deck,
         orchestrator_pane,
         WORKER_ROLE,
         "Do the thing under test for status/observing.",
-        "#803",
     );
     assert!(
         output.status.success(),
@@ -984,15 +843,12 @@ fn observing_009_attached_deck_flips_orchestrator_card_on_delegate_and_work_done
         describe_orchestrator_card(&deck)
     );
 
-    let (worker_generation, worker_boot_id, _worker_cwd) =
-        worker_fail_closed_identity(&deck, &worker_pane);
-    let work_done_output = run_work_done_cli_with_subject(
+    let task_id = delegated_task_id(&deck, &worker_pane);
+    let work_done_output = run_work_done_cli(
         &deck,
         &worker_pane,
-        worker_generation,
-        &worker_boot_id,
+        &task_id,
         "Finished the delegated task. e2e-observing-report-5d20",
-        "#803",
     );
     assert!(
         work_done_output.status.success(),
@@ -1157,15 +1013,12 @@ fn observing_018_orchestrator_keeps_observing_after_the_respawned_worker_announc
         describe_orchestrator_card(&deck)
     );
 
-    let (worker_generation, worker_boot_id, _worker_cwd) =
-        worker_fail_closed_identity(&deck, &worker_pane);
-    let work_done_output = run_work_done_cli_with_subject(
+    let task_id = delegated_task_id(&deck, &worker_pane);
+    let work_done_output = run_work_done_cli(
         &deck,
         &worker_pane,
-        worker_generation,
-        &worker_boot_id,
+        &task_id,
         "Finished the delegated task. e2e-observing-report-9c41",
-        "#803",
     );
     assert!(
         work_done_output.status.success(),
@@ -1317,12 +1170,11 @@ fn assert_undelivered_delegate_leaves_no_delegated_cards(
         .expect("re-point the worker role");
     }
 
-    let output = run_delegate_cli_with_subject(
+    let output = run_delegate_cli(
         &deck,
         &orchestrator_pane,
         WORKER_ROLE,
         "Do the thing under test for an undelivered delegate.",
-        "#805",
     );
     assert!(
         output.status.success(),
@@ -1333,11 +1185,11 @@ fn assert_undelivered_delegate_leaves_no_delegated_cards(
     );
     assert!(
         common::wait_until(common::load_scaled(Duration::from_secs(30)), || {
-            orchestrator_pty(&deck, &orchestrator_agent).contains(exit_needle)
+            orchestrator_inbox_text(&deck, &orchestrator_pane).contains(exit_needle)
         }),
         "setup: the daemon never told the orchestrator that the delegate did not reach a worker \
-         ({exit}), so the dispatch did not take the exit under test; orchestrator pane = {:?}",
-        orchestrator_pty(&deck, &orchestrator_agent)
+         ({exit}), so the dispatch did not take the exit under test; orchestrator inbox = {:?}",
+        orchestrator_inbox_text(&deck, &orchestrator_pane)
     );
 
     // The delegation was announced to the deck before the dispatch ran, so a

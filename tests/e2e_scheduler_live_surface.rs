@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 live-surfacing tests for the daemon-hosted scheduler (PRD #127 finding
 //! #2): a scheduled fire must surface its card to an ALREADY-ATTACHED TUI —
@@ -14,21 +14,23 @@
 //! fires are triggered with the existing `RunNow` control message over the
 //! deck's attach socket (no real LLM, no real-time cron wait).
 //!
-//! `live/001`-`live/005` are GREEN today, and have been since the fixes below
+//! `live/001`-`live/006` are GREEN today, and have been since the fixes below
 //! landed — with ONE exception: `78f92b6` widened the retire predicate and made
 //! `/004` RED again for the window it was on the tree, until `8f579dd` reverted
 //! it (see `/004`'s own note below). Outside that window they have been green,
-//! so do NOT read any of them as known-failing. A failure in `/001`-`/005` is a
+//! so do NOT read any of them as known-failing. A failure in `/001`-`/006` is a
 //! real regression at the live-surfacing / supersession / local-config-drift
 //! seam (issue #284: an earlier stale `RED today:` note here caused exactly
 //! that misclassification, so an investigation stopped looking at a genuine
 //! break).
 //!
-//! `live/005` (fork issues #318/#320) pins the local-config-drift warning at
+//! `live/006` (fork issues #318/#320) pins the local-config-drift signal at
 //! the daemon-surfacing call site (`surface_one_orchestration`) — see its own
 //! doc comment for the full mechanism. It was RED as written, by design, until
-//! `6ef0269` landed `LocalConfigState` and folded it into the "all green"
-//! statement above, along with `orchestration/hydration/002`. This note is
+//! `6ef0269` landed the drift check, and is folded into the "all green"
+//! statement above along with `orchestration/hydration/002`; upstream's #554
+//! design (`orchestration_config_drift_warning`) has since replaced the
+//! fork's helper, and the signal it pins is that design's. This note is
 //! itself the thing issue #284 is about: update it alongside the next fix
 //! that touches this file, rather than leaving a claim here for the next
 //! reader to trust past its expiry.
@@ -59,14 +61,15 @@
 //!     hook superseding the placeholder. Was RED; closed by `ccadbbc`, which
 //!     captures the retired session's `display_name` (keyed by the stable pane
 //!     id) and seeds the replacement session with it. Shipped green in v0.35.0.
-//!   - `live/005`: a daemon-surfaced orchestration whose local
+//!   - `live/006`: a daemon-surfaced orchestration whose local
 //!     `.dot-agent-deck.toml` no longer lists it by the time the
-//!     ALREADY-ATTACHED TUI live-surfaces it renders the same on-screen drift
-//!     warning `orchestration/hydration/001` pins for the reconnect path. Was
+//!     ALREADY-ATTACHED TUI live-surfaces it shows the same on-screen drift
+//!     signal `orchestration/hydration/001` pins for the reconnect path (the
+//!     `Config drift:` status line and the `[config drift]` tab marker). Was
 //!     RED — `surface_one_orchestration` mapped the renamed-out case through
-//!     `.ok().flatten()` and logged nothing. Closed by `6ef0269`, which
-//!     introduces `LocalConfigState` and routes both call sites through the
-//!     same drift-warning helper.
+//!     `.ok().flatten()` and logged nothing. Closed by `6ef0269`; upstream's
+//!     #554 design now routes both call sites through
+//!     `surface_orchestration_config_drift`.
 
 mod common;
 
@@ -101,14 +104,19 @@ fn run_now(deck: &TuiDeck, name: &str) {
     .unwrap_or_else(|e| panic!("RunNow {name} over the attach socket failed: {e}"));
 }
 
-/// Same on-screen drift substring `orchestration/hydration/001` pins for the
-/// reconnect-hydration call site. `scheduler/live/005` drives fork issue
-/// #318's OTHER call site (`surface_one_orchestration`, via
-/// `pending_orchestration_surfaces`) and is meant to end up sharing the same
-/// drift-warning helper once the fix lands, so this deliberately reuses the
-/// identical text rather than inventing a second spelling of one message —
-/// the coder must make both call sites produce this exact substring.
-const SCHEDULER_LIVE_DRIFT_NEEDLE: &str = "orchestration 'demo-orch' not found in local config";
+/// Same on-screen drift status line `orchestration/hydration/001` pins for the
+/// reconnect-hydration call site (the head of `Config drift: an orchestration
+/// tab marked ! … [config drift] no longer matches .dot-agent-deck.toml`).
+/// `scheduler/live/006` drives fork issue #318's OTHER call site
+/// (`surface_one_orchestration`, via `pending_orchestration_surfaces`), which
+/// upstream's #554 design routes through the same
+/// `surface_orchestration_config_drift`, so this deliberately reuses the
+/// identical text rather than inventing a second spelling of one message.
+const SCHEDULER_LIVE_DRIFT_STATUS_NEEDLE: &str = "Config drift:";
+
+/// The suffix the tab strip paints on the drifted tab; it outlives the status
+/// line, which expires.
+const SCHEDULER_LIVE_DRIFT_TAB_MARKER: &str = "[config drift]";
 
 /// Write `content` to `path` (expected to be a FIFO / named pipe) on a
 /// background thread, bounded by a generous timeout. `open()` on a FIFO
@@ -145,7 +153,7 @@ fn write_fifo_rendezvous(path: &std::path::Path, content: &'static str, what: &s
 /// LIVE on the rendered dashboard. Pins live surfacing for a bare (hookless)
 /// command: green since `ed0c3bf` publishes a synthetic `SessionStart` for
 /// single-agent fires. When written this was RED — the daemon had the agent but
-/// the attached TUI stayed on "No active sessions", because no broadcast
+/// the attached TUI stayed on "No active agents", because no broadcast
 /// triggered live hydration.
 #[spec("scheduler/live/001")]
 #[test]
@@ -166,7 +174,7 @@ fn live_001_scheduled_card_surfaces_to_attached_tui() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule into the SAME daemon this TUI is attached to.
     run_now(&deck, "livecard");
@@ -222,9 +230,10 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
     .expect("write fixture schedules.toml");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule; the daemon spawns the agent.
     run_now(&deck, "schedfocus");
@@ -317,7 +326,7 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule into the SAME daemon this TUI is attached to.
     run_now(&deck, "morning-digest");
@@ -418,9 +427,10 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
     .expect("write fixture schedules.toml");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule into the SAME daemon this TUI is attached to.
     run_now(&deck, "morning-digest");
@@ -543,13 +553,14 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
 /// reconnect-hydration path, which is a different call site entirely and
 /// needs no such rendezvous (nothing races there; the file is already
 /// rewritten by the time a fresh client attaches). Pins that the SAME
-/// on-screen drift warning `orchestration/hydration/001` asserts also appears
-/// for THIS path once the config no longer lists the orchestration — this was
-/// RED when written, because `surface_one_orchestration` used `.ok().flatten()`
-/// and logged nothing at all; closed by `6ef0269`.
-#[spec("scheduler/live/005")]
+/// on-screen drift signal `orchestration/hydration/001` asserts (the
+/// `Config drift:` status line and the `[config drift]` tab marker) also
+/// appears for THIS path once the config no longer lists the orchestration —
+/// this was RED when written, because `surface_one_orchestration` used
+/// `.ok().flatten()` and logged nothing at all; closed by `6ef0269`.
+#[spec("scheduler/live/006")]
 #[test]
-fn live_005_daemon_surfaced_orchestration_config_drift_warns() {
+fn live_006_daemon_surfaced_orchestration_config_drift_warns() {
     let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("orchdrift");
     std::fs::create_dir_all(&work).expect("create work dir");
@@ -568,7 +579,7 @@ fn live_005_daemon_surfaced_orchestration_config_drift_warns() {
     // files before opening them. If that hardening is ever applied to
     // `load_project_config` too, this test breaks -- as a mysterious hang,
     // not a clean assertion failure, since the daemon/TUI reader would then
-    // never open the FIFO at all. If `live_005` starts hanging or timing out
+    // never open the FIFO at all. If `live_006` starts hanging or timing out
     // here for no visible reason, check whether `load_project_config` grew a
     // not-a-regular-file guard, and if so replace this FIFO-as-config
     // technique with a regular config file plus a SEPARATE synchronization
@@ -598,7 +609,7 @@ fn live_005_daemon_surfaced_orchestration_config_drift_warns() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule on a BACKGROUND thread: the daemon's spawn path opens
     // `config_path` for reading (inside `decide_target`) before it can do
@@ -685,19 +696,106 @@ fn live_005_daemon_surfaced_orchestration_config_drift_warns() {
     // deck's own rendered grid.
     let _ = fire.join();
 
-    // The pin: the SAME drift message `orchestration/hydration/001` pins for
+    // The pin: the SAME drift signal `orchestration/hydration/001` pins for
     // the reconnect-hydration path must also appear here, for the
     // mid-session daemon-surfacing path. This was RED when written —
     // `surface_one_orchestration` logged nothing at all for this case;
-    // closed by `6ef0269`.
+    // closed by `6ef0269`. The status line is the transient half, so it is
+    // waited for first; the tab marker outlives it.
     assert!(
-        deck.wait_for_grid_string_within(SCHEDULER_LIVE_DRIFT_NEEDLE, Duration::from_secs(10)),
+        deck.wait_for_grid_string_within(
+            SCHEDULER_LIVE_DRIFT_STATUS_NEEDLE,
+            Duration::from_secs(10)
+        ),
         "a daemon-surfaced orchestration whose local .dot-agent-deck.toml no \
          longer lists it (renamed out from under it between spawn and \
-         surfacing) must render an on-screen drift warning naming the \
-         orchestration -- expected the substring {SCHEDULER_LIVE_DRIFT_NEEDLE:?} \
-         on the rendered grid within 10s, got:\n{}",
+         surfacing) must render the config-drift status line -- expected the \
+         substring {SCHEDULER_LIVE_DRIFT_STATUS_NEEDLE:?} on the rendered grid \
+         within 10s, got:\n{}",
         deck.snapshot_grid()
+    );
+    deck.wait_until_grid(
+        "the surfaced demo-orch tab carries the [config drift] marker",
+        |grid| {
+            grid.lines().any(|row| {
+                row.contains("demo-orch") && row.contains(SCHEDULER_LIVE_DRIFT_TAB_MARKER)
+            })
+        },
+    );
+
+    drop(scratch);
+}
+
+/// Scenario: Launch the deck attached to a daemon with TWO enabled schedules
+/// (`review-nightly`, `review-hourly`) that both target the same directory,
+/// `shared-repo`, whose `.dot-agent-deck.toml` defines one orchestration
+/// (`team`, two `cat` roles). Fire both via `RunNow` without detaching, then
+/// read the tab strip: it must show two orchestration tabs a user can tell
+/// apart — `team · shared-repo` and `team · shared-repo · 2` — rather than two
+/// identical `team · shared-repo` labels (issue #1339).
+#[spec("scheduler/live/005")]
+#[test]
+fn live_005_two_schedules_firing_one_repo_get_tabs_with_distinct_labels() {
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
+    let work = scratch.path().join("shared-repo");
+    std::fs::create_dir_all(&work).expect("create work dir");
+    // `cat` roles: what is under test is the label the DAEMON admits each run
+    // under and the attached TUI paints, which no agent participates in.
+    std::fs::write(
+        work.join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"team\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+         [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"cat\"\n",
+    )
+    .expect("write the shared repo's orchestration config");
+
+    let work_dir = work.to_string_lossy();
+    let sched_path = scratch.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        format!(
+            "{}\n{}",
+            single_task_toml("review-nightly", &work_dir, "cat", "NIGHTLY"),
+            single_task_toml("review-hourly", &work_dir, "cat", "HOURLY"),
+        ),
+    )
+    .expect("write fixture schedules.toml");
+
+    let deck = TuiDeck::builder()
+        // Wide enough that two run-identifying labels fit the strip whole, so
+        // neither is ellipsized into looking like the other.
+        .with_pty_size(220, 50)
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+
+    run_now(&deck, "review-nightly");
+    // The first run's tab is up before the second fires, so the order — and
+    // therefore which run carries the number — is fixed.
+    deck.wait_until_grid("the first scheduled run's tab is in the strip", |grid| {
+        grid.lines()
+            .next()
+            .is_some_and(|strip| strip.contains("team · shared-repo"))
+    });
+    run_now(&deck, "review-hourly");
+
+    let count = |strip: &str, needle: &str| strip.matches(needle).count();
+    deck.wait_until_grid(
+        "two orchestration tabs in the strip, the second numbered",
+        |grid| {
+            let strip = grid.lines().next().unwrap_or_default();
+            count(strip, "team · shared-repo") == 2 && count(strip, "team · shared-repo · 2") == 1
+        },
+    );
+    let strip = deck
+        .snapshot_grid()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !strip.contains("· 3"),
+        "two runs need exactly one number; strip: {strip:?}"
     );
 
     drop(scratch);

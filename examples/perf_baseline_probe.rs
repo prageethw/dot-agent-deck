@@ -82,6 +82,8 @@ fn realistic_thinking_event(pane_id: &str, agent_id: &str, cwd: &str, n: usize) 
         schema_version: Some(1),
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     }
 }
 

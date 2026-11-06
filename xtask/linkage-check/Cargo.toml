@@ -2,6 +2,7 @@
 name = "xtask-linkage-check"
 version = "0.0.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 # PRD #77 Decision 7: enforces the catalog↔test linkage and Decision 21's
@@ -13,12 +14,34 @@ name = "xtask-linkage-check"
 path = "src/main.rs"
 
 [dependencies]
-proc-macro2 = "1"
+# `span-locations` (issue #688, rule 17) so a finding can name the line syn
+# parsed a `fn` at, rather than re-finding it by text. A feature of a crate
+# already in Cargo.lock, on the normal-dependency instance only — proc-macro
+# builds get their own resolution and are untouched.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 regex = "1"
-# PRD #819 M7 (check 12) walks the desktop crate's AST, so it needs `visit`
+# Issue #1850: `affected-checks --run` sends its OpenTelemetry spans over OTLP/HTTP
+# (`src/gate_telemetry.rs`). The workspace carries no OpenTelemetry crate — the
+# deck's own export encodes OTLP by hand over this same `reqwest` — so these are
+# the root package's `reqwest` and `serde_json` at the same versions, plus
+# reqwest's `blocking` feature, whose `futures-channel` and `futures-util` are
+# already in Cargo.lock. No new crate in Cargo.lock.
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "blocking",
+] }
+serde_json = "1"
+# PRD #819 M7 (rule 12) walks the desktop crate's AST, so it needs `visit`
 # on top of what the `#[spec]` binding already uses. Pure feature — it pulls no
 # new crate into Cargo.lock.
 syn = { version = "3", features = ["full", "parsing", "visit"] }
+# PRD #802 M3 (rule 14) reads `desktop/src-tauri/src/voice/commands.toml`. The
+# same library `voice/table.rs` parses it with, deliberately: two readers of one
+# file is two answers about what the file says, and the lenient one always wins
+# by accepting what the strict one rejected. No new crate in Cargo.lock — the
+# root package and the desktop crate both already declare toml_edit 0.25, and
+# this needs the DOM only, so no feature is turned on.
+toml_edit = "0.25"
 xtask-docs = { path = "../docs" }
 # PRD fork#340 M3: `work-type-check --self-test` builds a scratch git repo at
 # runtime (production code, not `#[cfg(test)]`) to prove the gate genuinely
@@ -26,8 +49,11 @@ xtask-docs = { path = "../docs" }
 # here, not only a dev one. Already a root dev-dependency at the same "3"
 # version (root `Cargo.toml`), so this pulls no new crate into Cargo.lock.
 tempfile = "3"
+# PRD #1419: `cargo xtask site <out-dir>` dispatches into this library.
+xtask-site = { path = "../site" }
 
-# `clean-e2e-tmp` needs two libc calls that have no std equivalent:
+# `clean-e2e-tmp` needs two libc calls that have no std equivalent, and gate
+# telemetry a third:
 #
 # - `geteuid(2)` (issue #322) scopes the harness's private `/var/tmp` parent to
 #   the effective UID, and proves that parent is really this user's before
@@ -35,6 +61,8 @@ tempfile = "3"
 # - `kill(pid, 0)` (issue #461) decides ownership by liveness — the only call
 #   that distinguishes "no such process" (ESRCH, dead) from "not yours" (EPERM,
 #   alive).
+# - `gethostname(2)` (issue #1893) fills the gate spans' `host.name` the way the
+#   deck fills its own, so the two group by machine.
 #
 # `libc` is already a workspace dependency at the same version and gating (the
 # root package declares it under `[target.'cfg(unix)'.dependencies]`), so this
@@ -45,11 +73,12 @@ tempfile = "3"
 libc = "0.2"
 
 [dev-dependencies]
-# Already a root-package dependency at the same version, so this pulls no new
-# crate into Cargo.lock. Used by `issue_labeler_policy` to read back the
-# `label-policy.json` the labeler's setup step writes.
-serde_json = "1"
 tempfile = "3"
+# Already a root-package dependency at the same pinned version, so this pulls
+# no new crate into Cargo.lock. `sandbox_run` drives `task run-all`'s script on
+# a real terminal, because what it guards — which process group owns the
+# terminal's foreground — exists only on one.
+portable-pty = "=0.8.1"
 # Issue #1061: `skill_frontmatter` has to decide whether a `SKILL.md`
 # frontmatter block is really valid YAML, and the whole defect it guards is
 # that a LENIENT reader accepted what a spec-correct one rejected — so

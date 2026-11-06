@@ -18,11 +18,28 @@
   --paper-sunken-strong: #eceae3;
   --skeleton: #e5e2da;
 
-  /* Light chrome — text. */
+  /* Light chrome — text. Issue #821: --faint and --muted both failed AA (4.5:1
+     for normal text) on every surface they land on, at 2.39–3.05:1 and
+     3.95–5.04:1. Fixing that is not a free choice of two values, because the
+     dimmest ground --faint lands on is `rgb(var(--scrim-rgb) / .04)` over
+     --red-soft — an `.overview-lease` badge on a failed overview row — and
+     clearing 4.5:1 there caps --faint at CIE L* 40.8. --muted's own ceiling is
+     only 1.9 L* above that, so using it would leave the two nearly equal. Keeping
+     a full, visible step BELOW --faint instead was a choice, not a necessity, and
+     it lands --muted where --ink-soft used to be (L* 31.4). That is why
+     --ink-soft moved as well — `.voice-help-section p` renders in --ink-soft and
+     in --muted as a deliberate undimmed/dimmed pair, so the two going equal
+     would flatten a distinction the markup relies on.
+
+     The four now sit ~8.7 L* apart (13.8 / 22.4 / 31.2 / 40.1), which is a more
+     even ladder than the 17.6 / 14.9 / 14.3 it replaces and no smaller a step
+     than the 8.2 the dark block below already ships between --ink-soft and
+     --muted.
+     The per-surface arithmetic is in the PR that closed #821. */
   --ink: #1d2522;
-  --ink-soft: #434c48;
-  --muted: #66706b;
-  --faint: #8d948f;
+  --ink-soft: #313734;
+  --muted: #444b48;
+  --faint: #5a605b;
   --on-accent: #ffffff;
 
   /* Light chrome — lines. */
@@ -59,6 +76,20 @@
 
   /* Red: failed / destructive. */
   --red: #a13e38;
+  /* Issue #1781: GitHub's own Primer colours, for the pull request badge only,
+     so it reads the way the pull request does on GitHub. The *-fg tokens are
+     an icon on the surface; the *-emphasis ones fill a circle under
+     --gh-on-emphasis, as GitHub's review icons do. */
+  --gh-open-fg: #1a7f37;
+  --gh-closed-fg: #d1242f;
+  --gh-merged-fg: #8250df;
+  --gh-draft-fg: #59636e;
+  --gh-attention-fg: #9a6700;
+  --gh-success-emphasis: #1f883d;
+  --gh-danger-emphasis: #cf222e;
+  --gh-attention-emphasis: #9a6700;
+  --gh-neutral-emphasis: #59636e;
+  --gh-on-emphasis: #ffffff;
   --red-ink: #7d2e29;
   --red-rim-strong: #c87e78;
   --red-rim: #d9aaa5;
@@ -69,10 +100,35 @@
   --violet-soft: #e8e0ef;
 
   /* Live status, read against both the light chrome and the dark instrument
-     chrome, so these are one family rather than two. */
+     chrome, so these are one family rather than two — which is why the dark
+     blocks below repeat these values rather than moving them.
+
+     Issue #822: --status-error was #d0685f, which put `.terminal-input-status
+     .is-blocked` — 9px text on --shell — at 4.08:1 in light and exactly 4.50:1
+     in dark, so light failed AA and dark sat on it to two decimal places. This is
+     the same hue and saturation one lightness step up (HSL 4.8° / 54%, L 59.4% →
+     63.9%): 4.76:1 on the light --shell and 5.25:1 on the dark one.
+
+     What that costs is recorded rather than hidden. `.connection-lamp
+     .connection-error` uses this token as a FILL, at four JSX call sites, and
+     they split evenly rather than mostly-dark: `App.tsx` and `AgentOverview.tsx`
+     each put one in `.rail-bottom`, which is DARK (`.rail`'s own `--shell`
+     background) — and the other two are LIGHT, `.topbar` (the deck selector's
+     lamp, which inherits the topbar's background because `.deck-selector-trigger`
+     declares none of its own) and `.daemon-group-header`. The two constraints
+     barely overlap: 4.5:1 as text on the light --shell needs relative luminance
+     >= 0.2714, and 3:1 as a fill on --paper (which the topbar wash resolves to)
+     needs <= 0.2739. A value in that band — #d3736b is one — sits at both bars
+     at once, 4.50–4.53:1 as text and 3.00–3.02:1 as the fill, which is the
+     no-headroom position #822 was opened about. This value takes the headroom on
+     the text and lets the fill/--topbar figure fall to 2.86:1 (from 3.33:1).
+     The lamp keeps its WCAG 1.4.11 standing from the 2px
+     --shell-line ring the base `.connection-lamp` rule gives it: the ring is
+     what identifies the component against the page, and the fill only has to be
+     told apart from the ring, which it clears at 4.37:1. */
   --status-ok: #6db58b;
   --status-warn: #c69a4e;
-  --status-error: #d0685f;
+  --status-error: #d57971;
 
   /* Instrument chrome — the dark surfaces wrapped around the terminals: the
      rail, the tab strip, the agent footer, the output panels and the reader
@@ -115,6 +171,28 @@
   --rail-width: 74px;
   --drawer-width: 358px;
   --radius: 6px;
+
+  /* PRD #802's reserved voice row. Declared HERE rather than beside `.voice-row`
+     at the foot of this file, and that is load-bearing: `--bottom-rail-height`
+     is overridden by a `:root` rule inside `@media (max-width: 680px)`, media
+     queries add no specificity, and a custom property declared later in source
+     order would win over it unconditionally. See `.voice-row` for what each one
+     is and which surfaces subtract it. */
+  --voice-row-height: 40px;
+  /* The row's least height while voice is ON (PR #1451): the resting height,
+     a constant rather than `--voice-row-height` itself, because that variable
+     is overwritten with the row's measured height while voice is on and a
+     least height that read it could only ever grow. The row grows past this
+     when its larger text needs more, or a sentence wraps, and then
+     `VoiceControlPanel` writes the measured height into `--voice-row-height`
+     on the root, so every surface below still keeps clear of it. */
+  --voice-row-min-height: 40px;
+  /* The rail's height when it is a BOTTOM bar, which it is only under
+     `max-width: 680px`. Zero everywhere else, so the row sits on the window's
+     own bottom edge. */
+  --bottom-rail-height: 0px;
+  /* What a viewport-anchored surface has to leave alone at the bottom. */
+  --voice-reserved: calc(var(--voice-row-height) + var(--bottom-rail-height));
 }
 
 /* Dark values (PRD #743 M3), delivered twice because both paths are required:
@@ -185,6 +263,17 @@
     --amber-bright: #241d0e;  /* the subtlest amber ground, as it is in light */
     /* Red: failed / destructive. */
     --red: #e28880;
+    /* Issue #1781: GitHub's dark Primer colours. */
+    --gh-open-fg: #3fb950;
+    --gh-closed-fg: #f85149;
+    --gh-merged-fg: #ab7df8;
+    --gh-draft-fg: #9198a1;
+    --gh-attention-fg: #d29922;
+    --gh-success-emphasis: #238636;
+    --gh-danger-emphasis: #da3633;
+    --gh-attention-emphasis: #9e6a03;
+    --gh-neutral-emphasis: #656c76;
+    --gh-on-emphasis: #ffffff;
     --red-ink: #efaba4;
     --red-rim-strong: #8f4f49;
     --red-rim: #743e39;
@@ -192,12 +281,17 @@
     /* Violet: needs a human. */
     --violet: #ab92ca;
     --violet-soft: #29223a;
-    /* Live status. Unchanged: these were already picked to read against the dark */
-    /* instrument chrome, and every one of their call sites is on it -- the rail's */
-    /* connection lamp, the composer's caution/error lines, the check rows. */
+    /* Live status. Identical to the light block by decision: these were picked to */
+    /* read against the dark instrument chrome, which is where the terminal */
+    /* input-state notices and the check rows are. NOT every call site, though -- */
+    /* `.connection-lamp` also sits in `.topbar` (via the deck selector, whose own */
+    /* background is none) and in `.daemon-group-header`, both LIGHT chrome in */
+    /* light mode; issue #822's note in the light block has what that constrains */
+    /* and what it cost. --status-error moved from #d0685f for #822 and moved in */
+    /* all three blocks, keeping the family identical across appearances. */
     --status-ok: #6db58b;
     --status-warn: #c69a4e;
-    --status-error: #d0685f;
+    --status-error: #d57971;
     /* Instrument chrome. Near-invariant by decision: PRD #743 keeps the terminals */
     /* dark in both appearances, so these surfaces were already right. The three */
     /* nudges are all one thing -- the canvas around them is dark now, so the */
@@ -289,6 +383,17 @@
   --amber-bright: #241d0e;  /* the subtlest amber ground, as it is in light */
   /* Red: failed / destructive. */
   --red: #e28880;
+  /* Issue #1781: GitHub's dark Primer colours. */
+  --gh-open-fg: #3fb950;
+  --gh-closed-fg: #f85149;
+  --gh-merged-fg: #ab7df8;
+  --gh-draft-fg: #9198a1;
+  --gh-attention-fg: #d29922;
+  --gh-success-emphasis: #238636;
+  --gh-danger-emphasis: #da3633;
+  --gh-attention-emphasis: #9e6a03;
+  --gh-neutral-emphasis: #656c76;
+  --gh-on-emphasis: #ffffff;
   --red-ink: #efaba4;
   --red-rim-strong: #8f4f49;
   --red-rim: #743e39;
@@ -296,12 +401,17 @@
   /* Violet: needs a human. */
   --violet: #ab92ca;
   --violet-soft: #29223a;
-  /* Live status. Unchanged: these were already picked to read against the dark */
-  /* instrument chrome, and every one of their call sites is on it -- the rail's */
-  /* connection lamp, the composer's caution/error lines, the check rows. */
+  /* Live status. Identical to the light block by decision: these were picked to */
+  /* read against the dark instrument chrome, which is where the terminal */
+  /* input-state notices and the check rows are. NOT every call site, though -- */
+  /* `.connection-lamp` also sits in `.topbar` (via the deck selector, whose own */
+  /* background is none) and in `.daemon-group-header`, both LIGHT chrome in */
+  /* light mode; issue #822's note in the light block has what that constrains */
+  /* and what it cost. --status-error moved from #d0685f for #822 and moved in */
+  /* all three blocks, keeping the family identical across appearances. */
   --status-ok: #6db58b;
   --status-warn: #c69a4e;
-  --status-error: #d0685f;
+  --status-error: #d57971;
   /* Instrument chrome. Near-invariant by decision: PRD #743 keeps the terminals */
   /* dark in both appearances, so these surfaces were already right. The three */
   /* nudges are all one thing -- the canvas around them is dark now, so the */
@@ -344,12 +454,14 @@ button:disabled { cursor: not-allowed; opacity: .46; }
 code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
 
 .control-deck { min-height: 100vh; background: var(--canvas); }
-.deck-main { min-height: 100vh; margin-left: var(--rail-width); transition: margin-right .18s ease; }
+/* `padding-bottom` is the voice row (see `.voice-row`): border-box, so the
+   100vh minimum still holds and the CONTENT box is what shrinks. Not a margin,
+   because the narrow-width rule below owns the margin for the bottom rail. */
+.deck-main { min-height: 100vh; margin-left: var(--rail-width); padding-bottom: var(--voice-row-height); transition: margin-right .18s ease; }
 .control-deck.with-evidence .deck-main { margin-right: var(--drawer-width); }
 
 .rail { position: fixed; z-index: 40; inset: 0 auto 0 0; width: var(--rail-width); padding: 14px 10px; display: flex; flex-direction: column; align-items: center; background: var(--shell); color: var(--shell-ink); border-right: 1px solid var(--shell-line-deep); }
-.brand-mark { width: 42px; height: 42px; display: grid; place-items: center; position: relative; border: 1px solid var(--shell-edge); border-radius: 6px; font-size: 11px; font-weight: 750; letter-spacing: .08em; }
-.brand-mark i { position: absolute; right: -3px; bottom: -3px; width: 9px; height: 9px; border: 2px solid var(--shell); border-radius: 50%; background: var(--shell-teal); }
+.brand-mark { width: 36px; height: 36px; display: block; }
 .rail nav { width: 100%; margin-top: 28px; display: grid; gap: 7px; }
 .rail nav button, .rail-bottom button { width: 52px; height: 48px; margin: auto; padding: 0; display: grid; place-items: center; border: 1px solid transparent; border-radius: 5px; color: var(--shell-muted); background: transparent; cursor: pointer; }
 .rail nav button span { position: fixed; left: 67px; padding: 6px 9px; pointer-events: none; opacity: 0; transform: translateX(-4px); color: var(--shell-ink-bright); background: var(--shell); border: 1px solid var(--shell-edge); border-radius: 4px; white-space: nowrap; font-size: 12px; transition: opacity .12s, transform .12s; }
@@ -437,6 +549,15 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .connection-banner > div { display: flex; flex-direction: column; gap: 2px; }
 .connection-banner strong { font-size: 11px; }
 .connection-banner span { font-size: 10px; }
+.hook-binary-notices { margin: 8px 16px 0; display: flex; flex-direction: column; gap: 6px; }
+.hook-binary-notice { padding: 6px 10px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--amber-edge); border-radius: var(--radius); color: var(--amber-ink); background: var(--amber-soft); }
+.hook-binary-notice > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
+.hook-binary-notice span { overflow-wrap: anywhere; }
+.hook-binary-notice code { font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.connection-detail { font-size: 10px; }
+.connection-detail summary { cursor: pointer; width: fit-content; }
+.connection-detail > span { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+.overview-note .connection-detail { font-size: 12px; color: var(--muted); }
 .connection-banner .button { margin-left: auto; }
 .connection-actions { margin-left: auto; display: flex !important; flex-direction: row !important; gap: 6px !important; }
 .connection-actions .button { margin-left: 0; }
@@ -460,6 +581,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .node-active .node-glyph { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); box-shadow: 0 0 0 3px rgb(var(--teal-rgb) / .1); }
 .node-failed .node-glyph { color: var(--red); border-color: var(--red-rim-strong); background: var(--red-soft); }
 .node-waiting .node-glyph { color: var(--amber); border-color: var(--amber-rim); background: var(--amber-soft); }
+.node-blocked .node-glyph { color: var(--red); border-color: var(--red-rim-strong); border-style: dashed; background: var(--red-soft); }
 .workflow-node.is-disabled { opacity: .42; }
 .workflow-node.is-disabled .node-glyph { border-style: dashed; }
 .workflow-empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
@@ -473,27 +595,75 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-tile.is-selected { border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
 .agent-header { min-height: 58px; padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .agent-identity { min-width: 0; display: flex; align-items: flex-start; gap: 8px; }
+/* The text column may shrink below its longest line, so a one-line notice ends in
+   an ellipsis and the deck-message rows below it wrap inside the tile. */
+.agent-identity > div { min-width: 0; }
 .agent-state-mark { width: 8px; height: 8px; margin-top: 5px; flex: 0 0 8px; border: 2px solid var(--paper-strong); border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 1px currentColor; }
 .agent-state-mark.status-running { color: var(--teal); background: var(--teal); }
 .agent-state-mark.status-passed { color: var(--green); background: var(--green); }
 .agent-state-mark.status-failed { color: var(--red); background: var(--red); }
-.agent-state-mark.status-waiting, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
+/* Issue #714: blocked shares failed's colour (a person has to act) but not its
+   shape, so it reads as a distinct state beside a crashed agent. */
+.agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
+.agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
 .agent-title-line { display: flex; align-items: center; gap: 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
+/* Issue #2001: the title is the agent's name, which can be long, so it is the
+   one part of the line that gives way — cut with an ellipsis, the whole name in
+   its tooltip — and the status and badges beside it keep their full width. */
+.agent-title-line h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-title-line > :not(h2) { flex: 0 0 auto; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
 .status-label { padding: 2px 4px; border-radius: 2px; color: var(--faint); background: var(--paper-sunken-strong); font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .status-label.status-running { color: var(--teal); background: var(--teal-soft); }
 .status-label.status-passed { color: var(--green); background: var(--green-soft); }
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
-.status-label.status-waiting, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
+.status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
+.agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
+.agent-inbox-badge { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; flex-shrink: 0; }
+/* PRD #1666 §6.4: a long list of deliveries waiting on Retry or Cancel scrolls in
+   place, so every row and its buttons stay reachable in a tile that hides overflow. */
+.agent-inbox-attention { min-width: 0; max-width: 100%; max-height: 160px; margin: 4px 0 0; padding: 0; overflow-y: auto; list-style: none; }
+/* Each row wraps inside the tile, so the whole reason — what Retry would do — is
+   readable without widening the tile, as the TUI picker shows it whole. */
+.agent-inbox-attention-row { padding: 4px 0; border-top: 1px solid var(--line); color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; line-height: 1.45; white-space: normal; overflow-wrap: anywhere; }
+.agent-inbox-attention-who, .agent-inbox-attention-subject { color: var(--ink); font-weight: 700; }
+.agent-inbox-attention-reason { display: block; margin-top: 2px; }
+.agent-inbox-attention-actions { display: flex; gap: 4px; margin-top: 4px; }
+.agent-inbox-attention-actions button { padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: var(--radius); color: var(--ink); background: var(--paper-strong); font: inherit; font-weight: 700; cursor: pointer; }
+.agent-inbox-attention-actions button:disabled { color: var(--faint); cursor: default; }
+.agent-inbox-attention-answer { display: block; margin-top: 3px; color: var(--ink); }
+.agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Issue #1678: background work still running after the turn ended. Ink rather
+   than --muted, as the TUI draws it in its primary text colour: it is a reading
+   about now, not a label. */
+.agent-identity p.agent-background-work { color: var(--ink); }
+.status-label.status-needs_input, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
+/*
+  Issue #1143 — a HELD record's status is a past reading, so it is drawn as one:
+  the live colour goes and the mark hollows out. Written after the per-status
+  rules above so it wins on source order at equal specificity, which is what
+  lets one selector neutralise all five of them rather than restating each.
+*/
+.status-label.is-held { color: var(--faint); background: var(--paper-sunken-strong); }
+.agent-state-mark.is-held { color: var(--faint); background: transparent; }
 .agent-attempt { width: 38px; height: 33px; display: grid; grid-template-columns: 1fr; place-items: center; border-left: 1px solid var(--line); }
 .agent-attempt span { color: var(--faint); font-size: 7px; letter-spacing: .08em; }
 .agent-attempt strong { font-family: "JetBrains Mono", monospace; font-size: 11px; }
-.agent-assignment { min-height: 50px; padding: 7px 11px; border-bottom: 1px solid var(--line); background: var(--paper); }
-.agent-assignment > span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .12em; }
-.agent-assignment p { margin: 3px 0 0; display: -webkit-box; overflow: hidden; color: var(--ink-soft); font-size: 9.5px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-.agent-instruments { min-height: 40px; display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
-.agent-instruments > div { padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--line); }
+/* Issue #2000: each label sits on its value's first line rather than on a row
+   of its own. A prompt that wraps hangs under its own first word, as the TUI
+   card's `Prmt:` does; the min-height is the two-line clamp, so a one-line
+   prompt does not make its tile shorter than its neighbours. */
+.agent-assignment { min-height: 40px; padding: 7px 11px; display: flex; align-items: baseline; gap: 8px; border-bottom: 1px solid var(--line); background: var(--paper); }
+.agent-assignment > span { flex: 0 0 auto; color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .12em; }
+.agent-assignment p { min-width: 0; margin: 0; display: -webkit-box; overflow: hidden; color: var(--ink-soft); font-size: 9.5px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+/* One equal column per reading rather than a fixed four: with the agent
+   details hidden (issue #1400) a live tile shows two, TIME and TOOLS. */
+.agent-instruments { min-height: 26px; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; border-bottom: 1px solid var(--line); }
+/* Issue #2000: label and value on one row, wrapping to two only when a cell is
+   too narrow for both. */
+.agent-instruments > div { padding: 6px 8px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 5px; border-right: 1px solid var(--line); }
 .agent-instruments > div:last-child { border: 0; }
 .agent-instruments span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .1em; }
 .agent-instruments strong { font-size: 9px; }
@@ -503,33 +673,34 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-tabs button em { min-width: 14px; padding: 1px 3px; border-radius: 8px; color: var(--shell-ink-soft); background: var(--shell-raised); font-size: 7px; font-style: normal; }
 .agent-tabs button:hover, .agent-tabs button.is-active { color: var(--shell-ink); }
 .agent-tabs button.is-active { border-bottom-color: var(--shell-teal); }
-.agent-panel { min-height: 320px; height: 42vh; max-height: 560px; display: flex; flex-direction: column; background: var(--terminal); }
-/* The terminal fills whatever the composer leaves; min-height:0 lets it shrink
-   instead of shoving the composer past the tile's overflow:hidden edge. A
-   bounded terminal also makes FitAddon report real rows to the PTY, so the
+/* Issue #2000: the 26px the inline labels saved above the terminal go to the
+   terminal, so a tile keeps its height and shows more of it. The overlay's
+   panel flexes and needs no such sum. */
+.agent-panel { min-height: 346px; height: calc(42vh + 26px); max-height: 586px; display: flex; flex-direction: column; background: var(--terminal); }
+/* The terminal fills whatever the input-state notice leaves; min-height:0 lets
+   it shrink instead of shoving that line past the tile's overflow:hidden edge.
+   A bounded terminal also makes FitAddon report real rows to the PTY, so the
    CLI's own input line stays on screen. */
 .agent-terminal-stack { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .terminal-viewport { flex: 1 1 auto; min-height: 120px; }
 .terminal-viewport, .terminal-host { width: 100%; }
 .terminal-host { height: 100%; }
 .terminal-viewport { padding: 6px 4px 3px 8px; overflow: hidden; }
-/* Always-visible external prompt box, pinned below the terminal. */
-.agent-composer { flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px; padding: 7px 9px 8px; border-top: 1px solid var(--shell-line); background: var(--paper-strong); }
-.agent-composer.is-coordinator { background: var(--shell); border-top-color: var(--shell-teal-edge); }
-.composer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.composer-title { color: var(--faint); font-size: 8px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-.composer-prompt-picker { display: flex; align-items: center; gap: 3px; color: var(--faint); }
-.composer-prompt-picker select { border: 1px solid var(--line-strong); border-radius: 5px; padding: 1px 4px; color: var(--ink); background: var(--paper); font-size: 9px; }
-.agent-composer textarea { width: 100%; resize: none; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--ink); background: var(--paper); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 11.5px; line-height: 1.45; }
-.agent-composer textarea:focus { outline: none; border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
-.agent-composer textarea:disabled { opacity: .55; cursor: not-allowed; }
-.composer-actions { display: flex; align-items: center; gap: 8px; }
-.composer-spacer { flex: 1 1 auto; }
-.composer-caution { display: flex; align-items: center; gap: 4px; color: var(--status-warn); font-size: 8px; line-height: 1.3; }
-.composer-error { display: flex; align-items: center; gap: 4px; color: var(--status-error); font-size: 8.5px; }
-.composer-status { display: flex; align-items: center; gap: 4px; margin: 0; font-size: 9px; }
-.composer-status.is-delivered { color: var(--status-ok); }
-.composer-status.is-failed { color: var(--status-error); }
+/* Issue #1042 — the terminal's own delivery state, pinned under the pane it
+   describes. A blocked pane dims its terminal so the disabled input reads as
+   disabled rather than as an agent that has gone quiet. */
+.terminal-input-status { flex: 0 0 auto; margin: 0; padding: 5px 9px 6px; display: flex; align-items: flex-start; gap: 5px; border-top: 1px solid var(--shell-line); background: var(--shell); font-size: 9px; line-height: 1.35; }
+.terminal-input-status svg { flex: 0 0 auto; margin-top: 1px; }
+.terminal-input-status.is-blocked { color: var(--status-error); }
+.terminal-viewport[aria-disabled="true"] { opacity: .62; }
+/* PRD #1105 — what stands where the terminal would be when this pane has none,
+   which today means an agent on a deck that is not the selected one. It reuses
+   `.panel-empty` on purpose: this IS one of that state's family, and the thing
+   it replaces is a black rectangle that reads as an agent gone quiet. Wider
+   measure than the other empty panels because it carries a sentence rather than
+   a label. */
+.terminal-absent { padding: 12px 18px; }
+.terminal-absent span { max-width: 52ch; font-size: 9px; line-height: 1.5; }
 .button.compact { padding: 3px 9px; font-size: 10px; gap: 4px; }
 
 /* ---- Output Reader: a large readable rendering of an agent's CLI output ---- */
@@ -537,7 +708,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-open:hover { color: var(--shell-teal-text-strong); background: var(--shell-teal-surface); }
 /* Outrank the .agent-tabs button span {display:none} tab-label rule. */
 .agent-tabs .reader-open span { display: inline; }
-.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw; background: rgb(var(--scrim-rgb) / .74); backdrop-filter: blur(2px); }
+/* The bottom padding is 3vh plus the voice row (see `.voice-row`): the scrim
+   still covers the window, and the reader inside it stops above the row. */
+.reader-overlay { position: fixed; inset: 0; z-index: 85; display: flex; justify-content: center; padding: 3vh 3vw calc(3vh + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); backdrop-filter: blur(2px); }
 .reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--shell-line); border-radius: 12px; background: var(--shell-deep); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
 .reader-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--shell-line); background: var(--shell-deep); }
 .reader-title { display: flex; align-items: center; gap: 9px; color: var(--shell-ink); }
@@ -547,11 +720,15 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-tail.is-live { color: var(--shell-teal); background: var(--shell-teal-surface); }
 .reader-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 26px 22px; scrollbar-color: var(--shell-thumb) var(--shell-deep); scrollbar-width: thin; }
 .reader-text { margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--shell-ink); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 13.5px; line-height: 1.7; user-select: text; }
-.reader-jump { position: absolute; bottom: 148px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .4); }
+.reader-jump { position: absolute; bottom: 26px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .4); }
 .reader-jump:hover { background: var(--shell-teal-surface); }
-.reader-panel .agent-composer { border-top: 1px solid var(--shell-line); }
 .terminal-host .xterm { height: 100%; }
 .terminal-host .xterm-viewport { scrollbar-color: var(--shell-thumb) var(--terminal); scrollbar-width: thin; }
+/* Issue #1492: xterm shows its scrollbar only while the terminal is hovered or
+   scrolled, so output above or below the rows on screen was invisible at rest.
+   `has-scrollback` is set by `TerminalViewport` while there is any, and keeps
+   the bar shown and usable then; a terminal whose output fits has none. */
+.terminal-host.has-scrollback .xterm .xterm-scrollable-element > .scrollbar.vertical { opacity: 1; pointer-events: auto; }
 .text-panel { width: 100%; height: 100%; padding: 10px; overflow: auto; color: var(--shell-ink); background: var(--terminal); font-size: 9px; }
 .panel-caption { margin-bottom: 8px; display: flex; align-items: center; gap: 5px; color: var(--shell-faint); text-transform: uppercase; letter-spacing: .09em; }
 .diff-panel > code { padding: 4px 0; display: block; border-bottom: 1px solid var(--shell-line); color: var(--shell-teal-text); }
@@ -571,7 +748,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-footer span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
 .agent-footer strong { color: var(--shell-teal); font-size: 7px; }
 
-.evidence-drawer { width: var(--drawer-width); position: fixed; z-index: 35; inset: 0 0 0 auto; display: grid; grid-template-rows: 72px 38px minmax(160px, 1fr) auto 30px; border-left: 1px solid var(--line-strong); background: var(--paper); }
+/* The bottom inset is the voice row (see `.voice-row`); this drawer is z-index
+   35 and would otherwise have its last grid row drawn over. */
+.evidence-drawer { width: var(--drawer-width); position: fixed; z-index: 35; inset: 0 0 var(--voice-reserved) auto; display: grid; grid-template-rows: 72px 38px minmax(160px, 1fr) auto 30px; border-left: 1px solid var(--line-strong); background: var(--paper); }
 .evidence-drawer > header { padding: 0 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .evidence-drawer h2 { margin: 2px 0 0; font-size: 13px; }
 .evidence-drawer > header button, .shortcut-dialog header button { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 3px; background: transparent; cursor: pointer; }
@@ -629,8 +808,15 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .empty-deck > div { margin-top: 15px; display: flex; gap: 7px; }
 
 .sheet-backdrop, .dialog-backdrop { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; background: rgb(var(--scrim-rgb) / .42); }
+/* PR #1680 review — a sheet opened over the agent's pane (90) or the pull
+   request browser (92), from the deck's command menu, is what the user just
+   asked for: drawn above both, and still below the voice row (95) and every
+   dialog (100). `OVERLAY_LAYER` in `useInertBackground.ts` holds these
+   numbers as the order voice's "close" walks; `overlayLayers.test.ts` reads
+   them back from this file. */
+.sheet-backdrop.is-raised { z-index: 93; }
 .config-sheet { width: min(780px, calc(100vw - 74px)); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--paper); box-shadow: -12px 0 32px rgb(var(--scrim-rgb) / .12); }
-.workflow-sheet { width: min(610px, calc(100vw - 74px)); }
+.orchestration-sheet { width: min(610px, calc(100vw - 74px)); }
 .projects-sheet { width: min(850px, calc(100vw - 74px)); }
 .sheet-header { min-height: 92px; padding: 18px 20px; display: flex; align-items: flex-start; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .sheet-header h2 { margin: 3px 0 5px; font-size: 20px; letter-spacing: -.02em; }
@@ -689,24 +875,24 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .sheet-footer > div { display: flex; align-items: center; gap: 9px; }
 .sheet-footer > div > span, .sheet-footer > span { color: var(--faint); font-size: 8px; }
 .configuration-empty { display: grid; place-items: center; color: var(--muted); }
-.workflow-editor-list { padding: 12px 16px; display: grid; gap: 7px; overflow: auto; }
-.workflow-launch-form { padding: 13px 16px; display: grid; grid-template-columns: minmax(130px, .55fr) minmax(220px, 1.45fr); gap: 10px; border-bottom: 1px solid var(--line); background: var(--paper-sunken); }
-.workflow-launch-form label { display: flex; flex-direction: column; gap: 5px; }
-.workflow-launch-form .workflow-task-prompt { grid-column: 1 / -1; }
-.workflow-launch-form label span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-.workflow-launch-form input, .workflow-launch-form textarea { padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper-strong); font-family: "JetBrains Mono", monospace; font-size: 9px; }
-.workflow-launch-form input { height: 33px; }
-.workflow-launch-form textarea { min-height: 104px; padding-top: 8px; resize: vertical; line-height: 1.45; }
-.workflow-launch-form > small { grid-column: 1 / -1; display: flex; align-items: center; gap: 5px; color: var(--red); font-size: 8px; }
-.workflow-editor-row { min-height: 57px; padding: 7px 8px; display: grid; grid-template-columns: 17px 28px minmax(0, 1fr) auto 55px; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-strong); }
-.workflow-editor-row.is-disabled { opacity: .58; }
-.workflow-editor-row > svg { color: var(--faint); }
-.workflow-order { color: var(--teal); font-family: "JetBrains Mono", monospace; font-size: 9px; }
-.workflow-editor-row > div:nth-child(3) { display: flex; flex-direction: column; gap: 3px; }
-.workflow-editor-row strong { font-size: 10px; }
-.workflow-editor-row strong .start-role { margin-left: 6px; padding: 2px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 6px; font-style: normal; letter-spacing: .08em; vertical-align: 1px; }
-.workflow-editor-row strong .custom-command-badge { margin-left: 5px; padding: 2px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: 6px; font-style: normal; letter-spacing: .06em; vertical-align: 1px; }
-.workflow-editor-row small { color: var(--faint); font-size: 8px; }
+.orchestration-editor-list { padding: 12px 16px; display: grid; gap: 7px; overflow: auto; }
+.orchestration-launch-form { padding: 13px 16px; display: grid; grid-template-columns: minmax(130px, .55fr) minmax(220px, 1.45fr); gap: 10px; border-bottom: 1px solid var(--line); background: var(--paper-sunken); }
+.orchestration-launch-form label { display: flex; flex-direction: column; gap: 5px; }
+.orchestration-launch-form .orchestration-task-prompt { grid-column: 1 / -1; }
+.orchestration-launch-form label span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.orchestration-launch-form input, .orchestration-launch-form textarea { padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper-strong); font-family: "JetBrains Mono", monospace; font-size: 9px; }
+.orchestration-launch-form input { height: 33px; }
+.orchestration-launch-form textarea { min-height: 104px; padding-top: 8px; resize: vertical; line-height: 1.45; }
+.orchestration-launch-form > small { grid-column: 1 / -1; display: flex; align-items: center; gap: 5px; color: var(--red); font-size: 8px; }
+.orchestration-editor-row { min-height: 57px; padding: 7px 8px; display: grid; grid-template-columns: 17px 28px minmax(0, 1fr) auto 55px; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-strong); }
+.orchestration-editor-row.is-disabled { opacity: .58; }
+.orchestration-editor-row > svg { color: var(--faint); }
+.orchestration-order { color: var(--teal); font-family: "JetBrains Mono", monospace; font-size: 9px; }
+.orchestration-editor-row > div:nth-child(3) { display: flex; flex-direction: column; gap: 3px; }
+.orchestration-editor-row strong { font-size: 10px; }
+.orchestration-editor-row strong .start-role { margin-left: 6px; padding: 2px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 6px; font-style: normal; letter-spacing: .08em; vertical-align: 1px; }
+.orchestration-editor-row strong .custom-command-badge { margin-left: 5px; padding: 2px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: 6px; font-style: normal; letter-spacing: .06em; vertical-align: 1px; }
+.orchestration-editor-row small { color: var(--faint); font-size: 8px; }
 .compact-check { display: flex; flex-direction: row !important; align-items: center; gap: 4px !important; cursor: pointer; }
 .compact-check input { position: absolute; opacity: 0; pointer-events: none; }
 .compact-check > span { width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 3px; color: var(--on-accent); }
@@ -714,7 +900,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .compact-check em { color: var(--muted); font-size: 8px; font-style: normal; }
 .order-buttons { display: flex; gap: 3px; }
 .order-buttons button { width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 3px; background: transparent; cursor: pointer; }
-.workflow-footer { margin-top: auto; }
+.orchestration-footer { margin-top: auto; }
 
 .project-notice { border-bottom-color: var(--teal-rim); color: var(--teal-wash-ink); background: var(--teal-wash); }
 /* Settings sheet (PRD #803 M3). Section list beside the active panel, in the
@@ -733,6 +919,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .settings-footer { justify-content: flex-start; }
 .settings-footer > span { display: flex; align-items: center; gap: 7px; }
 .settings-footer code { color: var(--muted); font-size: 8px; }
+/* The document is not in use (issue #829): the footer carries the reason in
+   place of the path, in the same ink the panel's own problem line uses. */
+.settings-footer .is-problem { color: var(--red-ink); }
 
 /* One setting, one row: a two-column grid — a label column, a gutter, then the
    control immediately beside it (PRD #803's density rule —
@@ -784,6 +973,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    the reason the rule above gives: it lays out identically in both engines and
    keeps the group's accessible name. */
 .settings-row > .settings-row-label { color: var(--ink); font-size: 13px; font-weight: 650; }
+/* A row that STATES a value instead of offering one (PRD #802 M5). Used where
+   a setting has exactly one legal value today and a `<select>` with one option
+   would imply a choice the user does not have. Sized like a select's own text
+   so a stated row and a chosen row sit on the same baseline, and rendered in
+   `--ink` rather than `--muted` because it is the value, not a hint about one.
+   When the setting gains its other values it becomes an ordinary select row. */
+.settings-value { margin: 0; color: var(--ink); font-size: 10px; }
 .settings-row select { min-width: 96px; height: 28px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font-size: 10px; }
 .settings-row select:disabled { color: var(--faint); background: var(--paper-sunken); cursor: not-allowed; }
 
@@ -807,6 +1003,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* A port is four digits; a full-width box for it reads as a field that wants a
    sentence. */
 .settings-input.is-narrow { width: 96px; }
+
+/* A credential row's control (PRD #802 M4): the field plus its one or two
+   buttons, as ONE grid item, so the row keeps the 132px label column and two
+   children that `e2e/settings-rows.spec.ts` can measure. */
+.voice-secret { width: 100%; display: flex; align-items: center; gap: 7px; }
+.voice-secret .settings-input { flex: 1 1 auto; }
+.voice-secret .button { flex: 0 0 auto; }
 /* What is wrong with a field. Below the row it belongs to and inside the label
    column's gutter, so it reads as attached to the control rather than as a new
    setting. */
@@ -823,6 +1026,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .deck-choice label { min-width: 0; display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .deck-choice label > span { overflow: hidden; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .deck-choice input { accent-color: var(--teal); }
+/* A named deck's address (issue #1426): beside the name and quieter than it,
+   so the name reads first and the machine it points at is still in view. */
+.deck-choice-address { min-width: 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+/* A deck row's confirming button — Rename, or Add this daemon — under the
+   controls it acts on, starting where they start: the 132px label column plus
+   the 16px gutter. Not a `.settings-row`, which is one label and one control. */
+.deck-row-actions { padding-left: 148px; display: flex; align-items: center; gap: 7px; }
 .add-deck { min-height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px dashed var(--teal-rim); border-radius: 4px; color: var(--teal); background: var(--teal-wash); cursor: pointer; font-size: 9px; font-weight: 700; }
 /* The chosen deck's own fields. A rule above them rather than a card around
    them: the rows inside are the same two-column rows as everywhere else, and a
@@ -897,21 +1107,146 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .confirm-dialog { text-align: center; }
 .danger-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--red); background: var(--red-soft); }
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
-.confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; }
+.confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
-.toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: 16px; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
+/* PRD #1487 M5 — the Upgrade / Replace daemon dialog: the confirm card, plus its stages and stop lists. */
+.upgrade-dialog { width: min(440px, 100%); }
+.upgrade-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--green); background: var(--green-soft); }
+.upgrade-stages { list-style: none; margin: 12px auto 4px; padding: 0; max-width: 320px; display: grid; gap: 5px; text-align: left; font-size: 10.5px; }
+.upgrade-stages li { display: flex; align-items: center; gap: 7px; color: var(--muted); }
+.upgrade-stages li[data-state="active"] { color: var(--ink); font-weight: 600; }
+.upgrade-stages li[data-state="done"] { color: var(--ink); }
+.upgrade-stage-dot { width: 14px; height: 14px; display: inline-grid; place-items: center; }
+.upgrade-stage-dot::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); }
+.upgrade-stop-list { margin: 0 auto 12px; padding: 7px 10px 7px 24px; max-width: 360px; max-height: 180px; overflow: auto; text-align: left; font-size: 10px; line-height: 1.5; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); overflow-wrap: anywhere; }
+.upgrade-dialog [data-testid="upgrade-decision"] > div:last-child, .upgrade-dialog [data-testid="upgrade-outcome"] > div:last-child { display: flex; justify-content: center; gap: 7px; }
+/* The decision and outcome bodies are the dialog's last child, so `.confirm-dialog > div:last-child` (the button row rule) would lay their sentences, list and buttons out side by side. They stack; only their own last child is a button row. */
+.confirm-dialog.upgrade-dialog > div[data-testid="upgrade-decision"], .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-outcome"] { display: block; }
+/* Issue #1635 — this machine's own copies: the rail's newer-release button, the dashboard banner, and the dialog's per-copy plans. */
+.rail-bottom .rail-update { color: var(--shell-teal); border-color: var(--shell-teal-edge); background: var(--shell-teal-surface); }
+.rail-bottom .rail-update:hover, .rail-bottom .rail-update:focus-visible { color: var(--shell-teal-text-strong); }
+.self-upgrade-banner { margin-bottom: 8px; }
+.self-upgrade-banner .self-upgrade-banner-open { width: auto; padding: 0 8px; border: 1px solid currentColor; font-size: 10px; font-weight: 600; }
+.self-upgrade-dialog { width: min(520px, 100%); max-height: 80vh; overflow: auto; }
+.self-upgrade-plan { margin: 12px 0 0; padding: 9px 11px; text-align: left; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+.self-upgrade-plan h3 { margin: 0 0 5px; font-size: 11px; }
+.self-upgrade-lines p { margin: 4px 0; max-width: none; color: var(--muted); font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.self-upgrade-command { margin: 4px 0; display: flex; align-items: flex-start; gap: 6px; }
+.self-upgrade-command code { flex: 1; padding: 5px 7px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-sunken); color: var(--ink); font-size: 9px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.self-upgrade-command button { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: var(--paper-strong); cursor: pointer; }
+.self-upgrade-running { margin: 6px 0 0; display: flex; align-items: center; gap: 6px; color: var(--ink); font-size: 9.5px; }
+.self-upgrade-result { margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.self-upgrade-result[data-ok="true"] .self-upgrade-lines p:first-child { color: var(--ink); font-weight: 600; }
+.self-upgrade-result[data-ok="false"] .self-upgrade-lines p:first-child { color: var(--red); }
+.self-upgrade-actions { margin-top: 14px; }
+.self-upgrade-actions > p { margin: 0 auto 10px; color: var(--ink); font-size: 10.5px; }
+.self-upgrade-actions > div { display: flex; justify-content: center; gap: 7px; }
+/* The actions block is the dialog's last child, so `.confirm-dialog > div:last-child` would lay its question and buttons out side by side. */
+.confirm-dialog.self-upgrade-dialog > div.self-upgrade-actions { display: block; }
+
+/* PRD #1223 M4 — the New agent dialog. One card over the `.dialog-backdrop`
+   scrim, as the palette and the confirmation are: a deck step, a directory step
+   and a form share it, so its height follows the step rather than a sheet's. */
+.new-agent-dialog { width: min(560px, 100%); max-height: calc(100vh - 11vh - 40px); display: flex; flex-direction: column; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
+.new-agent-dialog > header { padding: 12px 13px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); }
+.new-agent-dialog > header h2 { margin: 0; font-size: 14px; }
+.new-agent-dialog > header .icon-button { margin-left: auto; }
+.new-agent-deck { min-width: 0; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-body { min-height: 0; padding: 12px 13px; display: flex; flex-direction: column; gap: 9px; overflow: auto; }
+.new-agent-dialog > footer { padding: 10px 13px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; border-top: 1px solid var(--line); }
+.new-agent-list { max-height: 300px; margin: 0; padding: 4px; overflow: auto; list-style: none; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+.new-agent-list:focus-visible { outline: 2px solid var(--teal); outline-offset: 1px; }
+.new-agent-row { min-height: 30px; padding: 5px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+.new-agent-row:hover { background: var(--paper-sunken); }
+.new-agent-row.is-active { background: var(--teal-soft); }
+.new-agent-row.is-chosen .new-agent-row-name { color: var(--teal-deep); }
+.new-agent-row-name { min-width: 0; overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-row-tag { padding: 1px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); font-size: 8.5px; text-transform: uppercase; letter-spacing: .04em; }
+.new-agent-current input, .new-agent-field input, .new-agent-field select { min-width: 0; height: 30px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper); font: inherit; font-size: 11px; }
+.new-agent-current { display: flex; align-items: center; gap: 9px; }
+.new-agent-current strong { min-width: 0; flex: 1; overflow: hidden; font-family: "JetBrains Mono", monospace; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-current input { width: 150px; }
+.new-agent-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10.5px; white-space: nowrap; cursor: pointer; }
+.new-agent-current .new-agent-toggle input { width: auto; height: auto; margin: 0; }
+.new-agent-hint, .new-agent-keys { margin: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9.5px; line-height: 1.4; }
+.new-agent-keys { color: var(--faint); }
+.new-agent-error { margin: 0; color: var(--red); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.new-agent-cleanup { font-weight: 650; }
+.cleanup-warning p { margin: 0; }
+.cleanup-warning ul { margin: 2px 0 0; padding-left: 15px; max-height: 96px; overflow: auto; overflow-wrap: anywhere; }
+.new-agent-detail { color: var(--muted); font-size: 9.5px; line-height: 1.4; }
+.new-agent-detail summary { cursor: pointer; }
+.new-agent-detail p { margin: 4px 0 0; max-height: 120px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }
+.new-agent-form { display: flex; flex-direction: column; gap: 9px; }
+/* The single surface (PRD #1223): deck, directory browser and form stacked in one scrolling body. */
+.new-agent-section { display: flex; flex-direction: column; gap: 7px; }
+.new-agent-section + .new-agent-section { padding-top: 9px; border-top: 1px solid var(--line); }
+.new-agent-section > h3, .new-agent-section-head > h3 { margin: 0; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+/* PR #1451 round 3, change 4: the daemons are always shown in full. */
+.new-agent-list.is-decks { max-height: none; overflow: visible; }
+.new-agent-list.is-directories { max-height: 200px; }
+.new-agent-list[aria-disabled="true"] { opacity: .6; }
+.new-agent-current .new-agent-keys { flex: 1; }
+.new-agent-unset { color: var(--faint); font-family: inherit; font-weight: 400; }
+.new-agent-field { display: grid; grid-template-columns: 76px minmax(0, 1fr); align-items: center; gap: 9px; font-size: 11px; }
+.new-agent-field > span { color: var(--muted); font-weight: 650; }
+.new-agent-field > strong { min-width: 0; overflow: hidden; font-family: "JetBrains Mono", monospace; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-field input[data-testid="new-agent-command"] { font-family: "JetBrains Mono", monospace; }
+.new-agent-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.new-agent-chip { min-height: 26px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 13px; color: var(--ink); background: var(--paper); cursor: pointer; font-size: 10px; font-weight: 650; }
+.new-agent-chip.is-active { border-color: var(--teal-deep); color: var(--on-accent); background: var(--teal); }
+.new-agent-chip.is-disabled { border-style: dashed; color: var(--faint); cursor: not-allowed; }
+/*
+  PR #1451 round 3, change 4 — while voice is on, the dialog takes its full
+  height and the directory rows fill what the body leaves, as a grid of as many
+  columns as fit (`NewAgentDialog` measures the list and pages it to what it
+  holds), so nothing voice can choose is scrolled out of sight. The list never
+  scrolls then: its height comes from the space, not from its rows. The Mode
+  chips become a grid of the field's width, paged to the rows the body shows.
+*/
+.new-agent-dialog.is-voice-pages { width: min(880px, 100%); height: calc(100vh - 11vh - 40px); }
+.new-agent-dialog.is-voice-pages .new-agent-body { flex: 1 1 auto; }
+.new-agent-dialog.is-voice-pages .new-agent-directory-panel { flex: 1 0 auto; }
+.new-agent-list.is-directories.is-paged { flex: 1 1 0; min-height: 106px; max-height: none; overflow: hidden; display: grid; grid-auto-flow: column; gap: 2px; align-content: stretch; }
+.new-agent-list.is-paged .new-agent-row { min-width: 0; flex-wrap: nowrap; }
+.new-agent-chips.is-paged { display: grid; gap: 5px; }
+.new-agent-chips.is-paged .new-agent-chip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 9px; }
+.new-agent-page { color: var(--muted); font-size: 9.5px; font-weight: 650; white-space: nowrap; }
+.new-agent-field > span .new-agent-page { display: block; margin-top: 2px; font-weight: 500; }
+/* The overview's own line for what the New agent flow could not finish on
+   screen — an agent that started and has not been listed yet. */
+.overview-banner { padding: 8px 10px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); font-size: 10px; }
+.overview-banner span { flex: 1; }
+.overview-banner button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 3px; color: inherit; background: transparent; cursor: pointer; }
+.daemon-new-agent { flex: 0 0 auto; margin-left: auto; }
+.daemon-pips + .daemon-new-agent { margin-left: 0; }
+.daemon-upgrade { flex: 0 0 auto; margin-left: auto; }
+.daemon-pips + .daemon-upgrade { margin-left: 0; }
+.daemon-upgrade + .daemon-new-agent { margin-left: 0; }
+/* Lifted clear of the voice row (see `.voice-row`). It is z-index 120 and would
+   otherwise sit on top of the report text, which is the same corner. The STACK
+   is what is positioned (issue #1234): each undismissed cleanup warning is its
+   own box above the message, so a column of them scrolls rather than running
+   off the top of the window. */
+.toast-stack { max-width: min(470px, calc(100vw - 30px)); max-height: calc(100vh - var(--voice-reserved) - 32px); position: fixed; z-index: 120; right: 18px; bottom: calc(var(--voice-reserved) + 16px); display: flex; flex-direction: column; align-items: flex-end; gap: 6px; overflow-y: auto; }
+.toast { max-width: 100%; min-height: 42px; padding: 8px 9px; flex: 0 0 auto; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
+.toast-body { display: grid; gap: 3px; min-width: 0; }
+/* PRD #1666 part 2 (G-fix7d): the restart notice names every agent it holds, so a long list scrolls inside the toast rather than run off it. */
+.toast-restart .toast-body { max-height: 40vh; overflow-y: auto; overflow-wrap: anywhere; }
 .toast button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
 @media (min-width: 1450px) {
   .agent-tabs button span { display: inline; }
   .agent-tabs button { min-width: 61px; }
-  .agent-panel { height: 36vh; max-height: 520px; }
+  .agent-panel { height: calc(36vh + 26px); max-height: 546px; }
 }
 
 @media (max-width: 1260px) {
   .control-deck.with-evidence .deck-main { margin-right: 0; }
   .evidence-drawer { z-index: 55; box-shadow: -10px 0 28px rgb(var(--scrim-rgb) / .14); }
-  .run-instruments .instrument:nth-child(3), .run-instruments .instrument:nth-child(5) { display: none; }
+  .deck-instruments .instrument:nth-child(3), .deck-instruments .instrument:nth-child(5) { display: none; }
+  .overview-instruments .instrument-optional { display: none; }
   .topbar { grid-template-columns: minmax(180px, 1fr) auto minmax(230px, auto); }
 }
 
@@ -921,7 +1256,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .topbar { height: auto; min-height: 68px; grid-template-columns: 1fr auto; }
   .run-instruments { display: none; }
   .agent-grid { grid-template-columns: 1fr; }
-  .agent-panel { height: 340px; max-height: 340px; }
+  .agent-panel { height: 366px; max-height: 366px; }
   .workflow-track { overflow-x: auto; grid-template-columns: repeat(6, minmax(125px, 1fr)); }
   .command-trigger span { display: none; }
   .command-trigger { min-width: auto; }
@@ -930,7 +1265,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 }
 
 @media (max-width: 680px) {
-  :root { --rail-width: 0px; }
+  /* The rail is a 54px BOTTOM bar here, so the voice row sits on top of it
+     rather than on the window's edge. See `.voice-row`. */
+  :root { --rail-width: 0px; --bottom-rail-height: 54px; }
   .rail { width: 100%; height: 54px; inset: auto 0 0; padding: 4px 8px; flex-direction: row; border: 0; border-top: 1px solid var(--shell-line-deep); }
   .brand-mark, .rail-bottom { display: none; }
   .rail nav { margin: 0; display: flex; justify-content: space-around; }
@@ -952,10 +1289,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .agent-tile:not(.is-selected) { display: none; }
   .agent-panel, .agent-tabs { display: none; }
   .agent-footer { height: 34px; }
-  .agent-instruments { min-height: 46px; }
-  .agent-assignment { min-height: 58px; }
-  .evidence-drawer { width: 100%; inset: 0; grid-template-rows: 64px 38px 1fr auto 30px; }
-  .config-sheet, .workflow-sheet, .projects-sheet { width: 100%; }
+  .agent-instruments { min-height: 32px; }
+  .agent-assignment { min-height: 48px; }
+  .evidence-drawer { width: 100%; inset: 0 0 var(--voice-reserved); grid-template-rows: 64px 38px 1fr auto 30px; }
+  .config-sheet, .orchestration-sheet, .projects-sheet { width: 100%; }
   .projects-layout { display: flex; flex-direction: column; }
   .project-library { max-height: 185px; border-right: 0; border-bottom: 1px solid var(--line); }
   .project-library nav { display: flex; }
@@ -966,13 +1303,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .form-grid { grid-template-columns: 1fr; }
   .form-wide { grid-column: auto; }
   .sheet-footer > div > span { display: none; }
-  .workflow-editor-row { grid-template-columns: 20px 25px minmax(0, 1fr) 50px; }
-  .workflow-launch-form { grid-template-columns: 1fr; }
-  .workflow-launch-form > small { grid-column: auto; }
-  .workflow-editor-row .compact-check em { display: none; }
-  .workflow-editor-row .order-buttons { grid-column: 4; }
-  .workflow-editor-row .compact-check { grid-column: 1; grid-row: 1; }
-  .workflow-editor-row > svg { display: none; }
+  .orchestration-editor-row { grid-template-columns: 20px 25px minmax(0, 1fr) 50px; }
+  .orchestration-launch-form { grid-template-columns: 1fr; }
+  .orchestration-launch-form > small { grid-column: auto; }
+  .orchestration-editor-row .compact-check em { display: none; }
+  .orchestration-editor-row .order-buttons { grid-column: 4; }
+  .orchestration-editor-row .compact-check { grid-column: 1; grid-row: 1; }
+  .orchestration-editor-row > svg { display: none; }
   .loading-grid { grid-template-columns: 1fr; }
   .loading-grid > div:not(:first-child) { display: none; }
 }
@@ -993,6 +1330,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   /* The stacked row has no label column, so the problem line has nothing to
      align under. */
   .settings-hint.is-problem { margin-left: 0; }
+  .deck-row-actions { padding-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1010,7 +1348,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .handoff-endpoint { font-family: "JetBrains Mono", monospace; font-size: 10.5px; }
 .handoff-respawn { display: inline-flex; color: var(--amber); }
 .handoff-status { display: inline-flex; align-items: center; gap: 4px; margin-left: 2px; font-style: normal; font-size: 9.5px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
-.handoff-status.is-dispatched { color: var(--muted); }
+.handoff-status.is-delegated { color: var(--muted); }
 .handoff-status.is-delivered { color: var(--teal); }
 .handoff-status.is-done { color: var(--green); }
 .handoff-status.is-failed { color: var(--red); }
@@ -1030,6 +1368,32 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    fleet view; the gap is what separates two decks' cards from each other now
    that there can be several, and with one deck it changes nothing. */
 .overview-body { padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+/* Issue #1492: the dashboard's daemons scroll in their own region, between the
+   top bar and the voice row, rather than the whole window scrolling. Its
+   scrollbar is then the dashboard's own and is drawn at rest: macOS and most
+   Linux desktops otherwise show a scrollbar only while it is being scrolled,
+   so a dashboard with more below looked complete. Styling it is what keeps
+   WebKit and WebView2 from treating it as an overlay that fades; it is still
+   drawn only when the daemons overflow. A region rather than the window, so
+   the full-window layers over the dashboard (an agent pane, a dialog, the
+   voice row) keep the whole window's width. Not beside
+   `scrollbar-color`/`scrollbar-width`, which make Chromium ignore these rules. */
+.overview-screen .deck-main { height: calc(100vh - var(--bottom-rail-height)); min-height: 0; display: flex; flex-direction: column; }
+/* `position: relative` makes the region the containing block of what is
+   absolutely positioned inside it — the visually hidden table headers — so it
+   clips them; otherwise they sit at their static place below the window and
+   make the window scroll as well. */
+.overview-screen .overview-body { position: relative; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+/* Focusable so the keyboard can scroll it; the ring sits inside the region, which would clip one drawn outside. */
+.overview-screen .overview-body:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.overview-body::-webkit-scrollbar { width: 12px; }
+.overview-body::-webkit-scrollbar-track { background: var(--canvas); }
+.overview-body::-webkit-scrollbar-thumb { min-height: 40px; border: 3px solid var(--canvas); border-radius: 6px; background: var(--line-strong); }
+.overview-body::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+.workspace-page { color: var(--ink); font-weight: 700; }
+/* Issue #1492: a row scrolled into view by voice (`revealAgent`) stops a
+   little inside the dashboard's scroll region rather than flush with its edge. */
+.overview-row { scroll-margin: 12px 0; }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
 /* A deck that is not answering, sitting beside decks that are. Dimmed rather
    than alarming: an unreachable deck in a fleet is a fact about that deck, and
@@ -1048,6 +1412,31 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .daemon-state { min-width: 0; margin: 0; overflow: hidden; color: var(--faint); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 .daemon-pips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 5px; }
 .daemon-group-body { padding: 11px 12px 13px; }
+/* PRD #1258: the deck's host — a compact button beside the deck's name,
+   coloured by the worst level the deck's daemon reported, opening the numbers
+   in a popover. The green/amber/red families are the ones the status labels
+   use, with their light and dark values; no level leaves the button neutral. */
+.host-metrics-anchor { position: relative; flex: none; }
+.host-metrics-button.host-button-ok { color: var(--green); background: var(--green-soft); border-color: var(--green-rim); }
+.host-metrics-button.host-button-warn { color: var(--amber-ink); background: var(--amber-soft); border-color: var(--amber-rim); }
+.host-metrics-button.host-button-critical { color: var(--red-ink); background: var(--red-soft); border-color: var(--red-rim-strong); }
+.host-metrics-popover { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; width: min(380px, calc(100vw - 24px)); border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); }
+.host-metrics { padding: 9px 12px 10px; }
+/* PR #1672 — the popover's X, the other overlays' icon button, in the top-right
+   corner; the header keeps clear of it and is tall enough that the first row
+   starts below it. */
+.host-metrics-close { position: absolute; top: 4px; right: 4px; }
+.host-metrics-header { min-height: 26px; padding-right: 32px; display: flex; flex-wrap: wrap; align-items: baseline; align-content: center; gap: 8px; margin-bottom: 6px; }
+.host-metrics-header strong { font-size: 11px; font-weight: 720; }
+.host-metrics-subtitle { color: var(--faint); font-size: 9.5px; }
+.host-metrics-rows { margin: 0; display: grid; gap: 3px; }
+.host-metrics-row { display: flex; gap: 8px; min-width: 0; font-size: 10.5px; }
+.host-metrics-row dt { flex: 0 0 112px; color: var(--muted); }
+.host-metrics-row dd { margin: 0; min-width: 0; font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; }
+.host-metrics-row dd.host-level-ok { color: var(--green); }
+.host-metrics-row dd.host-level-warn { color: var(--amber); }
+.host-metrics-row dd.host-level-critical { color: var(--red); font-weight: 650; }
+.host-metrics-unavailable { margin: 0; color: var(--muted); font-size: 10.5px; }
 
 .overview-legend { padding: 0 12px 6px; }
 .overview-legend span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .12em; }
@@ -1159,10 +1548,12 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-note h3 { margin: 11px 0 5px; color: var(--ink); font-size: 14px; }
 .overview-note p { max-width: 460px; margin: 0 0 4px; font-size: 10px; line-height: 1.55; }
 .overview-note-hint { color: var(--faint); }
+/* #1083: the same note inside a config sheet, clear of the sheet's edges. */
+.overview-note.sheet-select-deck { min-height: 200px; margin: 16px 20px; }
 .overview-note > div { margin-top: 15px; display: flex; gap: 7px; }
 
 .count-running { color: var(--teal); }
-.count-waiting { color: var(--amber); }
+.count-needs-input { color: var(--amber); }
 .count-failed { color: var(--red); }
 /* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
 .overview-screen .count-unknown { color: var(--faint); }
@@ -1195,3 +1586,335 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    mystery icon in a menu of words. */
 .overview-columns-reset { margin-top: 6px; padding: 4px 5px; display: flex; align-items: center; gap: 5px; border: 0; border-top: 1px solid var(--line); border-radius: 0 0 3px 3px; background: none; color: var(--muted); font-size: 9.5px; cursor: pointer; }
 .overview-columns-reset:hover { color: var(--ink); background: var(--paper-strong); }
+
+/* ---- Issue #1496: the agent dashboard's filter ---- */
+.dashboard-filter { display: flex; align-items: center; gap: 6px; }
+.dashboard-filter .button span { white-space: nowrap; }
+.dashboard-filter-text { width: 120px; height: 28px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper); font: inherit; font-size: 10px; }
+.dashboard-filter-text:focus { outline: 2px solid var(--line-strong); outline-offset: 1px; }
+.dashboard-filter-menu { min-width: 220px; max-height: min(420px, 70vh); overflow-y: auto; }
+.dashboard-filter-menu fieldset { margin: 0 0 6px; padding: 0; border: 0; }
+.dashboard-filter-menu legend { padding: 2px 4px; color: var(--faint); font-size: 8.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+/* What the filter shows, on its own line under the header; the counts in the header stay the whole fleet's. */
+.dashboard-filter-line { min-height: 34px; padding: 4px 22px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); color: var(--ink); background: var(--paper-strong); font-size: 10px; }
+.dashboard-filter-summary { font-weight: 700; }
+.dashboard-filter-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.dashboard-filter-chip { display: inline-flex; align-items: center; gap: 3px; padding: 2px 3px 2px 8px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--paper); }
+.dashboard-filter-chip button { width: 18px; height: 18px; display: grid; place-items: center; border: 0; border-radius: 50%; color: var(--muted); background: transparent; cursor: pointer; }
+.dashboard-filter-chip button:hover { color: var(--ink); background: var(--paper-strong); }
+.dashboard-filter-line > .button { margin-left: auto; }
+/* A daemon or group none of whose agents the filter shows: one line, never dropped silently. */
+.overview-filter-empty { margin: 0; padding: 8px 12px; color: var(--muted); font-size: 10px; }
+@media (max-width: 760px) {
+  .dashboard-filter-text { width: 110px; }
+  .dashboard-filter-line { padding: 4px 10px; }
+}
+
+/* ---- PRD #1105: one agent's pane, over the screen it was opened from ---- */
+/* The frame around every tile, open or not. Closed it is `display: contents`,
+   so `.agent-tile` stays the grid item it has always been and nothing about the
+   deck's layout moves — the element exists only so React has a stable position
+   to promote the tile IN, rather than unmounting it into an overlay. */
+.agent-pane-slot { display: contents; }
+/* Open, the same element is the dialog. `position: fixed` takes it out of the
+   grid's flow entirely, so the tiles behind it re-flow one cell and keep their
+   size — `.agent-grid`'s columns are a fixed template, and `ResizeObserver`
+   fires on box size rather than position, so this costs no extra geometry
+   report. `inset: 0` with no margin is what makes the box the window, which is
+   what the browser tier measures. Between `.reader-overlay` (85) and
+   `.dialog-backdrop` (100): a modal dialog still belongs on top of a pane. */
+.agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
+/* Every rule below is keyed off `data-presentation`, the seam M1 put on the
+   tile, and every one of them exists to outrank something. The compound
+   `.agent-tile[data-presentation="overlay"]` is (0,2,0) rather than the (0,1,0)
+   an attribute selector alone would be, which is what it takes to beat
+   `@media (max-width: 680px)`'s `.agent-tile:not(.is-selected)` — `:not()`
+   carries its argument's specificity, so that rule is (0,2,0) too and this one
+   wins on source order, being last in the file. Media queries add no
+   specificity of their own. */
+.agent-tile[data-presentation="overlay"] { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; border-color: var(--teal-focus); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
+/* The terminal's box, and the whole of "enlarging really enlarges": drop the
+   tile's fixed 42vh band for whatever the window leaves after the header,
+   assignment, instruments, tabs and footer. `TerminalViewport` measures its own
+   host under a `ResizeObserver`, so the bigger box reports a bigger geometry
+   through the path that already exists and no measurement code changes.
+   `display: none` here is what `@media (max-width: 680px)` would otherwise
+   leave, which is a pane with no terminal in it at all. */
+[data-presentation="overlay"] .agent-panel { min-height: 0; height: auto; max-height: none; flex: 1 1 auto; display: flex; }
+[data-presentation="overlay"] .agent-tabs { display: flex; }
+/* The tab labels. They are hidden by a `min-width: 1450px` media query, which
+   asks how wide the WINDOW is when the question is how wide this PANE is — a
+   pane-width question a media query structurally cannot answer, and the overlay
+   is the case where the two answers differ. */
+[data-presentation="overlay"] .agent-tabs button span { display: inline; }
+[data-presentation="overlay"] .agent-tabs button { min-width: 61px; }
+/* The two-line clamp exists for a half-width tile. Nothing else in the header
+   is removed or compacted: in the grid, position tells a reader which tile they
+   are looking at, and in the pane that context is gone, so identity matters
+   MORE here rather than less. */
+[data-presentation="overlay"] .agent-assignment p { display: block; -webkit-line-clamp: none; }
+
+/* The header's right-hand group: the attempt read-out and whichever of Open and
+   Close this tile was given. One `<div>` so the header's `space-between` still
+   has exactly two children and the identity block keeps the whole left side. */
+.agent-header-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+.agent-pane-control { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.agent-pane-control:hover { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+/* The overview's entry control. `margin-left: auto` puts it at the end of the
+   name cell rather than beside the name, so a long display name is still
+   clamped by its own `text-overflow` and the control never moves. */
+.overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.overview-open-agent:hover, .overview-open-agent:focus-visible, .overview-row.is-openable:hover .overview-open-agent { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.overview-stop-agent { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.overview-stop-agent:hover, .overview-stop-agent:focus-visible { color: var(--red); border-color: currentColor; }
+.overview-close-orchestration { margin-left: 6px; }
+/* A click anywhere on the row opens the pane too, so the row reads as one
+   target: a pointer over all of it, and while it is hovered the control lights
+   exactly as it does under the pointer itself. The control is what carries the
+   hover here rather than the row's background, because a failed row's red
+   background already wins over `.overview-row:hover` and would show nothing. */
+.overview-row.is-openable { cursor: pointer; }
+
+/* PRD #802 M6 — the voice surface: ONE RESERVED ROW at the bottom.
+
+   The product owner's own shape: *"a dedicated row at the bottom for the button
+   and, if it's turned on, the text that it hears to the right next to it in the
+   same row that does not overlap anything (including the overlay with the agent
+   enlarged)"*.
+
+   **What it replaces.** The trigger and the report were two independently fixed
+   boxes at z-index 90, the report stacked above the button and growing upward as
+   it filled. Floating means overlapping, and the collision that mattered was the
+   agent pane: that pane is where the user is working, and a sentence describing
+   a navigation was drawn over the terminal they had enlarged to read it. Moving
+   the boxes buys a different collision rather than none, because a floating
+   box's height is its content's and no other element can set room aside for it.
+
+   **A row can, and `--voice-row-height` is the contract.** Every surface below
+   that would otherwise reach the bottom edge subtracts it: `.deck-main` (both
+   screens), `.agent-pane-overlay`, `.reader-overlay`, `.evidence-drawer` and
+   `.toast-stack`. Each of those edits is marked `voice row` where it sits, so a later
+   full-height surface can be checked against this list.
+
+   **Two deliberate exclusions, because the unqualified claim would be false.**
+   `.dialog-backdrop` (z-index 100) and `.sheet-backdrop` still cover this row,
+   and that is correct: they are modal, the voice surface is not exempted from
+   `useInertBackground` for them the way it is for the agent pane, and shrinking
+   them would make a control clickable underneath a modal that is claiming the
+   whole window. And `.rail` is not on the list because it never overlaps the row
+   — at desktop widths the row starts at the rail's right edge, and at the narrow
+   width where the rail becomes a bottom bar the row sits on top of it, which is
+   what `--bottom-rail-height` is for.
+
+   **z-index 95** — above `.agent-pane-overlay` (90) and `.reader-overlay` (85),
+   below `.dialog-backdrop` (100) for the reason above. The row is opaque, so it
+   is the pane's scrim that stops at its top edge rather than the pane's box: the
+   overlay still covers the window, which is what a modal scrim should do, and
+   its CONTENT box stops above this row. */
+.voice-row { position: fixed; z-index: 95; left: var(--rail-width); right: 0; bottom: var(--bottom-rail-height); height: var(--voice-row-height); padding: 0 14px; display: flex; align-items: center; gap: 12px; border-top: 1px solid var(--line-strong); background: var(--paper-strong); }
+/* The left cell. No longer positioned — the row places it — and `flex: 0 0 auto`
+   so a long sentence beside it never shrinks the one control that is always
+   there. */
+.voice-trigger { flex: 0 0 auto; min-height: 26px; padding: 0 11px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--teal-deep); border-radius: 13px; color: var(--on-accent); background: var(--teal); cursor: pointer; font-size: 11px; font-weight: 650; }
+.voice-trigger:hover { background: var(--teal-deep); }
+/* Off is the resting state and reads as one: the control is quiet until it is
+   doing something, and the filled teal above is reserved for "listening". */
+.voice-trigger[aria-pressed="false"] { border-color: var(--line-strong); color: var(--ink); background: var(--paper-strong); }
+.voice-trigger[aria-pressed="false"]:hover { background: var(--paper); }
+.voice-note { flex: 0 0 auto; margin: 0; color: var(--muted); white-space: nowrap; font-size: 9px; }
+/* The right cell: what the microphone heard and what came of it, on the button's
+   own line. It is NOT a dialog and takes no focus — continuous voice means the
+   next utterance arrives without anything being dismissed first.
+
+   `min-width: 0` on both this and the card is what lets the sentences inside
+   them elide instead of pushing the row wider than the window: a flex item's
+   automatic minimum size is its content's, and without this the ellipsis below
+   never engages. */
+.voice-report { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; }
+/* The card, not the region: the live region itself is always mounted so a screen
+   reader is listening before the first sentence lands. It carries no border,
+   background or shadow any more — it is a group inside the row rather than a box
+   over the screen. */
+.voice-report-card { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 10px; }
+/* One sentence, one element, nothing else inside it: the transcript embedded in
+   it has to reach the DOM exactly as Rust rendered it. Elided rather than
+   wrapped, because the row's height is the reservation other surfaces made and a
+   row that grew would be back to overlapping them; the full text is on `title`,
+   already clamped and scrubbed by `displayText`. */
+.voice-sentence { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 11px; }
+/* Never elided and never squeezed: the Undo is a real control, so a long
+   transcript loses characters before this loses the button. `margin-left: auto`
+   pins it to the row's right end while the sentences pack against the button —
+   `flex: 0 1 auto` above is what keeps them at their natural width instead of
+   sharing the row's spare space between them. */
+.voice-outcome-foot { flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; gap: 7px; }
+.voice-cost { color: var(--faint); white-space: nowrap; font-size: 8px; }
+/* PRD #802 — the empty state, in the report cell before the first utterance.
+   Quieter than a sentence and elided the same way, because the row's height is
+   the reservation every other surface made and this must not be what grows it. */
+.voice-hint { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
+
+/* PRD #802 D7 — the discovery overlay.
+
+   A CHILD of `.voice-row` in the DOM and a `position: fixed` box on screen, and
+   the split is deliberate: the parent carries `VOICE_PEER_PROPS`, so being
+   inside it is what keeps this clickable behind an open agent pane, while
+   `fixed` takes it out of the row's one-line flow entirely. A row 40px high
+   cannot hold a list of every command, which is the whole reason the
+   requirement says overlay.
+
+   z-index 96 — one above `.voice-row` so the list covers the report rather than
+   being cut off by it, and still below `.dialog-backdrop` (100), because a real
+   modal claiming the whole window must cover this too. */
+.voice-help-backdrop { position: fixed; z-index: 96; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgb(var(--scrim-rgb) / .42); }
+/* Bounded rather than sized: the list is as tall as it needs to be until it
+   reaches the viewport, and then it scrolls inside itself. `min()` against
+   `vh` is what stops a long table pushing its own Close button off screen. */
+.voice-help { width: min(680px, 100%); max-height: min(560px, 100%); display: flex; flex-direction: column; border: 1px solid var(--dialog-edge); border-radius: 8px; background: var(--paper); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .22); }
+.voice-help-head { flex: 0 0 auto; padding: 13px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); }
+.voice-help-head h2 { margin: 0; font-size: 13px; font-weight: 650; }
+.voice-help-problem { margin: 0; padding: 14px 16px; color: var(--ink-soft); font-size: 11px; }
+/* The scroll region is this and not the panel, so the heading and the Close
+   button stay put while the list moves under them. */
+.voice-help-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 16px 14px; }
+.voice-help-section { margin-top: 12px; }
+.voice-help-section h3 { margin: 0 0 7px; color: var(--muted); font-size: 9px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.voice-help-section ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 9px; }
+.voice-help-section li { display: grid; gap: 3px; }
+.voice-help-section code { justify-self: start; padding: 1px 6px; border-radius: 4px; color: var(--teal-wash-ink); background: var(--teal-wash); font-family: "JetBrains Mono", monospace; font-size: 10px; }
+.voice-help-section p { margin: 0; color: var(--ink-soft); font-size: 11px; line-height: 1.45; }
+/* Dimmed rather than hidden. A command the user cannot say here is still worth
+   knowing exists — that is most of what discovery is for — and the contrast
+   step is what says which half of the list they are reading without a second
+   sentence saying so. */
+.voice-help-section[data-where="elsewhere"] code { color: var(--faint); background: var(--paper-sunken); }
+.voice-help-section[data-where="elsewhere"] p { color: var(--muted); }
+/* PRD #802 D6 — where the microphone is aimed, and the countdown to a send.
+   In the reserved row like every other sentence, and elided like them: a
+   countdown that wrapped would grow the row every time it reached a long agent
+   name. `--amber` rather than the muted ink the hint uses, because this is the
+   one line in the row that says something is ABOUT to happen. */
+.voice-dictation { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--amber-ink); font-size: 11px; font-weight: 600; }
+/* PRD #1260 — the dictation mode's non-voice exit, beside the Voice button and
+   never squeezed out by a long report. */
+.voice-stop-typing { flex: 0 0 auto; }
+/* PRD #1497 decision 6 — typing's and reading's marks side by side on ONE row,
+   pinned to the top edge of the window over the content area, and so over the
+   open agent pane's top edge, where typing's mark used to sit alone. Reading is
+   deck-wide, so its mark shows on every screen. A child of `.voice-row` (for
+   its `VOICE_PEER_PROPS`), escaping it with a `position: fixed` of its own, and
+   so above the agent pane overlay as the row is. It holds no control. */
+.voice-indicators { position: fixed; top: 0; left: calc(var(--rail-width) + (100vw - var(--rail-width)) / 2); transform: translateX(-50%); max-width: calc(100vw - var(--rail-width) - 28px); display: flex; gap: 6px; pointer-events: none; }
+.voice-indicator { min-width: 0; margin: 0; padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 0 0 7px 7px; color: var(--on-accent); font-size: 11px; font-weight: 650; line-height: 14px; }
+.voice-indicator.is-typing { background: var(--amber-ink); }
+.voice-indicator.is-reading { flex: 0 0 auto; background: var(--teal-deep); }
+/* PR #1451 — typing mode's nudge to send: the "“send it” to send" words lit
+   after a pause with dictated text unsent. Styling only — the sentence reads
+   the same lit or not — and a pulse that runs twice rather than forever, so it
+   catches the eye and then stays put. */
+.voice-send-hint { border-radius: 4px; transition: background-color .2s ease, color .2s ease; }
+.voice-send-hint[data-nudge="on"] { padding: 0 .3em; color: var(--ink); background: var(--amber-soft); box-shadow: 0 0 0 1px var(--amber-rim); animation: voice-nudge 1.1s ease-in-out 2; }
+@keyframes voice-nudge { 50% { box-shadow: 0 0 0 3px var(--amber-rim); } }
+@media (prefers-reduced-motion: reduce) { .voice-send-hint[data-nudge="on"] { animation: none; } }
+
+/* PR #1451 — while voice is ON what the row SAYS is half as large again, so it
+   can be read at a glance from the keyboard. Every text size below is 1.5
+   times its resting value above. The Voice button keeps its resting size: a
+   1.5x button made the row taller than its text, and the difference was empty
+   space (the maintainer's hand test). So the row is only as tall as what it
+   holds, never under `--voice-row-min-height`.
+
+   **It wraps instead of eliding while on**, which is a change to the row's
+   contract rather than an exception to it: the reservation every other surface
+   makes is `--voice-row-height`, and while voice is on that is the row's
+   measured height (see `--voice-row-min-height`), so a wrapped sentence grows
+   the reservation with it instead of running under the screen. At a narrow
+   window the larger text would otherwise lose most of a sentence to the
+   ellipsis. Off, none of this applies and the row is its resting 40px. */
+.voice-row[data-voice="on"] { height: auto; min-height: var(--voice-row-min-height); padding-top: 4px; padding-bottom: 4px; }
+.voice-row[data-voice="on"] .voice-report-card { flex-wrap: wrap; row-gap: 4px; column-gap: 15px; }
+.voice-row[data-voice="on"] .voice-sentence,
+.voice-row[data-voice="on"] .voice-dictation,
+.voice-row[data-voice="on"] .voice-hint { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
+.voice-row[data-voice="on"] .voice-sentence,
+.voice-row[data-voice="on"] .voice-dictation { font-size: 16.5px; }
+.voice-row[data-voice="on"] .voice-hint { font-size: 15px; }
+.voice-row[data-voice="on"] .voice-note { font-size: 13.5px; }
+.voice-row[data-voice="on"] .voice-cost { font-size: 12px; }
+
+/* PRD #1261 — the numbered choice, a dialog centred over the screen in
+   `ConfirmDialog`'s card (`.confirm-dialog` on the same element) rather than a
+   strip in this row (PR #1451 round 3).
+
+   It is a DOM child of `.voice-row` so that it keeps the row's modal-peer
+   exemption, and a child cannot be drawn above its parent's stacking context —
+   so while a choice is open the ROW is raised over `.dialog-backdrop` (100),
+   which is what puts the choice above the New agent dialog, where the
+   daemon, directory and mode ties happen. The scrim stops at the row's top
+   edge (`--voice-reserved`), so the row stays readable below it, saying what
+   was heard. A D5 confirmation closes the choice, so the two never stack. */
+.voice-row[data-choice="open"] { z-index: 101; }
+.voice-choice-backdrop { position: fixed; inset: 0 0 var(--voice-reserved) 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgb(var(--scrim-rgb) / .42); }
+.voice-choice { width: min(420px, 100%); max-height: 100%; overflow-y: auto; }
+.voice-choice p { font-size: 11px; }
+.voice-choice-list { margin: 0 0 14px; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 5px; }
+.voice-choice-list button { width: 100%; justify-content: flex-start; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; text-align: left; }
+.voice-choice > div:last-child { align-items: center; gap: 12px; }
+/* Amber for the dictation countdown's reason — it is the one thing here that
+   says something is about to END. */
+.voice-choice-timer { color: var(--amber-ink); font-size: 13px; font-weight: 600; white-space: nowrap; }
+
+/* PR #1451 round 3, change 3 — the number an item shows while voice is on,
+   before its name. One look on every numbered list: the dashboard's rows, the
+   Daemons screen's tiles, and the New agent dialog's daemons, directories and
+   modes. Tabular figures, so 9 and 10 take the same width down a list. */
+.voice-number { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; min-width: 20px; height: 16px; padding: 0 4px; border-radius: 3px; color: var(--teal-deep); background: var(--teal-soft); font-family: "JetBrains Mono", monospace; font-size: 10px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; }
+
+/* PRD #1401 — an agent's pull request: its badge, and GitHub's page over the
+   agent's screen. */
+
+/* The badge: the number between a state icon and a review icon, compact
+   enough to sit in the tile's title line beside the status. Colour repeats
+   what the accessible name already says; it never says it alone. */
+.pr-badge { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; padding: 1px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--ink-soft); background: var(--paper-sunken); font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 700; line-height: 1.3; font-variant-numeric: tabular-nums; }
+button.pr-badge { cursor: pointer; }
+button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-focus); background: var(--teal-soft); }
+.pr-state-open .pr-badge-state { color: var(--gh-open-fg); }
+.pr-state-draft .pr-badge-state { color: var(--gh-draft-fg); }
+.pr-state-merged .pr-badge-state { color: var(--gh-merged-fg); }
+.pr-state-closed .pr-badge-state { color: var(--gh-closed-fg); }
+.pr-state-unknown .pr-badge-state { color: var(--faint); }
+/* Issue #1781 — CI as GitHub's pull request list draws it: a bare green check,
+   red cross or amber dot. */
+.pr-checks-passing .pr-badge-checks { color: var(--gh-open-fg); }
+.pr-checks-failing .pr-badge-checks { color: var(--gh-closed-fg); }
+.pr-checks-pending .pr-badge-checks { color: var(--gh-attention-fg); }
+.pr-checks-unknown .pr-badge-checks { color: var(--faint); }
+/* The review sits in a filled circle, so an approval and passing CI — both a
+   check on GitHub — never look alike. */
+.pr-badge-review { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 12px; height: 12px; border-radius: 50%; color: var(--gh-on-emphasis); background: var(--gh-neutral-emphasis); }
+.pr-review-approved .pr-badge-review { background: var(--gh-success-emphasis); }
+.pr-review-changes_requested .pr-badge-review { background: var(--gh-danger-emphasis); }
+.pr-review-review_required .pr-badge-review { background: var(--gh-attention-emphasis); }
+
+/* The browser. Over the agent's pane (90) and below the voice row (95) and
+   every modal (100): the page is drawn by a native webview in `.pr-browser-frame`,
+   which sits above everything this document renders, so the frame stops at the
+   voice row's top edge (`--voice-reserved`) the way the pane does, and the page
+   is hidden while a modal is open over it. */
+.pr-browser-overlay { position: fixed; z-index: 92; inset: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
+.pr-browser-panel { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; border: 1px solid var(--teal-focus); border-radius: 6px; overflow: hidden; background: var(--paper); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
+.pr-browser-toolbar { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 40px; padding: 0 10px; border-bottom: 1px solid var(--line-strong); background: var(--paper-strong); }
+.pr-browser-title { min-width: 0; display: flex; align-items: center; gap: 7px; color: var(--ink); font-size: 12px; }
+.pr-browser-title strong { flex: 0 0 auto; font-weight: 720; }
+.pr-browser-title span { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+/* The controls are the app's `.button.secondary.compact` and `.icon-button`;
+   only the gap between them is the toolbar's. Close sits apart, in the corner. */
+.pr-browser-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+.pr-browser-actions .icon-button { margin-left: 6px; }
+.pr-browser-frame { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; background: var(--paper-sunken); }
+/* What the page did not do (Back, a scroll, the hand-off), above the frame: the
+   page is drawn over the frame, so a notice inside it would be hidden. */
+.pr-browser-problem { flex: 0 0 auto; margin: 0; padding: 6px 12px; overflow: hidden; border-bottom: 1px solid var(--red-rim); color: var(--red-ink); background: var(--red-soft); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.pr-browser-notice { max-width: 420px; margin: 0; padding: 0 16px; color: var(--muted); font-size: 12px; text-align: center; }
+@media (max-width: 680px) { .pr-browser-actions .button span { display: none; } }

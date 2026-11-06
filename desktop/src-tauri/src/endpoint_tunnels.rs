@@ -442,10 +442,32 @@ impl EndpointTunnels {
     /// still holding an authenticated `ssh` child. The epoch is what
     /// [`Self::acquire`] compares to refuse that publish, and it is bumped under
     /// this same lock so the two cannot interleave.
+    ///
+    /// The tests' form: a settings save's deck work calls
+    /// [`Self::retain_unless`] (issue #1620).
+    #[cfg(test)]
     pub(crate) async fn retain(&self, live: &HashSet<EndpointIdentity>) {
+        self.retain_unless(live, || false).await;
+    }
+
+    /// [`Self::retain`], unless `superseded` answers yes once the map lock is
+    /// held (issue #1620): a settings save's deck work asks whether a newer
+    /// save has been published, and a newer deck list may keep a deck `live`
+    /// does not. Asked under the lock rather than before it, so a save
+    /// published while this waits for the lock is still seen. Returns whether
+    /// it retained.
+    pub(crate) async fn retain_unless(
+        &self,
+        live: &HashSet<EndpointIdentity>,
+        superseded: impl FnOnce() -> bool,
+    ) -> bool {
         let mut tunnels = self.tunnels.lock().await;
+        if superseded() {
+            return false;
+        }
         self.generation.bump();
         tunnels.retain(|key, _| live.contains(key));
+        true
     }
 
     /// Drop every handle. The app-exit teardown.
@@ -456,6 +478,15 @@ impl EndpointTunnels {
         let mut tunnels = self.tunnels.lock().await;
         self.generation.bump();
         tunnels.clear();
+    }
+
+    /// Hold the map lock, so a test can keep a [`Self::retain_unless`] waiting
+    /// for it (issue #1620). Test-only.
+    #[cfg(test)]
+    pub(crate) async fn hold(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<EndpointIdentity, Arc<TunnelLease>>> {
+        self.tunnels.lock().await
     }
 
     /// Seed the map with a stand-in transport under `endpoint`'s key. Test-only.
@@ -474,6 +505,39 @@ impl EndpointTunnels {
         let address = PathBuf::from(STAND_IN_ADDRESS);
         let lease = Arc::new(TunnelLease {
             address: address.clone(),
+            connection: Mutex::new(EndpointConnection::Local(
+                dot_agent_deck::daemon_client::LocalEndpoint::at(address),
+            )),
+        });
+        self.tunnels
+            .lock()
+            .await
+            .insert(endpoint.identity(), Arc::clone(&lease));
+        lease
+    }
+
+    /// Seed the map with a transport under `endpoint`'s key that **leads
+    /// somewhere**: a real daemon listening on `address`. Test-only.
+    ///
+    /// [`Self::insert_stand_in`]'s docs draw the line this crosses on purpose:
+    /// that seam's lease is never connected through, and "anything that would
+    /// *use* the transport belongs in an integration test with a real deck at
+    /// the other end". This is that test's half. What a forwarded `ssh -L`
+    /// socket hands a client is a local Unix socket whose far end is a daemon,
+    /// so a lease whose address is a real daemon's socket, filed under a
+    /// **remote** deck's identity, is that same shape with the `ssh` hop taken
+    /// out — and the hop is the one part a unit test cannot run. PRD #1223 M3
+    /// needs it because a settings document can only name remote rows beside
+    /// the local deck, so the "other" deck of an All Decks fleet is remote by
+    /// construction.
+    #[cfg(test)]
+    pub(crate) async fn insert_route(
+        &self,
+        endpoint: &Endpoint,
+        address: &std::path::Path,
+    ) -> Arc<TunnelLease> {
+        let lease = Arc::new(TunnelLease {
+            address: address.to_path_buf(),
             connection: Mutex::new(EndpointConnection::Local(
                 dot_agent_deck::daemon_client::LocalEndpoint::at(address),
             )),
@@ -558,10 +622,23 @@ impl EndpointTunnels {
         tunnels.remove(&endpoint.identity());
     }
 
+    #[cfg(test)]
     pub(crate) async fn retain(&self, live: &HashSet<EndpointIdentity>) {
+        self.retain_unless(live, || false).await;
+    }
+
+    pub(crate) async fn retain_unless(
+        &self,
+        live: &HashSet<EndpointIdentity>,
+        superseded: impl FnOnce() -> bool,
+    ) -> bool {
         let mut tunnels = self.tunnels.lock().await;
+        if superseded() {
+            return false;
+        }
         self.generation.bump();
         tunnels.retain(|key, _| live.contains(key));
+        true
     }
 
     pub(crate) async fn close_all(&self) {

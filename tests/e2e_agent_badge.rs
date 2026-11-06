@@ -2,9 +2,10 @@
 
 //! L2 end-to-end test for fork #339's agent-type badge toggle. Spawns the
 //! real `dot-agent-deck` binary inside an isolated PTY and drives the
-//! deck-global `Ctrl+m` / bare-`m` toggle through the genuine `render_frame`
-//! path — the one seam no L1 test reaches. Synthetic (no real agent, no LLM
-//! spend), so this file is not `[reel]`-marked.
+//! deck-global bare-`b` toggle (command mode only; `m` and `Ctrl+m` belong to
+//! the host-metrics overlay) through the genuine `render_frame` path — the one
+//! seam no L1 test reaches. Synthetic (no real agent, no LLM spend), so this
+//! file is not `[reel]`-marked.
 
 mod common;
 
@@ -15,20 +16,21 @@ use spec::spec;
 /// synthetic `SessionStart` hooks (one Claude Code carrying `model:
 /// "Opus"`, one Codex carrying `model: "gpt-5.1-codex-mini"`) so two cards
 /// render, and confirm neither shows its agent-type label or model at rest
-/// (default hidden). Press a bare `m` and confirm both labels AND their
+/// (default hidden). Press a bare `b` and confirm both labels AND their
 /// models appear as `ClaudeCode (Opus)` / `Codex (5.1-codex-mini)` once the
 /// status bar reports `Agent badge: shown` — the Codex fixture's `gpt-`
 /// vendor prefix is stripped by `normalize_model_label`, while `Opus`
 /// matches no vendor prefix and passes through unchanged, which is why the
-/// two fixtures render differently; press `m` again and confirm both
-/// disappear once it reports `Agent badge: hidden`. Presses only `m`, never
-/// `\x0d` — under a legacy PTY `Ctrl+M` decodes as Enter and `FocusPane`
-/// wins first (by design), so this is the only door that works everywhere.
+/// two fixtures render differently; press `b` again and confirm both
+/// disappear once it reports `Agent badge: hidden`. Presses only a plain
+/// `b`, never `m` or `\x0d`: `m` (and `Ctrl+m`) open the host-metrics
+/// overlay, and under a legacy PTY `Ctrl+M` decodes as Enter, so the plain
+/// letter is the door that works on every terminal.
 #[spec("dashboard/agent-badge/003")]
 #[test]
-fn agent_badge_003_m_toggles_badges_on_every_card_real_binary() {
+fn agent_badge_003_b_toggles_badges_on_every_card_real_binary() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Session ids stay at or under the dashboard's 11-char truncation limit
     // (`id_display` in `render_session_card`) so the full id is what
@@ -73,12 +75,12 @@ fn agent_badge_003_m_toggles_badges_on_every_card_real_binary() {
     deck.wait_for_absence("Opus");
     deck.wait_for_absence("5.1-codex-mini");
 
-    deck.send_keys(b"m");
+    deck.send_keys(b"b");
     deck.wait_for_string("Agent badge: shown");
     deck.wait_for_string("ClaudeCode (Opus)");
     deck.wait_for_string("Codex (5.1-codex-mini)");
 
-    deck.send_keys(b"m");
+    deck.send_keys(b"b");
     deck.wait_for_string("Agent badge: hidden");
     deck.wait_for_absence("ClaudeCode");
     deck.wait_for_absence("Codex");

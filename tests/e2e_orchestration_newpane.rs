@@ -88,7 +88,7 @@ fn newpane_001_ctrl_n_opens_picker_with_orchestrator_pane_focused() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     // Isolated-clone provisioning needs a ref to branch from — an unborn
     // HEAD (the harness's own bare `git init`) does not provide one.
     commit_fixture(deck.workdir());
@@ -137,7 +137,7 @@ fn newpane_002_ctrl_n_csi_u_encoding_with_orchestrator_pane_focused() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     // Isolated-clone provisioning needs a ref to branch from — an unborn
     // HEAD (the harness's own bare `git init`) does not provide one.
     commit_fixture(deck.workdir());
@@ -180,7 +180,7 @@ fn newpane_003_ctrl_n_after_tab_switch_away_and_back_to_orchestrator_pane() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     // Isolated-clone provisioning needs a ref to branch from — an unborn
     // HEAD (the harness's own bare `git init`) does not provide one.
     commit_fixture(deck.workdir());
@@ -257,7 +257,7 @@ fn newpane_004_ctrl_n_swallowed_when_focused_pane_reports_history_only() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("newpane-nonlive");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let script = deck.workdir().join("newpane-nonlive.sh");
     write_executable(
@@ -356,7 +356,7 @@ fn newpane_005_ctrl_n_after_second_concurrent_orchestration_opened() {
     // from — it fails against an unborn HEAD (the harness's own bare
     // `git init`). Same reason `identity_009` commits the fixture first.
     commit_fixture(&work);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
@@ -438,7 +438,7 @@ fn newpane_006_ctrl_n_when_orchestrator_pane_genuinely_unconfirmed() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("newpane-unconfirmed");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let script = deck.workdir().join("newpane-unconfirmed.sh");
     write_executable(

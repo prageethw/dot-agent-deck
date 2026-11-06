@@ -60,10 +60,12 @@
 //!
 //!    Its scope is `localStorage` in `.ts`/`.tsx` under `desktop/src`, and the
 //!    boundary is worth stating rather than implying: **`sessionStorage`,
-//!    IndexedDB, `document.cookie` and a `.js` file are outside it.** None of
-//!    the four appears under `desktop/src` today — checked, not assumed — so
-//!    this is a scope statement rather than a known hole; the moment one does,
-//!    it needs its own row here.
+//!    IndexedDB, `document.cookie` and a `.js` file are outside it.** One of
+//!    them now appears: issue #1496's dashboard filter keeps the window
+//!    session's filter in `sessionStorage`. Its key's literal is pinned in
+//!    [`PINNED_STORAGE_KEYS`] like the others, because the literal scan reads
+//!    every `dot-agent-deck.` literal whatever stores it, but its accesses are
+//!    not scanned the way `localStorage`'s are.
 //!
 //! It lives here rather than in vitest for the reason the palette guards do:
 //! these tests run under `cargo test-fast` (via `--workspace`, CLAUDE.md rule
@@ -132,7 +134,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 31] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -219,6 +221,28 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
          '/', and required to be absolute; ':' is refused because ssh parses \
          its -L forward specification by splitting on it",
     ),
+    // Issue #1426: the deck's name in the shared deck list, the one the CLI's
+    // `connect <name>` takes.
+    (
+        "DeckName",
+        FieldKind::Scalar,
+        "a newtype over String whose deserializer runs deck_list's \
+         validate_deck_name — the rule `remote add` applies: at most 64 bytes, \
+         ASCII letters, digits, '.', '-' and '_', starting with a letter or \
+         digit. Too narrow for a PEM block, a base64 blob with padding, or \
+         anything with whitespace. It names a deck the user typed into a shell \
+         as `connect <name>`, and reaches no authentication surface as text",
+    ),
+    // Issue #1426's review: what a row carries instead of a stored name the
+    // rule refuses, so a stale rename can be told from a fresh one.
+    (
+        "NameDigest",
+        FieldKind::Scalar,
+        "a newtype over String whose deserializer accepts exactly 16 lowercase \
+         hex digits — the FNV-1a hash of a stored deck name — and nothing else. \
+         No text is representable beyond those 64 bits: it fingerprints a name \
+         without carrying it, and reaches no authentication surface",
+    ),
     // PRD #741 M6: the endpoint list's own identity and selection tokens.
     (
         "EndpointId",
@@ -258,6 +282,210 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
         "ZoomSettings",
         FieldKind::Section,
         "a section struct, whose own fields this check walks",
+    ),
+    // PRD #802 M4: the `[voice]` section. This is the moment the module docs
+    // above predicted — "the one that will go red when PRD #802 adds a
+    // `String`" — and it went red, at all four of the fields below, which is
+    // the friction working rather than an obstacle. The resolution is the first
+    // of the two honest ones that test names: the values that could have been a
+    // `String` are closed enums instead, and the value that genuinely is a
+    // credential went behind the `SecretStore` seam
+    // (`desktop/src-tauri/src/secrets.rs`) rather than into this document.
+    //
+    // Read the three scalar reasons as the STRONG kind — no text is
+    // representable. Each is a Rust enum whose `Deserialize` folds an
+    // unrecognised token to the default and errors above MAX_VOICE_TOKEN_BYTES,
+    // so the value this crate reads out and writes back is one of the listed
+    // tokens and nothing else. That is `AppearanceMode`'s claim exactly, and it
+    // carries `AppearanceMode`'s caveat exactly: a hand-edited file can hold
+    // any string at one of these keys until the next save, which is why
+    // `settings.rs` follows a sentinel through the load as well.
+    (
+        "ActivationMode",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token — `toggle` today, with \
+         hold-to-talk and always-on deferred to PRD #802 D4. Its deserializer \
+         folds anything else to the default and refuses a token over \
+         MAX_VOICE_TOKEN_BYTES, so no text is representable",
+    ),
+    (
+        "IntentBackend",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `anthropic` or \
+         `openai_compatible` — WHICH wire protocol resolves an utterance, \
+         never how it authenticates. The set was `claude | opencode | remote`, \
+         and all three of those tokens are now withdrawn. PRD #802's \
+         landed-work security audit took `opencode` first: the agent-CLI \
+         backend hands a general-purpose coding agent a prompt built partly \
+         from untrusted input, so the child has to be containable, and \
+         `opencode run` has no no-tools flag and no no-persistence option (its \
+         sessions were confirmed locally to be resumable and to hold the \
+         utterance). `claude` had a flag for each and survived that audit, \
+         then went with PRD #802's provider work, which removed the \
+         subprocess backend outright — and `remote` went with it, because the \
+         one keyed backend became two protocol dialects and a token naming \
+         neither is not a choice a user can act on. Where a credential is \
+         needed it lives in the OS keychain under SecretId::VoiceIntent and \
+         has no field here at all; a loopback endpoint is asked for none. Same \
+         folding deserializer and same MAX_VOICE_TOKEN_BYTES bound, so no text \
+         is representable — and that folding is what makes a stale \
+         `intent = \"opencode\"`, `\"claude\"` or `\"remote\"` load as the \
+         default rather than fail",
+    ),
+    (
+        "TranscriptionBackend",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `local` or `remote`. Same as \
+         IntentBackend — it names a backend, and the keyed one's credential is \
+         in the OS keychain under SecretId::VoiceTranscription rather than \
+         anywhere in this document. The set was `off | remote` until PRD \
+         #802's provider work measured a keyless speech container on loopback: \
+         `off` was a setting whose whole function was to make the feature do \
+         nothing, so it went and `local` took the default. Same folding \
+         deserializer and same MAX_VOICE_TOKEN_BYTES bound, so no text is \
+         representable",
+    ),
+    (
+        "LabelSharing",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `shared` or `withheld` — \
+         whether a voice command request carries the names the app observed \
+         (PRD #1223, audit finding A1). A choice about what is SENT, never a \
+         value that is sent: no name, label or credential is stored here. A \
+         closed enum rather than a `bool`, which is not on this list. Same \
+         folding deserializer and same MAX_VOICE_TOKEN_BYTES bound as its \
+         three neighbours, so no text is representable",
+    ),
+    (
+        "SpeechSource",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `auto`, `provider` or `system` \
+         — where reading mode's voice comes from (PRD #1497 D9). A choice of \
+         source, never a value that is sent: no text, voice name or credential \
+         is stored here. Same folding deserializer and same \
+         MAX_VOICE_TOKEN_BYTES bound as its neighbours, so no text is \
+         representable",
+    ),
+    (
+        "ReadingConsent",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `off` or `on` — whether \
+         reading mode may be turned on (PRD #1497 D4). A consent, never a \
+         value that is sent: no reply, summary or credential is stored here. \
+         Same folding deserializer and same MAX_VOICE_TOKEN_BYTES bound as \
+         its neighbours, so no text is representable",
+    ),
+    (
+        "SpeechLanguage",
+        FieldKind::Scalar,
+        "a newtype in desktop/src-tauri/src/settings.rs serialised as one \
+         token: `auto` or the ISO-639-1 code of a language the speech services \
+         accept — which language a transcription request names (issue #1458). \
+         The value it holds is a `&'static str` taken from \
+         SPEECH_LANGUAGE_TOKENS, never a copy of what the document said, so \
+         the set is closed exactly as an enum's is: an unlisted token folds to \
+         English through the same folding deserializer and the same \
+         MAX_VOICE_TOKEN_BYTES bound as its neighbours, and no text is \
+         representable",
+    ),
+    (
+        "ReadingNotice",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `pending` or `shown` — whether \
+         the one-time notice of where reading sends replies has been shown \
+         (PRD #1497, decision 5 of 2026-10-09). A record that a notice was \
+         shown, never the notice or anything it names. Same folding \
+         deserializer and same MAX_VOICE_TOKEN_BYTES bound as its neighbours, \
+         so no text is representable",
+    ),
+    // PRD #802's provider work: the two stages stopped being one token each
+    // and became a backend plus the coordinates it is reached at. The endpoint
+    // and the model are the values that COULD have been `String`s — this list
+    // is why they are not, and the two rows below are the written assertion of
+    // what each can hold. Read them as the ssh-argument kind of reason, not the
+    // `u32` kind: each says what this charset and this bound make
+    // unrepresentable, not that the field is proof against every secret anyone
+    // could think of.
+    (
+        "ServiceUrl",
+        FieldKind::Scalar,
+        "a newtype over String in desktop/src-tauri/src/model_service.rs \
+         holding the URL a voice stage's requests go to, bounded at 2048 bytes \
+         and restricted to printable ASCII with no space — so no control byte, \
+         no whitespace, no non-ASCII byte, and nothing multi-line, which rules \
+         out a PEM block and every wrapped token. Its deserializer runs the \
+         constructor's own check, so a hand-edited desktop.toml cannot smuggle \
+         past what the panel applies: it must parse as an absolute http or \
+         https URL naming a host, http ONLY when that host is loopback, and it \
+         REFUSES a user:password@ authority outright — which is the one place \
+         a URL carries a credential and the specific reason this type exists \
+         rather than a `String`. A single-line token would still fit the \
+         charset inside a path segment; what rules that out is that the value \
+         is handed to reqwest as a destination and reaches no authentication \
+         surface as text, the same argument KeyPath makes about `ssh -i`. The \
+         credential these endpoints authenticate with is in the OS keychain \
+         under SecretId::VoiceIntent / SecretId::VoiceTranscription and has no \
+         field here at all",
+    ),
+    (
+        "ModelId",
+        FieldKind::Scalar,
+        "a newtype over String in desktop/src-tauri/src/model_service.rs \
+         naming which model a service is asked for, bounded at 128 bytes and \
+         restricted to ASCII alphanumerics plus '.', '/', '-', '_', ':' and \
+         '+' — the charset the three ecosystems PRD #802 touches actually \
+         publish identifiers in. That refuses every control byte, every \
+         whitespace byte and every non-ASCII byte, so a multi-line or padded \
+         blob is unrepresentable, and 128 bytes is far below anything that \
+         could carry a key. Its deserializer runs the constructor's own check. \
+         It is a label sent as one field of a request body and authenticates \
+         nothing",
+    ),
+    (
+        "TokenCeiling",
+        FieldKind::Scalar,
+        "a newtype over u32 in desktop/src-tauri/src/model_service.rs holding \
+         how many tokens one command answer may cost, bounded at 64..=32768 by \
+         a deserializer that runs the constructor's own check. It is an \
+         integer; there is no text for a credential to be, which is `u32`'s \
+         reason and means the guard would have passed a bare integer here. \
+         Read the newtype as being about the RANGE rather than about this \
+         list: `max_tokens = 0` is a stage that can never answer and \
+         `max_tokens = 4000000000` is a bill, and both are perfectly good \
+         `u32`s. It is sent as one field of a request body and authenticates \
+         nothing",
+    ),
+    (
+        "VoiceSettings",
+        FieldKind::Section,
+        "a section struct, whose own fields this check walks. It holds one \
+         enum and two nested stage sections, and deliberately NOT a boolean \
+         saying whether a key is stored — which PRD #803's rule would have \
+         allowed: the panel asks the SecretStore itself, so the answer cannot \
+         go stale against the keychain, and `bool` stays off this list",
+    ),
+    (
+        "TranscriptionSettings",
+        FieldKind::Section,
+        "a section struct — the speech stage — whose own fields this check \
+         walks: which backend, the ServiceUrl it is reached at, the ModelId it \
+         is asked for, the SpeechLanguage it is told. Nested rather than flattened into VoiceSettings because \
+         this struct serialises to both TOML and JSON and every field name has \
+         to stay one snake_case word on both sides; `speech_endpoint` and \
+         `commands_endpoint` would be two spellings waiting to drift",
+    ),
+    (
+        "IntentSettings",
+        FieldKind::Section,
+        "a section struct — the command stage — whose own fields this check \
+         walks, in TranscriptionSettings' shape plus one field: the answer \
+         ceiling, which the speech stage has no counterpart for because a \
+         transcription is as long as the audio was. Both of its backends are \
+         HTTP, so the endpoint and the model are live under either one and the \
+         panel shows them always — the backend picks which preset they default \
+         to, not whether they are read. They were ignored under the withdrawn \
+         agent-CLI backend, which spawned a process rather than making a \
+         request; nothing in the enum does that now",
     ),
 ];
 
@@ -327,7 +555,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 31] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -340,6 +568,11 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
     // section over a user's decks. A required field here would make the
     // normaliser fabricate one.
     ("DesktopSettingsDto", "endpoints?", "EndpointSettingsDto"),
+    // PRD #802 M4. `?` is load-bearing for the reason `endpoints?` is: the Rust
+    // field is an `Option<VoiceSettings>` whose `None` means *unspecified*, and
+    // a required field here would make the normaliser fabricate a section that
+    // the merge then writes over the user's choices.
+    ("DesktopSettingsDto", "voice?", "VoiceSettingsDto"),
     ("DesktopSettingsDto", "zoom", "{ level: number }"),
     // The two nested interfaces are scanned as well, and that is the point of
     // adding them rather than letting `EndpointSettingsDto` be an opaque name:
@@ -354,9 +587,66 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
     ("RemoteEndpointDto", "id", "string"),
     ("RemoteEndpointDto", "identity?", "string"),
     ("RemoteEndpointDto", "jump?", "string"),
+    // Issue #1426: the deck's name in the shared deck list, a validated slug
+    // (`DeckName`) on the Rust side. `null` is a row whose stored name is not
+    // a usable deck name.
+    ("RemoteEndpointDto", "name?", "string | null"),
+    // Issue #1426's review: a fingerprint of a stored name the rule refuses
+    // (`NameDigest`, 16 hex digits) — carried back on a rename, never shown.
+    ("RemoteEndpointDto", "name_digest?", "string"),
     ("RemoteEndpointDto", "port", "number"),
     ("RemoteEndpointDto", "socket?", "string"),
     ("RemoteEndpointDto", "user?", "string"),
+    // Scanned as its own interface rather than left an opaque name, for the
+    // reason the endpoint ones are: a credential riding in through a nested
+    // shape would otherwise be invisible to this pin. `activation` is a token
+    // naming a MODE and the two stages are nested objects, whose own interface
+    // is pinned below. The credential those backends authenticate with is in
+    // the OS keychain and has no field here — `SecretStatusDto` below is a
+    // boolean plus a sentence, and is the whole of what this side ever learns
+    // about one.
+    ("VoiceSettingsDto", "activation", "string"),
+    ("VoiceSettingsDto", "intent", "VoiceIntentStageDto"),
+    (
+        "VoiceSettingsDto",
+        "transcription",
+        "VoiceTranscriptionStageDto",
+    ),
+    // PRD #1223, audit finding A1: a closed token (`VOICE_LABEL_SHARING`) —
+    // whether names are SENT, never a name.
+    ("VoiceSettingsDto", "labels", "string"),
+    // PRD #1497 D9: a closed token (`VOICE_SPEECH_SOURCES`) — where reading
+    // mode's voice comes from, never a voice name or a key.
+    ("VoiceSettingsDto", "speech", "string"),
+    // PRD #1497 D4: a closed token (`VOICE_READING_CONSENT`) — whether reading
+    // may be turned on, never a reply or a summary.
+    ("VoiceSettingsDto", "reading", "string"),
+    // PRD #1497, decision 5 of 2026-10-09: a closed token
+    // (`VOICE_READING_NOTICE`) — whether the notice was shown, never its text.
+    ("VoiceSettingsDto", "reading_notice", "string"),
+    // PRD #802's provider work. One interface for both stages, because both
+    // hold the same three values and a second copy would be a second place to
+    // forget a field. Every one is a REFERENCE — which backend, where it is,
+    // which model to ask it for — and the Rust counterpart of each is either a
+    // closed enum or a validating newtype on ALLOWED_FIELD_TYPES. There is
+    // still no key field, on either stage, in either direction.
+    ("VoiceStageDto", "backend", "string"),
+    ("VoiceStageDto", "endpoint", "string"),
+    ("VoiceStageDto", "model", "string"),
+    // PRD #802's ceiling fix. The command stage is the shared interface plus
+    // one number, so it extends rather than copies — `ts_interface_fields`
+    // reads the declared members of each block, so the three inherited names
+    // are pinned once above and `max_tokens` is pinned here. It is snake_case
+    // because these keys are the wire's own spelling and nothing renames. A
+    // ceiling on the answer is not a credential in any reading: it is an
+    // integer, and the Rust counterpart is a newtype bounded at 64..=32768.
+    ("VoiceIntentStageDto", "max_tokens", "number"),
+    // Issue #1458. The speech stage extends the shared interface the same way,
+    // with the language each request names: `auto` or a code from the closed
+    // list in `speechLanguages.json`, whose Rust counterpart `SpeechLanguage`
+    // holds only the table's own `&'static str`. A language code is not a
+    // credential in any reading.
+    ("VoiceTranscriptionStageDto", "language", "string"),
     (
         "DesktopSettingsSnapshotDto",
         "settings",
@@ -367,6 +657,14 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
     // — and `DesktopSettingsSnapshot`'s Rust doc comment records why that is
     // not in tension with the error paths refusing to name a path.
     ("DesktopSettingsSnapshotDto", "path?", "string"),
+    // The second legitimate string, and it is a DIAGNOSTIC rather than a value
+    // (issue #1072): why the app is on defaults, built from a `line N, column N`
+    // locator plus fixed prose. It is never a byte of the document — which is
+    // precisely the property #827 needs here, because `toml::de::Error`'s own
+    // `Display` echoes the offending value and this string reaches a webview.
+    // Pinned on the Rust side by
+    // `a_document_problem_carries_a_locator_and_never_the_documents_bytes`.
+    ("DesktopSettingsSnapshotDto", "problem?", "string"),
 ];
 
 /// The keys the desktop app stores under, and the literal each one is built
@@ -386,7 +684,12 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
 /// deleted the key. Removing it from the pin is the deliberate edit this check
 /// exists to force: the guard reddened on the merge that brought #827's pin and
 /// #819's deletion together, which is the mechanism working rather than failing.
-const PINNED_STORAGE_KEYS: [(&str, &str, bool); 5] = [
+///
+/// Issue #1045 renamed the desktop's "workflow" to the TUI's "orchestration", so
+/// the role-order key moved to `ORCHESTRATION_STORAGE_KEY`. The old one stays
+/// pinned as `LEGACY_WORKFLOW_STORAGE_KEY` because `App.tsx` still reads it once,
+/// to migrate a saved order, and then removes it.
+const PINNED_STORAGE_KEYS: [(&str, &str, bool); 7] = [
     (
         "FIXTURE_SETTINGS_KEY",
         "dot-agent-deck.desktop-settings",
@@ -398,7 +701,12 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 5] = [
         true,
     ),
     (
-        "WORKFLOW_STORAGE_KEY",
+        "ORCHESTRATION_STORAGE_KEY",
+        "dot-agent-deck.desktop.orchestration-preview.v1",
+        true,
+    ),
+    (
+        "LEGACY_WORKFLOW_STORAGE_KEY",
         "dot-agent-deck.desktop.workflow-preview.v1",
         true,
     ),
@@ -410,6 +718,16 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 5] = [
     (
         "STORAGE_KEY",
         "dot-agent-deck.desktop.agent-profiles.v1",
+        true,
+    ),
+    // Issue #1496 — `sessionStorage`, not `localStorage`: the dashboard
+    // filter lasts for the window session. It holds the selected facet ids
+    // and the search text the user supplied, by typing or by voice, and
+    // does not automatically serialize settings credentials or agent
+    // prompts — though text a user types can be anything.
+    (
+        "DASHBOARD_FILTER_STORAGE_KEY",
+        "dot-agent-deck.desktop.dashboard-filter.v1",
         true,
     ),
 ];
@@ -1219,6 +1537,10 @@ pub struct VoiceSettings {
             "DesktopSettingsDto",
             "EndpointSettingsDto",
             "RemoteEndpointDto",
+            "VoiceSettingsDto",
+            "VoiceStageDto",
+            "VoiceIntentStageDto",
+            "VoiceTranscriptionStageDto",
             "DesktopSettingsSnapshotDto",
         ] {
             let body = block_after(&source, &format!("export interface {interface} "))
@@ -1265,6 +1587,19 @@ pub struct VoiceSettings {
             "export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto ",
             "function normalizeEndpointSettings(value: unknown): EndpointSettingsDto | undefined ",
             "function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined ",
+            // PRD #802 M4's section normaliser. It is on this list for the same
+            // reason the endpoint ones are: a spread inside it would carry an
+            // undeclared field into the document just as surely as one in the
+            // parent, and this document is written to `localStorage` verbatim
+            // by the fixture bridge.
+            "function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined ",
+            // And the command stage's own normaliser, which builds on
+            // `normalizeVoiceStage` rather than spreading it — the field this
+            // list is about would ride in just as easily through a nested
+            // builder as through the parent.
+            "function normalizeVoiceIntentStage(value: unknown): VoiceIntentStageDto ",
+            // And the speech stage's, for the same reason (issue #1458).
+            "function normalizeVoiceTranscriptionStage(value: unknown): VoiceTranscriptionStageDto ",
         ] {
             let body = block_after(&source, signature)
                 .unwrap_or_else(|| panic!("no `{signature}` in {BRIDGE_TS}"));
@@ -1293,7 +1628,7 @@ pub struct VoiceSettings {
         keys.sort();
         assert_eq!(
             keys,
-            ["appearance", "endpoints", "version", "zoom"],
+            ["appearance", "endpoints", "version", "voice", "zoom"],
             "unexpected normaliser result shape:\n{returned}"
         );
     }

@@ -2,15 +2,46 @@
 members = [
     ".",
     "desktop/src-tauri",
+    "xtask/cross-version",
     "xtask/docs",
     "xtask/linkage-check",
+    "xtask/screenshots",
+    "xtask/site",
     "xtask/spec",
 ]
+# The patched crossterm below is a path dependency inside the workspace root,
+# which cargo would otherwise make a member and lint as our own code.
+exclude = ["vendor/crossterm"]
+
+# Issue #451 — the minimum supported Rust toolchain, inherited by every member
+# through `rust-version.workspace = true`. Without it, a build on an older
+# rustc dies at an arbitrary compile error instead of cargo saying which
+# version the package needs, which is what `docs/installation.md` sends Nix
+# overlay users into.
+#
+# THIS IS THE TOOLCHAIN THIS PROJECT ACTUALLY TESTS, and that is the whole
+# reason it is this number. It equals the pin in `devbox.json` and in every
+# `.github/workflows/` job, so `the_declared_msrv_matches_the_pinned_toolchain`
+# in `xtask/linkage-check/src/pin_lockstep.rs` fails the build when the two
+# drift apart — move this line and the pins together, or that test says so.
+#
+# A LOWER, MEASURED floor was the obvious alternative and was rejected. It can
+# be established once, on one host, on one platform, in one profile — and then
+# nothing re-establishes it: no job builds on it, so a dependency bump or a new
+# `std` call raises the real floor silently and the declared one becomes a
+# claim with nothing behind it. `docs/develop/versioning.md` has the rest,
+# including what this means for `cargo update` and Renovate.
+[workspace.package]
+rust-version = "1.99.0"
 
 [package]
 name = "dot-agent-deck"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
+# PRD #1859: `src/bin/dot-agent-deck-collector.rs` is this package's second
+# binary, so a bare `cargo run` needs telling which one is the deck.
+default-run = "dot-agent-deck"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -28,14 +59,17 @@ ratatui = "0.30"
 # hand, and re-read `ctrl_c0_byte`'s contract, before bumping it. (The
 # `keyevent_ctrl_c0_matches_crossterm_decoder` round-trip test catches an
 # encoder/decoder mismatch under `cargo test-fast`, but not a stale line
-# reference.) NOTE: ratatui 0.30 also pulls crossterm in via `ratatui-crossterm`,
-# which offers crossterm 0.28 and 0.29 as mutually-exclusive optional
-# dependencies (renamed packages `crossterm_0_28`/`crossterm_0_29`) and
-# defaults to 0.29 — the same version this pin now names, so cargo unifies
-# both into the single `crossterm 0.29.0` entry in `Cargo.lock`. This pin still
-# binds OUR direct dependency — the one `src/ui.rs` reads events from —
-# explicitly, rather than relying on `ratatui-crossterm`'s default feature to
-# stay in sync.
+# reference.) ratatui 0.30 also depends on crossterm, through
+# `ratatui-crossterm`. Both requirements resolve to the one patched copy that
+# `[patch.crates-io]` below supplies, so a bump also means re-applying or
+# dropping that patch: a version the patch does not supply makes cargo use the
+# registry crate with only a warning, which `tests/vendored_crossterm.rs`
+# turns into a failure.
+# Fork note (PRD #242): `ratatui-crossterm` offers crossterm 0.28 and 0.29 as
+# mutually-exclusive optional features and defaults to 0.29, the version this pin
+# names, so cargo unifies both into the single `crossterm 0.29.0` entry in
+# `Cargo.lock`. This pin still binds OUR direct dependency explicitly rather than
+# relying on that default staying in sync.
 crossterm = "=0.29.0"
 clap = { version = "4", features = ["derive"] }
 toml = "1.0"
@@ -69,12 +103,45 @@ semver = "1"
 # Unix paths natively). Revisit together with native-Windows support; until then
 # 0.8.1 keeps the flag, and the whole problem, out of the tree.
 portable-pty = "=0.8.1"
-vt100 = "0.16"
+vt100 = "0.18"
 futures-util = "=0.3.34"
 regex = "1"
 open = "5"
-unicode-width = "0.2"
+# Held at 0.2.2 (Renovate PR #1982, closed). 0.2.3 gives the halfwidth katakana
+# sound marks U+FF9E/U+FF9F width 1, and ratatui-core 0.1.2's `CellWidth` still
+# adds 1 per mark to make up for the zero width 0.2.2 reported, so ratatui lays
+# a halfwidth `ｶﾞ` out across 3 cells while a terminal draws it in 2: a blank
+# cell after every such cluster, and
+# `ui::tests::truncate_styled_segments_budgets_clusters_at_their_drawn_width`
+# fails. The exact pin holds the whole graph, ratatui's copy included, because
+# cargo resolves every `0.2` requirement to one version — which also keeps
+# Renovate's lock file maintenance (`cargo update`) from taking 0.2.3. Lift it
+# once a ratatui-core release adds that 1 only when unicode-width reports the
+# mark as zero-width, together with the `unicode-width` rule in renovate.json.
+unicode-width = "=0.2.2"
 cron = "0.17.0"
+# Issue #1077: OS randomness for the per-spawn hook capability token
+# (`src/hook_provenance.rs`). Already in this workspace's dependency graph as a
+# transitive of `tempfile`/`rand`, so naming it directly adds no new code to the
+# build — it only makes the dependency explicit rather than incidental, which is
+# what a security-relevant use of it requires. Deliberately `getrandom` and not
+# `rand`: the whole requirement is "N bytes from the operating system", and a
+# userspace PRNG adds seeding and generator surface for nothing.
+getrandom = "0.4"
+# Issue #1635: SHA-256 of a downloaded release asset, checked against the
+# release's checksum manifest before `dot-agent-deck upgrade` replaces
+# anything. Already in this workspace's lockfile (the desktop crate's graph
+# carries 0.10.9), so the version resolves to code the workspace builds today.
+sha2 = "0.11"
+# PRD #1859: the collector's body reader takes a response's chunks as reqwest
+# hands them over, as `bytes::Bytes`, so it can refuse one past its cap before
+# copying any of it. Already in the graph as reqwest's own dependency, so
+# naming it adds no new code to the build.
+bytes = "1"
+# Issue #1884: `src/pty_open_retry.rs` implements `portable_pty::PtySystem`,
+# whose `openpty` returns `anyhow::Result`. Already in the graph through
+# `portable-pty` itself, so this adds no crate to the build.
+anyhow = "1"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of
@@ -85,6 +152,10 @@ cron = "0.17.0"
 # revived the bug #250 exists to fix. Same version pin as the package dep.
 [build-dependencies]
 semver = "1"
+# PRD #1419: `build.rs` parses `docs/published.toml` with the shared
+# `src/published_docs.rs` parser to embed the `docs` subcommand's pages.
+# Same version as the package dependency.
+toml = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
@@ -98,12 +169,26 @@ serial_test = "4"
 toml = "1.0"
 # PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
 # so a future patch release cannot silently reshape snapshot diffs.
-insta = { version = "=1.48.0", features = ["yaml"] }
+insta = { version = "=1.49.0", features = ["yaml"] }
 spec = { path = "xtask/spec" }
 # PRD #77 Decision 30 / M4: the L2 harness's recording dump also
 # regenerates the paired .md so local DOT_AGENT_DECK_RECORD=1 runs
 # keep the docs in sync without a separate `cargo xtask docs --tests`.
 xtask-docs = { path = "xtask/docs" }
+# Issue #1322: `tests/e2e_docs_screenshots.rs` renders the harness's vt100
+# screen to HTML with this crate's renderer, for `cargo docs-screenshots`.
+xtask-screenshots = { path = "xtask/screenshots" }
+# Issue #1473: both live-deck isolation guards (`src/test_isolation.rs`,
+# `tests/common/mod.rs`) detach the test process before `main`, so a test that
+# never calls a guard — including one written later — still cannot inherit or
+# resolve a route to the developer's running deck. Already in the lockfile via
+# `tauri-utils`, with the same `default-features = false`, so this adds no
+# crate to the build.
+ctor = { version = "1.0", default-features = false }
+# PRD #1589: `src/agent_pty.rs`'s PTY-less test master implements
+# `portable_pty::MasterPty`, whose methods return `anyhow::Error`. Already in the
+# lockfile through `portable-pty` itself, so this adds no crate to the build.
+anyhow = "1"
 
 # PRD #42 M1: `libc` is Unix-only. Every `libc::` reference lives behind a
 # `#[cfg(unix)]` path (mostly `src/platform/*/unix.rs`), so on Windows the
@@ -140,6 +225,9 @@ windows-sys = { version = "0.61", features = [
     # PRD #163 M4: `OVERLAPPED` + `GetOverlappedResultEx`/`CancelIoEx`, the
     # deadline mechanism for the above.
     "Win32_System_IO",
+    # PR #1735 review: `CreateToolhelp32Snapshot`/`Process32*W`, the parent
+    # lookup behind the inbox's process-tree check (`platform::proc`).
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 # `%USERPROFILE%` / `%LOCALAPPDATA%` resolution for `src/platform/paths.rs`.
 dirs = "7"
@@ -179,15 +267,15 @@ e2e = []
 # NOTHING IN CI ENABLES THIS FEATURE'S TESTS TO RUN, and that is the decision
 # rather than an omission: no e2e test reaches a real agent in CI, so no TEST
 # credential is registered on this repository. (Narrow claim on purpose — the
-# Codex issue-labeler is a separately credentialed workflow that does put a
+# agent PR reviewer is a separately credentialed workflow that does put a
 # repository secret on a runner and does reach a real agent; see
-# `docs/develop/issue-labeling.md`. It is out of scope for the e2e tier.) The
+# `docs/develop/governance.md`. It is out of scope for the e2e tier.) The
 # line the feature draws is exactly "reaches a real agent", which is wider than
 # "reads a key" — on a developer box the agent CLIs are pre-authenticated, so
 # spawning `claude` spends a credential with no environment variable
 # involved. Credential handling for a LOCAL lane-2 run is issue #785.
 #
-# One CI job does still compile these files, and it is the only one: rule 2's
+# One CI job does still compile these files, and it is the only one: CLAUDE.md rule 2's
 # `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D
 # warnings`. Do not "simplify" `e2e-live` out of that command — it is all that
 # stands between these files and a type error nobody sees until someone runs
@@ -209,3 +297,23 @@ path = "examples/render_config_gen_prompt.rs"
 [[example]]
 name = "diff_config"
 path = "examples/diff_config.rs"
+
+# Issue #1450: the desktop's voice check (`desktop/src-tauri/src/voice/human_voice.rs`)
+# runs `earshot`, a small neural network, over every utterance before it is
+# transcribed. Unoptimised it scores 30 s of audio in about 4 s, which in a
+# `tauri dev` build is latency added to every spoken command and in
+# `cargo test-fast` is seconds per test; optimised it is milliseconds. This
+# optimises that one dependency in debug builds and changes nothing else —
+# release builds are optimised already, and this crate's own code still builds
+# at the dev profile's settings.
+[profile.dev.package.earshot]
+opt-level = 3
+
+# crossterm 0.29.0 with its Unix event source fixed to handle a whole readiness
+# batch: upstream stranded keys typed right after a terminal resize until the
+# next keystroke. Replaces the registry crate for every dependent, ratatui's
+# included. vendor/crossterm/VENDORED.md has the change, why no release or
+# feature avoids it, when to drop it, and what keeps it applied and audited
+# (`tests/vendored_crossterm.rs`, `scripts/audit-vendored-upstream.sh`).
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

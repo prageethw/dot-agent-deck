@@ -111,7 +111,7 @@ async fn fixture(coder_command: &str) -> Fixture {
 
     {
         let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
+        let identity = OrchestrationIdentity {
             id: ORCHESTRATION_ID.to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -146,6 +146,7 @@ async fn spawn_role(fx: &Fixture, caller_pane_id: &str, role: &str) -> SpawnRole
         pane_id: caller_pane_id.to_string(),
         role: role.to_string(),
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     handle_spawn_role_with_state(
         signal,
@@ -377,6 +378,7 @@ async fn pane_spawn_008_concurrent_spawns_of_the_same_role_never_leave_two_live_
         pane_id: ORCH_PANE.to_string(),
         role: REVIEWER_ROLE.to_string(),
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     let signal_b = signal_a.clone();
 

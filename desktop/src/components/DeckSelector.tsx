@@ -31,6 +31,9 @@
  * function precisely so that dropping the links, releasing the tunnels, telling
  * the watcher and emitting a fresh snapshot cannot be done by halves. A second
  * route from here — a bespoke "switch deck" command — would be a second half.
+ * Voice's `switch_deck` (PRD #1195 M3) is not one: the menu and the spoken
+ * command dispatch the same registry entry, `switchDeck`, which calls
+ * {@link chooseDeckSelection} and so this same write.
  *
  * # An unreachable deck shows its state; it never blanks the screen
  *
@@ -53,12 +56,14 @@
  *
  * # Vocabulary
  *
- * Rendered text says **Deck**, never "daemon". The sweep of the existing strings
- * is M15's; nothing new is written in the old vocabulary.
+ * Rendered text says **daemon**, never "Deck" (issue #1045 reversed PRD #741
+ * M15; `docs/develop/glossary.md` has the canonical words). Identifiers keep
+ * their `deck` spelling.
  */
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronsUpDown, Server } from "lucide-react";
-import { LOCAL_ENDPOINT_SELECTION } from "../lib/bridge";
+import { LOCAL_ENDPOINT_SELECTION, REMOTE_ADDRESS_FIELDS, type RemoteEndpointDto, type VoiceDeckIdentityDto } from "../lib/bridge";
+import { VOICE_ACTIONS } from "../lib/voiceActions";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
   type DeckSelection,
@@ -70,6 +75,9 @@ import {
   UNKNOWN_DECK_LABEL,
 } from "../lib/endpoints";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
+import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
+import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
+import { VoiceNumber } from "./VoiceNumber";
 import type { ConnectionView } from "../types";
 
 /**
@@ -83,7 +91,7 @@ export function deckStateNote(connection: ConnectionView): string | undefined {
   // CONNECTED — to the local deck, while the selector names another one — so a
   // check on `status` alone would find nothing wrong and say nothing.
   if (connection.selectionFallback) return connection.selectionFallback;
-  if (connection.status === "loading") return "Connecting to this deck…";
+  if (connection.status === "loading") return "Connecting to this daemon…";
   if (connection.status !== "connected") return connection.message;
   // Connected, with a caveat the app is required to keep on screen for the whole
   // session (issue #801, PRD #741 M8). For a remote deck the build stamp is an
@@ -98,6 +106,67 @@ function noteIsProblem(connection: ConnectionView): boolean {
   return Boolean(connection.selectionFallback) || connection.status === "disconnected" || connection.status === "error";
 }
 
+/**
+ * What {@link VOICE_ACTIONS}' `switchDeck` does, for the menu and for voice
+ * alike (PRD #1195 M3): store `token` as the selection, through the one write
+ * this file has always made. Answers `undefined` when it did, or when `token`
+ * is already the selection — the no-op guard below writes nothing then, and
+ * "Showing <deck>." is still true — or the sentence saying why it did not.
+ *
+ * The one refusal is a token the selector does not list. A click cannot
+ * produce one; a voice answer can, because the list it resolved against was
+ * read before the round trip and a deck can be removed in Settings meanwhile.
+ * Storing a token naming no row would put the app on the local deck under an
+ * "Unknown deck" label, which is a worse answer than saying so.
+ *
+ * The second refusal is the same race one step narrower (PRD #1195): the row is
+ * still listed, but Settings changed one of its address fields
+ * (`REMOTE_ADDRESS_FIELDS`: host, SSH user, port, socket, SSH key or jump host)
+ * under the same id. `identity` is the address voice resolved the switch against;
+ * when it no longer matches the row, the switch would reach a machine or deck
+ * the user did not name, so nothing is written and the user is asked to say it
+ * again. The menu passes no `identity` — it writes the row it rendered — and
+ * neither does voice for the local deck, which has no remote address; an
+ * identity arriving with a token that names no remote row is refused too.
+ */
+export function chooseDeckSelection(settings: DesktopSettingsState, token: string, identity?: VoiceDeckIdentityDto): string | undefined {
+  const section = settings.settings.endpoints;
+  const next = deckChoices(section).find((choice) => choice.token === token);
+  if (!next) return "That daemon is not in the Daemon selector any more.";
+  if (identity && !sameDeckIdentity(section?.remote?.find((row) => row.id === token), identity)) {
+    return "That daemon changed in Settings since you asked for it — try again.";
+  }
+  /*
+    The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6
+    and is a data safety property rather than a tidiness one.
+
+    The claim it used to carry here was that when the document has NO
+    `[endpoints]` section the only choice is the local deck and it is already
+    selected, so every click lands on the guard and the section below is only
+    ever built from one that already exists. **All Decks is a second choice
+    that needs no configuration**, so that stopped being true at M1.
+
+    What an unguarded click costs: the webview's section is ordinarily absent
+    because the DOCUMENT's is, so writing `{ remote: [], selection }` deletes
+    nothing. It is also absent when `desktop.toml` failed to parse and
+    `load_from` fell back to defaults — and there `remote: []` merges over
+    rows that are still on disk. `endpointSectionToSave` is where that is
+    refused for every write site at once, and its doc comment carries the rest
+    of the reasoning, including what it deliberately does not close.
+  */
+  const write = endpointSectionToSave(section, {
+    remote: section?.remote ?? [],
+    selection: selectionToken(next.selection),
+  });
+  if (write) settings.save({ ...settings.settings, endpoints: write });
+  return undefined;
+}
+
+/** Whether `row` still has the address voice resolved a switch against. */
+function sameDeckIdentity(row: RemoteEndpointDto | undefined, identity: VoiceDeckIdentityDto): boolean {
+  return row !== undefined && REMOTE_ADDRESS_FIELDS.every((field) => row[field] === identity[field]);
+}
+
 export function DeckSelector({ settings, connection }: { settings: DesktopSettingsState; connection: ConnectionView }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
@@ -110,6 +179,23 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
   const selection = parseSelection(section?.selection ?? LOCAL_ENDPOINT_SELECTION);
   const current = choices.find((choice) => sameSelection(choice.selection, selection));
   const note = deckStateNote(connection);
+  /*
+    PR #1451 round 3, change 4 — while the menu is open its entries are a
+    numbered list, over whatever screen it opened on (the dialog layer), so
+    "two" switches to the second, as saying its name would. All daemons is
+    numbered like the rest (issue #1491): voice's `switch_deck` switches to it
+    by name, so its number dispatches the same switch with its `all` token.
+  */
+  const numberedChoices = useMemo(() => (open ? choices : undefined), [choices, open]);
+  const numberedEntries = useMemo(() => numberedChoices?.map((choice): VoiceNumberedEntryDto => ({
+    kind: "deck_switch",
+    value: choice.token,
+    label: choice.label,
+    names: choice.address ? [choice.address] : [],
+  })), [numberedChoices]);
+  const numberedSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedEntries && [{ kind: "deck", entries: numberedEntries }], [numberedEntries]);
+  useNumberedList("dialog", numberedSections);
+  const numbersShown = useNumbersShown();
 
   /*
     Dismiss on a pointer-down anywhere else, exactly as `OverviewColumnPicker`
@@ -130,32 +216,14 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
     return () => document.removeEventListener("pointerdown", dismiss);
   }, [open]);
 
+  /*
+    PRD #1195 M3: the menu dispatches through the registry entry voice's
+    `switch_deck` row names, so the drop-down and the spoken command are one
+    control by two routes rather than two writes that agree today.
+  */
   const choose = (next: DeckSelection) => {
     setOpen(false);
-    /*
-      The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6
-      and is a data safety property rather than a tidiness one.
-
-      The claim it used to carry here was that when the document has NO
-      `[endpoints]` section the only choice is the local deck and it is already
-      selected, so every click lands on the guard and the section below is only
-      ever built from one that already exists. **All Decks is a second choice
-      that needs no configuration**, so that stopped being true at M1.
-
-      What an unguarded click costs: the webview's section is ordinarily absent
-      because the DOCUMENT's is, so writing `{ remote: [], selection }` deletes
-      nothing. It is also absent when `desktop.toml` failed to parse and
-      `load_from` fell back to defaults — and there `remote: []` merges over
-      rows that are still on disk. `endpointSectionToSave` is where that is
-      refused for every write site at once, and its doc comment carries the rest
-      of the reasoning, including what it deliberately does not close.
-    */
-    const write = endpointSectionToSave(section, {
-      remote: section?.remote ?? [],
-      selection: selectionToken(next),
-    });
-    if (!write) return;
-    settings.save({ ...settings.settings, endpoints: write });
+    VOICE_ACTIONS.switchDeck.run({ switchDeck: (token) => chooseDeckSelection(settings, token) }, { deckSelection: selectionToken(next) });
   };
 
   return (
@@ -163,6 +231,15 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
       className="deck-selector"
       ref={root}
       onKeyDown={(event) => {
+        /* A digit picks the daemon showing it while the numbers show. */
+        const number = open && numbersShown ? numberKey(event.nativeEvent) : undefined;
+        const numbered = number === undefined ? undefined : numberedChoices?.[number - 1];
+        if (numbered) {
+          event.preventDefault();
+          event.stopPropagation();
+          choose(numbered.selection);
+          return;
+        }
         if (event.key !== "Escape") return;
         setOpen(false);
         event.stopPropagation();
@@ -173,7 +250,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
         data-testid="deck-selector-toggle"
         aria-expanded={open}
         aria-haspopup="true"
-        title="Choose which deck these screens are showing."
+        title="Choose which daemon these screens are showing."
         onClick={() => setOpen((wasOpen) => !wasOpen)}
       >
         <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
@@ -199,7 +276,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
       )}
       {open && (
         <div className="deck-selector-menu" data-testid="deck-selector-menu">
-          <span className="deck-selector-menu-label" id={labelId}>Deck</span>
+          <span className="deck-selector-menu-label" id={labelId}>Daemon</span>
           <div role="radiogroup" aria-labelledby={labelId}>
             {choices.map((choice) => {
               const chosen = sameSelection(choice.selection, selection);
@@ -210,15 +287,16 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
                   aria-checked={chosen}
                   className={chosen ? "deck-selector-option is-selected" : "deck-selector-option"}
                   data-testid={`deck-selector-option-${choice.token}`}
+                  title={choice.address ? displayText(choice.address, DISPLAY_LIMITS.name) : undefined}
                   onClick={() => choose(choice.selection)}
                 >
-                  <span>{displayText(choice.label, DISPLAY_LIMITS.name)}</span>
+                  <span><VoiceNumber number={numbersShown && numberedChoices ? (numberedChoices.indexOf(choice) + 1 || undefined) : undefined} />{displayText(choice.label, DISPLAY_LIMITS.name)}</span>
                   {chosen && <Check size={12} aria-hidden="true" />}
                 </button>
               );
             })}
           </div>
-          <p>Decks are added and removed in Settings.</p>
+          <p>Daemons are added and removed in Settings.</p>
         </div>
       )}
     </div>

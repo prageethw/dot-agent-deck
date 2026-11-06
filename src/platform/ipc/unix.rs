@@ -11,7 +11,7 @@
 //! so every bound endpoint ends up owner-only exactly as before.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -64,8 +64,15 @@ impl IpcStream {
     /// Connect to a daemon endpoint. Lift of `UnixStream::connect`; preserves
     /// the exact `io::Error` kinds callers match on (`ConnectionRefused` for a
     /// stale inode, `NotFound` for a missing socket file).
+    ///
+    /// Since issue #1121 round two it also refuses a listener owned by another
+    /// uid — see [`refuse_foreign_peer`]. That adds one error kind,
+    /// `PermissionDenied`, and it is the same kind `connect(2)` itself reports
+    /// for a socket we may not talk to.
     pub async fn connect(endpoint: &Path) -> io::Result<Self> {
-        Ok(Self(UnixStream::connect(endpoint).await?))
+        let stream = UnixStream::connect(endpoint).await?;
+        refuse_foreign_peer(stream.as_raw_fd(), endpoint)?;
+        Ok(Self(stream))
     }
 
     /// Split into owned read/write halves via
@@ -158,12 +165,54 @@ impl IpcListener {
         Ok(IpcStream(stream))
     }
 
+    /// Bind a listener at `endpoint`, owner-only, **without** touching the
+    /// process umask — by making the socket's directory owner-only first.
+    ///
+    /// [`bind`] gets its guarantee by flipping the **process** umask around
+    /// `bind(2)`, which every other thread in the process sees for that moment.
+    /// Under a plain `cargo test` that is every sibling test, and the desktop
+    /// crate's lib tests, which run the production attach server in-process,
+    /// raced on it (issue #1078). This gets the same guarantee from the
+    /// directory instead: [`ensure_owner_only_dir`] creates `endpoint`'s parent
+    /// at `0o700`, or tightens an existing one to it, refusing a symlink or a
+    /// directory another user owns. With the parent owner-only no other user
+    /// can reach the socket while it is bound at the ambient umask, and the
+    /// `0o600` restatement [`bind`] also performs follows.
+    ///
+    /// It tightens the parent as a side effect, so point it only at a directory
+    /// that is meant to be this user's alone. Like [`ensure_owner_only_dir`] it
+    /// vouches for the final component only; an ancestor another user controls
+    /// is outside what it can promise.
+    ///
+    /// [`bind`]: Self::bind
+    /// [`ensure_owner_only_dir`]: crate::platform::fsperm::ensure_owner_only_dir
+    pub fn bind_in_owner_only_dir(endpoint: &Path) -> io::Result<Self> {
+        let parent = endpoint
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} names no directory to make owner-only",
+                        endpoint.display()
+                    ),
+                )
+            })?;
+        crate::platform::fsperm::ensure_owner_only_dir(parent)?;
+        let listener = UnixListener::bind(endpoint)?;
+        crate::platform::fsperm::set_endpoint_mode_owner_only(endpoint)?;
+        Ok(Self(listener))
+    }
+
     /// Test-only: adopt an already-bound [`tokio::net::UnixListener`] as an
     /// `IpcListener` **without** the umask/permission dance [`bind`] performs.
     /// The daemon hook-ingestion tests bind their socket with a plain
     /// `UnixListener::bind` on purpose — [`bind`]'s process-global umask flip
     /// races sibling tests under single-process `cargo test` — yet still need to
     /// hand the listener to `run_hook_loop`, which takes an `IpcListener`.
+    ///
+    /// [`bind`]: Self::bind
     #[cfg(test)]
     pub(crate) fn from_tokio_listener(listener: UnixListener) -> Self {
         Self(listener)
@@ -190,7 +239,9 @@ impl IpcClient {
     ///
     /// [`connect_timeout`]: Self::connect_timeout
     pub fn connect(endpoint: &Path) -> io::Result<Self> {
-        Ok(Self(std::os::unix::net::UnixStream::connect(endpoint)?))
+        let stream = std::os::unix::net::UnixStream::connect(endpoint)?;
+        refuse_foreign_peer(stream.as_raw_fd(), endpoint)?;
+        Ok(Self(stream))
     }
 
     /// Connect synchronously, bounded by `timeout` (issue #435).
@@ -269,6 +320,7 @@ impl IpcClient {
         }
 
         stream.set_nonblocking(false)?;
+        refuse_foreign_peer(fd, endpoint)?;
         Ok(Self(stream))
     }
 
@@ -281,6 +333,13 @@ impl IpcClient {
         Ok(())
     }
 
+    /// The connected socket itself, for a caller that reads it on a thread of
+    /// its own and bounds each write by its own deadline
+    /// ([`crate::inbox_oneshot::Connection`]).
+    pub fn into_std(self) -> std::os::unix::net::UnixStream {
+        self.0
+    }
+
     /// Half-close the write side, leaving the read side open. Lift of the
     /// `stream.shutdown(std::net::Shutdown::Write)` call in
     /// `hook::request_from_socket`: after writing its single request line the
@@ -291,6 +350,12 @@ impl IpcClient {
     /// request/response deadlocks.
     pub fn shutdown_write(&self) -> io::Result<()> {
         self.0.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+impl AsRawFd for IpcClient {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
     }
 }
 
@@ -308,6 +373,59 @@ impl std::io::Write for IpcClient {
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
     }
+}
+
+/// Refuse a connection whose peer is not the uid running this process
+/// (issue #1121 round two).
+///
+/// **This is the clause that makes the endpoint trust check mean what it has
+/// always claimed.** [`crate::platform::fsperm::verify_endpoint_trusted`]'s
+/// doc used to say the descriptor a caller connects with is "anchored to the
+/// inode the kernel resolves during this single call". It is not: the `lstat`
+/// and the `connect(2)` are two separate pathname resolutions, and every
+/// caller that probes and then connects again resolves it a third time. In a
+/// sticky world-writable directory a foreign uid cannot replace a *live*
+/// victim-owned inode — but when an old daemon unlinks its socket during
+/// shutdown the name is free, and a permissive listener bound in that window
+/// passes an `lstat` taken before it and receives whatever the caller sends.
+///
+/// A peer credential is not subject to that, because it is not a name: the
+/// kernel records who is on the other end of *this* connection when it is
+/// established, and `SO_PEERCRED` / `getpeereid` read that record back. It is
+/// welded into all three Unix connect entry points rather than offered as
+/// something a caller may ask for, which is exactly the shape the Windows
+/// backend has always had — `IpcStream::connect` and `IpcClient::connect`
+/// there both compare the pipe server's owner SID with ours, whether or not a
+/// caller asks. Until now `src/platform/fsperm/mod.rs`'s own site table said
+/// so, and recorded Unix's connect as "unguarded".
+///
+/// **Two things it does not do.** It says nothing about who listens on the far
+/// end of an ssh-forwarded socket, because the peer of that connection is the
+/// *local* `ssh` process and is ours by construction. And it is not a
+/// substitute for [`crate::platform::fsperm::verify_endpoint_trusted`], which
+/// runs *before* a connect is attempted and is what keeps the deck from
+/// touching a foreign entry at all; this runs after, on a connection that was
+/// allowed to be made.
+///
+/// Root is outside this, as it is outside every uid check — a process running
+/// as uid 0 can bind wherever it likes. It is not the actor this is written
+/// against.
+fn refuse_foreign_peer(fd: RawFd, endpoint: &Path) -> io::Result<()> {
+    let peer_uid = crate::platform::peercred::peer_uid_raw(fd)?;
+    let our_uid = crate::platform::paths::current_uid();
+    if peer_uid != our_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing the daemon connection at {}: the process listening there runs as \
+                 uid {peer_uid} and we are uid {our_uid}. Another user may have bound this \
+                 endpoint. Set DOT_AGENT_DECK_SOCKET and DOT_AGENT_DECK_ATTACH_SOCKET to \
+                 paths under a directory only you can write.",
+                endpoint.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A fresh, unconnected `AF_UNIX` stream socket with close-on-exec set.
@@ -418,7 +536,7 @@ fn sockaddr_un(endpoint: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -436,7 +554,7 @@ mod tests {
     /// is full — the one place the two Unixes genuinely differ, so the test
     /// asserts against what the platform actually did rather than guessing.
     #[derive(Debug, PartialEq, Eq)]
-    enum QueueFull {
+    pub(crate) enum QueueFull {
         /// Linux: a *blocking* `connect(2)` parks indefinitely. This is the
         /// hang issue #435 is about.
         Parks,
@@ -458,18 +576,44 @@ mod tests {
     /// The backlog is set to 1 via a raw `listen(2)` because
     /// `UnixListener::bind` hardcodes 128, and queuing 129 connections to reach
     /// the same state is slower and no more faithful.
-    struct SaturatedListener {
+    pub(crate) struct SaturatedListener {
         _dir: tempfile::TempDir,
-        path: std::path::PathBuf,
+        pub(crate) path: std::path::PathBuf,
         listener: UnixListener,
         /// Connections already sitting in the accept queue. Held so they are
         /// not closed, and so the queue stays full for the whole test.
         _queued: Vec<UnixStream>,
-        behaviour: QueueFull,
+        /// The receivers of filling connects that were slow to answer but
+        /// turned out not to be parked (issue #1137). Held so a connect that
+        /// completes late still has somewhere to deliver its stream, instead of
+        /// the send failing and the stream closing — which would drop a queued
+        /// connection and could leave the queue short of full.
+        _late: Vec<mpsc::Receiver<io::Result<UnixStream>>>,
+        pub(crate) behaviour: QueueFull,
+    }
+
+    /// One non-blocking `connect(2)` to `path`, the probe
+    /// [`SaturatedListener::new`] uses to tell a full queue from a slow thread.
+    ///
+    /// A non-blocking socket never parks: against a full queue Linux answers
+    /// `EAGAIN` (`WouldBlock`) and the BSDs `ECONNREFUSED`, and against a queue
+    /// with room the connect completes on the spot, because an `AF_UNIX`
+    /// connect has no handshake to wait for.
+    fn nonblocking_connect(path: &std::path::Path) -> io::Result<UnixStream> {
+        let stream = cloexec_stream_socket()?;
+        stream.set_nonblocking(true)?;
+        let (addr, len) = sockaddr_un(path)?;
+        // SAFETY: `addr`/`len` describe a well-formed `sockaddr_un` that
+        // outlives the call, and the fd is the socket `stream` owns.
+        let rc = unsafe { libc::connect(stream.as_raw_fd(), std::ptr::addr_of!(addr).cast(), len) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(stream)
     }
 
     impl SaturatedListener {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("saturated.sock");
 
@@ -499,7 +643,16 @@ mod tests {
             // its own thread because on Linux the one that finds the queue full
             // parks: that parked connect is the bug under test, and it stays
             // parked until the process exits, which is harmless.
+            //
+            // Silence alone is NOT read as "full" (issue #1137): a filling
+            // thread starved for longer than the wait against a queue that
+            // still had room would otherwise be classified `Parks`, leaving a
+            // listener that is not saturated and a connect under test that
+            // simply succeeds. So a timeout is confirmed with a non-blocking
+            // probe, which cannot park, and filling resumes if the probe gets
+            // in.
             let mut queued = Vec::new();
+            let mut late = Vec::new();
             for _ in 0..64 {
                 let probe = path.clone();
                 let (tx, rx) = mpsc::channel();
@@ -512,13 +665,27 @@ mod tests {
                         continue;
                     }
                     Ok(Err(_)) => QueueFull::Refuses,
-                    Err(_) => QueueFull::Parks,
+                    Err(_) => match nonblocking_connect(&path) {
+                        Ok(stream) => {
+                            // The queue had room, so the silence was a slow
+                            // thread rather than a parked connect.
+                            queued.push(stream);
+                            late.push(rx);
+                            continue;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => QueueFull::Parks,
+                        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                            QueueFull::Refuses
+                        }
+                        Err(e) => panic!("probe connect to the filling listener: {e}"),
+                    },
                 };
                 return Self {
                     _dir: dir,
                     path,
                     listener,
                     _queued: queued,
+                    _late: late,
                     behaviour,
                 };
             }
@@ -647,6 +814,27 @@ mod tests {
         );
     }
 
+    /// Issue #1137: the probe that confirms a saturated queue must tell the two
+    /// states apart — it gets in while the queue has room, and it reports the
+    /// platform's queue-full answer once it has none. If it could not, the
+    /// fill loop would either stop early (the bug) or never stop.
+    #[test]
+    fn the_saturation_probe_tells_a_full_queue_from_one_with_room() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("roomy.sock");
+        let _roomy = UnixListener::bind(&path).expect("bind a listener with room");
+        nonblocking_connect(&path).expect("a queue with room must admit the probe");
+
+        let saturated = SaturatedListener::new();
+        let err = nonblocking_connect(&saturated.path)
+            .expect_err("a full queue must not admit the probe");
+        let expected = match saturated.behaviour {
+            QueueFull::Parks => io::ErrorKind::WouldBlock,
+            QueueFull::Refuses => io::ErrorKind::ConnectionRefused,
+        };
+        assert_eq!(err.kind(), expected, "{err:?}");
+    }
+
     /// The retry loop must not swallow a FINAL answer. A socket inode with no
     /// listener behind it — what a crashed daemon leaves — reports
     /// `ECONNREFUSED`, the same errno the BSDs use for a full accept queue, and
@@ -698,6 +886,60 @@ mod tests {
         assert!(
             elapsed < CONNECT_BUDGET,
             "a healthy connect must be fast, took {elapsed:?}"
+        );
+    }
+
+    /// Scenario: a socket is bound in a directory that does not exist yet, and
+    /// another in an existing world-readable (`0o755`) one. Both directories end
+    /// up `0o700`, both sockets `0o600`, and a client connects to each. A
+    /// symlink standing where the directory should be is refused rather than
+    /// followed (issue #1078).
+    #[test]
+    fn binding_in_an_owner_only_dir_makes_the_dir_and_the_socket_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("a runtime to bind in");
+        let _entered = runtime.enter();
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let fresh = root.path().join("fresh");
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).expect("create the open dir");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0o755");
+        for dir in [&fresh, &open] {
+            let endpoint = dir.join("attach.sock");
+            let _listener = IpcListener::bind_in_owner_only_dir(&endpoint).expect("bind");
+            assert_eq!(mode(dir), 0o700, "{} is owner-only", dir.display());
+            assert_eq!(
+                mode(&endpoint),
+                0o600,
+                "{} is owner-only",
+                endpoint.display()
+            );
+            UnixStream::connect(&endpoint).expect("a client reaches the listener");
+        }
+
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).expect("create the link target");
+        let linked = root.path().join("linked");
+        std::os::unix::fs::symlink(&target, &linked).expect("plant the symlink");
+        assert!(
+            IpcListener::bind_in_owner_only_dir(&linked.join("attach.sock")).is_err(),
+            "a symlinked directory must be refused, not followed"
+        );
+        assert!(
+            !target.join("attach.sock").exists(),
+            "nothing was bound through the link"
         );
     }
 }

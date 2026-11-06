@@ -76,7 +76,7 @@ pub fn visible_tail_lines(snapshot: &[u8], rows: u16, cols: u16, max_lines: usiz
     // caller gets no lines and the notice says the pane rendered nothing, which
     // is the honest answer when the screen could not be reconstructed.
     let parsed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let mut parser = crate::vt_grid::parser(rows, cols, 0);
         parser.process(snapshot);
         parser
             .screen()
@@ -101,6 +101,67 @@ pub fn visible_tail_lines(snapshot: &[u8], rows: u16, cols: u16, max_lines: usiz
         .collect();
     tail.reverse();
     tail
+}
+
+/// Where [`visible_rows_and_cursor`] found the terminal cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenCursor {
+    /// The screen row.
+    pub row: usize,
+    /// The length of the row's processed text up to and including the cursor
+    /// cell, in `char`s: `row.chars().take(through)` is everything at or
+    /// before the cursor.
+    pub through: usize,
+    /// The cursor's cell column, 0-based. On a blank row, where `through` is
+    /// 0 wherever the cursor sits, this still says where it is.
+    pub cell: usize,
+}
+
+/// Issue #1383: every row of the rendered screen, blank ones included so the
+/// index is a screen row, and where the terminal cursor is.
+///
+/// Rows are trimmed and rule-collapsed like [`visible_tail_lines`]'s.
+/// [`ScreenCursor::through`] is counted in `char`s of that processed row
+/// rather than in cells, and it counts the cell UNDER the cursor too.
+/// Including that cell covers a line that fills the row exactly, where the
+/// terminal parks the cursor ON the last character (pending wrap) rather than
+/// after it. `None` when the snapshot is empty or the parser panicked (the
+/// same vt100 0.16.2 short-pane edge case [`visible_tail_lines`] contains).
+pub fn visible_rows_and_cursor(
+    snapshot: &[u8],
+    rows: u16,
+    cols: u16,
+) -> Option<(Vec<String>, ScreenCursor)> {
+    if snapshot.is_empty() {
+        return None;
+    }
+    let (rows, cols) = parser_init_dims(rows, cols);
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut parser = crate::vt_grid::parser(rows, cols, 0);
+        parser.process(snapshot);
+        let screen = parser.screen();
+        let lines = screen
+            .rows(0, cols)
+            .map(|row| collapse_rules(row.trim()))
+            .collect::<Vec<_>>();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        // Processed the same way as the whole row, so the count indexes it:
+        // `collapse_rules` streams left to right, so it maps a prefix of the
+        // row onto a prefix of its output.
+        let through_cursor = screen
+            .rows(0, cursor_col.saturating_add(1).min(cols))
+            .nth(usize::from(cursor_row))
+            .map_or(0, |left| collapse_rules(left.trim_start()).chars().count());
+        (
+            lines,
+            ScreenCursor {
+                row: usize::from(cursor_row),
+                through: through_cursor,
+                cell: usize::from(cursor_col),
+            },
+        )
+    }))
+    .ok()
 }
 
 /// Shrink runs of one repeated non-alphanumeric character to
@@ -178,6 +239,41 @@ mod tests {
             visible_tail_lines(b"content\r\n", 0, 0, MAX_REPORTED_ROWS),
             vec!["content".to_string()]
         );
+    }
+
+    #[test]
+    fn visible_rows_and_cursor_reports_the_cursor_row_and_keeps_blank_rows() {
+        let (rows, cursor) =
+            visible_rows_and_cursor(b"history\r\n\r\n> typed\x1b[4;1Hfooter\x1b[3;8H", 24, 80)
+                .expect("parsed");
+        assert_eq!(&rows[..4], ["history", "", "> typed", "footer"]);
+        assert_eq!(rows.len(), 24, "every screen row, so the index is a row");
+        assert_eq!(cursor.row, 2);
+        assert_eq!(
+            cursor.through,
+            "> typed".len(),
+            "the cursor sits right after the text"
+        );
+        assert_eq!(cursor.cell, 7);
+        // Leading padding is trimmed from the row, and from the count with it.
+        let (rows, cursor) = visible_rows_and_cursor(b"   > ab\x1b[1;5H", 24, 80).expect("parsed");
+        assert_eq!(rows[0], "> ab");
+        assert_eq!(
+            &rows[0][..cursor.through],
+            "> ",
+            "through the cell under the cursor"
+        );
+        assert_eq!(cursor.cell, 4, "the cell column keeps the padding");
+        // A line that fills the row parks the cursor on its last character.
+        let (rows, cursor) = visible_rows_and_cursor(b"0123456789", 24, 10).expect("parsed");
+        assert_eq!(
+            rows[0].chars().take(cursor.through).collect::<String>(),
+            "0123456789"
+        );
+        // On a blank row only the cell column says where the cursor is.
+        let (_, cursor) = visible_rows_and_cursor(b"text\x1b[2;3H", 24, 80).expect("parsed");
+        assert_eq!((cursor.row, cursor.through, cursor.cell), (1, 0, 2));
+        assert_eq!(visible_rows_and_cursor(b"", 24, 80), None);
     }
 
     #[test]

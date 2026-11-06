@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! PRD #699 fix-round (issue #782 / upstream PR #918 review): PTY-attached
 //! L2 coverage for `pane restart <role>` — the coverage gap every existing
@@ -16,10 +16,15 @@
 //! `tests/pane_restart.rs`.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::time::Duration;
 
-use common::{TuiDeck, commit_fixture, open_orchestration, retry_pane_restart_until_success};
+use common::{
+    TuiDeck, agent_records_on, commit_fixture, open_orchestration,
+    retry_pane_restart_until_success, write_hook_line,
+};
 use dot_agent_deck::agent_pty::TabMembership;
 use spec::spec;
 
@@ -45,27 +50,17 @@ const LONG_LIVED_CONFIG: &str = "[[orchestrations]]\n\
      clear = false\n";
 
 /// Run the real `dot-agent-deck delegate` CLI as a subprocess from
-/// `caller_pane`'s identity — the same fork-#358/#567 caller-identity
-/// technique `tests/e2e_work_done_reporting.rs`'s
-/// `run_delegate_cli_with_subject` and `tests/e2e_dispatcher_mode.rs`'s
-/// `run_delegate_to` already use, reimplemented locally since integration
-/// test binaries cannot share helpers across files.
+/// `caller_pane`'s identity, mirroring `tests/e2e_dispatcher_mode.rs`'s own
+/// `run_delegate_to` — reimplemented locally since integration test binaries
+/// cannot share helpers across files. The deck is launched with
+/// `impersonating_pane_signals()`, so the daemon accepts this harness-launched
+/// CLI (it carries no per-spawn capability token) as the caller pane's.
 fn run_delegate_cli(
     deck: &TuiDeck,
     caller_pane: &str,
     to: &str,
     task: &str,
 ) -> std::process::Output {
-    let caller_record = common::agent_records_on(deck.attach_socket_path())
-        .into_iter()
-        .find(|r| r.pane_id_env.as_deref() == Some(caller_pane))
-        .expect("the caller pane must still be present in ListAgents");
-    let caller_generation = caller_record
-        .registration_generation
-        .expect("the caller pane must carry a registration_generation once registered");
-    let caller_boot_id = caller_record
-        .daemon_boot_id
-        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
     std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .arg("delegate")
         .arg("--to")
@@ -74,11 +69,6 @@ fn run_delegate_cli(
         .arg(task)
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", caller_pane)
-        .env(
-            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
-            caller_generation.to_string(),
-        )
-        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", caller_boot_id)
         .output()
         .expect("run the real `dot-agent-deck delegate` CLI")
 }
@@ -95,40 +85,36 @@ fn run_delegate_cli(
 /// subprocess (no `--force` needed, since the pane genuinely crashes on its
 /// own) until it succeeds, exactly as a real orchestrator agent would from
 /// inside its own pane: `ListAgents`/`agent_records()` deliberately filters
-/// out exited-but-not-reaped entries (`src/agent_pty.rs:8071-8082`), so
-/// polling it for coder's `crashed == Some(true)` marker can never observe
-/// that marker firing — the real CLI call itself, retried against the "has
-/// not crashed; pass --force" refusal (`src/state.rs:8258-8266`) until
-/// coder's boot command has actually exited, is the reliable signal
-/// available from outside the daemon. A successful restart IS the proof the
-/// precondition held; any OTHER failure is a genuine test failure, not a
-/// wait condition. Once restarted, prove the pane is genuinely reachable —
-/// not merely that the daemon's own registry says so — by running the REAL
-/// `dot-agent-deck delegate --to coder` CLI and confirming the delegated
-/// task's one-line file-pointer (`compose_delegate_prompt`'s "Read
-/// .dot-agent-deck/worker-task-coder..." text, the same substring
-/// `tests/e2e_pi_live.rs` already waits for to prove a delegate landed)
-/// actually renders in `coder`'s pane through the STILL-ATTACHED TUI once
-/// focused there (a `cat` stand-in carries no recognized agent identity, so
-/// the role card's own unfocused `Prmt:` preview field never activates for
-/// it — only the raw, focused PTY echo shows the pointer text). A daemon
-/// that only fixes its own bookkeeping but never gets an already-attached
-/// viewer to follow the pane onto its new agent would pass every
-/// handler-level `pane/restart/*` test and still fail this one.
+/// out exited-but-not-reaped entries, so polling it for coder's `crashed ==
+/// Some(true)` marker can never observe that marker firing — the real CLI
+/// call itself, retried against the "has not crashed; pass --force" refusal
+/// (`src/state.rs`) until coder's boot command has actually exited, is the
+/// reliable signal available from outside the daemon. A successful restart
+/// IS the proof the precondition held; any OTHER failure is a genuine test
+/// failure, not a wait condition. Once restarted, prove the pane is
+/// genuinely reachable — not merely that the daemon's own registry says so —
+/// by running the REAL `dot-agent-deck delegate --to coder` CLI and
+/// confirming the task is posted to `coder`'s inbox bound to the RESTARTED
+/// generation (PRD #1666: the deck posts a task rather than typing it), then
+/// focusing `coder` in the STILL-ATTACHED TUI and typing a probe that must
+/// render as `cat`'s echo inside the restarted pane. A daemon that only fixes
+/// its own bookkeeping but never gets an already-attached viewer to follow
+/// the pane onto its new agent would pass every handler-level
+/// `pane/restart/*` test and still fail this one.
 #[spec("pane/restart/009")]
 #[test]
 fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .launch_with_fixture("pane-restart-live");
-    let work = deck.workdir().to_path_buf();
     // Isolated-clone provisioning needs a ref to branch from — an unborn HEAD
     // (the harness's own bare `git init`) does not provide one.
-    commit_fixture(&work);
-    deck.wait_for_string("No active sessions");
+    commit_fixture(deck.workdir());
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
     deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, orchestrator focused
 
     assert!(
@@ -184,7 +170,16 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         Duration::from_secs(30),
     );
 
-    deck.wait_until_quiescent();
+    // The successful restart response orders the delegate below, and coder's
+    // new generation listed by the daemon confirms it — a condition, not a
+    // quiet screen: a live TUI keeps emitting redraw bytes, so terminal silence
+    // is not a readiness signal.
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            role_agent_id(&deck, CODER_ROLE).is_some()
+        }),
+        "the restart must publish coder's new generation"
+    );
 
     let delegate_output = run_delegate_cli(
         &deck,
@@ -200,36 +195,208 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         String::from_utf8_lossy(&delegate_output.stderr)
     );
 
+    // The task reached the RESTARTED generation: one message in coder's inbox,
+    // bound to the agent id the daemon lists for coder now.
+    let (coder_agent, coder_pane) =
+        role_agent_id(&deck, CODER_ROLE).expect("coder's restarted generation is listed");
+    let task = "prove the restarted pane is reachable";
+    assert!(
+        inbox_view::wait_for(
+            deck.attach_socket_path(),
+            &coder_pane,
+            task,
+            Duration::from_secs(15)
+        ),
+        "the delegate to the just-restarted coder never reached its inbox; inbox = {:?}",
+        inbox_view::messages(deck.attach_socket_path(), &coder_pane)
+    );
+    let bound: Vec<_> = inbox_view::messages(deck.attach_socket_path(), &coder_pane)
+        .into_iter()
+        .filter(|message| message.text.as_deref().is_some_and(|t| t.contains(task)))
+        .collect();
+    assert!(
+        bound.len() == 1 && bound[0].bind_agent.as_deref() == Some(coder_agent.as_str()),
+        "the delegated task must be one message bound to coder's restarted generation \
+         {coder_agent}; matching messages = {bound:?}"
+    );
+
     // Focus coder's own role pane (command mode via Ctrl+d, then `2` jumps to
     // role card 2 and focuses its pane -- coder is the second role declared
-    // in the fixture, after the start-role orchestrator) so its live,
-    // verbatim-echoed PTY content is what the detail panel actually draws.
-    // `cat` carries no recognized agent identity, so `is_empty_placeholder`
-    // (`src/ui.rs`) never clears for it -- that gate needs a genuine,
-    // non-synthetic status assertion from the agent's own hooks
-    // (`agent_report_activity_seen`, `src/state.rs`), which a bare `cat`
-    // stand-in never produces -- meaning the role card's own `Prmt:` preview
-    // (`tests/e2e_pi_live.rs`'s route for a real, hook-integrated agent) never
-    // activates here. The delegated pointer text is only ever observable
-    // through the raw PTY echo, which requires focus.
+    // in the fixture, after the start-role orchestrator), then type a probe.
+    // `cat`'s echo of it can only render if the still-attached TUI follows the
+    // pane onto its restarted agent's live PTY.
     //
     // A single `2` press, then a pure wait -- not a retry. The digit jump
-    // only resolves in `UiMode::Normal` (`src/ui.rs`); a successful
-    // `focus_deck` switches straight to `UiMode::PaneInput`, so only the
-    // FIRST `2` after `\x04` is ever interpreted as a jump -- resending `2`
-    // on a retry would land as a literal keystroke forwarded into whichever
-    // pane is already focused, not a jump, so it could never recover from
-    // the race it would be trying to guard against. Waiting once for the
-    // needle after a single press is both correct and sufficient here.
+    // only resolves in `UiMode::Normal`; a successful `focus_deck` switches
+    // straight to `UiMode::PaneInput`, so only the FIRST `2` after `\x04` is
+    // ever interpreted as a jump -- resending `2` on a retry would land as a
+    // literal keystroke forwarded into whichever pane is already focused.
     deck.send_bytes(b"\x04"); // PaneInput -> Command Mode
+    deck.wait_for_absence("[Command Mode Ctrl+D]");
     deck.send_bytes(b"2"); // jump to role card 2 (coder) and focus it
+    // Back in PaneInput: the probe below goes to the focused pane, never to
+    // Command Mode's key bindings.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    let probe = "RESTART-PROBE-009";
+    deck.send_bytes(probe.as_bytes());
     assert!(
-        deck.wait_for_grid_string_within("worker-task-coder", Duration::from_secs(15)),
+        deck.wait_for_grid_string_within(probe, Duration::from_secs(15)),
         "a role restarted via `pane restart` must stay genuinely reachable in an \
-         ALREADY-ATTACHED TUI -- after focusing coder's role card, the delegated \
-         task's file-pointer text never rendered in coder's pane, meaning a \
-         still-attached TUI failed to render the restarted pane's live PTY once \
-         focused after the fact.\nGrid:\n{}",
+         ALREADY-ATTACHED TUI -- after focusing coder's role card, a probe typed into \
+         it never rendered as the restarted `cat`'s echo, meaning a still-attached TUI \
+         failed to render the restarted pane's live PTY once focused after the fact.\n\
+         Grid:\n{}",
         deck.snapshot_grid()
+    );
+}
+
+/// The registry agent id `role` runs under right now, read from the daemon.
+fn role_agent_id(deck: &TuiDeck, role: &str) -> Option<(String, String)> {
+    agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == role
+            )
+        })
+        .and_then(|r| r.pane_id_env.map(|pane| (r.id, pane)))
+}
+
+/// One hook frame as `agent_id`'s own hook would post it for `pane_id`.
+fn session_start_hook(pane_id: &str, agent_id: &str, session_id: &str, prompt: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "agent_type": "claude_code",
+        "event_type": "session_start",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "pane_id": pane_id,
+        "agent_id": agent_id,
+        "user_prompt": prompt,
+    })
+    .to_string()
+}
+
+/// Scenario: Open the `pane-restart-late-start` orchestration, let `coder` exit on the test's go-ahead and restart it with the real `pane restart` CLI, so the daemon has published two generations on coder's pane. The new generation reports a `SessionStart` whose prompt marks its card; then a late `SessionStart` from the REPLACED generation arrives, as a slow-booting old agent's hook can. The attached TUI must keep showing the live generation's card and never draw the replaced one's (issue #320).
+#[spec("pane/restart/014")]
+#[test]
+fn restart_014_a_replaced_generations_late_start_cannot_take_the_card_back() {
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(160, 40)
+        .launch_with_fixture("pane-restart-late-start");
+    // Isolated-clone provisioning needs a ref to branch from, as in
+    // `restart_009`: commit the fixture before the orchestration is opened.
+    commit_fixture(deck.workdir());
+    deck.wait_for_string("No active agents");
+    open_orchestration(&deck);
+    deck.wait_for_absence("┌ New Agent");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    let records = agent_records_on(deck.attach_socket_path());
+    let orchestrator = records
+        .iter()
+        .find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(TabMembership::Orchestration {
+                    is_start_role: true,
+                    ..
+                })
+            )
+        })
+        .expect("the orchestrator role must be registered");
+    let orchestrator_pane_id = orchestrator
+        .pane_id_env
+        .clone()
+        .expect("the orchestrator role must carry a pane id");
+    let cwd = orchestrator
+        .cwd
+        .clone()
+        .expect("the orchestrator role must carry its cwd");
+    // The roles spawn concurrently, so coder may not be listed yet; and it
+    // stays listed only until it exits, which is why this fixture's coder
+    // waits for the test's go-ahead instead of exiting on a timer.
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            role_agent_id(&deck, CODER_ROLE).is_some()
+        }),
+        "coder must have a daemon record before it exits"
+    );
+    let (replaced, coder_pane) =
+        role_agent_id(&deck, CODER_ROLE).expect("coder is held alive until the go-ahead below");
+    std::fs::write(std::path::Path::new(&cwd).join("coder-may-exit"), b"")
+        .expect("let coder's first generation exit");
+
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        LONG_LIVED_CONFIG,
+    )
+    .expect("swap coder's command to a long-lived one before restarting it");
+    retry_pane_restart_until_success(
+        deck.hook_socket_path(),
+        &orchestrator_pane_id,
+        CODER_ROLE,
+        Duration::from_secs(30),
+    );
+    let replaced_by_now = || role_agent_id(&deck, CODER_ROLE).filter(|(id, _)| *id != replaced);
+    assert!(
+        common::wait_until(Duration::from_secs(15), || replaced_by_now().is_some()),
+        "the restart must publish a new generation on coder's pane"
+    );
+    let (live, live_pane) = replaced_by_now().expect("a new generation was just observed");
+    assert_eq!(live_pane, coder_pane, "a restart keeps the role's pane");
+
+    // Command mode, so the role cards are what the screen draws.
+    deck.send_bytes(b"\x04");
+    write_hook_line(
+        deck.hook_socket_path(),
+        &session_start_hook(
+            &coder_pane,
+            &live,
+            "live-generation-320",
+            "live-generation-marker",
+        ),
+    )
+    .expect("post the live generation's SessionStart");
+    assert!(
+        deck.wait_for_grid_string_within("live-generation-marker", Duration::from_secs(10)),
+        "precondition: the live generation's card must show its prompt.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The late frame, then a barrier on the ORCHESTRATOR's pane, on one
+    // connection: the daemon reads a connection's lines in order, so once the
+    // barrier is drawn the late frame has been applied. The barrier is on
+    // another pane so it retires nothing on coder's — a barrier from coder's
+    // live generation would re-retire a card the late frame had wrongly taken
+    // back, and hide the very thing this asserts.
+    let late_then_barrier = format!(
+        "{}\n{}",
+        session_start_hook(
+            &coder_pane,
+            &replaced,
+            "replaced-generation-320",
+            "replaced-generation-marker",
+        ),
+        session_start_hook(
+            &orchestrator_pane_id,
+            &orchestrator.id,
+            "orchestrator-barrier-320",
+            "barrier-marker-320",
+        ),
+    );
+    write_hook_line(deck.hook_socket_path(), &late_then_barrier)
+        .expect("post the replaced generation's late SessionStart and the barrier");
+    let drawn = deck.wait_for_grid_string_within("barrier-marker-320", Duration::from_secs(10));
+    let grid = deck.snapshot_grid();
+    assert!(
+        drawn,
+        "precondition: the barrier frame must be drawn.\nGrid:\n{grid}"
+    );
+    assert!(
+        grid.contains("live-generation-marker") && !grid.contains("replaced-generation-marker"),
+        "a late SessionStart from the generation `pane restart` replaced took coder's card \
+         back in the attached TUI.\nGrid:\n{grid}"
     );
 }

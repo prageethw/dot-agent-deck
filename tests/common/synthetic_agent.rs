@@ -101,68 +101,33 @@ impl SyntheticAgent {
             schema_version: None,
             live_target: None,
             model: None,
+            background: None,
+            background_revision: None,
         }
     }
 
     /// Build the [`DelegateSignal`] this agent (as an orchestrator) would send
     /// via `dot-agent-deck delegate --to <role> --task <text>`.
-    ///
-    /// Issue #567: `handle_delegate_with_state` now refuses on a
-    /// generation/boot-id mismatch (mirroring fork #358's `work-done` guard),
-    /// so this reads both back from `state` — `pane_registration_generation`
-    /// for this agent's own pane (set by [`Self::register_role`], which now
-    /// reserves one) and `state.daemon_boot_id()`, which is never
-    /// hand-rollable (minted fresh per `AppState` instance).
-    pub fn delegate(
-        &self,
-        state: &AppState,
-        task: impl Into<String>,
-        to: &[&str],
-    ) -> DelegateSignal {
-        let generation = state
-            .pane_registration_generation
-            .get(&self.pane_id)
-            .copied()
-            .unwrap_or(0);
+    pub fn delegate(&self, task: impl Into<String>, to: &[&str]) -> DelegateSignal {
         DelegateSignal {
             pane_id: self.pane_id.clone(),
             task: task.into(),
             to: to.iter().map(|r| r.to_string()).collect(),
+            supersede: false,
             timestamp: chrono::Utc::now(),
-            generation,
-            daemon_boot_id: state.daemon_boot_id().to_string(),
-            subject: None,
+            token: None,
         }
     }
 
     /// Build the [`WorkDoneSignal`] this agent (as a worker, or as the
     /// orchestrator with `done`) would send via `dot-agent-deck work-done`.
-    ///
-    /// Fork #358: no test currently calls this method against a live
-    /// `handle_work_done`, so the placeholder `generation: 0` /
-    /// `daemon_boot_id: ""` below have never needed to be real. If a future
-    /// caller wires this up, note that `handle_work_done` now refuses on a
-    /// generation/boot-id mismatch (fork #358 M4), and
-    /// [`Self::register_role`] does NOT call the real
-    /// `AppState::register_orchestration_role` (it hand-rolls the same
-    /// maps), so it does not populate `pane_registration_generation`
-    /// either — `0`/`""` would be refused as "no registration on file"
-    /// exactly as `state.rs`'s and `delegate_prompt_injection.rs`'s test
-    /// helpers were before their fork #358 fixes. A caller wiring this up
-    /// for real needs to set `state.pane_registration_generation`
-    /// explicitly (or switch `register_role` to call
-    /// `register_orchestration_role`) and pass matching values here —
-    /// `state.daemon_boot_id()` for the boot id, since that one is never
-    /// hand-rollable (it is minted fresh per `AppState` instance).
     pub fn work_done(&self, task: impl Into<String>, done: bool) -> WorkDoneSignal {
         WorkDoneSignal {
             pane_id: self.pane_id.clone(),
             task: task.into(),
             done,
             timestamp: chrono::Utc::now(),
-            generation: 0,
-            daemon_boot_id: String::new(),
-            subject: None,
+            token: None,
         }
     }
 
@@ -192,11 +157,5 @@ impl SyntheticAgent {
         state
             .pane_cwd_map
             .insert(self.pane_id.clone(), cwd.to_string());
-        // Issue #567: a real registration always reserves a
-        // `pane_registration_generation` entry — this hand-rolled fixture
-        // must too, now that `handle_delegate_with_state` enforces the same
-        // generation/boot-id compound key `handle_work_done` already did
-        // (fork #358). See [`Self::delegate`] for the read-back side.
-        state.reserve_registration_generation(&self.pane_id);
     }
 }

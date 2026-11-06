@@ -81,6 +81,9 @@ fn start_agent_request(client_pane_id: &str) -> AttachRequest {
         agent_type: None,
         seed: None,
         isolated_clone_origin: None,
+        authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
     }
 }
 

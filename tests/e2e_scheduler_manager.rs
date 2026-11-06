@@ -1,6 +1,6 @@
 #![cfg(feature = "e2e")]
 
-//! L2 tests for PRD #127 M3.3 — the "Scheduled Tasks" management dialog.
+//! L2 tests for PRD #127 M3.3 — the "Schedules" management dialog.
 //!
 //! All L2 (no public L1 dialog render seam — same constraint as
 //! `prompt/new-pane/007`): the real TUI is driven via `TuiDeck::send_keys` and
@@ -47,13 +47,13 @@ fn scratch_with_schedules(body: &str) -> (tempfile::TempDir, std::path::PathBuf)
 }
 
 /// Scenario: With a fixture global `schedules.toml` containing an enabled task
-/// (`digest`) and a disabled task (`paused`), press `S` to open the "Scheduled
-/// Tasks" dialog. Assert the dialog lists each task with a status indicator and
+/// (`digest`) and a disabled task (`paused`), press `S` to open the Schedules
+/// dialog. Assert the title and each task's status indicator and
 /// a next-fire cell — `digest` shows an `idle` status, `paused` shows the
 /// `disabled` indicator with a `—` next-fire placeholder. Also assert each
 /// action button advertises its keyboard shortcut next to the label
 /// (`[Add a]` / `[Edit e]` / `[Delete d]` / `[Run now r]`), mirroring the
-/// `[Scheduled Tasks s]` button-bar button.
+/// `[Schedules s]` button-bar button.
 #[spec("scheduler/manager/001")]
 #[test]
 fn manager_001_lists_schedules_with_status_and_next_fire() {
@@ -77,17 +77,21 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    // PRD #127 finding #4: the dashboard now carries a `[Scheduled Tasks s]`
-    // button-bar button, so the bare "Scheduled Tasks" substring is on-screen
+    // PRD #127 finding #4: the dashboard now carries a `[Schedules s]`
+    // button-bar button, so the bare "Schedules" substring is on-screen
     // BEFORE the dialog opens — waiting for it would snapshot the dashboard. The
     // `NEXT FIRE` column header only renders once the dialog is open with its
     // rows loaded, so it's an unambiguous "dialog is up" signal.
     deck.wait_for_string("NEXT FIRE");
 
     let grid = deck.snapshot_grid();
+    assert!(
+        grid.contains(" Schedules "),
+        "manager dialog title must use the glossary wording.\nGrid:\n{grid}"
+    );
     assert!(
         grid.contains("digest") && grid.contains("paused"),
         "manager dialog must list both configured schedules.\nGrid:\n{grid}"
@@ -107,7 +111,7 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
 
     // PRD #127: each action button must advertise its keyboard shortcut next to
     // the label — `[Add a]`, `[Edit e]`, `[Delete d]`, `[Run now r]` — mirroring
-    // the `[Scheduled Tasks s]` button-bar button, so a keyboard user can tell
+    // the `[Schedules s]` button-bar button, so a keyboard user can tell
     // which key drives each action. Before the fix the buttons rendered `[Add]` /
     // `[Edit]` / `[Delete]` / `[Run now]` with the shortcut field empty
     // (src/ui.rs Button::new(.., "", ..)), so no `<label> <key>` pair appeared.
@@ -121,7 +125,7 @@ fn manager_001_lists_schedules_with_status_and_next_fire() {
             grid.contains(&format!("{label} {key}")),
             "the `{label}` action button must show its `{key}` shortcut key \
              alongside its label (e.g. `[{label} {key}]`), like the \
-             `[Scheduled Tasks s]` button-bar button.\nGrid:\n{grid}"
+             `[Schedules s]` button-bar button.\nGrid:\n{grid}"
         );
     }
     drop(scratch);
@@ -181,9 +185,9 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             format!(
                 "#!/bin/sh\n\
                  {hook}\
-                 while IFS= read -r l; do printf '%s\\n' \"$l\" >> {rec}; done\n",
-                rec = common::sh_quote_path(record),
+                 {answer}\n",
                 hook = common::claude_session_start_line(bin, "authoring"),
+                answer = record_and_answer_doorbell(bin, record),
             ),
         )
         .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -222,10 +226,10 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the dir picker
 
     // PRD #170 unify: Edit now reuses the Ctrl+n flow. `e` opens the directory
@@ -287,7 +291,7 @@ fn manager_003_delete_removes_definition_but_keeps_open_tab() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open a tab for the schedule by firing it (existing RunNow socket path).
     common::attach_request_on(
@@ -309,8 +313,11 @@ fn manager_003_delete_removes_definition_but_keeps_open_tab() {
 
     // Delete the definition via the manager.
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"d"); // delete the auto-selected row → confirmation
+    // Issue #1799: a `y` queued before the question's first frame is dropped,
+    // as for the other confirmations, so answer the question once it is drawn.
+    deck.wait_for_string("(y/n)");
     deck.send_keys(b"y"); // confirm
 
     // Half 1: the definition is gone from the global config.
@@ -362,10 +369,10 @@ fn manager_005_delete_confirm_contained_within_modal() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"d"); // arm the delete confirmation for the auto-selected row
     deck.wait_for_string("Delete schedule"); // the (left-aligned) prefix is always visible
 
@@ -404,7 +411,7 @@ fn manager_004_run_now_fires_selected_task() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // No agent for the task yet.
     assert!(
@@ -418,7 +425,7 @@ fn manager_004_run_now_fires_selected_task() {
     );
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"r"); // run-now the auto-selected row
 
     assert!(
@@ -464,7 +471,7 @@ fn manager_006_click_row_moves_selection() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
     // `NEXT FIRE` only renders once the dialog is open with its rows loaded.
@@ -502,7 +509,7 @@ fn manager_006_click_row_moves_selection() {
 }
 
 /// Scenario: With a fixture `schedules.toml` holding one enabled task whose name
-/// is LONGER than the legacy fixed-width name cell, open the "Scheduled Tasks"
+/// is LONGER than the legacy fixed-width name cell, open the "Schedules"
 /// manager at a roomy (200-col) terminal and again at a windowed (80-col)
 /// terminal. Assert the task's FULL name renders un-clipped on the grid at BOTH
 /// widths — proving the dialog auto-sizes to its content (PRD #144 shared modal
@@ -533,7 +540,7 @@ fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
             .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
             .with_pty_size(cols, rows)
             .launch_with_fixture("minimal");
-        deck.wait_for_string("No active sessions");
+        deck.wait_for_string("No active agents");
         deck.send_keys(MANAGER_KEY);
         // `NEXT FIRE` only renders once the dialog is open with its rows loaded —
         // an unambiguous "dialog is up" signal (also proves the column labels
@@ -564,11 +571,29 @@ fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
     drop(scratch);
 }
 
+/// PRD #1666 S5: the recorder loop a shim runs once it has announced itself.
+/// It appends every line typed into it to `record`, and when that line is the
+/// deck's doorbell it does what an agent does — runs `inbox fetch` in its own
+/// pane — and appends what it fetched, so the seed the deck posted to its inbox
+/// lands in `record` whole.
+fn record_and_answer_doorbell(bin: &str, record: &std::path::Path) -> String {
+    // POSIX single-quoted (issue #57), like the rest of this file's generated
+    // scripts: `bin` follows the cargo target dir and `record` follows `TMPDIR`.
+    let rec = common::sh_quote_path(record);
+    let bin = common::sh_quote(bin);
+    format!(
+        "while IFS= read -r l; do printf '%s\\n' \"$l\" >> {rec}; \
+         case \"$l\" in \" dot-agent-deck: message \"*) {bin} inbox fetch >> {rec} 2>&1;; \
+         esac; done"
+    )
+}
+
 /// Write a recorder shim named `name` into `shim_dir`: it records its working
 /// directory (`pwd`) — the dir the agent was SPAWNED in — then opens the
 /// gated-delivery readiness gate (posts SessionStart via the real hook path) and
-/// appends every delivered line to `record`, so BOTH the spawn cwd AND the
-/// authoring seed a spawned agent receives are observable on disk. Distinct-name
+/// records what reaches it ([`record_and_answer_doorbell`]: the doorbell, then
+/// the seed it fetches from its inbox), so BOTH the spawn cwd AND the authoring
+/// seed a spawned agent receives are observable on disk. Distinct-name
 /// shims let a test tell WHICH agent command actually spawned; the recorded
 /// `pwd` lets a test assert the agent spawned in the PICKED directory. Mirrors
 /// the inline recorder in `manager_002`.
@@ -591,8 +616,9 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
             "#!/bin/sh\n\
              pwd >> {rec}\n\
              {hook}\
-             while IFS= read -r l; do printf '%s\\n' \"$l\" >> {rec}; done\n",
+             {answer}\n",
             hook = common::claude_session_start_line(bin, "authoring"),
+            answer = record_and_answer_doorbell(bin, record),
         ),
     )
     .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -785,10 +811,10 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
         builder = builder.with_env(key, value);
     }
     let deck = builder.launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"a"); // ADD → opens the dir picker (blank-context add)
 
     // PRD #170 unify: `a` opens the dir picker; confirm the dir with Space to
@@ -830,43 +856,96 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     drop(scratch);
 }
 
-/// Return the visible synthetic side-pane line markers from a rendered grid.
-/// Comparing the marker sequence isolates pane scrollback from manager-dialog
-/// changes such as moving the selected schedule row.
-/// Sample the visible side-pane markers only once the frame has stopped
-/// changing them.
+/// Sample the visible side-pane markers only from a frame in which the
+/// Schedules dialog is painted down to its bottom border, and once two such
+/// reads agree.
 ///
 /// A single-shot `snapshot_grid()` read is unsound here for the same reason a
 /// single-shot `find_in_grid` is (issues #807/#395): ratatui flushes a frame as
 /// a byte stream and the harness reader consumes it in chunks, so a read can
 /// land mid-repaint. The hazard in this test is specific and worse than a
-/// missing needle -- the centered Scheduled Tasks dialog paints **over** the
+/// missing needle -- the centered Schedules dialog paints **over** the
 /// side pane and occludes marker rows, so a half-painted overlay yields a
 /// marker set the settled frame does not show. Comparing such a sample against
 /// a settled one then fails an assertion with no defect present, which is
 /// exactly how `manager_016` reddened `e2e-deterministic` on four unrelated
 /// branches -- one of them a pnpm bump carrying no Rust at all.
 ///
-/// Two consecutive agreeing reads is a sound settle here because
-/// `wait_until_grid` sleeps 20ms between polls, which is orders of magnitude
-/// longer than a ratatui frame takes to flush.
+/// Two agreeing reads alone are NOT a settle (issue #818). The deck writes a
+/// frame through a buffered stdout, so a large frame reaches the PTY in several
+/// `write`s, and on a starved machine the deck can be descheduled between two
+/// of them for far longer than the harness sleeps between polls. Both reads
+/// then see the same half-painted overlay and agree on it. CI caught exactly
+/// that twice, on runners at 100% CPU pressure: the baseline was read from an
+/// overlay painted only down to the row under `bravo`, its button and
+/// `Esc close` rows still missing, so four markers the full dialog covers were
+/// counted as visible and every later, fully painted read looked like a leak.
+/// The bottom border is the positive signal instead: ratatui emits a frame's
+/// changed cells in row-major order, so once that row is on screen every dialog
+/// row above it is too, and opening the dialog changes no side-pane marker
+/// below it. The border check and the marker read run on one locked screen
+/// (`capture_screen_when`), so they cannot see two different frames.
 ///
-/// Deliberately settles on ANY value, including an empty set: a genuine wheel
-/// leak could scroll every marker out of view, and this must then return that
-/// empty set so the caller's assertion reports the leak, rather than spinning
-/// to a wait timeout that says nothing about why.
+/// Deliberately settles on ANY marker value, including an empty set: a genuine
+/// wheel leak could scroll every marker out of view, and this must then return
+/// that empty set so the caller's assertion reports the leak, rather than
+/// spinning to a wait timeout that says nothing about why. A leak leaves the
+/// dialog painted, so the border condition does not hold it back.
 fn settled_side_scroll_markers(deck: &TuiDeck, what: &str) -> Vec<String> {
     let last: std::cell::RefCell<Option<Vec<String>>> = std::cell::RefCell::new(None);
-    deck.wait_until_grid(what, |grid| {
-        let now = visible_side_scroll_markers(grid);
+    deck.capture_screen_when(what, |screen| {
+        if !schedules_dialog_fully_painted(screen) {
+            *last.borrow_mut() = None;
+            return None;
+        }
+        let now = visible_side_scroll_markers(&screen.contents());
         let mut prev = last.borrow_mut();
         let settled = prev.as_ref() == Some(&now);
-        *prev = Some(now);
-        settled
-    });
-    last.into_inner().unwrap_or_default()
+        *prev = Some(now.clone());
+        settled.then_some(now)
+    })
 }
 
+/// Whether the Schedules dialog is painted down to its bottom border.
+///
+/// Anchored to the dialog's own cells rather than searched for as text: find
+/// the top-left `┌` followed by the `Schedules` title and the `┐` closing that
+/// row, then require a later row with `└` and `┘` in exactly those two columns
+/// and `─` in every cell between them. A border elsewhere on screen, or one in
+/// other columns, cannot satisfy it. Cells are read through the vt100 API
+/// because the text grid drops a row's leading unwritten cells, so a column
+/// read off a grid line is not the screen column.
+fn schedules_dialog_fully_painted(screen: &vt100::Screen) -> bool {
+    const TITLE: &str = "Schedules";
+    let (rows, cols) = dot_agent_deck::vt_grid::size(screen);
+    let cell = |row: u16, col: u16| screen.cell(row, col).map_or("", |c| c.contents());
+    for top in 0..rows {
+        for left in 0..cols {
+            let titled = cell(top, left) == "┌"
+                && usize::from(left) + 2 + TITLE.len() <= usize::from(cols)
+                && TITLE
+                    .chars()
+                    .zip(left + 2..cols)
+                    .all(|(ch, col)| cell(top, col).chars().eq([ch]));
+            if !titled {
+                continue;
+            }
+            let Some(right) = (left + 1..cols).find(|&col| cell(top, col) == "┐") else {
+                return false;
+            };
+            return (top + 1..rows).any(|row| {
+                cell(row, left) == "└"
+                    && cell(row, right) == "┘"
+                    && (left + 1..right).all(|col| cell(row, col) == "─")
+            });
+        }
+    }
+    false
+}
+
+/// Return the visible synthetic side-pane line markers from a rendered grid.
+/// Comparing the marker sequence isolates pane scrollback from manager-dialog
+/// changes such as moving the selected schedule row.
 fn visible_side_scroll_markers(grid: &str) -> Vec<String> {
     const PREFIX: &str = "SIDE_SCROLL_LINE_";
     grid.lines()
@@ -878,7 +957,7 @@ fn visible_side_scroll_markers(grid: &str) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: Open an output-filled mode tab, scroll its right-hand side pane into history, then open Scheduled Tasks and wheel down and up over the dialog where it overlaps that pane. The visible side-pane lines must remain unchanged while the dialog handles the wheel events instead of leaking them to the pane behind it.
+/// Scenario: Open an output-filled orchestration tab, prove its start-role pane scrolls, then open Schedules and wheel down and up where the dialog covers that same pane. The visible pane lines must remain unchanged while the dialog handles the wheel events.
 #[spec("scheduler/manager/016")]
 #[test]
 fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
@@ -903,22 +982,20 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         .with_pty_size(120, 40)
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("scheduler-manager-scroll");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
-    // Open the fixture's `scroll` mode. Its persistent side pane occupies the
-    // right half of the active mode tab, registering the rect that currently
-    // receives wheel events leaked through the manager dialog.
+    // Open the fixture's `scroll` orchestration. Its start-role pane carries
+    // enough output for scrollback behind the manager dialog.
     deck.send_bytes(b"\x0e"); // Ctrl+N -> directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // choose current dir -> new-pane form
     deck.wait_for_string("Mode:");
-    deck.send_bytes(b"\x1b[C"); // No mode -> scroll
-    deck.wait_for_string("scroll mode");
-    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
-    deck.click(submit_col, submit_row);
+    deck.send_bytes(b"\x1b[C"); // No mode -> Orch: scroll
+    deck.wait_for_string("Orch: scroll");
+    deck.send_bytes(b"\r\r"); // Mode → Name → submit
     deck.wait_for_string("SIDE_SCROLL_LINE_119");
     deck.wait_for_string("[Command Mode Ctrl+D]");
-    deck.send_bytes(b"\x04"); // detach to Normal mode on the active mode tab
+    deck.send_bytes(b"\x04"); // detach to Normal mode on the orchestration tab
     deck.wait_for_absence("[Command Mode Ctrl+D]");
 
     // Move the side pane away from the bottom so both wheel directions have
@@ -926,7 +1003,7 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     let bottom_markers = visible_side_scroll_markers(&deck.snapshot_grid());
     assert!(
         !bottom_markers.is_empty(),
-        "precondition: the mode side pane must visibly contain synthetic scrollback"
+        "precondition: the start-role pane must visibly contain synthetic scrollback"
     );
     deck.scroll_n(100, 10, false, 8);
     // `scroll_n` queues all 8 notches with no gap between them; the deck
@@ -940,6 +1017,18 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         visible_side_scroll_markers(grid) != bottom_markers
     });
     deck.wait_for_settled_grid_value(common::OBSERVATION_BUDGET, visible_side_scroll_markers);
+    let scrollable_rows = deck.capture_screen_when(
+        "the start-role pane's scrollback to finish painting",
+        |screen| {
+            let rows: Vec<_> = screen
+                .contents()
+                .lines()
+                .enumerate()
+                .filter_map(|(row, line)| line.contains("SIDE_SCROLL_LINE_").then_some(row))
+                .collect();
+            (rows.len() >= 34).then_some(rows)
+        },
+    );
 
     deck.send_keys(b"s");
     deck.wait_for_string("NEXT FIRE");
@@ -952,21 +1041,23 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     // frame, not a torn one that would make the `assert_eq!`s below report a
     // scrollback leak that never happened.
     deck.wait_for_string("\u{25b6} alpha");
-    let before =
-        settled_side_scroll_markers(&deck, "the Scheduled Tasks overlay to finish painting");
+    let before = settled_side_scroll_markers(&deck, "the Schedules overlay to finish painting");
     let before_grid = deck.snapshot_grid();
     assert!(
         before.len() >= 5,
         "precondition: several side-pane markers must remain visible around the centered dialog.\nGrid:\n{before_grid}"
     );
 
-    // NEXT FIRE sits inside the visible dialog and, in this mode-tab layout,
-    // inside the right-half side-pane rect behind it.
+    // NEXT FIRE sits inside the visible dialog and over the role pane behind it.
     let (dialog_col, dialog_row) = deck.wait_for_in_grid("NEXT FIRE");
     let wheel_col = dialog_col + "NEXT FIRE".len() as u16 + 2;
     assert!(
         wheel_col >= 60,
-        "precondition: the wheel target must overlap the right-half side pane (col {wheel_col})"
+        "precondition: the wheel target must overlap the role pane (col {wheel_col})"
+    );
+    assert!(
+        scrollable_rows.contains(&(dialog_row as usize)),
+        "precondition: the wheel target row must cross the scrollable start-role pane, not the empty worker pane.\nWheel: ({wheel_col}, {dialog_row})\nScrollable rows before dialog: {scrollable_rows:?}"
     );
 
     deck.scroll(wheel_col, dialog_row, true);
@@ -976,7 +1067,7 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         });
     assert!(
         selection_moved_down,
-        "wheel-down over the Scheduled Tasks dialog must move the selection from `alpha` to `bravo` before wheel-up is sent.\nGrid after wheel-down:\n{}",
+        "wheel-down over the Schedules dialog must move the selection from `alpha` to `bravo` before wheel-up is sent.\nGrid after wheel-down:\n{}",
         deck.snapshot_grid()
     );
     let after_down = settled_side_scroll_markers(&deck, "the side pane to settle after wheel-down");
@@ -989,7 +1080,7 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         });
     assert!(
         selection_moved_up,
-        "wheel-up over the Scheduled Tasks dialog must move the selection from `bravo` back to `alpha`.\nGrid after wheel-up:\n{}",
+        "wheel-up over the Schedules dialog must move the selection from `bravo` back to `alpha`.\nGrid after wheel-up:\n{}",
         deck.snapshot_grid()
     );
     let after_up = settled_side_scroll_markers(&deck, "the side pane to settle after wheel-up");
@@ -997,16 +1088,16 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
 
     assert_eq!(
         after_down, before,
-        "wheel-down over the Scheduled Tasks dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-down: {after_down:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-down:\n{after_down_grid}"
+        "wheel-down over the Schedules dialog leaked into the orchestration role pane behind it; the visible scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-down: {after_down:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-down:\n{after_down_grid}"
     );
     assert_eq!(
         after_up, before,
-        "wheel-up over the Scheduled Tasks dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-up: {after_up:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-up:\n{after_up_grid}"
+        "wheel-up over the Schedules dialog leaked into the orchestration role pane behind it; the visible scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-up: {after_up:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-up:\n{after_up_grid}"
     );
     drop(scratch);
 }
 
-/// Scenario: Open Scheduled Tasks in a short PTY with more rows than the manager viewport can show, then send wheel-down reports over the visible list. The selection marker must move from the first task and drag the viewport far enough that the initially hidden thirteenth task becomes visible and selected.
+/// Scenario: Open Schedules in a short PTY with more rows than the manager viewport can show, then send wheel-down reports over the visible list. The selection marker must move from the first task and drag the viewport far enough that the initially hidden thirteenth task becomes visible and selected.
 #[spec("scheduler/manager/017")]
 #[test]
 fn manager_017_wheel_scrolls_windowed_schedule_list() {
@@ -1030,7 +1121,7 @@ fn manager_017_wheel_scrolls_windowed_schedule_list() {
         .with_pty_size(120, 20)
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_keys(b"s");
     deck.wait_for_string("NEXT FIRE");
 
@@ -1053,7 +1144,7 @@ fn manager_017_wheel_scrolls_windowed_schedule_list() {
     let grid = deck.snapshot_grid();
     assert!(
         moved_and_revealed,
-        "wheel-down over the Scheduled Tasks list must move the selection and its derived viewport: expected the initially hidden `wheel-task-13` row to become visible and selected, but the wheel input was a no-op.\nGrid after 12 wheel-down reports:\n{grid}"
+        "wheel-down over the Schedules list must move the selection and its derived viewport: expected the initially hidden `wheel-task-13` row to become visible and selected, but the wheel input was a no-op.\nGrid after 12 wheel-down reports:\n{grid}"
     );
     drop(scratch);
 }
@@ -1112,7 +1203,7 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The picker for Add opens at the deck's cwd; confirming it with Space makes
     // the picked dir = the deck's working dir. Its basename is the spawn-cwd marker.
@@ -1124,7 +1215,7 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
         .into_owned();
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"a"); // ADD → opens the dir picker
 
     deck.wait_for_string("Select Directory");
@@ -1232,10 +1323,10 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"e"); // EDIT the auto-selected `digest` row → opens the dir picker
 
     // The picker for Edit STARTS at the row's working_dir; confirm it with Space
@@ -1337,11 +1428,11 @@ fn assert_schedule_flow_cancel_returns_to_manager(entry_key: &[u8], at: CancelAt
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
     // `NEXT FIRE` renders only when the manager dialog is open with its rows
-    // loaded — the bare `Scheduled Tasks` substring is already on the dashboard
+    // loaded — the bare `Schedules` substring is already on the dashboard
     // button bar, so it can't tell the dialog apart from the dashboard.
     deck.wait_for_string("NEXT FIRE");
 
@@ -1398,7 +1489,7 @@ fn assert_schedule_flow_cancel_returns_to_manager(entry_key: &[u8], at: CancelAt
     drop(scratch);
 }
 
-/// Scenario: Open the "Scheduled Tasks" manager, press `a` (Add) to open the
+/// Scenario: Open the "Schedules" manager, press `a` (Add) to open the
 /// directory picker, then press `Esc`. Assert the flow returns to the MANAGER
 /// dialog (its `NEXT FIRE` header re-renders) — not the bare dashboard — with the
 /// picker chrome gone and no authoring agent spawned. RED today: the picker's Esc
@@ -1537,10 +1628,10 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"e"); // EDIT the auto-selected `digest` row → opens the dir picker
 
     // The Edit picker STARTS at the row's working_dir (A = ROWDIRALPHA). Re-pick a
@@ -1664,7 +1755,7 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_env("PATH", path_env)
         .launch_with_fixture("schedule-mode");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the new-pane form and cycle the Mode field to the experimental
     // `schedule: issues` authoring option.
@@ -1705,7 +1796,7 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
 }
 
 /// Scenario: Launch the deck with one ENABLED fixture schedule, open the
-/// Scheduled Tasks manager and press `t` on the auto-selected row. Assert the
+/// Schedules manager and press `t` on the auto-selected row. Assert the
 /// global `schedules.toml` now carries `enabled = false` while every other field
 /// of the definition survives (pausing is not deleting), and that the row
 /// re-renders as `disabled`. Press `t` again and assert it returns to
@@ -1727,10 +1818,10 @@ fn manager_018_toggle_pauses_and_resumes_without_losing_the_definition() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     // The dialog renders the state but, before issue #914, had no key to change
     // it — `t` is that key.
     deck.send_keys(b"t");

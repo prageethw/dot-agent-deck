@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! PTY-attached close-confirmation coverage for dashboard cards.
 
@@ -21,7 +21,7 @@ fn pane_002_confirmed_ctrl_w_removes_card() {
     deck.wait_for_string("close-card");
 
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -34,7 +34,7 @@ fn pane_002_confirmed_ctrl_w_removes_card() {
 
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -51,39 +51,37 @@ fn pane_002_confirmed_ctrl_w_removes_card() {
 #[test]
 fn pane_003_empty_dashboard_never_opens_close_confirmation() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(b"\x17");
     deck.send_keys(b"?");
-    deck.wait_for_string("Create new pane");
-    // `Create new pane` is a Help-overlay row, and the deck's frame reaches
-    // the vt100 parser in `read()`-sized chunks, so a frame carrying the
-    // overlay can be parsed while the tab-bar row above it still shows the
-    // previous screen (`wait_for_in_grid`'s doc comment describes that torn
-    // window). Waiting for the tab label too — rather than snapshotting once
-    // and asserting on it — is what makes the snapshot below whole. Fork #81:
-    // this exact race is why `pane_003` failed seven times on 2026-08-07 CI,
-    // every time on the `Dashboard` assertion, with the overlay and footer
-    // painted and the tab row blank.
-    deck.wait_for_string("Dashboard");
+    // One predicate over one grid, polled, rather than `wait_for_string` and a
+    // single snapshot: a frame arrives as a byte stream the reader consumes in
+    // chunks, so the help sentinel can land while the tab bar row is still
+    // cleared mid-repaint, and a one-shot "Dashboard" check then fails on a
+    // half-painted frame. Measured on PR #1291's e2e-deterministic run
+    // (36077156836), twice in a row. Same mechanism as #807/#395.
+    deck.wait_until_grid("help painted over a still-rendered Dashboard", |grid| {
+        grid.contains("Create new agent") && grid.contains("Dashboard")
+    });
 
     let grid = deck.snapshot_grid();
-    assert!(grid.contains("Dashboard"), "{grid}");
     assert!(
-        !grid.contains("Close selected pane?"),
+        !grid.contains("Close selected agent?"),
         "an empty dashboard must not arm a close confirmation\n{grid}"
     );
     assert!(
-        !grid.contains("Close this tab and all its panes?"),
+        !grid.contains("Close this tab and all its agents?"),
         "an empty dashboard must not leak a tab-scoped close confirmation\n{grid}"
     );
 }
 
-/// Scenario: Launch one live dashboard card and drive Ctrl+W through the real binary twice. Enter on the Cancel-default modal must preserve the card and daemon agent, while a fresh Ctrl+W followed by Down+Enter must remove both.
+/// Scenario: Launch one live dashboard card and drive Ctrl+W through the real binary twice. Enter on the Cancel-default modal preserves the card and daemon agent, while a fresh Ctrl+W followed by Down+Enter removes both at 80×24. Repeat with another card at 16×12: after Down, Enter may close it only if the final frame actually shows the Close choice, rather than covering it with Cancel.
 #[spec("prompt/close-confirm/002")]
 #[test]
 fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     let deck = TuiDeck::builder()
+        .with_pty_size(80, 24)
         .with_continue_session("confirm-target", "cat")
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -91,9 +89,9 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     deck.wait_for_string("confirm-target");
 
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     deck.send_keys(b"\r"); // Enter on the default Cancel option.
-    deck.wait_for_absence("Close selected pane?");
+    deck.wait_for_absence("Close selected agent?");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -105,10 +103,10 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     );
 
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -118,9 +116,119 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
         ),
         "Down+Enter on Close must remove the daemon agent"
     );
+
+    let mut tiny = TuiDeck::builder()
+        .with_pty_size(80, 24)
+        .with_continue_session("tiny-close-target", "cat")
+        .launch_with_fixture("minimal");
+    tiny.wait_for_string("[Command Mode Ctrl+D]");
+    tiny.send_keys(b"\x04");
+    tiny.wait_for_string("tiny-close-target");
+    tiny.send_keys(b"\x17");
+    tiny.wait_for_string("Close selected agent?");
+    tiny.resize(16, 12);
+    tiny.wait_until_grid("16×12 Close confirmation is drawn", |grid| {
+        grid.contains("┌ Close") && grid.contains("Cancel") && !grid.contains("tiny-close-target")
+    });
+    let before = tiny.snapshot_grid();
+    tiny.send_keys(b"\x1b[B");
+    tiny.wait_until_grid_then_hold(
+        "16×12 Close stays open after Down",
+        Duration::from_secs(1),
+        |grid| grid.contains("┌ Close") && grid.contains("Cancel"),
+    );
+    let selected = tiny.snapshot_grid();
+    let close_shown = selected.contains("> Close") || selected.contains("[Close]");
+    // Escape after Enter leaves an undrawn-choice refusal or Cancel without
+    // closing the agent. It cannot undo an accepted destructive Close.
+    tiny.send_keys(b"\r\x1b");
+    tiny.resize(80, 24);
+    tiny.wait_until_grid("close answer has settled back on the dashboard", |grid| {
+        !grid.contains("Close selected agent?")
+            && (grid.contains("tiny-close-target") || grid.contains("No active agents"))
+    });
+    if !close_shown {
+        assert!(
+            common::wait_for_agent_display_name(
+                tiny.attach_socket_path(),
+                "tiny-close-target",
+                true,
+                Duration::from_secs(5),
+            ),
+            "Enter closed an agent whose Close choice was covered by Cancel.\n\
+             Before Down:\n{before}\nAfter Down:\n{selected}\nAfter Enter:\n{}",
+            tiny.snapshot_grid()
+        );
+        let settled = tiny.snapshot_grid();
+        assert!(
+            settled.contains("tiny-close-target"),
+            "the refused close lost its card: {settled}"
+        );
+    }
 }
 
-/// Scenario: Launch one live card at a roomy width, click the real persistent `[Close Ctrl+W]` button, cancel, then press Ctrl+W. Both production input paths must display the same Cancel-default close modal while leaving the agent alive until explicit confirmation.
+/// Scenario: Launch one live card with the experimental flag on, press Ctrl+W, then shrink the terminal to 64×2, where the `experimental: on` label covers the dialog's [Close] button. A click where that button was drawn closes nothing: back at 80×24 the dialog is still open and the agent alive. A click on the whole [Close] at 80×24 then closes it (control).
+#[spec("prompt/close-confirm/010")]
+#[test]
+fn close_confirm_010_a_close_button_the_footer_covers_takes_no_click() {
+    let mut deck = TuiDeck::builder()
+        .with_pty_size(80, 24)
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_continue_session("covered-close-target", "cat")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("covered-close-target");
+    deck.wait_for_string("experimental: on");
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close selected agent?");
+
+    // At 64×2 the dialog has no room: its button row lands on the bottom row,
+    // [Close] at columns 13..19, and the label is painted over columns 0..15.
+    deck.resize(64, 2);
+    deck.wait_until_grid_then_hold(
+        "64×2: the label covers the start of [Close]",
+        Duration::from_millis(500),
+        |grid| {
+            grid.lines().nth(1).is_some_and(|row| {
+                row.starts_with("experimental: on")
+                    && row.contains("ose]")
+                    && !row.contains("[Close]")
+            })
+        },
+    );
+    deck.click(14, 1);
+    deck.resize(80, 24);
+    deck.wait_until_grid_then_hold(
+        "the dialog is still open after the click",
+        Duration::from_secs(1),
+        |grid| grid.contains("Close selected agent?") && grid.contains("[Close]"),
+    );
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "covered-close-target",
+            true,
+            Duration::from_secs(1),
+        ),
+        "a click on a [Close] the experimental label covered closed the agent"
+    );
+
+    // Control: the whole button closes it.
+    let (col, row) = deck.wait_for_in_grid("[Close]");
+    deck.click(col + 1, row);
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "covered-close-target",
+            false,
+            Duration::from_secs(5),
+        ),
+        "control: a click on the whole [Close] did not close the agent"
+    );
+}
+
+/// Scenario: Launch one live card at a roomy width, click the real persistent `[Close w/Ctrl+W]` button, cancel, then press Ctrl+W. Both production input paths must display the same Cancel-default close modal while leaving the agent alive until explicit confirmation.
 #[spec("prompt/close-confirm/003")]
 #[test]
 fn close_confirm_003_real_button_and_key_share_confirmation() {
@@ -130,19 +238,19 @@ fn close_confirm_003_real_button_and_key_share_confirmation() {
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
-    deck.wait_for_string("[Back to Pane Ctrl+D]");
+    deck.wait_for_string("[Back to Pane d/Ctrl+D]");
 
-    let (col, row) = deck.wait_for_in_grid("[Close Ctrl+W]");
+    let (col, row) = deck.wait_for_in_grid("[Close w/Ctrl+W]");
     deck.click(col + 1, row);
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let clicked_modal = deck.snapshot_grid();
     assert!(clicked_modal.contains("> Cancel"), "{clicked_modal}");
     assert!(clicked_modal.contains("  Close"), "{clicked_modal}");
 
     deck.send_keys(b"\r");
-    deck.wait_for_absence("Close selected pane?");
+    deck.wait_for_absence("Close selected agent?");
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let keyed_modal = deck.snapshot_grid();
     assert!(keyed_modal.contains("> Cancel"), "{keyed_modal}");
     assert!(keyed_modal.contains("  Close"), "{keyed_modal}");
@@ -157,7 +265,7 @@ fn close_confirm_003_real_button_and_key_share_confirmation() {
     );
 }
 
-/// Scenario: Launch one live card, send a single PTY burst containing the real `[Close Ctrl+W]` mouse click plus Down+Enter that was queued before the modal could render, and verify the burst cannot confirm it. After the modal is visibly drawn, a fresh Down+Enter must close the card.
+/// Scenario: Launch one live card, send a single PTY burst containing the real `[Close w/Ctrl+W]` mouse click plus Down+Enter that was queued before the modal could render, and verify the burst cannot confirm it. After the modal is visibly drawn, a fresh Down+Enter must close the card.
 #[spec("prompt/close-confirm/004")]
 #[test]
 fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
@@ -167,16 +275,16 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
-    deck.wait_for_string("[Back to Pane Ctrl+D]");
+    deck.wait_for_string("[Back to Pane d/Ctrl+D]");
 
-    let (col, row) = deck.wait_for_in_grid("[Close Ctrl+W]");
+    let (col, row) = deck.wait_for_in_grid("[Close w/Ctrl+W]");
     let click_col = col + 1;
     let sgr_col = click_col + 1;
     let sgr_row = row + 1;
     let burst = format!("\x1b[<0;{sgr_col};{sgr_row}M\x1b[<0;{sgr_col};{sgr_row}m\x1b[B\r");
     deck.send_bytes(burst.as_bytes());
 
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -194,7 +302,7 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
 
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 }
 
 /// Scenario: Arm a real dashboard card's close confirmation, then deliver a SessionStart for a different agent on the same pane so the armed session identity is replaced before confirmation. Down+Enter must close nothing, retain the live daemon agent/card, and surface that the armed target is gone rather than retargeting the replacement.
@@ -202,6 +310,7 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
 #[test]
 fn close_confirm_005_vanished_armed_session_closes_nothing() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 40)
         .with_continue_session("vanish-target", "cat")
         .launch_with_fixture("minimal");
@@ -218,7 +327,7 @@ fn close_confirm_005_vanished_armed_session_closes_nothing() {
         .as_deref()
         .expect("continued pane must retain its stable pane id");
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let replacement = serde_json::json!({
         "session_id": "replacement-generation",
         "agent_type": "claude_code",
@@ -266,6 +375,7 @@ fn close_confirm_005_vanished_armed_session_closes_nothing() {
 #[test]
 fn close_confirm_009_stable_key_respawn_closes_nothing() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 40)
         .with_continue_session("stable-key-target", "cat")
         .launch_with_fixture("minimal");
@@ -304,7 +414,7 @@ fn close_confirm_009_stable_key_respawn_closes_nothing() {
     deck.wait_for_string("generation-one-history-marker");
 
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
 
     // Generation two. Identical to generation one in every field the dashboard
     // renders — same producer key, same agent type, same pane — and differing

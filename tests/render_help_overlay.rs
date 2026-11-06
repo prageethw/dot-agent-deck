@@ -32,9 +32,12 @@ fn buffer_text_lower(buffer: &ratatui::buffer::Buffer) -> String {
 /// Scenario: Render the `?` help overlay into a tall (110×60) `TestBackend`
 /// buffer so all of its multi-section content fits, then assert it documents
 /// the canonical shortcut set: the five global commands the button bar
-/// advertises (New Pane Ctrl+N, Close Ctrl+W, Toggle Layout Ctrl+T, Help ?,
+/// advertises (New Agent Ctrl+N, Close Ctrl+W, Toggle Layout Ctrl+T, Help ?,
 /// Quit Ctrl+C) and the key dashboard / navigation actions (filter `/`,
-/// rename, generate, tab switching, card nav). Substring checks are
+/// rename, generate, tab switching, card nav). The labels must name agents
+/// and the schedule manager consistently. Ctrl+D is documented under Global as
+/// "Toggle command / pane".
+/// Substring checks are
 /// case-insensitive so a `Ctrl+n` vs `Ctrl+N` casing difference between the
 /// overlay and the buttons does not fail the test — it pins that each
 /// shortcut/command is *present* in the canonical reference.
@@ -46,7 +49,7 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
     // Each entry: (token, human description for the failure message).
     let required: &[(&str, &str)] = &[
         // Five global commands the M2 button bar advertises.
-        ("ctrl+n", "New Pane (Ctrl+N)"),
+        ("ctrl+n", "New Agent (Ctrl+N)"),
         ("ctrl+w", "Close (Ctrl+W)"),
         ("ctrl+t", "Toggle Layout (Ctrl+T)"),
         ("ctrl+c", "Quit (Ctrl+C)"),
@@ -70,14 +73,35 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
         missing.is_empty(),
         "help overlay is missing these canonical shortcuts/commands: {missing:?}\n--- rendered overlay ---\n{buf}"
     );
+    for label in [
+        "create new agent",
+        "filter agents",
+        "rename agent",
+        "jump to card n",
+        "close selected agent (confirms)",
+        "schedules manager",
+    ] {
+        assert!(
+            buf.contains(label),
+            "help overlay must show {label:?}\n{buf}"
+        );
+    }
 }
 
-/// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, so a user already on the dashboard can discover how to return to the pane. Also asserts the overlay documents the `Ctrl+m` / `m` agent-badge toggle added in PRD #339, so the help reference does not silently drift out of sync with the button/key actually wired up.
+/// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, so a user already on the dashboard can discover how to return to the pane. Also asserts the overlay documents the plain `b` agent-badge toggle added in PRD #339 (moved from `m` / `Ctrl+m`, which belong to the host-metrics overlay), so the help reference does not silently drift out of sync with the button/key actually wired up. And the dashboard shortcuts must advertise the `m` host-metrics overlay.
 #[spec("dashboard/help/002")]
 #[test]
 fn help_002_overlay_documents_ctrl_d_toggle() {
     let buf = buffer_text_lower(&render_help_overlay_to_buffer(110, 60));
 
+    let host_row = buf
+        .lines()
+        .find(|line| line.contains("host"))
+        .unwrap_or_else(|| panic!("help must document the host-metrics overlay\n{buf}"));
+    assert!(
+        host_row.split_whitespace().any(|word| word == "m"),
+        "help must show the default m host-metrics key\n{buf}"
+    );
     insta::assert_snapshot!(buf);
     assert!(
         buf.contains("toggle command / pane"),
@@ -87,8 +111,37 @@ fn help_002_overlay_documents_ctrl_d_toggle() {
         !buf.contains("command mode (dashboard)"),
         "the stale one-way Ctrl+D description must be removed\n--- rendered overlay ---\n{buf}"
     );
+    // The badge key moved from `m` / `Ctrl+m` to a plain `b`: its row names
+    // `b`, and no longer claims the `Ctrl+m` chord the host-metrics row owns.
+    let badge_row = buf
+        .lines()
+        .find(|line| line.contains("show / hide agent badges"))
+        .unwrap_or_else(|| {
+            panic!("help overlay must document the agent-badge toggle (b -> Show / hide agent badges)\n--- rendered overlay ---\n{buf}")
+        });
     assert!(
-        buf.contains("ctrl+m / m") && buf.contains("show / hide agent badges"),
-        "help overlay must document the agent-badge toggle (Ctrl+m / m -> Show / hide agent badges)\n--- rendered overlay ---\n{buf}"
+        badge_row.split_whitespace().any(|word| word == "b"),
+        "help overlay must show the plain b key on the agent-badge row\n--- rendered overlay ---\n{buf}"
+    );
+    assert!(
+        !badge_row.contains("ctrl+m"),
+        "the agent-badge row must not claim Ctrl+m, which belongs to host metrics\n--- rendered overlay ---\n{buf}"
+    );
+}
+
+/// Scenario: Render the dashboard help overlay and locate the row for opening
+/// the selected agent's pull request. That row advertises the `o` shortcut.
+#[spec("dashboard/help/003")]
+#[test]
+fn help_003_overlay_documents_open_pull_request() {
+    let buf = buffer_text_lower(&render_help_overlay_to_buffer(110, 60));
+    assert!(
+        buf.lines().any(|row| {
+            let words: Vec<_> = row.split_whitespace().collect();
+            words.contains(&"o")
+                && row.contains("open")
+                && (row.contains("pull request") || words.contains(&"pr"))
+        }),
+        "dashboard help must advertise o to open the selected pull request:\n{buf}"
     );
 }

@@ -1,6 +1,9 @@
 use chrono::{Duration, Utc};
-use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::event::{
+    AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType, GenerationVerdict, LiveTarget,
+    PANE_GENERATION_METADATA_KEY, TargetKind, Writable,
+};
+use dot_agent_deck::state::{AppState, SessionSnapshot, SessionStatus};
 
 use spec::spec;
 
@@ -46,6 +49,8 @@ fn event_on_pane(
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     }
 }
 
@@ -559,5 +564,1034 @@ fn status_supersede_011_a_cross_pane_frame_cannot_refresh_the_card_identity() {
     assert_eq!(
         state.sessions[&shared_session_id].started_at, first_timestamp,
         "a frame from another pane rebuilt the card and reset its start time"
+    );
+}
+
+/// Scenario: A Pi card on pane A accumulates a tool tally under the producer's
+/// `{pane_id}-session` key, then a DIFFERENT pane's agent reports under that same key.
+/// The colliding frame must land on a card of its own pane rather than dragging pane A's
+/// card across, leaving each pane with exactly one card carrying its own agent.
+#[spec("status/supersede/012")]
+#[test]
+fn status_supersede_012_a_colliding_frame_gets_its_own_panes_card() {
+    let shared_session_id = format!("{PANE_ID}-session");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.register_pane(OTHER_PANE_ID.to_string());
+
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions[&shared_session_id].tool_count, 1,
+        "precondition: the first pane's agent accumulated history on this card"
+    );
+
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(2),
+    ));
+
+    let card_on = |pane: &str| {
+        let mut found = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane));
+        let one = found.next();
+        assert!(
+            found.next().is_none(),
+            "pane {pane} carries more than one card"
+        );
+        one
+    };
+
+    let pane_a = card_on(PANE_ID).expect("pane A lost its card to a frame from another pane");
+    assert_eq!(
+        pane_a.agent_id.as_deref(),
+        Some("pi-agent-2"),
+        "pane A's card no longer belongs to pane A's agent"
+    );
+    assert_eq!(
+        pane_a.tool_count, 1,
+        "pane A's card lost the history it had accumulated"
+    );
+
+    let pane_b = card_on(OTHER_PANE_ID)
+        .expect("the colliding frame produced no card for the pane it actually named");
+    assert_eq!(
+        pane_b.agent_id.as_deref(),
+        Some("pi-agent-9"),
+        "the colliding frame's own agent did not get the card for its pane"
+    );
+}
+
+/// Scenario: Pane A and pane B each hold a live card, and pane B's agent then ends its
+/// conversation under a session key that pane A's card also happens to carry. The
+/// terminal frame must end pane B's own card and leave pane A's card, agent and tally
+/// exactly where they were.
+#[spec("status/supersede/013")]
+#[test]
+fn status_supersede_013_a_colliding_terminal_frame_ends_only_its_own_pane() {
+    let shared_session_id = format!("{PANE_ID}-session");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.register_pane(OTHER_PANE_ID.to_string());
+
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp + Duration::seconds(1),
+    ));
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        "other-pane-own-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(2),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        2,
+        "precondition: each pane holds exactly one card of its own"
+    );
+
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::SessionEnd,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(3),
+    ));
+
+    let pane_a = state
+        .sessions
+        .values()
+        .find(|s| s.pane_id.as_deref() == Some(PANE_ID))
+        .expect("another pane's SessionEnd removed pane A's live card");
+    assert_eq!(
+        pane_a.agent_id.as_deref(),
+        Some("pi-agent-2"),
+        "pane A's card no longer belongs to pane A's agent"
+    );
+    assert_eq!(
+        pane_a.tool_count, 1,
+        "pane A's card lost the history it had accumulated"
+    );
+    assert!(
+        !state.sessions.contains_key("other-pane-own-session"),
+        "the terminal frame did not end the card on the pane it actually named"
+    );
+}
+
+/// Scenario: A pane-less event creates a card, the pane it turns out to belong to is
+/// registered, and a later frame from the same agent names that pane. The card must
+/// learn its pane and keep its accumulated history rather than being split in two.
+#[spec("status/supersede/014")]
+#[test]
+fn status_supersede_014_a_pane_less_card_still_learns_its_pane() {
+    let roaming_session_id = "roaming-session";
+    let first_timestamp = Utc::now();
+
+    // No managed panes yet, which is what admits a pane-less event at all.
+    let mut state = AppState::default();
+    let mut paneless = event_on_pane(
+        PANE_ID,
+        roaming_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    );
+    paneless.pane_id = None;
+    state.apply_event(paneless);
+
+    assert_eq!(
+        state.sessions[roaming_session_id].pane_id, None,
+        "precondition: the card was created without a pane"
+    );
+
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        roaming_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "the pane-naming frame minted a second card instead of binding the existing one"
+    );
+    assert_eq!(
+        state.sessions[roaming_session_id].pane_id.as_deref(),
+        Some(PANE_ID),
+        "the card never learned the pane its own agent reported from"
+    );
+    assert_eq!(
+        state.sessions[roaming_session_id].tool_count, 1,
+        "the card lost its history on the way to learning its pane"
+    );
+}
+
+/// Scenario: Pane A holds a card under key `K` and a third pane already holds one under
+/// the very key that re-keying `K` for pane B produces. A frame naming pane B under `K`
+/// must still end up on a card of its own, leaving both other panes' cards untouched.
+#[spec("status/supersede/015")]
+#[test]
+fn status_supersede_015_a_stacked_key_collision_still_lands_on_its_own_pane() {
+    const THIRD_PANE_ID: &str = "scheduler-handoff-pane-c";
+    let shared_session_id = format!("{PANE_ID}-session");
+    // Exactly the spelling the re-key derives for `OTHER_PANE_ID`. Nothing stops
+    // a producer emitting it: session ids arrive verbatim on producer payloads.
+    let derived_session_id = format!("{OTHER_PANE_ID}::{shared_session_id}");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.register_pane(OTHER_PANE_ID.to_string());
+    state.register_pane(THIRD_PANE_ID.to_string());
+
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+    state.apply_event(event_on_pane(
+        THIRD_PANE_ID,
+        &derived_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-3"),
+        first_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        2,
+        "precondition: pane A and the third pane each hold a card of their own"
+    );
+
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(2),
+    ));
+
+    let card_on = |pane: &str| {
+        let mut found = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane));
+        let one = found.next();
+        assert!(
+            found.next().is_none(),
+            "pane {pane} carries more than one card"
+        );
+        one
+    };
+
+    for (pane, agent) in [(PANE_ID, "pi-agent-2"), (THIRD_PANE_ID, "pi-agent-3")] {
+        let card = card_on(pane).unwrap_or_else(|| panic!("pane {pane} lost its card"));
+        assert_eq!(
+            card.agent_id.as_deref(),
+            Some(agent),
+            "pane {pane}'s card no longer belongs to its own agent"
+        );
+        assert_eq!(card.tool_count, 1, "pane {pane}'s card lost its history");
+    }
+
+    let pane_b = card_on(OTHER_PANE_ID)
+        .expect("the colliding frame produced no card for the pane it actually named");
+    assert_eq!(
+        pane_b.agent_id.as_deref(),
+        Some("pi-agent-9"),
+        "the colliding frame's own agent did not get the card for its pane"
+    );
+}
+
+/// The generation a reconnecting TUI seeds a card for in `status/supersede/016`
+/// and `017`.
+const RECONNECT_AGENT_ID: &str = "reconnect-agent";
+
+/// An instant `offset` from now, truncated to a whole millisecond.
+/// `SessionSnapshot` carries `last_activity` in epoch milliseconds, so the
+/// reconnect tests stamp their frames on whole milliseconds and a comparison
+/// between the daemon's value and the seeded one is exact rather than off by
+/// the truncation.
+fn whole_ms(offset: Duration) -> chrono::DateTime<Utc> {
+    let at = Utc::now() + offset;
+    chrono::DateTime::from_timestamp_millis(at.timestamp_millis()).expect("in range")
+}
+
+/// Seed `tui`'s card for `PANE_ID` from `snapshot`, exactly as the TUI's
+/// reconnect hydration does (`ui.rs`: `register_pane`, then
+/// `seed_hydrated_session` under the same lock).
+fn reconnect(tui: &mut AppState, snapshot: Option<&SessionSnapshot>) {
+    tui.register_pane(PANE_ID.to_string());
+    tui.seed_hydrated_session(
+        PANE_ID.to_string(),
+        Some("/tmp/runbox".to_string()),
+        Some(AgentType::Pi),
+        Some(RECONNECT_AGENT_ID.to_string()),
+        snapshot,
+        None,
+    );
+}
+
+/// The key `seed_hydrated_session` stores `PANE_ID`'s card under.
+fn seeded_key() -> String {
+    format!("pane-{PANE_ID}")
+}
+
+/// Which generation a pane-keyed pick landed on. The daemon and a reconnected
+/// TUI key the same generation differently (the TUI's seeded card is
+/// `pane-<id>`), so the comparison is by the agent that owns the session.
+fn owner_of(state: &AppState, session_id: Option<String>) -> Option<String> {
+    session_id
+        .and_then(|id| state.sessions.get(&id))
+        .and_then(|session| session.agent_id.clone())
+}
+
+/// The `ListAgents` join's answer for `agent_id` on `PANE_ID`, as JSON so the
+/// whole snapshot — `last_activity_ms` included — compares at once.
+fn join(state: &AppState, agent_id: &str) -> Option<serde_json::Value> {
+    state
+        .live_session_for(agent_id, Some(PANE_ID))
+        .map(|snapshot| serde_json::to_value(snapshot).expect("a snapshot serializes"))
+}
+
+/// A history-only live-target declaration, so `pane_writable` has a visible
+/// answer that tells a seeded card apart from any session that declared none.
+fn history_only() -> LiveTarget {
+    LiveTarget {
+        kind: TargetKind::Process,
+        writable: Writable::HistoryOnly,
+    }
+}
+
+/// Scenario: A daemon holds an agent whose history-only card went quiet an hour ago, and a TUI reconnects and seeds its card from the daemon's snapshot. A different agent's frame then reaches both — stamped half an hour after the quiet instant in one run, half an hour before it in another. The TUI must retire or keep its seeded card exactly where the daemon retires or keeps its own, so `pane_writable`, `pane_session_id` and the `ListAgents` join pick the same generation on both sides.
+#[spec("status/supersede/016")]
+#[test]
+fn status_supersede_016_a_reconnected_card_is_superseded_exactly_where_the_daemons_is() {
+    let quiet_since = whole_ms(-Duration::hours(1));
+    for (straggler_at, daemon_retires_incumbent) in [
+        (quiet_since + Duration::minutes(30), true),
+        (quiet_since - Duration::minutes(30), false),
+    ] {
+        // The daemon's own state, built the way hook frames build it.
+        let mut daemon = AppState::default();
+        daemon.register_pane(PANE_ID.to_string());
+        let mut announced = event(
+            "incumbent-session",
+            AgentType::Pi,
+            EventType::SessionStart,
+            Some(RECONNECT_AGENT_ID),
+            quiet_since - Duration::minutes(5),
+        );
+        announced.live_target = Some(history_only());
+        daemon.apply_event(announced);
+        daemon.apply_event(event(
+            "incumbent-session",
+            AgentType::Pi,
+            EventType::Idle,
+            Some(RECONNECT_AGENT_ID),
+            quiet_since,
+        ));
+
+        // What `ListAgents` hands the reconnecting TUI for that record.
+        let snapshot = daemon
+            .live_session_for(RECONNECT_AGENT_ID, Some(PANE_ID))
+            .expect("the daemon holds a live session for the agent");
+        let mut tui = AppState::default();
+        reconnect(&mut tui, Some(&snapshot));
+
+        assert_eq!(
+            tui.sessions[&seeded_key()].last_activity,
+            quiet_since,
+            "the reconnected card must carry the daemon's quiet instant, not the moment it was seeded"
+        );
+        assert_eq!(
+            join(&tui, RECONNECT_AGENT_ID),
+            join(&daemon, RECONNECT_AGENT_ID),
+            "right after the reconnect the join must answer exactly what the daemon answers"
+        );
+
+        // Both sides receive the same broadcast frame: a different agent on the
+        // pane, whose takeover is only INFERRED, so `supersedes_generation`
+        // weighs its stamp against the incumbent's `last_activity`.
+        let straggler = event(
+            "successor-session",
+            AgentType::Pi,
+            EventType::Thinking,
+            Some("successor-agent"),
+            straggler_at,
+        );
+        daemon.apply_event(straggler.clone());
+        tui.apply_event(straggler);
+
+        let holds_incumbent = |state: &AppState| {
+            state
+                .sessions
+                .values()
+                .any(|session| session.agent_id.as_deref() == Some(RECONNECT_AGENT_ID))
+        };
+        assert_eq!(
+            holds_incumbent(&daemon),
+            !daemon_retires_incumbent,
+            "precondition: the daemon's own supersession decision"
+        );
+        assert_eq!(
+            holds_incumbent(&tui),
+            holds_incumbent(&daemon),
+            "a frame stamped {straggler_at} must retire the reconnected card exactly where it retires \
+             the daemon's (quiet since {quiet_since})"
+        );
+        assert_eq!(
+            tui.pane_writable(PANE_ID),
+            daemon.pane_writable(PANE_ID),
+            "pane_writable must pick the same generation on the TUI as on the daemon"
+        );
+        assert_eq!(
+            owner_of(&tui, tui.pane_session_id(PANE_ID)),
+            owner_of(&daemon, daemon.pane_session_id(PANE_ID)),
+            "pane_session_id must pick the same generation on the TUI as on the daemon"
+        );
+        for agent in [RECONNECT_AGENT_ID, "successor-agent"] {
+            assert_eq!(
+                join(&tui, agent),
+                join(&daemon, agent),
+                "the ListAgents join must answer the same for {agent} on both sides"
+            );
+        }
+    }
+}
+
+/// Scenario: A TUI already holds evidence for the card it is about to seed — the same agent's `SessionStart` that landed on the pane before hydration (tying the snapshot with or without a live target of its own, older than it, or older than a future-stamped one), a future-stamped session from another agent, a report the same agent sent without a pane (newer than the snapshot, or tying it), or the card itself after it saw a newer frame than the snapshot it is re-seeded from. The agent keeps one card, which takes the snapshot only when the snapshot is the fresher evidence and not in the future — except that on an exact tie a card declaring no live target adopts the snapshot's, and only that; a freshly minted card changes no newest-wins pick, and no card's `last_activity` drops below evidence the state already held.
+#[spec("status/supersede/017")]
+#[test]
+fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
+    let quiet_since = whole_ms(-Duration::hours(1));
+    let snapshot_at = |at: chrono::DateTime<Utc>| SessionSnapshot {
+        output_set_status: false,
+        subagent_wait: None,
+        status: SessionStatus::Working,
+        agent_type: Some(AgentType::Pi),
+        active_tool: None,
+        // Distinct from anything a bare `SessionStart` card carries, so the
+        // join's answer says whether the card took the snapshot.
+        tool_count: 7,
+        first_prompts: Vec::new(),
+        last_user_prompt: None,
+        live_target: Some(history_only()),
+        last_activity_ms: Some(at.timestamp_millis()),
+        blocked: None,
+        hook_generation: None,
+        delivery_notice: None,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: None,
+        background: None,
+        background_revision: None,
+        shell_synthetic_working: false,
+        model: None,
+        monitored_wait_active: false,
+        wait_synthetic_working: false,
+        shell_descendant_busy: false,
+        wait_deferred_revert: false,
+        agent_report_activity_seen: false,
+    };
+    let early_key = "zz-early-session";
+
+    // What the kept card must end up with, per PRD #1223's rule.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Outcome {
+        /// The snapshot is the fresher evidence: every overlaid field moves.
+        Overlay,
+        /// An exact tie and the card declares no live target: it adopts the
+        /// snapshot's live target and nothing else.
+        AdoptLiveTargetOnly,
+        /// The card is left exactly as it was.
+        Untouched,
+    }
+    let own_live = LiveTarget {
+        kind: TargetKind::Process,
+        writable: Writable::Live,
+    };
+
+    // A `SessionStart` from the same agent reached the TUI before hydration
+    // seeded the pane (its event subscriber starts first), so PRD #1223's
+    // upsert keeps that card instead of minting `pane-<id>` beside it.
+    // (a) It was the daemon's newest frame: the snapshot's instant EQUALS its
+    //     stamp, so the card already holds evidence as new as the snapshot's.
+    //     It declares no live target, so it adopts the snapshot's (a missing
+    //     one is a safety property) and keeps every display field.
+    // (a') The same tie, but the card declares its own live target: it keeps
+    //     its own, and nothing moves.
+    // (b) The snapshot is strictly newer than it: the daemon saw activity the
+    //     card has not, and the card must carry it.
+    // (b') The snapshot is newer but in the future: refused by #804's clock bar.
+    for (early_at, early_live, snapshot_instant, outcome) in [
+        (quiet_since, None, quiet_since, Outcome::AdoptLiveTargetOnly),
+        (quiet_since, Some(own_live), quiet_since, Outcome::Untouched),
+        (
+            quiet_since - Duration::minutes(10),
+            None,
+            quiet_since,
+            Outcome::Overlay,
+        ),
+        (
+            quiet_since - Duration::minutes(10),
+            None,
+            whole_ms(Duration::hours(1)),
+            Outcome::Untouched,
+        ),
+    ] {
+        let mut tui = AppState::default();
+        let mut early = event(
+            early_key,
+            AgentType::Pi,
+            EventType::SessionStart,
+            Some(RECONNECT_AGENT_ID),
+            early_at,
+        );
+        early.live_target = early_live;
+        tui.apply_event(early);
+        tui.register_pane(PANE_ID.to_string());
+        let before = join(&tui, RECONNECT_AGENT_ID);
+        let journal_before = tui.sessions[early_key].recent_events.len();
+        let status_before = tui.sessions[early_key].status.clone();
+        let tool_count_before = tui.sessions[early_key].tool_count;
+        reconnect(&mut tui, Some(&snapshot_at(snapshot_instant)));
+
+        let on_pane: Vec<&str> = tui
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(PANE_ID))
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(
+            on_pane,
+            vec![early_key],
+            "one agent on one pane keeps one card (early frame at {early_at}, snapshot at \
+             {snapshot_instant})"
+        );
+        let card = &tui.sessions[early_key];
+        match outcome {
+            Outcome::Overlay => {
+                assert_eq!(
+                    card.last_activity, snapshot_instant,
+                    "the kept card must take the fresher snapshot's instant"
+                );
+                assert_eq!(card.status, SessionStatus::Working, "fresher status");
+                assert_eq!(card.tool_count, 7, "fresher tool fields");
+                assert_eq!(
+                    card.writable(),
+                    Writable::HistoryOnly,
+                    "the snapshot's live target must reach the kept card, so it refuses input"
+                );
+                assert_eq!(
+                    tui.pane_session_id(PANE_ID).as_deref(),
+                    Some(early_key),
+                    "pane_session_id picks the one card"
+                );
+                assert_eq!(
+                    tui.pane_writable(PANE_ID),
+                    Writable::HistoryOnly,
+                    "pane_writable reads the snapshot's live target off the one card"
+                );
+                assert_eq!(
+                    tui.agent_writable(RECONNECT_AGENT_ID),
+                    Writable::HistoryOnly,
+                    "agent_writable reads the snapshot's live target off the one card"
+                );
+                assert_eq!(
+                    tui.live_session_for(RECONNECT_AGENT_ID, Some(PANE_ID))
+                        .map(|live| live.tool_count),
+                    Some(7),
+                    "the ListAgents join answers with the fresher evidence"
+                );
+            }
+            Outcome::AdoptLiveTargetOnly => {
+                assert_eq!(
+                    card.writable(),
+                    Writable::HistoryOnly,
+                    "on a tie, a kept card with no live target must adopt the snapshot's, so it \
+                     refuses input"
+                );
+                assert_eq!(
+                    tui.pane_writable(PANE_ID),
+                    Writable::HistoryOnly,
+                    "pane_writable reads the adopted live target off the one card"
+                );
+                assert_eq!(
+                    tui.agent_writable(RECONNECT_AGENT_ID),
+                    Writable::HistoryOnly,
+                    "agent_writable reads the adopted live target off the one card"
+                );
+                assert_eq!(
+                    card.recent_events.len(),
+                    journal_before + 1,
+                    "exactly one live-target carrier is pushed"
+                );
+                // Every display field stays: the join answers exactly as it did
+                // before, except for the adopted live target.
+                let mut expected = before.clone().expect("the kept card joins");
+                expected["live_target"] =
+                    serde_json::to_value(history_only()).expect("a live target serializes");
+                assert_eq!(
+                    join(&tui, RECONNECT_AGENT_ID),
+                    Some(expected),
+                    "a tie moves the live target and nothing else"
+                );
+                assert_eq!(card.status, status_before, "a tie keeps the card's status");
+                assert_eq!(
+                    card.tool_count, tool_count_before,
+                    "a tie keeps the card's tool fields"
+                );
+                assert_eq!(card.last_activity, early_at, "nor moves its evidence");
+            }
+            Outcome::Untouched => {
+                assert_eq!(
+                    join(&tui, RECONNECT_AGENT_ID),
+                    before,
+                    "a snapshot that is not the fresher evidence must leave the kept card as it \
+                     was (early frame at {early_at}, snapshot at {snapshot_instant})"
+                );
+                assert_eq!(
+                    card.recent_events.len(),
+                    journal_before,
+                    "nor push a live-target carrier onto it"
+                );
+                assert_eq!(card.last_activity, early_at, "nor move its evidence");
+                assert_eq!(
+                    card.live_target(),
+                    early_live,
+                    "a card that declares its own live target keeps it"
+                );
+            }
+        }
+    }
+
+    // (c) A session from another agent on the pane carries a stamp in the
+    // future, so a freshly minted card never beat it. A snapshot stamped even
+    // further out must not flip that.
+    let mut tui = AppState::default();
+    tui.apply_event(event(
+        "future-session",
+        AgentType::Pi,
+        EventType::SessionStart,
+        Some("future-agent"),
+        whole_ms(Duration::hours(1)),
+    ));
+    reconnect(&mut tui, Some(&snapshot_at(whole_ms(Duration::hours(2)))));
+    assert_eq!(
+        owner_of(&tui, tui.pane_session_id(PANE_ID)).as_deref(),
+        Some("future-agent"),
+        "a card that lost to a future-stamped session before the overlay must still lose to it"
+    );
+    assert_eq!(
+        tui.pane_writable(PANE_ID),
+        Writable::Live,
+        "pane_writable must still pick the future-stamped session"
+    );
+
+    // (d) The same agent reported without a pane before hydration, later than
+    // the snapshot's instant. `agent_writable` weighs that session against the
+    // seeded card, so it is evidence too, even though it is on no pane.
+    let mut tui = AppState::default();
+    let mut paneless = event(
+        "paneless-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some(RECONNECT_AGENT_ID),
+        quiet_since + Duration::minutes(1),
+    );
+    paneless.pane_id = None;
+    tui.apply_event(paneless);
+    reconnect(&mut tui, Some(&snapshot_at(quiet_since)));
+    assert_eq!(
+        tui.agent_writable(RECONNECT_AGENT_ID),
+        Writable::HistoryOnly,
+        "agent_writable must still pick the seeded card over the agent's paneless session"
+    );
+
+    // (d') The same agent's paneless report TIES the snapshot's instant. The
+    // minted card must keep its minted value rather than create a tie that
+    // hash order or the join's tiebreak would settle.
+    let mut tui = AppState::default();
+    let mut paneless = event(
+        "paneless-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some(RECONNECT_AGENT_ID),
+        quiet_since,
+    );
+    paneless.pane_id = None;
+    tui.apply_event(paneless);
+    let before_seed = Utc::now();
+    reconnect(&mut tui, Some(&snapshot_at(quiet_since)));
+    assert!(
+        tui.sessions[&seeded_key()].last_activity >= before_seed,
+        "a snapshot that only TIES the agent's newest evidence must leave the freshly minted \
+         value, not create a tie; got {}",
+        tui.sessions[&seeded_key()].last_activity
+    );
+
+    // (e) The card saw a frame newer than the snapshot it is later re-seeded
+    // from. The re-seed must not move its evidence backward — the same
+    // high-water mark `apply_event` keeps (`status/supersede/004`).
+    let mut tui = AppState::default();
+    let stale = snapshot_at(quiet_since);
+    reconnect(&mut tui, Some(&stale));
+    let newer = quiet_since + Duration::minutes(30);
+    tui.apply_event(event(
+        "later-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some(RECONNECT_AGENT_ID),
+        newer,
+    ));
+    assert_eq!(
+        tui.sessions[&seeded_key()].last_activity,
+        newer,
+        "precondition: the newer frame landed on the seeded card"
+    );
+    reconnect(&mut tui, Some(&stale));
+    assert!(
+        tui.sessions[&seeded_key()].last_activity >= newer,
+        "a re-seed from a snapshot older than the card's own evidence moved last_activity backward to {}",
+        tui.sessions[&seeded_key()].last_activity
+    );
+}
+
+/// Scenario: A TUI reconnects to a daemon whose agent reported a stamp an hour in the future, and seeds its card from that snapshot. A different agent then takes the pane and reports a minute after the reconnect. The card must not import the future stamp, so that honest successor still retires it; imported, the stamp would pin the stale card against every successor until the wall clock caught up, because the daemon's registry-ownership ground has no counterpart in a client.
+#[spec("status/supersede/018")]
+#[test]
+fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_card() {
+    let future = whole_ms(Duration::hours(1));
+    let snapshot = SessionSnapshot {
+        output_set_status: false,
+        subagent_wait: None,
+        status: SessionStatus::Working,
+        agent_type: Some(AgentType::Pi),
+        active_tool: None,
+        tool_count: 7,
+        first_prompts: Vec::new(),
+        last_user_prompt: None,
+        live_target: Some(history_only()),
+        last_activity_ms: Some(future.timestamp_millis()),
+        blocked: None,
+        hook_generation: None,
+        delivery_notice: None,
+        pending_question: None,
+        pull_request: None,
+        pull_request_revision: None,
+        background: None,
+        background_revision: None,
+        shell_synthetic_working: false,
+        model: None,
+        monitored_wait_active: false,
+        wait_synthetic_working: false,
+        shell_descendant_busy: false,
+        wait_deferred_revert: false,
+        agent_report_activity_seen: false,
+    };
+    let mut tui = AppState::default();
+    let before_seed = Utc::now();
+    reconnect(&mut tui, Some(&snapshot));
+    let after_seed = Utc::now();
+
+    let seeded = tui.sessions[&seeded_key()].last_activity;
+    assert!(
+        seeded >= before_seed && seeded <= after_seed,
+        "a snapshot stamped in the future must leave the freshly minted value, got {seeded}"
+    );
+
+    tui.apply_event(event(
+        "successor-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("successor-agent"),
+        after_seed + Duration::minutes(1),
+    ));
+    assert!(
+        !tui.sessions.contains_key(&seeded_key()),
+        "an honest successor's frame must still retire the reconnected card"
+    );
+    assert_eq!(
+        owner_of(&tui, tui.pane_session_id(PANE_ID)).as_deref(),
+        Some("successor-agent"),
+        "pane_session_id must follow the successor, not a card pinned by a future stamp"
+    );
+    assert_eq!(
+        tui.pane_writable(PANE_ID),
+        Writable::Live,
+        "pane_writable must follow the successor, not the pinned history-only card"
+    );
+}
+
+/// Issue #320: `event` as an attached TUI receives it from a daemon that has
+/// stamped its registry's generation verdict on it.
+fn stamped(mut event: AgentEvent, verdict: GenerationVerdict) -> AgentEvent {
+    event.metadata.insert(
+        PANE_GENERATION_METADATA_KEY.to_string(),
+        verdict.metadata_value().to_string(),
+    );
+    event
+}
+
+/// The agent id of every card on [`PANE_ID`], sorted.
+fn owners_on_pane(state: &AppState) -> Vec<Option<String>> {
+    let mut owners: Vec<Option<String>> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(PANE_ID))
+        .map(|s| s.agent_id.clone())
+        .collect();
+    owners.sort();
+    owners
+}
+
+/// Scenario: A TUI shows the incoming agent's live card after a takeover. Two late frames from the OUTGOING agent then arrive, each marked by the daemon as coming from a displaced generation: a `SessionStart`, and a `Thinking` stamped an hour in the future. Neither may retire the live card or add a card beside it, even though both pass the old type-and-timestamp test; the same frames without the daemon's mark, as an older daemon relays them, are still ordered by that old test.
+#[spec("status/supersede/019")]
+#[test]
+fn status_supersede_019_a_displaced_generation_cannot_retire_the_live_card() {
+    let now = Utc::now();
+    let live = || {
+        let mut tui = AppState::default();
+        tui.register_pane(PANE_ID.to_string());
+        tui.apply_event(stamped(
+            event(
+                "incoming-session",
+                AgentType::ClaudeCode,
+                EventType::SessionStart,
+                Some("incoming-agent"),
+                now,
+            ),
+            GenerationVerdict::Current,
+        ));
+        assert_eq!(
+            owners_on_pane(&tui),
+            vec![Some("incoming-agent".to_string())],
+            "precondition: the incoming generation's card is the pane's only card"
+        );
+        tui
+    };
+    let late_frames = [
+        (EventType::SessionStart, now - Duration::seconds(30)),
+        (EventType::Thinking, now + Duration::hours(1)),
+    ];
+
+    for (event_type, stamp) in late_frames.clone() {
+        let mut tui = live();
+        tui.apply_event(stamped(
+            event(
+                "outgoing-session",
+                AgentType::ClaudeCode,
+                event_type.clone(),
+                Some("outgoing-agent"),
+                stamp,
+            ),
+            GenerationVerdict::Displaced,
+        ));
+        assert_eq!(
+            owners_on_pane(&tui),
+            vec![Some("incoming-agent".to_string())],
+            "a late {event_type:?} from a generation the daemon marked displaced retired \
+             the live card or stacked a second one"
+        );
+    }
+
+    // Control: without the mark the old ordering still applies, so it is the
+    // daemon's verdict, not the frames' shape, that the live card owes its
+    // survival to.
+    for (event_type, stamp) in late_frames {
+        let mut tui = live();
+        tui.apply_event(event(
+            "outgoing-session",
+            AgentType::ClaudeCode,
+            event_type.clone(),
+            Some("outgoing-agent"),
+            stamp,
+        ));
+        assert_eq!(
+            owners_on_pane(&tui),
+            vec![Some("outgoing-agent".to_string())],
+            "an unmarked late {event_type:?} is ordered by type and timestamp, as before"
+        );
+    }
+}
+
+/// Scenario: A Pi agent (which sends no `SessionStart`) is respawned on a pane, and its first frame reaches the TUI stamped EARLIER than the outgoing card's last activity, marked by the daemon as the pane's current generation. It must still retire the outgoing card, leaving one card owned by the new agent, because the daemon's generation verdict and not the producer clock orders the takeover. The same frame unmarked is still held back by the timestamp.
+#[spec("status/supersede/020")]
+#[test]
+fn status_supersede_020_the_current_generation_supersedes_whatever_it_is_stamped() {
+    let now = Utc::now();
+    let outgoing_card = || {
+        let mut tui = AppState::default();
+        tui.register_pane(PANE_ID.to_string());
+        tui.apply_event(event(
+            "outgoing-session",
+            AgentType::Pi,
+            EventType::Idle,
+            Some("outgoing-agent"),
+            now,
+        ));
+        tui
+    };
+    let first_frame = event(
+        "incoming-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("incoming-agent"),
+        now - Duration::seconds(30),
+    );
+
+    let mut tui = outgoing_card();
+    tui.apply_event(stamped(first_frame.clone(), GenerationVerdict::Current));
+    assert_eq!(
+        owners_on_pane(&tui),
+        vec![Some("incoming-agent".to_string())],
+        "the pane's current generation must supersede the outgoing card however its \
+         first frame is stamped"
+    );
+
+    // Control: the unmarked frame is judged by its stamp and keeps both.
+    let mut tui = outgoing_card();
+    tui.apply_event(first_frame);
+    assert_eq!(
+        owners_on_pane(&tui),
+        vec![
+            Some("incoming-agent".to_string()),
+            Some("outgoing-agent".to_string())
+        ],
+        "an unmarked older-stamped frame is held back by the timestamp, as before"
+    );
+}
+
+/// Scenario: A pane's successor has reserved it but not reported yet, so the outgoing agent's card is still the one on screen when that agent's own `SessionEnd` arrives, marked by the daemon as coming from a displaced generation. The end must still end that card: the displaced mark refuses a frame's claim to a generation, and a `SessionEnd` makes none, so the card must not linger showing an agent that has finished.
+#[spec("status/supersede/021")]
+#[test]
+fn status_supersede_021_a_displaced_generation_still_ends_its_own_card() {
+    let now = Utc::now();
+    let mut tui = AppState::default();
+    tui.register_pane(PANE_ID.to_string());
+    tui.apply_event(event(
+        "outgoing-session",
+        AgentType::ClaudeCode,
+        EventType::SessionStart,
+        Some("outgoing-agent"),
+        now - Duration::seconds(30),
+    ));
+    assert_eq!(
+        owners_on_pane(&tui),
+        vec![Some("outgoing-agent".to_string())],
+        "precondition: the outgoing generation's card is the pane's card"
+    );
+
+    tui.apply_event(stamped(
+        event(
+            "outgoing-session",
+            AgentType::ClaudeCode,
+            EventType::SessionEnd,
+            Some("outgoing-agent"),
+            now,
+        ),
+        GenerationVerdict::Displaced,
+    ));
+    assert!(
+        !tui.sessions.contains_key("outgoing-session"),
+        "the outgoing agent's own SessionEnd must still end its card; the pane shows {:?}",
+        owners_on_pane(&tui)
+    );
+
+    // But only its OWN card. Pi reports every generation under the pane-derived
+    // `{pane_id}-session` key, so the successor's card can sit under the very
+    // key the outgoing agent's late end names — and the terminal branch removes
+    // by key. A displaced end that has no card of its own on the pane ends
+    // nothing.
+    let shared_key = format!("{PANE_ID}-session");
+    let mut tui = AppState::default();
+    tui.register_pane(PANE_ID.to_string());
+    tui.apply_event(stamped(
+        event(
+            &shared_key,
+            AgentType::Pi,
+            EventType::Thinking,
+            Some("incoming-agent"),
+            now,
+        ),
+        GenerationVerdict::Current,
+    ));
+    tui.apply_event(stamped(
+        event(
+            &shared_key,
+            AgentType::Pi,
+            EventType::SessionEnd,
+            Some("outgoing-agent"),
+            now + Duration::seconds(1),
+        ),
+        GenerationVerdict::Displaced,
+    ));
+    // Asserted on the card itself, not on the owners: the terminal branch
+    // rebuilds a bare placeholder carrying the removed card's `agent_id`, so a
+    // wiped successor still reads as "incoming-agent" by owner.
+    let successor = tui.sessions.get(&shared_key).unwrap_or_else(|| {
+        panic!(
+            "a displaced SessionEnd under the successor's session key removed the successor's \
+             card; the pane now holds {:?}",
+            tui.sessions.keys().collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(successor.agent_id.as_deref(), Some("incoming-agent"));
+    assert_eq!(
+        successor.status,
+        SessionStatus::Thinking,
+        "the successor's card must keep its own status"
     );
 }

@@ -1,0 +1,206 @@
+import { sendResultReason } from "../types";
+import type { AgentSession, SendResult } from "../types";
+import type { ActivityDisplay } from "./displayText";
+
+/**
+ * Issue #1042 — whether an agent's terminal will accept what is typed into it,
+ * and what to say when it will not.
+ *
+ * Two conditions block it, both read off the snapshot so neither needs a send
+ * and neither freezes at its mount value: the pane's write lease
+ * (`history-only`, `no-live-target`), which the desktop crate projects from
+ * `SessionSnapshot.live_target.writable` and pushes on every change, and the
+ * agent's status ({@link agentStatusInputReason}).
+ */
+export interface TerminalInputState {
+  /**
+   * The pane's input-acceptance state in the `SendResult` vocabulary, or
+   * `undefined` when nothing about the PANE is being claimed — which is what
+   * the agent-status gate below produces. Rendered as `data-input-state`.
+   */
+  state?: SendResult;
+  /** True when the terminal must not accept keystrokes. */
+  readOnly: boolean;
+  /** The operator-facing sentence, or nothing when input is accepted silently. */
+  notice?: string;
+  /** How the notice reads. */
+  tone: "open" | "blocked";
+}
+
+/**
+ * The agent-status gate, moved here verbatim from `composerDisabledReason`.
+ *
+ * It says nothing about the pane — an agent that has not started, has finished,
+ * or was stopped has no work in progress to type at, whatever its lease
+ * reports. `TerminalViewport`'s `readOnly` used to carry an inline copy of this
+ * condition and the composer carried the strings; both now read this one
+ * function, so the two can no longer disagree.
+ */
+export function agentStatusInputReason(agent: AgentSession): string | undefined {
+  if (agent.status === "queued") return "This agent has not started yet.";
+  if (agent.status === "passed") return "This agent has finished its work.";
+  if (agent.status === "stopped") return "This agent is stopped.";
+  return undefined;
+}
+
+/**
+ * The lease half: what the snapshot alone proves about this pane.
+ *
+ * `"unknown"` (and an absent lease) is the LEGACY LIVE DEFAULT and means
+ * writable — the desktop crate omits the key when the daemon declared no
+ * `live_target`, and every native PTY historically declared none. Reading it as
+ * read-only would falsely disable the input on those daemons, so only `"read"`
+ * and `"none"` produce a state here.
+ */
+function leaseState(agent: AgentSession): SendResult | undefined {
+  if (agent.writeLease === "read") return "history-only";
+  if (agent.writeLease === "none") return "no-live-target";
+  return undefined;
+}
+
+/** Resolve one agent's terminal-input state. */
+export function terminalInputState(agent: AgentSession): TerminalInputState {
+  const lease = leaseState(agent);
+  if (lease) {
+    return {
+      state: lease,
+      readOnly: true,
+      tone: "blocked",
+      notice: `Terminal input unavailable — ${sendResultReason(lease)}.`,
+    };
+  }
+
+  // Checked after the pane, not before it: for an agent that is both finished
+  // and paneless, "the agent has no live pane" is the sentence that explains
+  // why typing cannot work, which is what #1042 asked the terminal to say.
+  const statusReason = agentStatusInputReason(agent);
+  if (statusReason) return { state: undefined, readOnly: true, tone: "blocked", notice: statusReason };
+
+  return { state: "applied", readOnly: false, tone: "open" };
+}
+
+/**
+ * PRD #1105 — why a pane has NO TERMINAL AT ALL, which is a different question
+ * from whether the terminal it has will accept input.
+ *
+ * The overview lists every observed deck's agents (PRD
+ * [#742](https://github.com/vfarcic/dot-agent-deck/issues/742)) and every one
+ * of them is openable. Most of them attach: the pane carries its own
+ * `(deckId, agentId)` all the way through attach, output, input and resize, and
+ * the crate resolves that deck's link through `DaemonLinks`, so a non-selected
+ * deck's agent opens with the same live terminal as a selected one.
+ *
+ * What is left is the deck with **no link to attach over** — one that is
+ * disconnected, one that has not reported yet, one configured with no address,
+ * or one this app is not observing at all. A `TerminalViewport` mounted there
+ * receives no bytes, which renders as a black rectangle that reads *"this agent
+ * is producing no output"*. That is a lie about an agent that may be working
+ * normally on a machine this app has merely lost contact with, and it is the
+ * state this replaces.
+ *
+ * # Why this is not a value inside {@link TerminalInputState}
+ *
+ * That function answers *"will what is typed here be delivered"* in the
+ * `SendResult` vocabulary, and that vocabulary is the WIRE's — `SendResult`
+ * mirrors the Rust enum the daemon sends, so a desktop-only condition cannot
+ * be spelled in it without inventing a value no daemon will ever produce.
+ * `data-input-state` is therefore left to the daemon's answers and this gets
+ * its own attribute, `data-terminal-state`, on the wrapper around the
+ * terminal's place. The SHAPE is deliberately the same as #1042's — one state
+ * attribute readable from the DOM, plus one `role="status"` sentence — because
+ * a second vocabulary for the same kind of fact is how two seams come to
+ * disagree.
+ *
+ * There is no input gate to render beside it: where this is set no terminal is
+ * mounted, so there is nothing to type into and nothing a lease could say about
+ * it. One sentence, and it is this one.
+ */
+export type NoTerminalReason = "unreachable-deck";
+
+export interface NoTerminalState {
+  /** Rendered as `data-terminal-state`. `"attached"` is the absence of this. */
+  reason: NoTerminalReason;
+  /**
+   * The operator-facing sentence, and never absent: a box with no explanation
+   * is the blank rectangle this exists to replace.
+   */
+  notice: string;
+  /**
+   * The exact instant behind the relative age in {@link notice}, for the
+   * notice's hover — the same pairing {@link ActivityDisplay} established for
+   * every other relativised instant in this app, and absent for the same
+   * reason the clause is: there is no held record, or no age could be
+   * expressed for it (issue #1143).
+   */
+  noticeTitle?: string;
+}
+
+/**
+ * Issue #1143 — whether the agent record a surface is rendering is its deck's
+ * CURRENT answer or the last one that deck gave.
+ *
+ * `"held"` reaches one surface, and `grep recordFreshness desktop/src` is how
+ * to re-check that: `OverviewAgentPane` is the only call site that passes the
+ * prop at all, and it passes `"held"` only for an agent pane whose deck has
+ * stopped answering, where the record is kept so the pane can still be a pane
+ * (see `useHeldAgentRecord`). Every other render of a tile takes the default,
+ * because its record comes from a snapshot that was just built.
+ *
+ * It exists as an attribute on the tile — `data-agent-record`, sibling of
+ * `data-status` — rather than as a second sentence, for the reason
+ * {@link NoTerminalReason} gives for `data-terminal-state`: one state attribute
+ * readable from the DOM plus one `role="status"` sentence is the shape this
+ * feature already uses, and a second vocabulary for the same kind of fact is
+ * how two seams come to disagree.
+ */
+export type AgentRecordFreshness = "live" | "held";
+
+/**
+ * The pane's agent is on a deck this app cannot reach, so nothing is attached —
+ * said in full, with the deck named and what would change it stated.
+ *
+ * # This trigger was NARROWED rather than invented
+ *
+ * It read *"this agent is on `<deck>`, which is not the selected deck"* and
+ * fired for every non-selected deck, because attach was process-global. Being
+ * non-selected is no longer a reason to have no terminal — that is the whole of
+ * the cross-deck pane — so the sentence would now be false about the ordinary
+ * case. What survives is the case it was always also covering: a deck with no
+ * live link, where a mounted viewport really would sit black forever.
+ *
+ * `reason` is the deck's own connection message where it has one, because that
+ * sentence is written by whatever failed and says more than this function can
+ * infer; the fallback covers a deck that reported nothing at all.
+ *
+ * `deckLabel` is `deckName`'s (`lib/displayText.ts`), which is what every other
+ * surface in the app calls a deck — the overview's group header the user came
+ * from, and the label in the Deck selector.
+ *
+ * # `heldAge` is the staleness affordance, and it is not decoration
+ *
+ * Issue #1143 made this state reachable by keeping the last agent record an
+ * open pane's deck gave, and a held record's status, prompt and tool were true
+ * at some past moment and may be arbitrarily old. Showing them with nothing
+ * saying so would assert a liveness the app has no evidence for, which is
+ * arguably worse than showing nothing at all — so the pane says, in the same
+ * sentence that explains the missing terminal, that everything beside it is a
+ * past report and how old that report is.
+ *
+ * It is the app's own `displayActivity` reading, so the vocabulary is the one
+ * the overview's last-activity column already uses (`just now`, `4m ago`,
+ * `2h ago`) rather than a second set of buckets, and the exact instant rides
+ * along on {@link NoTerminalState.noticeTitle} for the hover.
+ *
+ * Absent means the record is LIVE — this pane's deck is merely unreachable for
+ * a pane that was never held, which is the state the app is in for the frame
+ * between a deck going away and the hold being read back.
+ */
+export function unreachableDeckTerminalState(deckLabel: string, reason?: string, heldAge?: ActivityDisplay): NoTerminalState {
+  const detail = reason?.trim() ? ` ${reason.trim()}` : "";
+  const held = heldAge ? ` The rest of this pane is what ${deckLabel} last reported ${heldAge.label}, and nothing in it is being updated.` : "";
+  return {
+    reason: "unreachable-deck",
+    notice: `No terminal here: the desktop has no live connection to ${deckLabel}, so there is nothing to attach to.${detail} The terminal appears on its own once that daemon answers again.${held}`,
+    noticeTitle: heldAge?.title,
+  };
+}

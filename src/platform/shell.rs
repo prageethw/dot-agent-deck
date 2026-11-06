@@ -114,7 +114,8 @@ pub fn shell_command_flag() -> &'static str {
 /// feeds this function's output to a live PTY — exactly the
 /// `dot-agent-deck watch --interval N <command>` use case named above —
 /// must call [`sanitize_shell_control_chars`] on `arg` itself first, as
-/// `watch_invocation`'s Unix arm now does.
+/// `watch_invocation`'s Unix arm did (the function was removed with the
+/// workspace modes, upstream sync 2026-11-05).
 #[cfg(unix)]
 pub fn quote_shell_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
@@ -123,10 +124,10 @@ pub fn quote_shell_arg(arg: &str) -> String {
 /// Replace the POSIX control characters that a real interactive terminal's
 /// canonical-mode line discipline treats as editing/signal bytes — with a
 /// space, mirroring `sanitize_cmd_exe_control_chars`'s Windows convention
-/// (fork issue #429; see `watch_invocation`'s Unix arm doc comment in
-/// `mode_manager.rs` for why these bytes must be gone before [`quote_shell_arg`]
-/// ever quotes them: on the persistent-watch-pane delivery path the emitted
-/// line is typed keystroke-by-keystroke into a live PTY, and the tty line
+/// (fork issue #429; the removed `mode_manager::watch_invocation`'s Unix arm
+/// explained why these bytes must be gone before [`quote_shell_arg`] ever
+/// quotes them: on the persistent-watch-pane delivery path its emitted line
+/// was typed keystroke-by-keystroke into a live PTY, and the tty line
 /// discipline consumes several bytes as editing/signal input *below* the
 /// shell's own grammar, before `sh` ever sees them — no amount of
 /// single-quoting protects against that, since single-quoting is a
@@ -143,8 +144,8 @@ pub fn quote_shell_arg(arg: &str) -> String {
 /// an unverified default one, and `\t` also carries none of the other
 /// bytes' width-corrupting/line-splitting effect on the pane if it did
 /// somehow reach a live terminal unreplaced). A real newline is genuinely
-/// safe here today — `watch_invocation_preserves_real_newline_posix`
-/// proves it — because it lands inside `quote_shell_arg`'s single-quoted
+/// safe here — `watch_invocation_preserves_real_newline_posix` (removed with
+/// `watch_invocation`) proved it — because it lands inside `quote_shell_arg`'s single-quoted
 /// wrapper as an *unterminated* quoted argument from the reading shell's
 /// point of view; POSIX shells recognize the still-open quote and
 /// continue reading (`PS2`) rather than executing anything, so the
@@ -179,9 +180,10 @@ pub fn quote_shell_arg(arg: &str) -> String {
 /// **`pub`, unlike its Windows sibling [`sanitize_cmd_exe_control_chars`]
 /// (module-private)**: that function's only two callers
 /// ([`escape_cmd_exe_program`], [`quote_cmd_exe_arg`]) both live in this
-/// same file, while this function's only caller,
-/// `mode_manager::watch_invocation`'s Unix arm, lives in a different
-/// module — so this needs at least crate-wide visibility to compile.
+/// same file, while this function's only caller was
+/// `mode_manager::watch_invocation`'s Unix arm (since removed), which lived in
+/// a different module — so it needed at least crate-wide visibility to compile,
+/// and it stays `pub`.
 #[cfg(unix)]
 pub fn sanitize_shell_control_chars(s: &str) -> String {
     s.chars()
@@ -217,8 +219,8 @@ pub fn sanitize_shell_control_chars(s: &str) -> String {
 /// own necessary quoting of the trailing command pushes the total past two.
 /// A caller can't know in advance whether the returned line will be handed
 /// to `cmd.exe /C` (this quirk) or typed into an already-running
-/// interactive `cmd.exe` (no such quirk — see `watch_invocation`'s Windows
-/// arm, whose output is typed into a pane's shell either way), so the fix
+/// interactive `cmd.exe` (no such quirk — the removed `watch_invocation`'s
+/// Windows arm typed its output into a pane's shell either way), so the fix
 /// has to work under both: never let the token start with `"` at all, and
 /// this preprocessing pass — which activates ONLY "if the first character
 /// is a quote character" — never triggers, in either context. Caret-
@@ -423,8 +425,8 @@ fn caret_escape_cmd_metachars(s: &str) -> String {
 /// then widened to the whole class once review finding C1 established
 /// that a real `\r`/`\n` was never the only member of it:
 ///
-/// - On the persistent-watch-pane delivery path (see `watch_invocation`'s
-///   doc comment in `mode_manager.rs`), the line is typed
+/// - On the persistent-watch-pane delivery path (described by the removed
+///   `mode_manager::watch_invocation`'s doc comment), the line is typed
 ///   character-by-character into an already-running interactive
 ///   `cmd.exe`. The Windows console's cooked-mode line editor
 ///   (`ENABLE_LINE_INPUT`) consumes several bytes as *editing commands*
@@ -538,9 +540,10 @@ mod windows_quoting_tests {
     /// the emitted line — `quote_cmd_exe_arg` replaces it with a space
     /// before either quoting pass runs, rather than caret-escaping it,
     /// since neither `cmd.exe`'s own scan nor a typed-PTY submit can be
-    /// stopped by a caret. The real-`cmd.exe` behavioral proof is
+    /// stopped by a caret. The real-`cmd.exe` behavioral proof was
     /// `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
-    /// in `mode_manager.rs`; this is the fast, deterministic companion pin.
+    /// in `mode_manager.rs` (removed with the watch mode); this is the fast,
+    /// deterministic pin.
     #[test]
     fn quote_cmd_exe_arg_replaces_a_real_newline_with_a_space() {
         let quoted = quote_cmd_exe_arg("line one\nline two");
@@ -595,8 +598,8 @@ mod windows_quoting_tests {
     /// deterministic string-level pin; the real-`cmd.exe` proof — which can
     /// only exercise the `/C <string>` delivery path, not the
     /// interactive-PTY console line editor a real Windows console applies —
-    /// is `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
-    /// in `mode_manager.rs`.
+    /// was `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
+    /// in `mode_manager.rs` (removed with the watch mode).
     #[test]
     fn quote_cmd_exe_arg_replaces_every_control_character_with_a_space() {
         let quoted = quote_cmd_exe_arg("a\x1bb\x08c\x03d\te");
@@ -604,5 +607,161 @@ mod windows_quoting_tests {
             !quoted.chars().any(|c| c.is_control()),
             "a control character survived quoting: {quoted:?}"
         );
+    }
+
+    /// Fork issue #423 review finding S2: the string-level pins above prove
+    /// the escaped text LOOKS right, and a real-`cmd.exe` test that an
+    /// injected payload did not run proves the parse was not broken, but
+    /// neither recovers the argument bytes the launched process actually
+    /// received. A quoting scheme that mangled the argument's content
+    /// instead of breaking `cmd.exe`'s parse of it (a stray caret leaking
+    /// through, a backslash run dropped) would pass both while silently
+    /// corrupting every command line built with these helpers.
+    ///
+    /// This test closes that gap the way
+    /// `quote_shell_arg_round_trips_through_posix_shell` closes it for the
+    /// POSIX side: drive a REAL child process's own argv recovery, not a
+    /// hand-trace of the algorithm. A `.bat` stub can't be that child:
+    /// `%1`/`%~1` substitute into the batch line as raw TEXT before
+    /// `cmd.exe` re-parses it, so an input containing `cmd.exe`
+    /// metacharacters would just re-trigger the same injection one layer
+    /// down and prove nothing about what the eventual child process
+    /// receives. A compiled helper's `std::env::args()` is populated by the
+    /// OS loader via the same `CommandLineToArgvW`-compatible mechanism
+    /// [`crt_argv_quote`] targets, with no shell in between to reinterpret
+    /// the recovered bytes, which is the genuinely independent check.
+    #[test]
+    fn quote_cmd_exe_arg_recovers_the_exact_argument_bytes_through_a_real_child_process() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let helper_src = scratch.path().join("echo_arg.rs");
+        let helper_exe = scratch.path().join("echo_arg.exe");
+        let helper_source = concat!(
+            "fn main() {\n",
+            "    let arg = std::env::args().nth(1).unwrap_or_default();\n",
+            "    std::fs::write(\"out.txt\", arg).expect(\"write out.txt\");\n",
+            "}\n",
+        );
+        std::fs::write(&helper_src, helper_source).expect("write helper source");
+
+        let compile = std::process::Command::new("rustc")
+            .arg("-o")
+            .arg(&helper_exe)
+            .arg(&helper_src)
+            .output()
+            .expect("rustc should run");
+        assert!(
+            compile.status.success(),
+            "failed to compile the argv-echo helper:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let out_file = scratch.path().join("out.txt");
+
+        // The A1 exploit shape (quote/ampersand break-out), a trailing
+        // backslash run immediately before what becomes the closing quote
+        // (the exact case `crt_argv_quote`'s backslash-doubling exists
+        // for), and the degenerate empty string (one empty `argv` element,
+        // not a dropped argument).
+        for input in [
+            r#"echo ok" & type nul > injected.marker & rem ""#,
+            r"C:\Program Files\",
+            "",
+        ] {
+            let _ = std::fs::remove_file(&out_file);
+            let line = format!(
+                "{} {}",
+                escape_cmd_exe_program(&helper_exe.display().to_string()),
+                quote_cmd_exe_arg(input)
+            );
+
+            let output = std::process::Command::new("cmd.exe")
+                .raw_arg("/C")
+                .raw_arg(&line)
+                .current_dir(scratch.path())
+                .output()
+                .expect("cmd.exe should run");
+
+            let recovered = std::fs::read_to_string(&out_file).unwrap_or_default();
+            assert_eq!(
+                recovered,
+                input,
+                "argument bytes did not round-trip for input {input:?}\n\
+                 line: {line}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[cfg(all(unix, test))]
+mod posix_quoting_tests {
+    use super::*;
+
+    /// Runs `quote_shell_arg(value)` through a real `sh -c` invocation via a
+    /// sentinel-prefixed `printf` and returns what the shell recovered.
+    ///
+    /// The separator is the literal control character itself, embedded
+    /// directly in the `printf` format word — not a `\xHH`/`\NNN` `printf`
+    /// escape, whose support varies across POSIX `printf` implementations.
+    /// `Command::arg` passes `script` to `sh -c` as raw bytes (no further
+    /// shell parses it), so embedding it here is safe and portable.
+    fn round_trip_through_posix_shell(value: &str) -> String {
+        let sentinel = "prd157-round-trip";
+        let sep = '\u{1f}';
+        let script = format!("printf '%s{sep}%s' {sentinel} {}", quote_shell_arg(value));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("sh -c should run");
+        assert!(output.status.success(), "sh -c failed: {output:?}");
+        let stdout = String::from_utf8(output.stdout).expect("utf8 output");
+        let (marker, recovered) = stdout.split_once('\u{1f}').expect("sentinel separator");
+        assert_eq!(marker, sentinel);
+        recovered.to_string()
+    }
+
+    /// Round-trips a command packed with shell metacharacters (spaces,
+    /// single/double quotes, `$`, backticks, backslashes, a real newline,
+    /// `;`, `&`, `|`, redirection, glob characters, parentheses) through an
+    /// actual `sh -c` invocation and confirms `sh` recovers the exact
+    /// original bytes as a single word — proving the quoting is not just
+    /// plausible-looking but round-trips through the real interpreter.
+    #[test]
+    fn quote_shell_arg_round_trips_through_posix_shell() {
+        let tricky =
+            "spaced 'single' \"double\" $VAR `backtick` \\backslash\nnewline; & | (sub) *.rs";
+        assert_eq!(round_trip_through_posix_shell(tricky), tricky);
+    }
+
+    /// An empty command is a legal (if odd) input — the empty-string case
+    /// of the general single-quoting contract, cheap to pin and the input
+    /// most likely to be skipped by hand-testing.
+    #[test]
+    fn quote_shell_arg_round_trips_an_empty_string() {
+        assert_eq!(round_trip_through_posix_shell(""), "");
+    }
+
+    /// A value that is *only* the one character single-quoting cannot
+    /// contain — the escape/reopen path (`'\''`) exercised with nothing
+    /// else around it to fall back on.
+    #[test]
+    fn quote_shell_arg_round_trips_a_lone_single_quote() {
+        assert_eq!(round_trip_through_posix_shell("'"), "'");
+    }
+
+    /// A single quote sitting directly against a real newline on both
+    /// sides — the two characters most likely to interact badly in a
+    /// future change to the escape (the close/escape/reopen sequence
+    /// inserts literal `'` and `\` bytes right next to whatever the
+    /// original text already had there).
+    #[test]
+    fn quote_shell_arg_round_trips_a_quote_adjacent_to_a_real_newline() {
+        let tricky = "before'\n'after";
+        assert_eq!(round_trip_through_posix_shell(tricky), tricky);
     }
 }

@@ -104,6 +104,8 @@ fn base_agent_event(
         schema_version: None,
         live_target: None,
         model: None,
+        background: None,
+        background_revision: None,
     }
 }
 

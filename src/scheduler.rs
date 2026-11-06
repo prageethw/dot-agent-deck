@@ -43,12 +43,14 @@ pub trait Notifier: Send + Sync {
 /// variants (spawn errors, mkdir failures) without touching existing arms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyEvent {
-    /// A `[[scheduled_tasks]]` entry (or the whole file) failed to load/parse.
-    /// `entry` is the array index when the failure is attributable to a single
-    /// entry, `None` for a file-level error.
+    /// A `[[scheduled_tasks]]` entry (or the whole file) failed to load/parse,
+    /// or, with [`ConfigSeverity::Warning`], loaded with part of it not in
+    /// effect. `entry` is the array index when the problem is attributable to
+    /// a single entry, `None` for a file-level one.
     ConfigError {
         entry: Option<usize>,
         message: String,
+        severity: ConfigSeverity,
     },
     /// A scheduled fire (cron tick or run-now) was skipped because the prior
     /// run for the same task name has not returned yet.
@@ -64,22 +66,28 @@ pub enum NotifyEvent {
     /// spawn itself failed. The fire is abandoned; other tasks keep running.
     SpawnFailed { task: String, message: String },
     /// PRD #120 M1.3: an `issue_dispatch` task successfully dispatched one issue
-    /// (per-issue worktree created + agent spawned).
+    /// (per-issue worktree created + agent spawned). `claims_unchecked` is why
+    /// the claims on the issue could not be read when claim gating is on (PRD
+    /// #421 M3.2: the issue is then dispatched without them), `None` otherwise.
     IssueDispatched {
         task: String,
         repo: String,
         issue: u64,
+        claims_unchecked: Option<String>,
     },
-    /// PRD #120 M1.3/M2.2 + PRD #421 M1.2/M1.3: an issue was skipped because it
-    /// is already claimed — `reason` names which of the four causes fired, so
-    /// no two skips ever render identically (a stray claim that can't be seen
-    /// silently starves the backlog).
+    /// PRD #120 M1.3/M2.2 + PRD #421 M1.2/M1.3/M3.2: an issue was skipped because
+    /// it is already claimed — its per-issue worktree exists, an open PR already
+    /// targets `branch` (`agent/issue-<n>`), the `in-progress` label is present,
+    /// another deck's claim on GitHub is live, or another run created the
+    /// worktree first. `cause` names which, so no two skips ever render
+    /// identically (a stray claim that can't be seen silently starves the
+    /// backlog).
     IssueDispatchSkipped {
         task: String,
         repo: String,
         issue: u64,
         branch: String,
-        reason: SkipReason,
+        cause: crate::issue_dispatch::SkipCause,
     },
     /// PRD #120 M3.2: dispatching ONE issue failed (clone/worktree/`gh` error).
     /// The failing issue is abandoned; the rest of the run continues.
@@ -125,11 +133,23 @@ pub enum NotifyEvent {
     /// claim existed (auditor F8). Left unreported, this failure is invisible
     /// on the surface an operator actually watches and can produce exactly
     /// the duplicate-dispatch-across-decks hazard PRD #421 exists to prevent.
-    IssueClaimFailed {
+    IssueInProgressClaimFailed {
         task: String,
         repo: String,
         issue: u64,
         message: String,
+    },
+    /// PRD #421 M2.6: an issue WAS dispatched, but its claim on GitHub did not
+    /// fully succeed. Raised once per issue, naming both outcomes: `label_error`
+    /// is why the `agent-deck/claimed` label was not added and `record_error`
+    /// why the claimant comment was not written, `None` for the half that
+    /// succeeded. The dispatch itself stands either way.
+    IssueClaimFailed {
+        task: String,
+        repo: String,
+        issue: u64,
+        label_error: Option<String>,
+        record_error: Option<String>,
     },
     /// Issue #164: an `issue_dispatch` task created a per-issue worktree
     /// (`git worktree add` succeeded — `IssueDispatched` still fires
@@ -153,68 +173,42 @@ pub enum NotifyEvent {
     },
 }
 
-/// PRD #421 M1.3: why an issue was skipped — the four causes `dispatch_decision`
-/// (worktree/PR/label) and the worktree-creation TOCTOU race recognize.
-/// `IssueDispatchSkipped` carries one so a skip can always say WHY it excluded
-/// an issue, not just THAT it did — an exclusion nobody can see is the actual
-/// hazard (a stray label, applied by anyone, silently starves the backlog).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SkipReason {
-    /// The per-issue worktree already exists on disk — the primary
-    /// idempotency signal.
-    WorktreeExists,
-    /// An open PR's head branch is `agent/issue-<n>` — the secondary signal.
-    OpenPr,
-    /// The `in-progress` label is present (PRD #421 M1.2, the third signal),
-    /// honoured regardless of who applied it — there is no "is this my own
-    /// claim?" comparison. `claimant` carries the deck's own claim-comment text
-    /// when one is discoverable among the issue's comments; `None` when the
-    /// label was applied by a human or an external tool, or no claim comment
-    /// can be found (`dispatch/016`'s "no claimant" case).
-    Labelled { claimant: Option<String> },
-    /// A concurrent creator won the `git worktree add` TOCTOU race
-    /// (`WorktreeCreation::AlreadyClaimed`/`TimedOut`) — a benign race, not a
-    /// failure. Has no deterministic black-box trigger, so it is covered only
-    /// by the pure-data render test, not an e2e one (`dispatch/017`).
-    ConcurrentCreator,
+/// How serious a [`NotifyEvent::ConfigError`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSeverity {
+    /// The entry, or the file, did not load.
+    Error,
+    /// The entry loaded and runs, but part of its configuration is not in
+    /// effect, such as claim gating whose TTL the cron cannot keep current
+    /// (PRD #421 M3.1).
+    Warning,
 }
 
-/// Render `reason` as the tail of an `IssueDispatchSkipped` stderr line. Pure
-/// and unit-tested on its own — `dispatch/017` covers only three of the four
-/// causes end-to-end (the TOCTOU race has no deterministic black-box trigger),
-/// so this is what makes the PRD's "no two causes render identically" success
-/// criterion fully evidenced across all four.
-fn render_skip_reason(reason: &SkipReason) -> String {
-    match reason {
-        SkipReason::WorktreeExists => "the worktree already exists".to_string(),
-        SkipReason::OpenPr => "an open PR already targets this branch".to_string(),
-        SkipReason::Labelled {
-            claimant: Some(comment),
-        } => format!(
-            "labelled `in-progress` ({})",
-            sanitize_claimant_for_render(comment)
-        ),
-        SkipReason::Labelled { claimant: None } => {
-            "labelled `in-progress`, no claimant recorded".to_string()
-        }
-        SkipReason::ConcurrentCreator => {
-            "a concurrent dispatch claimed the worktree first".to_string()
-        }
+/// The stderr line [`StderrNotifier`] prints for a [`NotifyEvent::ConfigError`].
+fn config_error_line(entry: Option<usize>, message: &str, severity: ConfigSeverity) -> String {
+    let label = match severity {
+        ConfigSeverity::Error => "config error",
+        ConfigSeverity::Warning => "warning",
+    };
+    match entry {
+        Some(i) => format!("[scheduler] {label} in scheduled_tasks[{i}]: {message}"),
+        None => format!("[scheduler] {label}: {message}"),
     }
 }
 
 /// PRD #421 review C6 (auditor F4): `claimant`, when present, is a GitHub
 /// comment body pulled from an issue on the WATCHED repo — controlled by
 /// anyone who can comment there, not by this deck — and rendered straight
-/// into the daemon's stderr/log via [`StderrNotifier`], the only place in
-/// this change where genuinely untrusted remote data reaches a local output
+/// into the daemon's stderr/log via [`StderrNotifier`] (through
+/// [`crate::issue_dispatch::SkipCause`]'s `Display`), the only place in this
+/// change where genuinely untrusted remote data reaches a local output
 /// sink. Strip every C0/DEL control character (this removes ANSI escape
 /// sequences too, since ESC is `0x1B`), collapse newlines/carriage returns to
 /// a single space so one comment can't forge additional log lines, and cap
 /// the length so a GitHub comment body (up to ~65 KB) can't flood the log.
-const CLAIMANT_RENDER_MAX_CHARS: usize = 200;
+pub(crate) const CLAIMANT_RENDER_MAX_CHARS: usize = 200;
 
-fn sanitize_claimant_for_render(s: &str) -> String {
+pub(crate) fn sanitize_claimant_for_render(s: &str) -> String {
     let cleaned: String = s
         .chars()
         .filter_map(|c| match c {
@@ -241,12 +235,11 @@ pub struct StderrNotifier;
 impl Notifier for StderrNotifier {
     fn notify(&self, event: NotifyEvent) {
         match event {
-            NotifyEvent::ConfigError { entry, message } => match entry {
-                Some(i) => {
-                    eprintln!("[scheduler] config error in scheduled_tasks[{i}]: {message}")
-                }
-                None => eprintln!("[scheduler] config error: {message}"),
-            },
+            NotifyEvent::ConfigError {
+                entry,
+                message,
+                severity,
+            } => eprintln!("{}", config_error_line(entry, &message, severity)),
             NotifyEvent::SkippedStillRunning { task } => {
                 eprintln!("[scheduler] skipped fire of {task:?}: previous run still active");
             }
@@ -262,11 +255,20 @@ impl Notifier for StderrNotifier {
             NotifyEvent::SpawnFailed { task, message } => {
                 eprintln!("[scheduler] task {task:?}: spawn failed: {message}");
             }
-            NotifyEvent::IssueDispatched { task, repo, issue } => {
-                eprintln!(
+            NotifyEvent::IssueDispatched {
+                task,
+                repo,
+                issue,
+                claims_unchecked,
+            } => match claims_unchecked {
+                None => eprintln!(
                     "[scheduler] task {task:?}: dispatched issue #{issue} of {repo} (agent/issue-{issue})"
-                );
-            }
+                ),
+                Some(reason) => eprintln!(
+                    "[scheduler] task {task:?}: dispatched issue #{issue} of {repo} (agent/issue-{issue}) \
+                     without checking its claims, which could not be read: {reason}"
+                ),
+            },
             NotifyEvent::IssueDispatchDryRun { task, repo, issue } => {
                 eprintln!(
                     "[scheduler] task {task:?}: dry run — would dispatch issue #{issue} of {repo} \
@@ -278,11 +280,10 @@ impl Notifier for StderrNotifier {
                 repo,
                 issue,
                 branch,
-                reason,
+                cause,
             } => {
                 eprintln!(
-                    "[scheduler] task {task:?}: skipping issue #{issue} of {repo} ({branch}) — {}",
-                    render_skip_reason(&reason)
+                    "[scheduler] task {task:?}: skipping already-claimed issue #{issue} of {repo} ({branch}): {cause}"
                 );
             }
             NotifyEvent::IssueDispatchFailed {
@@ -304,10 +305,29 @@ impl Notifier for StderrNotifier {
                 task,
                 repo,
                 issue,
+                label_error,
+                record_error,
+            } => {
+                let outcome = |error: Option<String>, done: &str| match error {
+                    Some(error) => format!("not {done} ({error})"),
+                    None => done.to_string(),
+                };
+                eprintln!(
+                    "[scheduler] task {task:?}: claim failed for issue #{issue} of {repo} \
+                     (the agent was still dispatched) — label {}: {}; claim record: {}",
+                    crate::issue_dispatch::CLAIM_LABEL,
+                    outcome(label_error, "added"),
+                    outcome(record_error, "written"),
+                );
+            }
+            NotifyEvent::IssueInProgressClaimFailed {
+                task,
+                repo,
+                issue,
                 message,
             } => {
                 eprintln!(
-                    "[scheduler] task {task:?}: issue #{issue} of {repo} was dispatched, but the claim could not be written: {message}"
+                    "[scheduler] task {task:?}: issue #{issue} of {repo} was dispatched, but the `in-progress` claim could not be written: {message}"
                 );
             }
             NotifyEvent::IssueWorktreeMarkerWarning {
@@ -334,7 +354,7 @@ impl Notifier for StderrNotifier {
 pub enum SchedulerError {
     #[error("invalid cron expression {expr:?}: {message}")]
     InvalidCron { expr: String, message: String },
-    #[error("no scheduled task named {0:?}")]
+    #[error("no schedule named {0:?}")]
     UnknownTask(String),
 }
 
@@ -384,6 +404,80 @@ pub fn validate_cron(expr: &str) -> Result<(), String> {
 /// [`Scheduler::tick_at`].
 pub fn fires_at<Z: TimeZone>(schedule: &CronSchedule, instant: DateTime<Z>) -> bool {
     schedule.includes(instant)
+}
+
+/// What [`fire_gap_over`] found about the gaps between consecutive fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireGap {
+    /// No gap is longer than the threshold the walk was given.
+    Within,
+    /// The longest gap, which is longer than that threshold.
+    Longest(chrono::Duration),
+}
+
+/// Whether any interval between two consecutive fires of `schedule` after
+/// `from` is longer than `threshold`, and if so the longest one (PRD #421
+/// M3.1: a claim's TTL must be at least twice the longest gap). The walk covers
+/// every gap that starts at a fire up to `from + horizon`, so the gap
+/// straddling the horizon's end counts too, and a schedule sparser than the
+/// horizon still yields one gap. `None` when no answer can be computed: the
+/// schedule stops firing before the walk passes the horizon, or the walk would
+/// take more than `max_steps` steps.
+///
+/// The walk does not visit every fire. From a fire `f` it jumps to the LAST
+/// fire at or before `f + threshold`: every fire in between lies inside one
+/// window no longer than the threshold, so no gap among them can exceed it,
+/// whatever the cron's shape. Only when no fire follows `f` within the window
+/// does it step to the next fire, and that gap, longer than the threshold, is
+/// the one recorded; the threshold then rises to it, so the walk goes on
+/// looking only for a longer one and the answer is the exact longest gap. A
+/// jump is taken only when the fire it lands on is provably inside the window,
+/// so a lookup that misreads a daylight-saving change costs a single step,
+/// never a missed gap. Every two steps move the walk more than `threshold`
+/// forward, so it takes at most about `2 × horizon / threshold` steps: a
+/// dense cron costs no more than a sparse one, and a long gap anywhere in the
+/// horizon is found because the walk reaches every part of it.
+pub fn fire_gap_over<Z: TimeZone>(
+    schedule: &CronSchedule,
+    from: &DateTime<Z>,
+    horizon: chrono::Duration,
+    threshold: chrono::Duration,
+    max_steps: usize,
+) -> Option<FireGap> {
+    let end = from.clone().checked_add_signed(horizon)?;
+    let mut threshold = threshold.max(chrono::Duration::zero());
+    let mut longest = None;
+    let mut previous = schedule.after(from).next()?;
+    let mut covered_a_gap = false;
+    for _ in 0..max_steps {
+        if covered_a_gap && previous > end {
+            return Some(longest.map_or(FireGap::Within, FireGap::Longest));
+        }
+        covered_a_gap = true;
+        // The last fire at or before `previous + threshold`: fires are whole
+        // seconds, and a reverse walk yields the fires strictly before its
+        // start, so it starts one second past the window's end.
+        let window_end = previous.clone().checked_add_signed(threshold);
+        let last_in_window = window_end.clone().and_then(|window_end| {
+            let after_window = window_end.checked_add_signed(chrono::Duration::seconds(1))?;
+            schedule.after(&after_window).next_back()
+        });
+        if let (Some(window_end), Some(fire)) = (window_end, last_in_window)
+            && fire > previous
+            && fire <= window_end
+        {
+            previous = fire;
+            continue;
+        }
+        let next = schedule.after(&previous).next()?;
+        let gap = next.clone().signed_duration_since(previous);
+        if gap > threshold {
+            longest = Some(gap);
+            threshold = gap;
+        }
+        previous = next;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +770,7 @@ impl Scheduler {
             self.notifier.notify(NotifyEvent::ConfigError {
                 entry: e.entry,
                 message: e.message.clone(),
+                severity: ConfigSeverity::Error,
             });
         }
     }
@@ -753,7 +848,10 @@ impl Scheduler {
     /// entries are treated as absent (removed). Returns a [`ReloadDiff`]
     /// describing the delta. Invalid cron expressions in `desired` are surfaced
     /// through the notifier and skipped — a single bad entry never aborts the
-    /// reload.
+    /// reload. So is every enabled issue-dispatch task whose `claim_gating`
+    /// the load turned off because its TTL cannot keep up with its cron (PRD
+    /// #421 M3.1): the task still registers, and the notice repeats on each
+    /// reload for as long as the config stays that way.
     ///
     /// This is the pure reload-apply logic only. The daemon's socket
     /// `ReloadSchedules` handler (a later task) will load the config and call
@@ -762,6 +860,24 @@ impl Scheduler {
     where
         F: FnMut(&ScheduledTask) -> Callback,
     {
+        for task in desired.iter().filter(|t| t.enabled) {
+            if let Some(reason) = task
+                .issue_dispatch
+                .as_ref()
+                .and_then(|disp| disp.claim.gating_off.as_deref())
+            {
+                self.notifier.notify(NotifyEvent::ConfigError {
+                    entry: None,
+                    message: format!(
+                        "schedule {:?}: claim_gating is OFF for this task \
+                         (claims are still written): {reason}",
+                        task.name
+                    ),
+                    severity: ConfigSeverity::Warning,
+                });
+            }
+        }
+
         let mut diff = ReloadDiff::default();
         let mut tasks = self.tasks.lock().expect("scheduler task map poisoned");
 
@@ -816,6 +932,7 @@ impl Scheduler {
                             self.notifier.notify(NotifyEvent::ConfigError {
                                 entry: None,
                                 message: e.to_string(),
+                                severity: ConfigSeverity::Error,
                             });
                         }
                     }
@@ -907,23 +1024,24 @@ mod tests {
         Local.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
     }
 
-    // PRD #421 M1.4: all four skip reasons render distinguishably. This is
+    // PRD #421 M1.4: every skip cause renders distinguishably. This is
     // what makes the PRD's "no two causes render identically" success
     // criterion fully evidenced for the fourth cause (`ConcurrentCreator`,
     // the `git worktree add` TOCTOU race), which `dispatch/017` cannot cover
     // end-to-end — it has no deterministic black-box trigger.
     #[test]
     fn skip_reasons_render_distinguishably() {
+        use crate::issue_dispatch::SkipCause;
         let reasons = [
-            SkipReason::WorktreeExists,
-            SkipReason::OpenPr,
-            SkipReason::Labelled { claimant: None },
-            SkipReason::Labelled {
-                claimant: Some("Claimed by scheduled task `dispatch-task`.".to_string()),
-            },
-            SkipReason::ConcurrentCreator,
+            SkipCause::WorktreeExists,
+            SkipCause::OpenPr,
+            SkipCause::LabelInProgress(None),
+            SkipCause::LabelInProgress(Some(
+                "Claimed by scheduled task `dispatch-task`.".to_string(),
+            )),
+            SkipCause::ConcurrentCreator,
         ];
-        let rendered: Vec<String> = reasons.iter().map(render_skip_reason).collect();
+        let rendered: Vec<String> = reasons.iter().map(ToString::to_string).collect();
         for (i, a) in rendered.iter().enumerate() {
             for (j, b) in rendered.iter().enumerate() {
                 if i != j {
@@ -948,9 +1066,7 @@ mod tests {
             "Claimed by \x1b[31mred\x1b[0m\nSecond forged line{}",
             "!".repeat(400)
         );
-        let rendered = render_skip_reason(&SkipReason::Labelled {
-            claimant: Some(hostile),
-        });
+        let rendered = crate::issue_dispatch::SkipCause::LabelInProgress(Some(hostile)).to_string();
         assert!(
             !rendered.contains('\x1b'),
             "rendered skip line must not contain a raw ESC byte, got {rendered:?}"
@@ -1453,5 +1569,269 @@ mod tests {
         assert_eq!(capped.len(), 5);
         assert_eq!(*capped.last().unwrap(), now);
         assert_eq!(capped[0], local_at(2026, 6, 8, 9, 0, 6));
+    }
+
+    fn utc_at(y: i32, mo: u32, d: u32, h: u32) -> DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, mo, d, h, 0, 0).unwrap()
+    }
+
+    // PRD #421 M3.1 — the longest gap between consecutive fires, which a
+    // claim TTL must be at least twice. Evaluated in UTC so no DST hour moves it.
+    #[test]
+    fn fire_gap_over_finds_the_weekday_cron_weekend_gap() {
+        let schedule = parse_cron("0 9 * * MON-FRI").unwrap();
+        let two_weeks = chrono::Duration::days(14);
+        // 2026-10-21 is a Wednesday; 2026-10-24 a Saturday. Whatever the
+        // threshold below the weekend, the answer is the weekend itself.
+        for from in [utc_at(2026, 10, 21, 0), utc_at(2026, 10, 24, 12)] {
+            for threshold in [0, 1, 23, 24, 30, 71] {
+                assert_eq!(
+                    fire_gap_over(
+                        &schedule,
+                        &from,
+                        two_weeks,
+                        chrono::Duration::hours(threshold),
+                        1_000
+                    ),
+                    Some(FireGap::Longest(chrono::Duration::hours(72))),
+                    "from {from}, threshold {threshold}h"
+                );
+            }
+            assert_eq!(
+                fire_gap_over(
+                    &schedule,
+                    &from,
+                    two_weeks,
+                    chrono::Duration::hours(72),
+                    1_000
+                ),
+                Some(FireGap::Within),
+                "from {from}"
+            );
+        }
+        // A 2-day horizon from Monday 00:00 ends Wednesday 00:00; the walk
+        // still takes the gap from the last fire before it, Tuesday 09:00, to
+        // Wednesday 09:00, and sees no weekend.
+        let monday = utc_at(2026, 10, 19, 0);
+        assert_eq!(
+            fire_gap_over(
+                &schedule,
+                &monday,
+                chrono::Duration::days(2),
+                chrono::Duration::hours(1),
+                1_000
+            ),
+            Some(FireGap::Longest(chrono::Duration::hours(24)))
+        );
+    }
+
+    #[test]
+    fn fire_gap_over_walks_past_the_horizon_for_a_sparse_cron() {
+        // Fires once a year: the horizon ends long before the second fire.
+        let schedule = parse_cron("0 9 1 1 *").unwrap();
+        let from = utc_at(2026, 10, 21, 0);
+        assert_eq!(
+            fire_gap_over(
+                &schedule,
+                &from,
+                chrono::Duration::days(14),
+                chrono::Duration::hours(1),
+                1_000
+            ),
+            Some(FireGap::Longest(
+                utc_at(2028, 1, 1, 9) - utc_at(2027, 1, 1, 9)
+            ))
+        );
+    }
+
+    #[test]
+    fn fire_gap_over_is_none_when_it_cannot_be_computed() {
+        let from = utc_at(2026, 10, 21, 0);
+        let year = chrono::Duration::days(366);
+        let hour = chrono::Duration::hours(1);
+        // Stops firing at the end of 2026, before the walk passes the horizon.
+        let ending = parse_cron("0 0 9 * * * 2026").unwrap();
+        assert_eq!(fire_gap_over(&ending, &from, year, hour, 1_000), None);
+        // A single fire left: no gap at all.
+        let once = parse_cron("0 0 9 1 1 * 2027").unwrap();
+        assert_eq!(fire_gap_over(&once, &from, year, hour, 1_000), None);
+        // More steps than the walk may take: a threshold below the gap makes
+        // the walk step fire by fire.
+        let hourly = parse_cron("0 * * * *").unwrap();
+        let half_hour = chrono::Duration::minutes(30);
+        assert_eq!(fire_gap_over(&hourly, &from, year, half_hour, 100), None);
+        assert_eq!(
+            fire_gap_over(&hourly, &from, chrono::Duration::days(1), half_hour, 100),
+            Some(FireGap::Longest(hour))
+        );
+    }
+
+    /// The fire-by-fire walk [`fire_gap_over`] replaces, as the reference its
+    /// answers are checked against.
+    fn longest_gap_fire_by_fire(
+        schedule: &CronSchedule,
+        from: &DateTime<chrono::Utc>,
+        horizon: chrono::Duration,
+    ) -> chrono::Duration {
+        let end = *from + horizon;
+        let mut fires = schedule.after(from);
+        let mut previous = fires.next().unwrap();
+        let mut longest = chrono::Duration::zero();
+        for fire in fires {
+            longest = longest.max(fire - previous);
+            if fire > end {
+                return longest;
+            }
+            previous = fire;
+        }
+        unreachable!("the reference crons keep firing")
+    }
+
+    #[test]
+    fn fire_gap_over_jumps_dense_stretches_without_missing_a_long_gap() {
+        let from = utc_at(2026, 10, 21, 0);
+        let year = chrono::Duration::days(366);
+        let hour = chrono::Duration::hours(1);
+        // Dense crons answer within the step bound of their threshold, and
+        // their gap never exceeds it.
+        for (cron, threshold) in [
+            ("* * * * *", chrono::Duration::minutes(30)),
+            ("*/5 * * * *", chrono::Duration::minutes(30)),
+            ("*/10 * * * *", hour * 83),
+            ("* * * * * *", chrono::Duration::minutes(30)),
+        ] {
+            let schedule = parse_cron(cron).unwrap();
+            assert_eq!(
+                fire_gap_over(&schedule, &from, year, threshold, 100_000),
+                Some(FireGap::Within),
+                "{cron}"
+            );
+        }
+        // Dense for part of the time and silent for the rest: every five
+        // minutes on the 1st of the month only, every minute in March only
+        // (four months after the walk's start, then silent for eleven), every
+        // fifteen minutes on weekdays only, and every five minutes in office
+        // hours only. The fire-by-fire walk is the reference.
+        for (cron, longest) in [
+            ("*/5 * 1 * *", None),
+            ("* * * 3 *", None),
+            (
+                "*/15 * * * MON-FRI",
+                Some(chrono::Duration::minutes(48 * 60 + 15)),
+            ),
+            (
+                "*/5 9-17 * * *",
+                Some(chrono::Duration::minutes(15 * 60 + 5)),
+            ),
+        ] {
+            let schedule = parse_cron(cron).unwrap();
+            let reference = longest_gap_fire_by_fire(&schedule, &from, year);
+            if let Some(longest) = longest {
+                assert_eq!(reference, longest, "{cron}: the reference walk");
+            }
+            for threshold in [
+                hour / 2,
+                hour,
+                hour * 12,
+                reference - chrono::Duration::seconds(1),
+            ] {
+                assert_eq!(
+                    fire_gap_over(&schedule, &from, year, threshold, 100_000),
+                    Some(FireGap::Longest(reference)),
+                    "{cron} at threshold {threshold}"
+                );
+            }
+            assert_eq!(
+                fire_gap_over(&schedule, &from, year, reference, 100_000),
+                Some(FireGap::Within),
+                "{cron}"
+            );
+        }
+    }
+
+    // PRD #421 M3.1 — a task whose `claim_gating` the load turned off is still
+    // registered, and every reload says why through the notifier.
+    #[test]
+    fn reload_apply_reports_an_issue_dispatch_task_whose_gating_was_turned_off() {
+        #[derive(Default)]
+        struct RecordingNotifier {
+            events: Mutex<Vec<NotifyEvent>>,
+        }
+        impl Notifier for RecordingNotifier {
+            fn notify(&self, event: NotifyEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+        let notifier = Arc::new(RecordingNotifier::default());
+        let scheduler = Scheduler::new(notifier.clone());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let make = |_t: &ScheduledTask| counting_callback(counter.clone());
+
+        let task = |name: &str, gating_off: Option<&str>, enabled: bool| ScheduledTask {
+            name: name.to_string(),
+            cron: "0 9 * * MON-FRI".to_string(),
+            working_dir: "/tmp".to_string(),
+            command: None,
+            prompt: "p".to_string(),
+            new_tab_per_fire: false,
+            enabled,
+            shape: None,
+            issue_dispatch: Some(crate::config::IssueDispatchConfig {
+                repo: "acme/widgets".to_string(),
+                max_per_run: 1,
+                label: None,
+                query: None,
+                triage: false,
+                repo_allowlist: None,
+                dry_run: false,
+                claim: crate::config::ClaimGatingConfig {
+                    gating: true,
+                    ttl_hours: 100,
+                    gating_off: gating_off.map(str::to_string),
+                },
+            }),
+        };
+
+        let diff = scheduler.reload_apply(
+            &[
+                task("off", Some("the TTL is too short"), true),
+                task("on", None, true),
+                task("disabled", Some("the TTL is too short"), false),
+            ],
+            make,
+        );
+        assert_eq!(diff.added, vec!["off".to_string(), "on".to_string()]);
+        assert_eq!(
+            *notifier.events.lock().unwrap(),
+            vec![NotifyEvent::ConfigError {
+                entry: None,
+                message: "schedule \"off\": claim_gating is OFF for this task \
+                          (claims are still written): the TTL is too short"
+                    .to_string(),
+                severity: ConfigSeverity::Warning,
+            }]
+        );
+    }
+
+    // PRD #421 M3.1 — a task that loads with gating off is reported as a
+    // warning, not as a config error; a load failure still reads as an error.
+    #[test]
+    fn a_config_warning_reads_as_a_warning_and_an_error_as_an_error() {
+        assert_eq!(
+            config_error_line(
+                None,
+                "schedule \"off\": claim_gating is OFF for this task",
+                ConfigSeverity::Warning
+            ),
+            "[scheduler] warning: schedule \"off\": claim_gating is OFF for this task"
+        );
+        assert_eq!(
+            config_error_line(Some(2), "bad cron", ConfigSeverity::Error),
+            "[scheduler] config error in scheduled_tasks[2]: bad cron"
+        );
+        assert_eq!(
+            config_error_line(None, "unreadable file", ConfigSeverity::Error),
+            "[scheduler] config error: unreadable file"
+        );
     }
 }

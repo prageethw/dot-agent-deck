@@ -30,8 +30,9 @@ const RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// file stays empty forever. That is precisely how `codex/spawn/005` and
 /// `codex/spawn/006` failed on CI while passing locally under nextest (PRD
 /// #225). Holding the lock across the whole set-env → spawn → observe window
-/// makes the override honest under both runners, and is also what makes the
-/// `set_var` calls sound: no sibling test is running while it is held.
+/// makes the override honest under both runners. It excludes sibling tests, and
+/// only sibling tests: it does not make the `set_var` calls sound on its own
+/// (issue #1516), which is what the SAFETY comments below are about.
 #[cfg(unix)]
 static WRAP_BIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -49,11 +50,17 @@ impl WrapBinOverride {
         let exclusive = WRAP_BIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Issue #668: every spawning test in this file goes through this
         // constructor, so this is the file's single arming point for the
-        // wrapped-child lifetime bound. Under the exclusion guard, which is
-        // also what makes its `set_var` sound.
+        // wrapped-child lifetime bound.
         common::init_test_env();
-        // SAFETY: the guard above excludes every other test in this binary, so
-        // nothing else reads or writes the environment while this runs.
+        common::env_write::assert_no_tokio_runtime("WrapBinOverride::pointing_at");
+        // SAFETY: a stated residual, not a proof (issue #1516). Every caller
+        // takes this guard before it builds a runtime or spawns an agent, which
+        // the assertion above checks for the runtime half. The threads that can
+        // exist: this test's own, libtest's runner thread waiting for it, and
+        // the harness's `load-context` heartbeat once a harness temp dir exists,
+        // which sleeps and reads `/proc`, never the environment. The guard
+        // above keeps the sibling tests of this binary out under plain
+        // `cargo test`.
         unsafe {
             std::env::set_var(dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN, recorder);
         }
@@ -66,8 +73,17 @@ impl WrapBinOverride {
 #[cfg(unix)]
 impl Drop for WrapBinOverride {
     fn drop(&mut self) {
-        // Leave no override pointing at a deleted fixture. SAFETY: as above —
-        // the exclusion guard is still held.
+        // Leave no override pointing at a deleted fixture.
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("WrapBinOverride::drop");
+        }
+        // SAFETY: as in `pointing_at`, and the exclusion guard is still held.
+        // The guard is declared before any runtime in its test, so the runtime
+        // has already dropped and joined its threads. What can still be running
+        // besides the threads named there is the detached PTY reader of an
+        // agent whose PTY has not reached EOF (`agent_pty::pump_reader`), which
+        // reads its PTY and updates the registry, and reads no environment
+        // variable.
         unsafe {
             std::env::remove_var(dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN);
         }
@@ -131,9 +147,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
         .expect("chmod respawn recorder");
 }
 
-/// Scenario: Spawn an initial pane process, then respawn that same pane with a
-/// bare `codex` command while PATH recorder stubs capture the actual argv. The
-/// replacement child must launch through the Wrapper strategy exactly once.
+/// Scenario: Respawn one pane first with an already-prefixed synthetic Codex command and then with bare Codex through the real wrapper. Each replacement must receive the embedded pair exactly once, preserving the existing-prefix control across respawn.
 #[spec("codex/spawn/005")]
 #[test]
 #[cfg(unix)]
@@ -147,17 +161,13 @@ fn spawn_005_respawn_wraps_codex() {
     std::fs::create_dir(&bin_dir).expect("create respawn bin dir");
     write_executable(
         &bin_dir.join("dot-agent-deck"),
-        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec cat\n",
+        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec \"$EMBEDDED_DECK_BIN\" \"$@\"\n",
     );
     write_executable(
         &bin_dir.join("codex"),
-        "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec cat\n",
+        include_str!("fixtures/codex-embedded.py"),
     );
-    let path = format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").expect("test runner PATH")
-    );
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
     // Point the wrapper rewrite at the recorder. The rewrite names the
     // co-located build by absolute path (so the suite tests what it just
     // compiled rather than whatever is installed on $PATH), which means a fake
@@ -179,6 +189,36 @@ fn spawn_005_respawn_wraps_codex() {
                 env: vec![
                     (DOT_AGENT_DECK_PANE_ID.into(), "respawn-pane".into()),
                     ("PATH".into(), path),
+                    ("HOME".into(), fixture.path().to_string_lossy().into_owned()),
+                    (
+                        "CODEX_HOME".into(),
+                        fixture
+                            .path()
+                            .join("codex-home")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
+                        "CODEX_ARGS_RECORD".into(),
+                        fixture
+                            .path()
+                            .join("args.jsonl")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
+                        "EMBEDDED_DECK_BIN".into(),
+                        env!("CARGO_BIN_EXE_dot-agent-deck").into(),
+                    ),
+                    ("OTEL_SDK_DISABLED".into(), "true".into()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".into(),
+                        fixture
+                            .path()
+                            .join("unbound.sock")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
                     (
                         "CODEX_RESPAWN_RECORD".into(),
                         record.to_string_lossy().into_owned(),
@@ -187,23 +227,40 @@ fn spawn_005_respawn_wraps_codex() {
                 ..SpawnOptions::default()
             })
             .expect("spawn initial pane process");
-        registry
-            .respawn_agent_for_pane("respawn-pane", "codex")
-            .await
-            .expect("respawn pane as Codex");
-
-        // Wait for a COMPLETE recorded line, not merely for the file to exist:
-        // the shim appends with `>>`, and the shell creates the file before
-        // `printf` writes into it, so an existence-only wait can read an empty
-        // string (PRD #225 — same defect as `orchestration/delegate/009`).
-        expect_launch_lines(&record, 1);
-        let launched = std::fs::read_to_string(&record).expect("read respawn recorder");
-        assert_eq!(
-            launched.trim(),
-            "WRAPPED wrap --agent codex -- codex",
-            "respawning a pane with bare Codex must apply the Wrapper strategy; observed {launched:?}"
-        );
+        let mut failures = Vec::new();
+        for (index, command) in ["codex -c 'shell_environment_policy.set={}'", "codex"]
+            .iter()
+            .enumerate()
+        {
+            registry
+                .respawn_agent_for_pane("respawn-pane", command)
+                .await
+                .expect("respawn pane as Codex");
+            expect_launch_lines(&record, index + 1);
+            common::wait_for_file_lines(&fixture.path().join("args.jsonl"), index + 1, RECORD_WAIT)
+                .expect("respawned synthetic child starts");
+            let launched = std::fs::read_to_string(&record).unwrap();
+            assert_eq!(
+                launched.lines().nth(index).unwrap(),
+                format!(
+                    "WRAPPED wrap --agent codex -- {}",
+                    command.replace('\'', "")
+                ),
+                "wrapper once per respawn"
+            );
+            let recorded = std::fs::read_to_string(fixture.path().join("args.jsonl")).unwrap();
+            let args: Vec<String> =
+                serde_json::from_str(recorded.lines().nth(index).unwrap()).unwrap();
+            if args != ["-c", "shell_environment_policy.set={}"] {
+                failures.push(format!(
+                    "respawn {command}: missing prepended embedded pair; argv={args:?}"
+                ));
+            } else {
+                eprintln!("PASS respawn existing-prefix control: {command}");
+            }
+        }
         registry.shutdown_all();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     });
 }
 
@@ -276,6 +333,150 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
             Some(AgentType::Codex),
         ),
         "explicit Codex identity must drive both launch wrapping and pane metadata"
+    );
+}
+
+/// Scenario: Spawn three explicitly-Codex panes through the real `dot-agent-deck
+/// wrap` — one whose command starts with an environment assignment, one that
+/// starts with a `( … ); exec` shell compound, and a plain launcher as the
+/// control — with a shim recording the wrapper's exact argv and a stand-in agent
+/// recording that it started. All three agents must start under the wrapper; the
+/// first two must reach it as the user's shell running their command verbatim,
+/// while the plain one keeps its direct `-- <program> <args>` shape.
+#[spec("codex/spawn/014")]
+#[test]
+#[cfg(unix)]
+fn spawn_014_assignment_and_compound_commands_start_under_the_wrapper() {
+    use dot_agent_deck::agent_pty::{AgentPtyRegistry, SpawnOptions};
+    use std::sync::Arc;
+
+    let fixture = common::harness_tempdir().expect("shell-syntax launch fixture");
+    let bin_dir = fixture.path().join("bin");
+    std::fs::create_dir(&bin_dir).expect("create shell-syntax bin dir");
+    // Records the argv the spawn seam hands the wrapper, one `[arg]` per
+    // argument so word boundaries survive, then runs the REAL wrapper: what is
+    // asserted is that the agent actually starts under it, not just its argv.
+    write_executable(
+        &bin_dir.join("dot-agent-deck"),
+        "#!/bin/sh\n{ printf 'WRAPPED'; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; printf '\\n'; } >> \"$WRAP_RECORD\"\nexec \"$REAL_DECK\" \"$@\"\n",
+    );
+    // Not named `codex`, so a wrapper without a pane installs no Codex hooks.
+    let standin = bin_dir.join("codex-standin");
+    write_executable(
+        &standin,
+        "#!/bin/sh\nprintf 'AGENT probe=%s args=%s\\n' \"${CODEX_WRAPPER_PROBE:-unset}\" \"$*\" >> \"$AGENT_RECORD\"\nexec cat\n",
+    );
+    let standin = standin.to_str().expect("fixture path is UTF-8").to_string();
+    let _wrap_bin = WrapBinOverride::pointing_at(&bin_dir.join("dot-agent-deck"));
+
+    let marker = fixture.path().join("compound-ran");
+    let cases = [
+        (
+            "assignment",
+            format!("CODEX_WRAPPER_PROBE=1 '{standin}'"),
+            "AGENT probe=1 args=",
+        ),
+        (
+            "compound",
+            format!(
+                "(umask 077; : > '{}'); exec '{standin}'",
+                marker.to_str().expect("fixture path is UTF-8")
+            ),
+            "AGENT probe=unset args=",
+        ),
+        (
+            "plain control",
+            format!("{standin} --flag"),
+            "AGENT probe=unset args=--flag",
+        ),
+    ];
+
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let mut observed = Vec::new();
+    for (name, command, want_agent) in &cases {
+        let wrap_record = fixture
+            .path()
+            .join(format!("{}-wrap.log", name.replace(' ', "-")));
+        let agent_record = fixture
+            .path()
+            .join(format!("{}-agent.log", name.replace(' ', "-")));
+        std::fs::write(&wrap_record, "").expect("initialize wrap record");
+        std::fs::write(&agent_record, "").expect("initialize agent record");
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(command),
+                env: vec![
+                    // Pins the shell the seam runs a command line under, so the
+                    // recorded argv is the same on every host.
+                    ("SHELL".into(), "/bin/sh".into()),
+                    ("HOME".into(), fixture.path().to_string_lossy().into_owned()),
+                    (
+                        "CODEX_HOME".into(),
+                        fixture
+                            .path()
+                            .join("codex-home")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
+                        "REAL_DECK".into(),
+                        env!("CARGO_BIN_EXE_dot-agent-deck").into(),
+                    ),
+                    (
+                        "WRAP_RECORD".into(),
+                        wrap_record.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "AGENT_RECORD".into(),
+                        agent_record.to_string_lossy().into_owned(),
+                    ),
+                ],
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .unwrap_or_else(|e| panic!("spawn the {name} case: {e}"));
+        let started = common::wait_for_file_lines(&agent_record, 1, RECORD_WAIT);
+        let wrapped = std::fs::read_to_string(&wrap_record).unwrap_or_default();
+        let agent = std::fs::read_to_string(&agent_record).unwrap_or_default();
+        observed.push((name, command.clone(), started, wrapped, agent, *want_agent));
+    }
+    registry.shutdown_all();
+
+    let report = observed
+        .iter()
+        .map(|(name, command, started, wrapped, agent, _)| {
+            format!(
+                "{name}: command={command:?}\n  wrapper argv: {:?}\n  agent: {:?} ({})",
+                wrapped.trim_end(),
+                agent.trim_end(),
+                match started {
+                    Ok(()) => "started".to_string(),
+                    Err(state) => format!("NEVER STARTED: {state}"),
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let shell_line =
+        |command: &str| format!("WRAPPED [wrap] [--agent] [codex] [--] [/bin/sh] [-c] [{command}]");
+    let expected_wrapper = [
+        shell_line(&cases[0].1),
+        shell_line(&cases[1].1),
+        format!("WRAPPED [wrap] [--agent] [codex] [--] [{standin}] [--flag]"),
+    ];
+    for ((name, _, started, wrapped, agent, want_agent), want_wrapper) in
+        observed.iter().zip(&expected_wrapper)
+    {
+        assert!(
+            started.is_ok()
+                && agent.trim_end() == *want_agent
+                && wrapped.trim_end() == want_wrapper,
+            "the {name} case must start its agent under the wrapper, reached as {want_wrapper:?}\n{report}"
+        );
+    }
+    assert!(
+        marker.exists(),
+        "the compound's own `( … )` must have run before its `exec`\n{report}"
     );
 }
 

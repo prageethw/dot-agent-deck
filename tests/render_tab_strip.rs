@@ -128,13 +128,12 @@ fn close_glyph_fg_after(buffer: &ratatui::buffer::Buffer, label: &str) -> Color 
 /// Scenario: Render the tab strip twice. First with only the Dashboard tab
 /// (`closeable = [false]`) — the strip must contain NO `×` close glyph,
 /// proving the Dashboard tab has no close affordance. Then with Dashboard
-/// plus a Mode tab and an Orchestration tab (`closeable = [false, true,
-/// true]`) — exactly two `×` glyphs must render, one per closeable tab and
+/// plus two closeable tabs (`closeable = [false, true, true]`) — exactly two `×` glyphs must render, one per closeable tab and
 /// none for the Dashboard. RED until M3 renders the `[×]` affordance (today
 /// `render_tab_strip` draws no close glyph at all).
 #[spec("mouse/tabstrip/002")]
 #[test]
-fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
+fn tabstrip_002_close_glyph_on_orchestration_not_dashboard() {
     // Dashboard alone: never closeable → no close glyph anywhere.
     // PRD fork#405 M2: `render_tab_bar_to_buffer` grows a trailing
     // `is_orchestration: &[bool]` parameter, aligned with `labels`, so the
@@ -150,7 +149,7 @@ fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
         dashboard_only_text(&dashboard_only)
     );
 
-    // Dashboard + Mode + Orchestration: only the two non-Dashboard tabs get
+    // Dashboard + two closeable tabs: only the two non-Dashboard tabs get
     // a close glyph, so exactly two `×` render. A third would mean the
     // Dashboard wrongly gained one; zero means the affordance is missing.
     let three_tabs = render_tab_bar_to_buffer(
@@ -164,7 +163,7 @@ fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
     assert_eq!(
         close_glyph_count(&three_tabs),
         2,
-        "Mode and Orchestration tabs must each render a [×] (and the Dashboard none), got {:?}",
+        "Both closeable tabs must each render a [×] (and the Dashboard none), got {:?}",
         dashboard_only_text(&three_tabs)
     );
 }
@@ -458,9 +457,9 @@ fn orchestration_017_active_dashboard_tab_bold_no_reversed() {
 /// unchanged, only its modifier, and REVERSED is scoped to
 /// `Tab::Orchestration` regardless of the underlying status colour, Idle
 /// included.
-#[spec("tabs/orchestration/014")]
+#[spec("tabs/orchestration/020")]
 #[test]
-fn orchestration_014_active_idle_coloured_bold() {
+fn orchestration_020_active_idle_coloured_bold() {
     use SessionStatus::*;
 
     let active_idle_buf = render_tab_bar_to_buffer(
@@ -599,7 +598,7 @@ fn orchestration_013_dispatched_run_label_reads_name_first_under_truncation() {
 /// the start: the render half (`render_tab_strip`) already colors any tab
 /// whose `tab_statuses` slot is `Some(..)` regardless of tab kind, exercised
 /// here directly via `render_tab_bar_to_buffer`. That `tab_status_data`
-/// actually produces `Some(&[Working])` for a live Mode tab is
+/// actually produces `Some(&[Working])` for a live Mode tab was the retired
 /// `tabs/label/001`'s concern; that `run_tui`'s call site wires the two
 /// together is covered by no test.
 #[spec("tabs/label/002")]
@@ -639,7 +638,7 @@ fn label_002_active_tab_with_status_data_renders_status_color_bold() {
 /// agent pane isn't live yet — and assert both render `palette::STATUS_IDLE`
 /// (maintainer decision 2026-08-15: colour is a total function of status,
 /// including Idle, following the same colour rule pinned in
-/// `orchestration_014_active_idle_coloured_bold`). The no-panes-yet
+/// `orchestration_020_active_idle_coloured_bold`). The no-panes-yet
 /// empty-slice case is intended to paint the same as an explicit Idle:
 /// `palette::highest_priority_status(&[])` also resolves to Idle.
 #[spec("tabs/label/003")]
@@ -802,5 +801,70 @@ fn orchestration_016_active_orchestration_tab_reversed_others_bold_only() {
             && !selected_dashboard_modifier.contains(Modifier::REVERSED),
         "a SELECTED Dashboard tab must carry BOLD only, never REVERSED, got \
          {selected_dashboard_modifier:?}"
+    );
+}
+
+/// Scenario: Build the strip label of two orchestration tabs through the
+/// production `orchestration_tab_label` — one rebuilt from daemon role metadata
+/// that no longer matches `.dot-agent-deck.toml` (issue #554), one that still
+/// matches — and render the strip. The drifted tab's label must read its name
+/// between a `!` prefix and a `[config drift]` suffix, and the matching tab must
+/// carry no marker. Then crowd the strip until the suffix is truncated away: the
+/// `!` prefix and the name must still read.
+#[spec("tabs/orchestration/014")]
+#[test]
+fn orchestration_014_config_drift_marker_paints_on_the_drifted_tab_only() {
+    use dot_agent_deck::tab::OrchestrationStatus;
+    use dot_agent_deck::ui::{
+        CONFIG_DRIFT_TAB_MARKER, CONFIG_DRIFT_TAB_PREFIX, orchestration_tab_label,
+    };
+
+    let drifted = orchestration_tab_label("review", &OrchestrationStatus::Delegated, true);
+    let clean = orchestration_tab_label("build", &OrchestrationStatus::Delegated, false);
+    let buf = render_tab_bar_to_buffer(
+        &["Dashboard", &drifted, &clean],
+        &[false, true, true],
+        0,
+        100,
+        &[None, None, None],
+        &[false, true, true],
+    );
+    let row = rendered_row(&buf);
+    assert!(
+        row.contains(&format!(
+            "{CONFIG_DRIFT_TAB_PREFIX} review [active] {CONFIG_DRIFT_TAB_MARKER}"
+        )),
+        "the drifted tab must paint its name, status and the drift marker; row = {row:?}"
+    );
+    assert!(
+        row.contains("build [active]"),
+        "precondition: the clean tab must paint; row = {row:?}"
+    );
+    assert_eq!(
+        row.matches(CONFIG_DRIFT_TAB_MARKER).count(),
+        1,
+        "only the drifted tab may carry the marker; row = {row:?}"
+    );
+
+    // Under truncation (Greptile on PR #1281): the strip keeps the HEAD of a
+    // label, so the spelled-out suffix is what goes first. The one-column
+    // prefix must still be there, followed by the orchestration name.
+    let narrow = render_tab_bar_to_buffer(
+        &["Dashboard", &drifted, "other-tab-one", "other-tab-two"],
+        &[false, true, true, true],
+        0,
+        60,
+        &[None, None, None, None],
+        &[false, true, false, false],
+    );
+    let narrow_row = rendered_row(&narrow);
+    assert!(
+        !narrow_row.contains(CONFIG_DRIFT_TAB_MARKER) && narrow_row.contains('…'),
+        "precondition: this width must truncate the spelled-out marker away, or this proves \
+         nothing; row = {narrow_row:?}"
+    );
+    assert!(
+        narrow_row.contains(&format!(" {CONFIG_DRIFT_TAB_PREFIX} review")),
+        "the drift prefix and the orchestration name must survive truncation; row = {narrow_row:?}"
     );
 }

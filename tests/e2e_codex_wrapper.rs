@@ -10,36 +10,60 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::event::{
-    AGENT_EVENT_SCHEMA_VERSION, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
+    AGENT_EVENT_SCHEMA_VERSION, AgentType, EventType, LiveTarget, TargetKind, Writable,
 };
 use spec::spec;
 
 const SENTINEL_NAME: &str = "codex_sentinel_a7c91f.txt";
 const INTERACTIVE_PROOF_NAME: &str = "codex-interactive-proof.txt";
+/// Codex's empty-composer placeholder. Same needle, and the same reasoning for
+/// matching only the meaningful part of it, as `tests/e2e_codex_hooks.rs`.
+const CODEX_COMPOSER_READY: &str = "Ask Codex to do anything";
 
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = std::path::Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("binary directory is UTF-8");
-    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
+/// Whether this host lets an unprivileged process create a user namespace,
+/// which Codex's Linux `workspace-write` sandbox needs (it runs its tools
+/// under `bwrap`). A host that refuses — Ubuntu's
+/// `kernel.apparmor_restrict_unprivileged_userns=1` is the measured case —
+/// makes every shell command and every patch Codex attempts fail with
+/// `bwrap: setting up uid map: Permission denied`, so a test that needs Codex
+/// to do real work there cannot pass whatever the deck does. Probed with
+/// util-linux's `unshare -Ur true`; a host without `unshare` is not judged, so
+/// the test runs and speaks for itself.
+fn check_codex_sandbox_can_start() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    match std::process::Command::new("unshare")
+        .args(["-Ur", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if !status.success() => Err(
+            "this host refuses unprivileged user namespaces (`unshare -Ur true` failed), so \
+             Codex's workspace-write sandbox cannot start a shell or apply a patch here — \
+             check `kernel.apparmor_restrict_unprivileged_userns`"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Scenario: Restore a pane running `dot-agent-deck wrap --agent codex` around
-/// a deterministic shell stand-in that emits realistic Codex JSONL turn-start
-/// and turn-completed records. Subscribe to the real daemon event stream and
-/// detach to the dashboard; events must carry the Codex identity and schema
-/// version while the visible card moves Thinking → Idle and reads `Codex`.
-/// Send identity-bound input and require it to reach the wrapped child exactly once.
+/// a deterministic shell stand-in that paints interactive-Codex-shaped text and
+/// ends its turn through Codex's native `Stop` hook, as real Codex does.
+/// Subscribe to the real daemon event stream and detach to the dashboard;
+/// events must carry the Codex identity and schema version while the visible
+/// card moves Thinking → Idle and reads `Codex`. Type input into the pane the
+/// way a client does and require it to reach the wrapped child exactly once.
 #[spec("codex/wrap/001")]
 #[test]
-fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
+fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
     let command = "dot-agent-deck wrap --agent codex -- /bin/sh codex-standin.sh";
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_continue_session("", command)
         .launch_with_fixture("codex-synthetic");
 
@@ -48,9 +72,12 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
     deck.send_bytes(b"\x04");
     deck.wait_for_string("Dir:");
 
+    // The stand-in sleeps 10 s before it paints anything, so a 15 s budget left
+    // 5 s for the wrapper's boot and the event's round trip, which a starved
+    // machine overran (seen while working on issue #1493).
     let working = events.wait_for(
         |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Thinking,
-        Duration::from_secs(15),
+        Duration::from_secs(40),
     );
     assert_eq!(working.schema_version, Some(AGENT_EVENT_SCHEMA_VERSION));
     assert_eq!(working.agent_type, AgentType::Codex);
@@ -66,32 +93,14 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
         .pane_id
         .as_deref()
         .expect("managed wrapper event carries its pane id");
-    // Issue #494: `compute_write_and_submit_outcome`'s paned branch fails
-    // closed on a missing `expected_agent_id` (and, when the dashboard's
-    // embedded live preview is attached to this pane, on a session mismatch
-    // too). A legitimate dashboard write carries both, mirroring exactly how
-    // `daemon_client::write_and_submit_with_identity` rides them alongside
-    // the base `write-and-submit` shape as additive JSON keys — this proves a
-    // real identity-bearing write still succeeds under the new gate, rather
-    // than proving the old permissive bare-2-field shape used to work.
-    let response = common::attach_json_request_on(
-        deck.attach_socket_path(),
-        &serde_json::json!({
-            "op": "write-and-submit",
-            "pane_id": pane_id,
-            "text": "MANAGED-WRAPPER-WRITE",
-            "expected_agent_id": working.agent_id.as_deref().expect(
-                "managed wrapper event carries its agent id"
-            ),
-            "expected_session_id": working.session_id,
-        }),
-    )
-    .expect("write through managed wrapper pane");
-    assert_eq!(
-        response.send_result,
-        Some(SendResult::Applied),
-        "dashboard writes to a managed wrapped Codex pane must be applied to its live PTY"
-    );
+    let agent_id = working
+        .agent_id
+        .as_deref()
+        .expect("managed wrapper event carries its agent id");
+    // Held open until the child has the line: the daemon reads an attach
+    // stream's input only after answering it, so closing at once can drop it.
+    let mut input = common::AttachInput::attach(deck.attach_socket_path(), agent_id);
+    input.write("MANAGED-WRAPPER-WRITE\r");
     assert!(
         common::wait_for_file_substr_count(
             &deck.workdir().join("managed-wrapper-input.log"),
@@ -101,6 +110,7 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
         ),
         "the managed wrapper declared Live but the submitted write never reached its child"
     );
+    drop(input);
     assert!(
         deck.wait_for_stream_string_within("Thinking", Duration::from_secs(10)),
         "the wrapped Codex card never visibly entered Thinking:\n{}",
@@ -118,11 +128,26 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
         deck.snapshot_grid()
     );
 
+    // Issue #1493: a wrapper that could not get Codex's hooks trusted (no
+    // `codex` on this host's PATH) also reports quiet output as a classified
+    // Idle, so wait for the hook's.
     let idle = events.wait_for(
-        |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
+        |event| {
+            event.agent_type == AgentType::Codex
+                && event.event_type == EventType::Idle
+                && !event.is_wrapper_output_classified()
+        },
         Duration::from_secs(15),
     );
-    assert_eq!(idle.schema_version, Some(AGENT_EVENT_SCHEMA_VERSION));
+    // Issue #540: the turn ends through Codex's native `Stop` hook, as it does
+    // for real Codex — the wrapper's classifier reads no printed line as Idle,
+    // because the interactive TUI prints none that means it. The hook path
+    // stamps no wrapper schema version; the wrapper's own events are checked
+    // for that above.
+    assert!(
+        !idle.is_wrapper_output_classified() && idle.pane_id.as_deref() == Some(pane_id),
+        "the Idle must be the native hook's, on this pane: {idle:?}"
+    );
     assert!(
         deck.wait_for_grid_string_within("Idle", Duration::from_secs(10)),
         "the wrapped Codex card never visibly completed its turn:\n{}",
@@ -139,9 +164,10 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
 #[test]
 fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     skip_unless!(common::check_codex_available());
+    skip_unless!(check_codex_sandbox_can_start());
 
     let prompt = format!(
-        "Use the shell to list the current directory and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME}. Do not modify any other file."
+        "Use the shell to run pwd, then list exactly the directory it prints and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME} in that same directory. Do not modify any other file."
     );
     let command = format!(
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
@@ -153,12 +179,12 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         .expect("write bare Codex default command");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_imported_codex_credentials()
         .launch_with_fixture("codex-live");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let events = deck.subscribe_events();
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
@@ -168,14 +194,49 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
+    // Case-insensitive: Codex paints the model's display name (`GPT-5.6-Luna`
+    // for `--model gpt-5.6-luna`), not the id it was launched with.
     assert!(
-        deck.wait_for_grid_string_within(common::codex_test_model(), Duration::from_secs(30)),
+        deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| grid
+            .to_ascii_lowercase()
+            .contains(&common::codex_test_model().to_ascii_lowercase())),
         "the bare interactive Codex UI never became ready in the new pane:\n{}",
+        deck.snapshot_grid()
+    );
+    // Typing before Codex's composer has painted loses the payload, and the
+    // first Enter after it is dropped while Codex is still initialising — both
+    // measured and written up in `codex_hooks_001` (`tests/e2e_codex_hooks.rs`),
+    // which gates and retries exactly as below. This test pressed Enter once, and
+    // in each of three runs against Codex 0.156.1 on 2026-09-24 the prompt sat
+    // unsubmitted in the composer until the proof-file wait expired.
+    assert!(
+        deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(90)),
+        "Codex's composer never painted {CODEX_COMPOSER_READY:?} within 90s:\n{}",
         deck.snapshot_grid()
     );
     deck.send_keys(prompt.as_bytes());
     deck.wait_for_string(SENTINEL_NAME);
-    deck.send_keys(b"\r");
+    // Retry on the OUTCOME: the placeholder returns only once the composer has
+    // been emptied into a turn, and an Enter landing on an empty composer does
+    // nothing, so a repeat after the submit is harmless.
+    let submit_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut attempts = 0_usize;
+    let submitted = loop {
+        deck.send_keys(b"\r");
+        attempts += 1;
+        if deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(2)) {
+            break true;
+        }
+        if std::time::Instant::now() >= submit_deadline {
+            break false;
+        }
+    };
+    assert!(
+        submitted,
+        "after {attempts} Enter(s) over 60s the prompt is still sitting unsubmitted \
+         in Codex's composer:\n{}",
+        deck.snapshot_grid()
+    );
 
     let thinking = events.wait_for(
         |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Thinking,
@@ -273,7 +334,7 @@ fn codex_live_002_real_interactive_session_reports_active_model() {
         .with_imported_codex_credentials()
         .launch_with_fixture("codex-live");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let events = deck.subscribe_events();
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
@@ -325,13 +386,17 @@ fn codex_live_002_real_interactive_session_reports_active_model() {
 fn codex_wrap_002_preserves_tty_resize_input_and_interrupt() {
     let command = "dot-agent-deck wrap --agent codex -- ./tty-probe.sh";
     let mut deck = TuiDeck::builder()
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_continue_session("tty-probe", command)
         .launch_with_fixture("codex-tty-probe");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     let record = deck.workdir().join("tty-probe.log");
+    // Wait for the probe's traps, not its first output: the isatty lines are
+    // written BEFORE the traps are installed, and a resize landing in that gap
+    // is delivered to a shell that still ignores SIGWINCH, so the WINCH wait
+    // below failed under load.
     let started =
-        common::wait_for_file_substr_count(&record, "isatty(2)=", 1, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&record, "TRAPS-READY", 1, Duration::from_secs(10));
 
     deck.resize(150, 50);
     let resized = common::wait_for_file_substr_count(&record, "WINCH", 1, Duration::from_secs(5));

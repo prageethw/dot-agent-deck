@@ -34,6 +34,7 @@ use common::synthetic_agent::SyntheticAgent;
 const ORCH_PANE: &str = "pi-orchestrator-pane";
 const WORKER_PANE: &str = "coder-worker-pane";
 const WORKER_ROLE: &str = "coder";
+const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
 /// Poll the agent's PTY snapshot until `needle` appears or `timeout` elapses,
 /// returning the final snapshot either way.
@@ -73,10 +74,10 @@ fn spawn_worker_stub(registry: &Arc<AgentPtyRegistry>, cwd: &str, pane_env: &str
 /// Scenario: A Pi-identity orchestrator (the synthetic harness,
 /// `AgentType::Pi`, the `start = true` role) calls `delegate --to coder` from
 /// its pane; the daemon's real `handle_delegate` routes the task into the
-/// `coder` worker pane's PTY. Assert the worker `cat` stub received the
-/// single-line task pointer — the same contract `orchestration/delegate/001`
-/// proves for claude/opencode, now driven by a Pi orchestrator through the
-/// harness.
+/// `coder` worker's inbox. Assert the worker was posted one task, bound to it,
+/// carrying the delegated text from the orchestrator, with nothing typed into
+/// its pane — the same contract `orchestration/delegate/001` proves for
+/// claude/opencode, now driven by a Pi orchestrator through the harness.
 // The linkage-check scanner links `#[spec(...)]` to the next plain `fn`
 // (not `async fn`), so the spec'd entry point is a sync `#[test]` that
 // `block_on`s the async body (mirrors `session/live/007` in rehydration.rs).
@@ -105,9 +106,9 @@ async fn delegate_005_pi_orchestrator_delegate_routes_to_worker_inner() {
     let worker_agent_id = spawn_worker_stub(&registry, &cwd_str, WORKER_PANE);
 
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "pi-orchestration".to_string(),
-        cwd: cwd_str.clone(),
     };
 
     // The Pi orchestrator is the ONLY valid delegate source; the coder worker
@@ -131,24 +132,40 @@ async fn delegate_005_pi_orchestrator_delegate_routes_to_worker_inner() {
         .pane_cwd_map
         .insert(WORKER_PANE.to_string(), cwd_str.clone());
 
-    let signal = pi.delegate(
-        &state,
-        "List the files in the current directory.",
-        &[WORKER_ROLE],
-    );
+    let signal = pi.delegate("List the files in the current directory.", &[WORKER_ROLE]);
     state.handle_delegate(signal, &registry, &event_tx).await;
 
-    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
-    let snap = wait_for_needle(
-        &registry,
-        &worker_agent_id,
-        &pointer,
-        Duration::from_secs(5),
-    )
-    .await;
+    // PRD #1666 S5: the task is posted to the worker's inbox, bound to the
+    // worker, carrying the delegated text — and nothing is typed into its pane.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let task = loop {
+        let task = registry
+            .inbox()
+            .list(WORKER_PANE)
+            .into_iter()
+            .zip(registry.inbox().rendered(WORKER_PANE))
+            .find(|(message, _)| message.bind_agent.as_deref() == Some(worker_agent_id.as_str()))
+            .map(|(_, delivery)| delivery.text);
+        if task.is_some() || tokio::time::Instant::now() >= deadline {
+            break task;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let task = task.unwrap_or_else(|| {
+        panic!(
+            "Pi orchestrator's delegate never reached the coder worker's inbox; inbox = {:?}",
+            registry.inbox().list(WORKER_PANE)
+        )
+    });
     assert!(
-        snap.windows(pointer.len()).any(|w| w == pointer.as_slice()),
-        "Pi orchestrator's delegate never reached the coder worker pane; snapshot = {:?}",
+        task.contains("List the files in the current directory.")
+            && task.contains("from the orchestrator]"),
+        "the worker's task must carry the delegated text from the orchestrator; task = {task:?}"
+    );
+    let snap = registry.snapshot(&worker_agent_id).unwrap_or_default();
+    assert!(
+        !snap.windows(POINTER.len()).any(|w| w == POINTER),
+        "nothing may be typed into the worker's pane; snapshot = {:?}",
         String::from_utf8_lossy(&snap)
     );
 
@@ -188,9 +205,9 @@ async fn delegate_006_pi_worker_delegate_is_rejected_by_role_guard_inner() {
     let worker_agent_id = spawn_worker_stub(&registry, &cwd_str, WORKER_PANE);
 
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "pi-orchestration".to_string(),
-        cwd: cwd_str.clone(),
     };
 
     // The Pi agent is a WORKER — registered in the role map but deliberately
@@ -210,26 +227,21 @@ async fn delegate_006_pi_worker_delegate_is_rejected_by_role_guard_inner() {
         .pane_cwd_map
         .insert(WORKER_PANE.to_string(), cwd_str.clone());
 
-    let signal = pi_worker.delegate(
-        &state,
-        "Escalate: do the orchestrator's job.",
-        &[WORKER_ROLE],
-    );
+    let signal = pi_worker.delegate("Escalate: do the orchestrator's job.", &[WORKER_ROLE]);
     state.handle_delegate(signal, &registry, &event_tx).await;
 
     // handle_delegate rejects a non-orchestrator sender synchronously (before
     // spawning any dispatch task), so a bounded grace window with the pointer
     // still absent is a strong "never delivered" signal.
-    let pointer = common::expected_delegate_pointer(cwd.path(), WORKER_ROLE, WORKER_PANE);
     let snap = wait_for_needle(
         &registry,
         &worker_agent_id,
-        &pointer,
+        POINTER,
         Duration::from_millis(1500),
     )
     .await;
     assert!(
-        !snap.windows(pointer.len()).any(|w| w == pointer.as_slice()),
+        !snap.windows(POINTER.len()).any(|w| w == POINTER),
         "a Pi WORKER's delegate must be rejected by the role guard, but the coder pane \
          received the task; snapshot = {:?}",
         String::from_utf8_lossy(&snap)

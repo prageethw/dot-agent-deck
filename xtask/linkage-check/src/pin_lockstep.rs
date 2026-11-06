@@ -28,6 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use regex::Regex;
 use tempfile::TempDir;
 
 /// The workspace root, from this crate's manifest dir rather than the process
@@ -71,6 +72,13 @@ fn combined(out: &Output) -> String {
 }
 
 /// A synthetic repository holding nothing but the two files the script reads.
+///
+/// Every fixture also gets a `default-pnpm.yml` carrying an agreeing pnpm pin
+/// ([`pnpm_workflow`] at [`PNPM`]) unless one of the workflows passed in already
+/// names `pnpm/action-setup`. Without it every fixture would also fail the pnpm
+/// class (issue #1262), and a test asserting only that the script FAILS — such
+/// as `an_unreadable_pin_fails_even_when_every_readable_pin_agrees` — would
+/// then pass for the wrong reason.
 struct Fixture {
     dir: TempDir,
 }
@@ -100,6 +108,26 @@ impl Fixture {
         for (name, body) in workflows {
             fs::write(wf.join(name), body).expect("write a fixture workflow");
         }
+        // A full-line comment naming the action is not a step, and the
+        // scanner ignores it too, so it must not suppress the default.
+        if !workflows.iter().any(|(_, body)| {
+            body.lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains("pnpm/action-setup"))
+        }) {
+            // A name no test passes, so the default can never overwrite a
+            // workflow a test supplied (raised by Qodo on #1284).
+            assert!(
+                workflows
+                    .iter()
+                    .all(|(name, _)| *name != DEFAULT_PNPM_WORKFLOW),
+                "{DEFAULT_PNPM_WORKFLOW} is reserved for the fixture's default pnpm pin"
+            );
+            fs::write(
+                wf.join(DEFAULT_PNPM_WORKFLOW),
+                pnpm_workflow(&format!("version: {PNPM}")),
+            )
+            .expect("write the fixture pnpm workflow");
+        }
         Self { dir }
     }
 
@@ -108,7 +136,13 @@ impl Fixture {
     }
 }
 
-/// devbox.json entries that agree with [`workflow`]'s defaults.
+/// The pnpm version the fixtures agree on.
+const PNPM: &str = "11.22.0";
+
+/// Where [`Fixture`] writes its default agreeing pnpm workflow.
+const DEFAULT_PNPM_WORKFLOW: &str = "default-pnpm.yml";
+
+/// devbox.json entries that agree with [`workflow`]'s defaults and [`PNPM`].
 fn good_packages() -> Vec<&'static str> {
     vec![
         "jq@1.8.2",
@@ -117,7 +151,26 @@ fn good_packages() -> Vec<&'static str> {
         "cargo@1.97.1",
         "clippy@1.97.1",
         "rustfmt@1.97.1",
+        "pnpm@11.22.0",
     ]
+}
+
+/// A workflow whose one `pnpm/action-setup` step carries `with_lines` verbatim
+/// under its `with:` — `version: 11.22.0`, say — followed by a
+/// `actions/setup-node` step, which is what follows it in the real files and
+/// whose `node-version:` must not be read as a pnpm pin.
+fn pnpm_workflow(with_lines: &str) -> String {
+    format!(
+        "jobs:\n  \
+         desktop-web:\n    \
+         steps:\n      \
+         - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6\n        \
+         with:\n          \
+         {with_lines}\n      \
+         - uses: actions/setup-node@v7\n        \
+         with:\n          \
+         node-version: 24\n"
+    )
 }
 
 /// A minimal workflow carrying one of each pin, in the exact spelling the real
@@ -171,6 +224,254 @@ fn repository_pins_are_in_lockstep() {
          version — `cargo test-fast` in a devbox shell and `cargo nextest run` \
          in CI would run different builds (issue #648):\n{}",
         combined(&out)
+    );
+}
+
+/// One renovate.json customManager, compiled: its one file pattern and its one
+/// matchString.
+struct RenovateManager {
+    files: Regex,
+    matcher: Regex,
+}
+
+/// renovate.json's customManagers that read `dep_name` from the `devbox`
+/// datasource, compiled. Found by what they read rather than by position in the
+/// array, and required to number exactly `expected`, so adding another manager
+/// for the same package goes red here instead of leaving a test comparing the
+/// guard against part of what Renovate reads. pnpm has one (issue #1319); the
+/// Rust toolchain, read as package `rustc`, has two — the workflows and
+/// Cargo.toml's `rust-version` (issue #1478).
+fn renovate_devbox_managers(dep_name: &str, expected: usize) -> Vec<RenovateManager> {
+    let text = fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&text).expect("renovate.json is not valid JSON");
+    let managers: Vec<&serde_json::Value> = config["customManagers"]
+        .as_array()
+        .expect("renovate.json has a customManagers array")
+        .iter()
+        .filter(|m| m["depNameTemplate"] == dep_name && m["datasourceTemplate"] == "devbox")
+        // The RWX configs' managers have their own comparison,
+        // `renovate_reads_exactly_the_rwx_sites_the_guard_finds`.
+        .filter(|m| !reads_rwx(m))
+        .collect();
+    assert_eq!(
+        managers.len(),
+        expected,
+        "renovate.json must carry exactly {expected} customManager(s) reading {dep_name} \
+         from the devbox datasource (issues #1319, #1478)"
+    );
+    managers
+        .into_iter()
+        .map(|manager| {
+            let only = |key: &str| -> String {
+                let values = manager[key]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("the {dep_name} customManager has no {key} array"));
+                assert_eq!(
+                    values.len(),
+                    1,
+                    "each {dep_name} customManager must have exactly one {key}; this test \
+                     and scripts/check-pin-lockstep.sh agree on ONE canonical layout"
+                );
+                values[0]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key} holds a non-string"))
+                    .to_string()
+            };
+            // managerFilePatterns wraps a regex in slashes, JavaScript-style.
+            let file_pattern = only("managerFilePatterns");
+            let file_pattern = file_pattern
+                .strip_prefix('/')
+                .and_then(|p| p.strip_suffix('/'))
+                .unwrap_or_else(|| panic!("the {dep_name} managerFilePatterns entry is a /regex/"));
+            RenovateManager {
+                files: Regex::new(file_pattern)
+                    .unwrap_or_else(|e| panic!("the {dep_name} managerFilePatterns regex: {e}")),
+                matcher: Regex::new(&only("matchStrings"))
+                    .unwrap_or_else(|e| panic!("the {dep_name} matchString: {e}")),
+            }
+        })
+        .collect()
+}
+
+/// The `managerFilePatterns` entry of renovate.json's RWX customManagers: the
+/// top level of `.rwx/`, matching what the guard's `rwx_files` reads.
+const RWX_FILE_PATTERN: &str = "/^\\.rwx/[^/]+\\.ya?ml$/";
+
+/// Whether a customManager reads ONLY the RWX configs.
+fn reads_rwx(manager: &serde_json::Value) -> bool {
+    manager["managerFilePatterns"]
+        .as_array()
+        .is_some_and(|p| p.len() == 1 && p[0] == RWX_FILE_PATTERN)
+}
+
+/// What `managers` extract under `root`, as `<file>:<line> <version>` — the
+/// same shape the guard's `--*-sites` modes print, with the line being the one
+/// the captured `currentValue` sits on.
+///
+/// The candidate files are the repository root's own files, `.github/workflows/`'s
+/// and `.rwx/`'s, which is every place a manager here points at; each
+/// manager's file pattern then picks among them, as Renovate's does among the
+/// repository's files.
+fn renovate_sites(managers: &[RenovateManager], root: &Path) -> Vec<String> {
+    let mut rels: Vec<String> = Vec::new();
+    for (dir, prefix) in [
+        (root.to_path_buf(), ""),
+        (root.join(".github/workflows"), ".github/workflows/"),
+        (root.join(".rwx"), ".rwx/"),
+    ] {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry.expect("read a directory entry");
+            if entry.path().is_file() {
+                rels.push(format!("{prefix}{}", entry.file_name().to_string_lossy()));
+            }
+        }
+    }
+    rels.sort();
+    let mut sites = Vec::new();
+    for manager in managers {
+        for rel in rels.iter().filter(|rel| manager.files.is_match(rel)) {
+            let text = fs::read_to_string(root.join(rel)).expect("read a candidate file");
+            for caps in manager.matcher.captures_iter(&text) {
+                let value = caps
+                    .name("currentValue")
+                    .expect("the matchString captures currentValue");
+                let line = text[..value.start()].matches('\n').count() + 1;
+                sites.push(format!("{rel}:{line} {}", value.as_str()));
+            }
+        }
+    }
+    sites.sort();
+    sites
+}
+
+/// What renovate.json's pnpm customManager extracts under `root`.
+fn renovate_pnpm_sites(root: &Path) -> Vec<String> {
+    renovate_sites(&renovate_devbox_managers("pnpm", 1), root)
+}
+
+/// What `scripts/check-pin-lockstep.sh <mode>` reports under `root`, for
+/// `--pnpm-sites` or `--toolchain-sites`: the sites it reads, sorted, and its
+/// `!ERR` lines for the ones it rejects.
+fn guard_sites(mode: &str, root: &Path) -> (Vec<String>, Vec<String>) {
+    let out = Command::new("bash")
+        .arg(script())
+        .arg(mode)
+        .arg(root)
+        .output()
+        .unwrap_or_else(|e| panic!("run scripts/check-pin-lockstep.sh {mode}: {e}"));
+    assert!(out.status.success(), "{mode} failed:\n{}", combined(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (errors, mut sites): (Vec<String>, Vec<String>) = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .partition(|l| l.starts_with("!ERR "));
+    sites.sort();
+    (sites, errors)
+}
+
+/// Issue #1319, and the other half of THE guard above. The workflows' pnpm pin
+/// is read by Renovate through a regex customManager, which matches one layout,
+/// while the guard finds a pnpm step by walking the YAML. If the two ever
+/// disagree about which sites exist, a pin can be one the guard compares and
+/// Renovate never bumps — so the next grouped pnpm PR carries only devbox.json's
+/// half and fails the lockstep check. This runs the matchString straight out of
+/// renovate.json over the real workflows and requires exactly the sites, lines
+/// and versions the guard reads, with nothing rejected.
+#[test]
+fn renovate_reads_exactly_the_pnpm_sites_the_guard_finds() {
+    if !bash_present() {
+        eprintln!("SKIP: the pin-lockstep guard needs `bash` on PATH");
+        return;
+    }
+    let root = repo_root();
+    let (guard, errors) = guard_sites("--pnpm-sites", &root);
+    assert!(
+        errors.is_empty(),
+        "scripts/check-pin-lockstep.sh rejects a pnpm site in .github/workflows/:\n{}",
+        errors.join("\n")
+    );
+    assert!(
+        !guard.is_empty(),
+        "the guard found no pnpm/action-setup site at all, so this comparison \
+         would pass vacuously"
+    );
+    assert_eq!(
+        renovate_pnpm_sites(&root),
+        guard,
+        "renovate.json's pnpm customManager and scripts/check-pin-lockstep.sh \
+         disagree about which pnpm pins exist in .github/workflows/ (left: what \
+         Renovate extracts, right: what the guard reads). A site only the guard \
+         reads is one Renovate never bumps (issue #1319)."
+    );
+}
+
+/// The Rust toolchain's customManagers (issue #1478) — package `rustc` from the
+/// devbox datasource — split into the sites they extract under the workflows
+/// and the ones they extract anywhere else.
+fn renovate_rustc_sites(root: &Path) -> (Vec<String>, Vec<String>) {
+    renovate_sites(&renovate_devbox_managers("rustc", 2), root)
+        .into_iter()
+        .partition(|site| site.starts_with(".github/workflows/"))
+}
+
+/// Issue #1478, the Rust toolchain's copy of the pnpm test above. Since #1478
+/// Renovate reads the workflows' `toolchain:` pins only through renovate.json's
+/// `rustc` regex — the github-actions manager's `uses-with` lane, which parsed
+/// the YAML, is disabled for `rust` — so a pin the guard compares and the regex
+/// misses is one the grouped Rust PR would leave behind, failing the lockstep
+/// check on the PR meant to satisfy it. This runs the matchString out of
+/// renovate.json over the real workflows and requires exactly the sites, lines
+/// and versions the guard reads, with nothing rejected.
+#[test]
+fn renovate_reads_exactly_the_toolchain_sites_the_guard_finds() {
+    if !bash_present() {
+        eprintln!("SKIP: the pin-lockstep guard needs `bash` on PATH");
+        return;
+    }
+    let root = repo_root();
+    let (guard, errors) = guard_sites("--toolchain-sites", &root);
+    assert!(
+        errors.is_empty(),
+        "scripts/check-pin-lockstep.sh rejects a Rust toolchain site in .github/workflows/:\n{}",
+        errors.join("\n")
+    );
+    assert!(
+        !guard.is_empty(),
+        "the guard found no `toolchain:` site at all, so this comparison would \
+         pass vacuously"
+    );
+    let (workflows, _) = renovate_rustc_sites(&root);
+    assert_eq!(
+        workflows, guard,
+        "renovate.json's workflow `rustc` customManager and scripts/check-pin-lockstep.sh \
+         disagree about which Rust toolchain pins exist in .github/workflows/ (left: \
+         what Renovate extracts, right: what the guard reads). A site only the guard \
+         reads is one the grouped Rust PR never bumps (issue #1478)."
+    );
+}
+
+/// Issue #1478: Cargo.toml's `[workspace.package] rust-version` moves in the
+/// grouped Rust PR only because a customManager reads it — Renovate's cargo
+/// manager does not — so this requires renovate.json's `rustc` managers to
+/// extract exactly one site outside the workflows: the declaration
+/// `the_declared_msrv_matches_the_pinned_toolchain` reads, at its line and
+/// value. Zero would leave the MSRV behind on every Rust PR; two would mean the
+/// regex also matches something that is not the declaration.
+#[test]
+fn renovate_reads_exactly_the_declared_msrv() {
+    let (line, declared) = declared_msrv();
+    let (_, elsewhere) = renovate_rustc_sites(&repo_root());
+    assert_eq!(
+        elsewhere,
+        vec![format!("Cargo.toml:{line} {declared}")],
+        "renovate.json's `rustc` customManagers must extract Cargo.toml's \
+         `[workspace.package] rust-version` and nothing else outside \
+         .github/workflows/ (issue #1478)"
     );
 }
 
@@ -280,6 +581,7 @@ fn inconsistent_devbox_rust_components_fail() {
             "cargo@1.98.0",
             "clippy@1.98.0",
             "rustfmt@1.97.1",
+            "pnpm@11.22.0",
         ],
         &good_workflows(),
     )
@@ -715,6 +1017,7 @@ fn object_packages(nextest: &str, rustc: &str, clippy: &str) -> String {
          \"cargo\": \"1.97.1\",\n    \
          \"clippy\": \"{clippy}\",\n    \
          \"rustfmt\": \"1.97.1\",\n    \
+         \"pnpm\": \"11.22.0\",\n    \
          \"path:tauri-deps#tauri-deps\": \"\"\n  \
          }}"
     )
@@ -864,4 +1167,813 @@ fn a_script_named_after_a_package_is_not_a_pin() {
          pin — the pins here agree and nothing should be reported:\n{}",
         combined(&out)
     );
+}
+
+/// Issue #1262, in the exact shape that shipped: a bare major. `pnpm/action-setup`
+/// accepts `version: 12` and installs whatever 12.x is newest at run time, so
+/// 12.6.0 reached `desktop-browser` with no commit here and hung it. The
+/// fixture's devbox side is deliberately the SAME major, so this fails on
+/// exactness and not merely because 12 differs from 11.22.0.
+#[test]
+fn a_major_only_pnpm_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let mut packages = good_packages();
+    packages.retain(|p| !p.starts_with("pnpm@"));
+    packages.push("pnpm@12.5.1");
+    let out = Fixture::new(
+        &packages,
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 12")),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "`version: 12` floats across every 12.x release and must fail:\n{text}"
+    );
+    assert!(
+        text.contains("not an exact X.Y.Z") && text.contains("desktop.yml"),
+        "the failure must say the pin is not exact and point at the file:\n{text}"
+    );
+}
+
+#[test]
+fn drifted_pnpm_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 11.21.0")),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "11.22.0 vs 11.21.0 must fail:\n{text}"
+    );
+    assert!(
+        text.contains("pnpm") && text.contains("11.21.0") && text.contains("11.22.0"),
+        "the failure must name the class and BOTH versions:\n{text}"
+    );
+}
+
+/// The half-applied bump: `desktop-web`, `desktop-browser` and the release's
+/// desktop bundle each carry their own `pnpm/action-setup` step, so "all but
+/// one moved" is the realistic way this pin goes wrong.
+#[test]
+fn one_drifted_pnpm_site_among_several_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 11.22.0")),
+            ("release.yml", pnpm_workflow("version: 11.27.1")),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "one pnpm site left behind must fail:\n{text}"
+    );
+    assert!(
+        text.contains("internally inconsistent") && text.contains("release.yml"),
+        "the failure must say the workflows disagree and point at the odd one:\n{text}"
+    );
+}
+
+#[test]
+fn a_pnpm_step_with_no_version_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("run_install: false")),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a pnpm/action-setup step with no version pins nothing and must fail:\n{text}"
+    );
+    assert!(
+        text.contains("no version: input"),
+        "the failure must say the version input is missing:\n{text}"
+    );
+}
+
+/// The toolchain and nextest pins' rule, now applied to pnpm too (issue #1319).
+/// Until then the pin was read by Renovate's github-actions known-actions
+/// registry, which YAML-parses the step, so a quoted version was tracked and
+/// this test asserted it passed. That lane is disabled for pnpm, and the regex
+/// customManager that replaced it wants a BARE X.Y.Z — so a quoted pin, even one
+/// that agrees, is a pin Renovate cannot bump and must fail as unreadable. A
+/// quoted pin that also drifted must still be reported, not skipped.
+#[test]
+fn a_quoted_pnpm_pin_fails_as_unreadable_by_renovate() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let agreeing = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: \"11.22.0\"")),
+            ("release.yml", pnpm_workflow("version: '11.22.0'")),
+        ],
+    );
+    let out = agreeing.run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a quoted pnpm pin is one renovate.json cannot read, even when it agrees:\n{text}"
+    );
+    for file in ["desktop.yml:6", "release.yml:6"] {
+        assert!(
+            text.contains(&format!(
+                "{file} has a pnpm/action-setup version renovate.json cannot read"
+            )),
+            "{file}'s quoted pin must be reported as unreadable by renovate.json:\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("not an exact"),
+        "the version is exact; only its spelling is wrong:\n{text}"
+    );
+    assert!(
+        renovate_pnpm_sites(agreeing.dir.path()).is_empty(),
+        "the premise: renovate.json's regex must not read a quoted pin"
+    );
+
+    let drifted = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: \"11.21.0\"")),
+        ],
+    )
+    .run();
+    let text = combined(&drifted);
+    assert!(
+        !drifted.status.success()
+            && text.contains(
+                "desktop.yml:6 has a pnpm/action-setup version renovate.json cannot read"
+            ),
+        "a quoted pin that drifted must still be reported:\n{text}"
+    );
+}
+
+/// Greptile's third form on #1320: another input written before `version:` in
+/// the same block `with:`, and — the same defect on the line above — a comment
+/// on the `with:` line. Both are valid YAML the old known-actions lane read, and
+/// both put a line the regex cannot cross between `uses:` and `version:`.
+#[test]
+fn a_pnpm_pin_off_the_canonical_lines_fails_as_unreadable_by_renovate() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let commented = "jobs:\n  desktop-web:\n    steps:\n      \
+                     - uses: pnpm/action-setup@v6\n        \
+                     with: # the desktop toolchain\n          \
+                     version: 11.22.0\n";
+    let fixture = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            (
+                "desktop.yml",
+                pnpm_workflow("run_install: false\n          version: 11.22.0"),
+            ),
+            ("release.yml", commented.to_string()),
+        ],
+    );
+    let out = fixture.run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a pin off the canonical lines is one renovate.json cannot read:\n{text}"
+    );
+    for file in ["desktop.yml:7", "release.yml:6"] {
+        assert!(
+            text.contains(&format!(
+                "{file} has a pnpm/action-setup version renovate.json cannot read"
+            )),
+            "{file} must be reported as unreadable by renovate.json:\n{text}"
+        );
+    }
+    assert!(
+        renovate_pnpm_sites(fixture.dir.path()).is_empty(),
+        "the premise: renovate.json's regex must read neither site"
+    );
+}
+
+/// What makes a `version:` a pnpm pin is the step it sits in, so the scanner
+/// walks the step rather than grepping for the key. Here the inputs are written
+/// BEFORE `uses:`, in flow style — valid YAML, and a layout renovate.json's
+/// regex cannot read (issue #1319), so the site must be FOUND and rejected,
+/// even though its value agrees: a walk that missed it would report nothing
+/// and the step would silently stop being bumped. The `version:` on the NEXT
+/// step belongs to another action and must not be read; it has drifted, so
+/// reading it would show up as a drift on line 7.
+#[test]
+fn a_pnpm_pin_is_found_by_its_step_not_by_its_key() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - with: { version: 11.22.0, run_install: false }\n        \
+                uses: pnpm/action-setup@v6\n      \
+                - uses: some/other-action@v1\n        \
+                with:\n          \
+                version: 11.21.0\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "the flow-style pin ahead of `uses:` must be found and rejected:\n{text}"
+    );
+    assert!(
+        text.contains("desktop.yml:4 has a pnpm/action-setup version renovate.json cannot read")
+            && !text.contains("desktop.yml:7"),
+        "exactly the pnpm step's version must be read, and the other action's \
+         `version:` must not be:\n{text}"
+    );
+}
+
+#[test]
+fn devbox_without_pnpm_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let packages: Vec<&str> = good_packages()
+        .into_iter()
+        .filter(|p| !p.starts_with("pnpm@"))
+        .collect();
+    let out = Fixture::new(&packages, &good_workflows()).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a workflow pnpm pin with nothing on the devbox side must fail:\n{text}"
+    );
+    assert!(
+        text.contains("pins no pnpm"),
+        "the failure must name the missing package:\n{text}"
+    );
+}
+
+/// Raised by Qodo on #1284. Renovate YAML-parses `uses:` as it does `version:`,
+/// so a quoted `uses: "pnpm/action-setup@…"` is the same tracked step. The
+/// scanner used to match only the bare spelling, so a quoted site that drifted
+/// was silently dropped and the class compared the survivors.
+#[test]
+fn a_quoted_pnpm_action_reference_is_still_a_site() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: \"pnpm/action-setup@v6\"\n        \
+                with:\n          \
+                version: 11.21.0\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 11.22.0")),
+            ("release.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains("release.yml:6 11.21.0"),
+        "the drifted pin behind a quoted `uses:` must be read and reported:\n{text}"
+    );
+}
+
+/// Raised by Qodo on #1284. A trailing comment that mentions `version:` is not
+/// an input, and reading it as one failed the guard on a file whose pin is
+/// fine — the false positive that makes a guard the problem.
+#[test]
+fn a_version_in_a_trailing_comment_is_not_a_pnpm_pin() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            (
+                "desktop.yml",
+                pnpm_workflow(
+                    "version: 11.22.0 # exact\n          run_install: false # was version: 12",
+                ),
+            ),
+        ],
+    )
+    .run();
+    assert!(
+        out.status.success(),
+        "a `version:` inside a trailing comment must not be read as a pin:\n{}",
+        combined(&out)
+    );
+}
+
+/// Raised by Greptile on #1284. Only the step's `with:` mapping carries the
+/// action's input, so a `version:` elsewhere in the step — here an `env:` —
+/// must not be read as the pin. It used to be, which let a step with NO pnpm
+/// version pass the missing-pin check on an unrelated key's agreeing value.
+#[test]
+fn a_version_outside_the_with_mapping_is_not_a_pnpm_pin() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                env: { version: 11.22.0 }\n        \
+                with:\n          \
+                run_install: false\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains("no version: input"),
+        "an `env:` version is not the action's input, so this step is unpinned:\n{text}"
+    );
+}
+
+/// Raised by Qodo on #1284. A flow mapping may span lines — `with: {` on one,
+/// the keys on the next. The scanner read a flow mapping only on the `with:`
+/// line itself, so this spelling reported a correctly pinned step as having no
+/// version. The quoted `${{ … }}` before the pin is the follow-up Qodo raised: a
+/// brace inside a quoted value must not read as the mapping closing. Since issue
+/// #1319 the pin is found and then REJECTED, because renovate.json's regex
+/// cannot read a flow mapping — so it must be reported on its own line, as
+/// unreadable, and never as a step with no version.
+#[test]
+fn a_multiline_flow_with_mapping_is_found_and_rejected() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                with: {\n          \
+                package_json_file: \"${{ matrix.file }}\",\n          \
+                version: 11.22.0,\n          \
+                run_install: false }\n      \
+                - uses: actions/setup-node@v7\n        \
+                with:\n          \
+                node-version: 24\n";
+    let fixture = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    );
+    let out = fixture.run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success()
+            && text.contains(
+                "desktop.yml:7 has a pnpm/action-setup version renovate.json cannot read"
+            ),
+        "the version inside a multi-line flow mapping must be found and rejected:\n{text}"
+    );
+    assert!(
+        !text.contains("no version: input"),
+        "a multi-line flow mapping carries the input, so the step is pinned:\n{text}"
+    );
+    assert!(
+        renovate_pnpm_sites(fixture.dir.path()).is_empty(),
+        "the premise: renovate.json's regex must not read a flow mapping"
+    );
+}
+
+/// Raised by Qodo on #1284. A double-quoted scalar may span lines, so the
+/// quote state has to survive the line break: here the `}` on the scalar's
+/// second line is inside the quotes and must not close the mapping, which
+/// would hide the `version:` after it and report the step as unpinned. The
+/// next step's drifted `version:` belongs to another action and must not be
+/// read.
+#[test]
+fn a_quoted_scalar_spanning_lines_does_not_close_the_flow_mapping() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                with: {\n          \
+                package_json_file: \"first half\n            \
+                second } half\",\n          \
+                version: 11.22.0 }\n      \
+                - uses: some/other-action@v1\n        \
+                with:\n          \
+                version: 11.21.0\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success()
+            && text.contains(
+                "desktop.yml:8 has a pnpm/action-setup version renovate.json cannot read"
+            )
+            && !text.contains("no version: input"),
+        "the pin after a multi-line quoted scalar must be found (and, being in a \
+         flow mapping, rejected as unreadable by renovate.json):\n{text}"
+    );
+    assert!(
+        !text.contains("desktop.yml:11"),
+        "the next action's `version:` must never be read as this step's pin:\n{text}"
+    );
+}
+
+/// Cargo.toml's `[workspace.package] rust-version`: the 1-based line it sits on
+/// and the version it declares.
+fn declared_msrv() -> (usize, String) {
+    let manifest = std::fs::read_to_string(repo_root().join("Cargo.toml"))
+        .expect("the workspace manifest is readable");
+    manifest
+        .lines()
+        .enumerate()
+        .find_map(|(i, l)| {
+            let rest = l.trim().strip_prefix("rust-version")?.trim_start();
+            let value = rest.strip_prefix('=')?.trim().trim_matches('"');
+            (!value.is_empty()).then(|| (i + 1, value.to_string()))
+        })
+        .expect(
+            "Cargo.toml declares `[workspace.package] rust-version` (issue #451). If it was \
+             removed deliberately, the tests that read it go with it — but read the doc \
+             comment on `the_declared_msrv_matches_the_pinned_toolchain` first: the point \
+             of the declaration is that it agrees with what CI installs.",
+        )
+}
+
+/// Issue #451: the declared MSRV is a **third** copy of the pinned toolchain,
+/// and it drifts for the same reason the other two did.
+///
+/// `Cargo.toml`'s `[workspace.package] rust-version` says what rustc this
+/// project supports. It is set to the toolchain the project actually tests —
+/// the one `devbox.json` installs and every workflow job asks
+/// `dtolnay/rust-toolchain` for — because that is the only number anything
+/// here verifies. A floor measured once and then left alone is a claim nothing
+/// re-checks: no job builds on it, so the real minimum moves under it silently.
+///
+/// Which makes the declaration worth exactly as much as its agreement with the
+/// pins, so this compares them. It reads the workflow side rather than
+/// `devbox.json` deliberately: the workflow pins are a plain `toolchain: X.Y.Z`
+/// this can parse in a few lines, and `repository_pins_are_in_lockstep` above
+/// already ties those to devbox — so agreeing with one is agreeing with both,
+/// without a second copy of `devbox_pins`' two-spelling parser.
+///
+/// Skips the `$VAR` sites for the same reason `scan_workflow_toolchain` does:
+/// `windows-cross-check` echoes a resolved rustup directory, which is
+/// diagnostics rather than a pin.
+#[test]
+fn the_declared_msrv_matches_the_pinned_toolchain() {
+    let (_, declared) = declared_msrv();
+
+    let mut sites: Vec<(String, String)> = Vec::new();
+    let workflows = repo_root().join(".github/workflows");
+    for entry in std::fs::read_dir(&workflows).expect("the workflow directory is readable") {
+        let path = entry.expect("a readable directory entry").path();
+        let is_yaml = path.extension().is_some_and(|e| e == "yml" || e == "yaml");
+        if !is_yaml {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).expect("a readable workflow file");
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((_, after)) = trimmed.split_once("toolchain:") else {
+                continue;
+            };
+            let value = after
+                .trim()
+                .split([' ', ',', '}'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if value.contains('$') || value.is_empty() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            sites.push((name, value));
+        }
+    }
+
+    assert!(
+        !sites.is_empty(),
+        "no `toolchain:` pin was found under .github/workflows/, so this check would pass \
+         vacuously. Either the jobs stopped pinning a toolchain, or the spelling changed \
+         (fix this test).",
+    );
+
+    let drifted: Vec<&(String, String)> = sites.iter().filter(|(_, v)| *v != declared).collect();
+    assert!(
+        drifted.is_empty(),
+        "Cargo.toml declares rust-version = \"{declared}\" but {} workflow site(s) pin a \
+         different toolchain: {}. The declared MSRV is the toolchain this project tests, so \
+         the two move together — bump both, or the floor is a number nothing verifies \
+         (issue #451).",
+        drifted.len(),
+        drifted
+            .iter()
+            .map(|(f, v)| format!("{f} => {v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+}
+
+/// The pins the guard compares in the RWX configs (`--rwx-sites`), and the
+/// renovate.json customManagers that bump them: one per spelling, each reading
+/// only `.rwx/`. Five: the Rust toolchain twice (`rust-version:` and rustup's
+/// `--default-toolchain`), cargo-nextest, pnpm and go-task.
+fn renovate_rwx_lockstep_managers() -> Vec<RenovateManager> {
+    let text = fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&text).expect("renovate.json is not valid JSON");
+    let lockstep = ["rustc", "cargo-nextest", "pnpm", "go-task"];
+    let managers: Vec<RenovateManager> = config["customManagers"]
+        .as_array()
+        .expect("renovate.json has a customManagers array")
+        .iter()
+        .filter(|m| reads_rwx(m))
+        .filter(|m| lockstep.iter().any(|d| m["depNameTemplate"] == *d))
+        .map(|m| {
+            let strings = m["matchStrings"].as_array().expect("matchStrings array");
+            assert_eq!(
+                strings.len(),
+                1,
+                "each RWX customManager has exactly one matchString"
+            );
+            RenovateManager {
+                files: Regex::new(
+                    RWX_FILE_PATTERN
+                        .strip_prefix('/')
+                        .and_then(|p| p.strip_suffix('/'))
+                        .expect("a /regex/"),
+                )
+                .expect("the RWX file pattern compiles"),
+                matcher: Regex::new(strings[0].as_str().expect("a string matchString"))
+                    .expect("an RWX matchString compiles"),
+            }
+        })
+        .collect();
+    assert_eq!(
+        managers.len(),
+        5,
+        "renovate.json must carry exactly five RWX customManagers for the lockstep \
+         classes (rustc twice, cargo-nextest, pnpm, go-task); a new spelling needs \
+         a manager AND a scanner in scripts/check-pin-lockstep.sh"
+    );
+    managers
+}
+
+/// The RWX configs' copy of the pnpm and toolchain tests above. `.rwx/` pins the
+/// CI toolchain in its own syntax (docs/develop/rwx.md), so renovate.json reads
+/// it with its own regexes, and a site the guard compares that those regexes
+/// miss is one a grouped Renovate PR would leave behind, failing the lockstep
+/// check on the PR meant to satisfy it.
+#[test]
+fn renovate_reads_exactly_the_rwx_sites_the_guard_finds() {
+    if !bash_present() {
+        eprintln!("SKIP: the pin-lockstep guard needs `bash` on PATH");
+        return;
+    }
+    let root = repo_root();
+    let (guard, errors) = guard_sites("--rwx-sites", &root);
+    assert!(
+        errors.is_empty(),
+        "scripts/check-pin-lockstep.sh rejects a site in .rwx/:\n{}",
+        errors.join("\n")
+    );
+    assert!(
+        !guard.is_empty(),
+        "the guard found no pin in .rwx/ at all, so this comparison would pass vacuously"
+    );
+    assert_eq!(
+        renovate_sites(&renovate_rwx_lockstep_managers(), &root),
+        guard,
+        "renovate.json's RWX customManagers and scripts/check-pin-lockstep.sh disagree \
+         about which pins exist in .rwx/ (left: what Renovate extracts, right: what \
+         the guard reads)"
+    );
+}
+
+/// An RWX config carrying the four lockstep pins in the spelling `.rwx/ci.yml`
+/// uses.
+fn rwx_config(rust: &str, nextest: &str, pnpm: &str, gotask: &str) -> String {
+    format!(
+        "tasks:\n  \
+         - key: rust\n    \
+         call: rust-lang/install 1.1.1\n    \
+         with:\n      \
+         rust-version: {rust}\n  \
+         - key: rustup\n    \
+         run: curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain {rust}\n  \
+         - key: nextest\n    \
+         run: curl -LsSf https://get.nexte.st/{nextest}/linux | tar zxf -\n  \
+         - key: pnpm\n    \
+         run: npm install -g pnpm@{pnpm}\n  \
+         - key: go-task\n    \
+         run: curl -LsSf https://github.com/go-task/task/releases/download/v{gotask}/task_linux_amd64.tar.gz\n"
+    )
+}
+
+/// [`Fixture`] with a `.rwx/ci.yml`, and devbox.json carrying go-task too.
+fn rwx_fixture(rwx: &str) -> Fixture {
+    let mut packages = good_packages();
+    packages.push("go-task@3.53.1");
+    let fixture = Fixture::new(&packages, &good_workflows());
+    let dir = fixture.dir.path().join(".rwx");
+    fs::create_dir_all(&dir).expect("create the fixture .rwx dir");
+    fs::write(dir.join("ci.yml"), rwx).expect("write the fixture RWX config");
+    fixture
+}
+
+#[test]
+fn agreeing_rwx_pins_pass() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = rwx_fixture(&rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1")).run();
+    assert!(
+        out.status.success(),
+        "an RWX config agreeing with devbox.json and the workflows must pass, or \
+         the drift tests below prove nothing:\n{}",
+        combined(&out)
+    );
+}
+
+#[test]
+fn a_drifted_rwx_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    for (class, rwx, version) in [
+        (
+            "Rust toolchain",
+            rwx_config("1.98.0", "0.9.143", PNPM, "3.53.1"),
+            "1.98.0",
+        ),
+        (
+            "cargo-nextest",
+            rwx_config("1.97.1", "0.9.140", PNPM, "3.53.1"),
+            "0.9.140",
+        ),
+        (
+            "pnpm",
+            rwx_config("1.97.1", "0.9.143", "11.21.0", "3.53.1"),
+            "11.21.0",
+        ),
+        (
+            "go-task",
+            rwx_config("1.97.1", "0.9.143", PNPM, "3.54.0"),
+            "3.54.0",
+        ),
+    ] {
+        let out = rwx_fixture(&rwx).run();
+        let text = combined(&out);
+        assert!(
+            !out.status.success(),
+            "a drifted RWX {class} pin must fail:\n{text}"
+        );
+        assert!(
+            text.contains(class) && text.contains(version),
+            "the failure must name the class and the RWX version:\n{text}"
+        );
+    }
+}
+
+/// Only rustup's `--default-toolchain` drifting: one spelling of the Rust
+/// toolchain in RWX agreeing does not cover the other.
+#[test]
+fn a_drifted_rustup_toolchain_in_rwx_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let rwx = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1")
+        .replace("--default-toolchain 1.97.1", "--default-toolchain 1.98.0");
+    let out = rwx_fixture(&rwx).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a drifted --default-toolchain must fail:\n{text}"
+    );
+    assert!(
+        text.contains("1.98.0"),
+        "the failure must name the version:\n{text}"
+    );
+}
+
+/// A pre-release suffix is a different version, not the same one written
+/// longer: `1.97.1-beta.1` in `.rwx/` against devbox's `1.97.1` must fail, not
+/// read as `1.97.1` and pass (PR #1802 review).
+#[test]
+fn a_prerelease_rwx_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let rwx = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1")
+        .replace("rust-version: 1.97.1", "rust-version: 1.97.1-beta.1");
+    let out = rwx_fixture(&rwx).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a pre-release RWX pin must fail:\n{text}"
+    );
+    assert!(
+        text.contains("1.97.1-beta.1"),
+        "the failure must name the pin:\n{text}"
+    );
+}
+
+/// An RWX config that dropped a pin is drift too: the RWX sites ride the
+/// workflow side, so a `.rwx/` with no go-task (or no nextest, ...) pin would
+/// otherwise leave the class passing on the workflows alone (PR #1802 review).
+#[test]
+fn an_rwx_config_missing_a_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let full = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1");
+    for (class, marker) in [
+        ("gotask", "go-task/task/releases"),
+        ("nextest", "get.nexte.st"),
+        ("pnpm", "pnpm@"),
+    ] {
+        let rwx: String = full
+            .lines()
+            .filter(|l| !l.contains(marker))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let out = rwx_fixture(&rwx).run();
+        let text = combined(&out);
+        assert!(
+            !out.status.success(),
+            "an .rwx/ with no {class} pin must fail:\n{text}"
+        );
+        assert!(
+            text.contains(class),
+            "the failure must name the class:\n{text}"
+        );
+    }
 }

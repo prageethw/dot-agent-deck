@@ -37,17 +37,21 @@ use std::path::Path;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SUCCESS, GENERIC_WRITE, HANDLE, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SetNamedSecurityInfoW, SetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetNamedSecurityInfoW,
+    SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+    DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
 };
-use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, WRITE_DAC};
 
 /// Security-descriptor string for a **named pipe** instance: we are the owner and
 /// the only principal in a protected DACL.
@@ -182,6 +186,25 @@ pub fn set_create_mode_owner_only(opts: &mut std::fs::OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
 
     opts.access_mode(OWNER_ONLY_WRITE_ACCESS);
+}
+
+/// [`OWNER_ONLY_WRITE_ACCESS`] plus `GENERIC_READ`, for the one caller that has to
+/// read a file through the same handle it then rewrites (issue #331).
+const OWNER_ONLY_READ_WRITE_ACCESS: u32 = OWNER_ONLY_WRITE_ACCESS | GENERIC_READ;
+
+/// [`set_create_mode_owner_only`] for a caller that also READS through the
+/// handle — the widening that function's precondition prescribes, since
+/// `access_mode` overrides `.read(true)`.
+///
+/// Issue #331: `orchestrator_context::replace_coordination_file_if` reads a
+/// work-done summary to decide whether it may replace it, then rewrites it on
+/// the same handle. Under the write-only mask that read fails with
+/// `ERROR_ACCESS_DENIED`, which surfaced on the `build-windows` job as every
+/// second summary write failing.
+pub fn set_create_mode_owner_only_readable(opts: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    opts.access_mode(OWNER_ONLY_READ_WRITE_ACCESS);
 }
 
 /// Apply a protected current-user-only DACL to an already-open file — the
@@ -320,6 +343,27 @@ pub fn verify_object_owner_is_current_user(handle: HANDLE) -> Result<(), String>
     super::endpoint_owner_is_trusted(&owner, &ours)
 }
 
+/// Verify that the **file** behind `handle` is one this process could have
+/// created with a default security descriptor: its owner SID is our user SID
+/// or our token's default owner SID ([`super::file_owner_is_trusted`] has the
+/// rule and why it is sound).
+///
+/// [`verify_object_owner_is_current_user`] is the wrong check for such a file:
+/// it relies on the object having been created with an explicit `O:<our-sid>`,
+/// and a file written without one is owned by `BUILTIN\Administrators` under an
+/// elevated administrator token, so our own file would be refused. The handle
+/// needs `READ_CONTROL`, which a file opened for reading holds (`GENERIC_READ`
+/// includes it).
+pub fn verify_file_owner_is_current_user(handle: HANDLE) -> Result<(), String> {
+    let owner = object_owner_sid_of(handle, SE_FILE_OBJECT)
+        .map_err(|err| format!("cannot read the owner SID: {err}"))?;
+    let ours =
+        current_user_sid().map_err(|err| format!("cannot read the current user's SID: {err}"))?;
+    let default_owner = crate::platform::paths::token_default_owner_sid()
+        .map_err(|err| format!("cannot read the token's default owner SID: {err}"))?;
+    super::file_owner_is_trusted(&owner, &ours, &default_owner)
+}
+
 /// Owner SID of the kernel object behind `handle`, in canonical string form.
 ///
 /// `SE_KERNEL_OBJECT` (not `SE_FILE_OBJECT`): both callers hold kernel objects (a
@@ -331,6 +375,12 @@ pub fn verify_object_owner_is_current_user(handle: HANDLE) -> Result<(), String>
 /// `GENERIC_READ` expands to `STANDARD_RIGHTS_READ | …`, `STANDARD_RIGHTS_READ`
 /// *is* `READ_CONTROL`, and `MUTEX_ALL_ACCESS` includes it too.
 fn object_owner_sid(handle: HANDLE) -> io::Result<String> {
+    object_owner_sid_of(handle, SE_KERNEL_OBJECT)
+}
+
+/// [`object_owner_sid`] for an object of type `object_type` — `SE_FILE_OBJECT`
+/// for a file handle.
+fn object_owner_sid_of(handle: HANDLE, object_type: SE_OBJECT_TYPE) -> io::Result<String> {
     let mut owner: PSID = ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: `handle` is a live pipe handle owned by the caller for this call.
@@ -341,7 +391,7 @@ fn object_owner_sid(handle: HANDLE) -> io::Result<String> {
     let rc = unsafe {
         GetSecurityInfo(
             handle,
-            SE_KERNEL_OBJECT,
+            object_type,
             OWNER_SECURITY_INFORMATION,
             &mut owner,
             ptr::null_mut(),
@@ -360,6 +410,125 @@ fn object_owner_sid(handle: HANDLE) -> io::Result<String> {
         ));
     }
     sid_to_string(owner)
+}
+
+// ---------------------------------------------------------------------------
+// Receipt-spool directories (PRD #1666 §3)
+// ---------------------------------------------------------------------------
+
+/// Create the directory `path` with a protected current-user-only DACL in the
+/// same `CreateDirectoryW` call, so it never exists under an inherited ACL and
+/// a concurrent opener never sees it half-secured. `Ok(false)` when it already
+/// exists: an existing directory is left as it is, to be verified, never
+/// repaired.
+pub(crate) fn create_dir_owner_only(path: &Path) -> io::Result<bool> {
+    let sd = security_descriptor_from_sddl(&file_sddl(&current_user_sid()?))?;
+    let attrs = sd.security_attributes();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path and `attrs` points at
+    // `sd`'s descriptor; both outlive the call, which copies the descriptor
+    // into the new directory and retains neither.
+    if unsafe { CreateDirectoryW(wide.as_ptr(), &attrs) } != 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+        return Ok(false);
+    }
+    Err(err)
+}
+
+/// The DACL stored on the object behind `handle`, as data. The handle needs
+/// `READ_CONTROL`, which `GENERIC_READ` includes.
+pub(crate) fn read_dacl(handle: HANDLE) -> io::Result<super::DaclSummary> {
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `handle` is live for the call; `dacl`/`sd` are valid
+    // out-pointers and the nulls are the documented "do not report this
+    // component" form. One `LocalAlloc`'d descriptor comes back, freed by the
+    // guard below, and `dacl` points into it.
+    let rc = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    win32_error_to_result(rc, "GetSecurityInfo (stored DACL)")?;
+    let sd = OwnedSecurityDescriptor(sd);
+    let mut control: u16 = 0;
+    let mut revision: u32 = 0;
+    // SAFETY: `sd.0` is the live descriptor the guard owns; the out-pointers
+    // are stack locals.
+    if unsafe { GetSecurityDescriptorControl(sd.0, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let protected = control & SE_DACL_PROTECTED != 0;
+    if dacl.is_null() {
+        return Ok(super::DaclSummary {
+            present: false,
+            protected,
+            aces: Vec::new(),
+        });
+    }
+    let mut size = ACL_SIZE_INFORMATION::default();
+    // SAFETY: `dacl` points into the descriptor `sd` keeps alive, and `size`
+    // is a correctly sized out-buffer for `AclSizeInformation`.
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut aces = Vec::with_capacity(size.AceCount as usize);
+    for index in 0..size.AceCount {
+        let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+        // SAFETY: `index` is below the ACL's ACE count and `ace` is a valid
+        // out-pointer; the ACE it receives lives inside `dacl`.
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: every ACE starts with an `ACE_HEADER`.
+        let kind = unsafe { (*(ace as *const ACE_HEADER)).AceType };
+        let sid = if kind == super::ACE_ALLOWED || kind == super::ACE_DENIED {
+            // SAFETY: allow and deny ACEs share `ACCESS_ALLOWED_ACE`'s layout,
+            // whose SID begins at `SidStart` and lies within the ACE.
+            let start =
+                unsafe { std::ptr::addr_of!((*(ace as *const ACCESS_ALLOWED_ACE)).SidStart) };
+            sid_to_string(start as PSID)?
+        } else {
+            String::new()
+        };
+        aces.push(super::AceSummary { kind, sid });
+    }
+    Ok(super::DaclSummary {
+        present: true,
+        protected,
+        aces,
+    })
+}
+
+/// Refuse a directory whose stored DACL is anything but protected and
+/// owner-only ([`super::dacl_is_owner_only`] has the rule).
+pub(crate) fn verify_dacl_owner_only(handle: HANDLE) -> Result<(), String> {
+    let dacl = read_dacl(handle).map_err(|err| format!("cannot read the DACL: {err}"))?;
+    let ours =
+        current_user_sid().map_err(|err| format!("cannot read the current user's SID: {err}"))?;
+    super::dacl_is_owner_only(&dacl, &ours)
 }
 
 // ---------------------------------------------------------------------------
@@ -741,5 +910,11 @@ mod tests {
     fn the_create_mode_seam_requests_write_dac() {
         assert_eq!(OWNER_ONLY_WRITE_ACCESS & WRITE_DAC, WRITE_DAC);
         assert_eq!(OWNER_ONLY_WRITE_ACCESS & GENERIC_WRITE, GENERIC_WRITE);
+        // Issue #331: the readable variant keeps both and adds the read.
+        assert_eq!(
+            OWNER_ONLY_READ_WRITE_ACCESS & OWNER_ONLY_WRITE_ACCESS,
+            OWNER_ONLY_WRITE_ACCESS
+        );
+        assert_eq!(OWNER_ONLY_READ_WRITE_ACCESS & GENERIC_READ, GENERIC_READ);
     }
 }

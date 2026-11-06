@@ -22,47 +22,17 @@ It **never verifies a PR and never addresses feedback itself**. All of that happ
 
 ## Step 0 — Fetch, and bring the base up to date
 
-**`dispatch` has no base or branch option.** It runs `git worktree add <dir> -b agent/dispatch-<name>` **in the caller's own working directory and with no start-point** — `ctx.working_dir` in `src/dispatch.rs` feeding `create_worktree` in `src/issue_dispatch_run.rs` — and git resolves an absent start-point to **`HEAD`**. So whatever `HEAD` is at dispatch time is the base every unit in this batch inherits, and no flag anywhere overrides it.
+**Apply the [`dispatch-base`](../dispatch-base/SKILL.md) skill here, before anything is dispatched, fetch included** — this skill selects through `gh` and would otherwise never touch the remote at all. It is where the base step for every dispatch in this repo is defined: that `dispatch` cuts every unit from `HEAD` and takes no base option, the three reads, the fast-forward under its preconditions, the four ways it refuses and what to say for each, resolving it before the first dispatch and never between two, reading the `cut from <branch> at <sha>` clause after each dispatch, and reporting the base as a distance from `origin/main`. This step used to carry its own copy, and issue #1638 replaced it with this pointer so the copies could not drift.
 
 **What a stale base costs here is not the verdict — it is the instructions, which is why this step is easy to think unnecessary.** `/verify-pr`'s `setup.sh` builds its own `../<repo>-pr-<n>` checkout from a fresh `git fetch origin refs/pull/<n>/head` and refreshes `origin/<default-branch>` with an explicit refspec before computing any merge-base, so the *code under review* is current no matter what the dispatch worktree was cut from. What is never re-fetched is the worktree the unit actually sits in — the copy of `CLAUDE.md` whose gate commands it runs, and the copy of `.claude/skills/verify-pr/` it executes as its own instructions, `setup.sh`, `scan.sh` and `checks.sh` included. A stale base hands the unit last week's copy of the very skill it was dispatched to run, and nothing in its output can tell it so.
 
 That is not a theoretical churn rate on this repo. Measured over the 30 days to 2026-08-30: **24** non-merge commits touched `CLAUDE.md` and **13** touched `.claude/skills/verify-pr/`. A base a handful of commits behind is a real chance of running last week's `scan.sh` against this week's rules, and of gating a merge recommendation on a rule that has since changed.
 
-**So bring the base up to date when it is safe to.** Fetch first — this skill selects through `gh` and would otherwise never touch the remote at all — then read the state:
+**A refusal is sharper here for the same reason.** When `HEAD` is a feature branch, every unit runs the gates and the skill scripts as they stand on it, and will happily verify a PR against instructions from an unmerged branch of the runner's own.
 
-```bash
-git fetch origin --quiet
-git rev-parse --abbrev-ref HEAD                        # the branch every unit is cut from
-git status --porcelain --untracked-files=no            # ANY output means tracked changes
-git rev-list --left-right --count HEAD...origin/main   # "0  6" is 0 ahead, 6 behind
-```
+**Do not stop the queue over a refusal.** Nothing in step 1's selection depends on the checkout — it is all `gh` — so carry the refusal forward and put it in front of the runner at the same moment you ask how many to dispatch (step 2), where they are already weighing what the batch costs. The three answers `dispatch-base` lists are the runner's to choose between, not yours.
 
-**When `HEAD` is `main`, that status output is empty, and the ahead count is `0`, fast-forward it and say you did.** No prompt, no question — an up-to-date base is the default here, and the runner is told what happened rather than asked to authorise it:
-
-```bash
-git merge --ff-only origin/main
-```
-
-**The sibling skills used to refuse to move the checkout at all, and this step deliberately does not. Read why before restoring that.** The rule they carried was *the runner may have local work, and this skill has no business moving their branch*. That hazard is real and it is kept — it is precisely what the three preconditions test for. What was wrong was the scope: the rule declined every case because it distinguished none of them, and distinguishing them is three commands that cost nothing next to a fetch. Together the preconditions are the statement **there is no local work here to move** — no uncommitted tracked change, no commit that is not already on the remote, and the branch is the one the remote's is. A fast-forward under them rewrites nothing, discards nothing, creates no merge commit, and is undone exactly by `git reset --hard <the sha you printed before moving>`.
-
-**What declining costs was measured on 2026-08-30**, on the sibling PRD queue rather than here: two units were dispatched from a local `main` six commits behind `origin/main`, and one of those six was the commit that introduced the `desktop/` directory both units had been dispatched to work on. They were cut from a tree without it, could not have done anything, and were re-dispatched after a pull with not one original commit between them. **A unit cannot discover this about itself** — and a verifying unit is the worst placed of all to, because its instructions are the thing that is stale, so the check that would have caught it is the check that is out of date.
-
-**`git merge --ff-only origin/main`, never `git pull`, and the difference is not stylistic.** The fetch above already put the ref in the repository, so the merge is purely local: no second network round trip, and nothing for a `pull.rebase` setting to reinterpret into a rebase of the runner's branch. It is also the second of two independent guards — the preconditions decide and `--ff-only` enforces, so if the two ever disagree the merge fails loudly instead of writing a merge commit onto `main`.
-
-**When the base cannot be brought up to date, do not touch the checkout.** Three of the four cases below are precondition failures; the fourth is the merge itself refusing. Say which one it was, in these terms:
-
-- **Tracked changes present** — name the files. They are invisible to the units either way: a unit's copy is made from the last commit ([`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md)), so uncommitted work never reaches one. Committing or stashing is therefore the same fix in both directions, and it is the runner's to make rather than yours. **Untracked files are deliberately not a blocker** — `--untracked-files=no` is load-bearing above. A fast-forward that would clobber one fails cleanly by itself, and counting them as dirtiness would refuse on nearly every real checkout, reinstating "never update" by another route.
-- **`HEAD` is not `main`** — every unit is cut from *that* branch, so every unit runs the gates and the skill scripts as they stand on it. Name the branch and its distance from `origin/main`. This is the sharper failure of the three, because nothing about it looks wrong: a feature branch dispatches exactly as smoothly as `main` does, and a unit standing on one will happily verify a PR against instructions from an unmerged branch of the runner's own.
-- **`HEAD` is ahead of `origin/main`** — there is nothing to fast-forward *to*, and the commits that put it ahead are inherited by every unit's branch. Report the count; pushing or moving is the runner's call.
-- **The merge command itself fails despite every precondition passing** — a fast-forward that would clobber a file `origin/main` newly tracks is the concrete case. Treat that failure exactly like the three above: report the git error and do not proceed to dispatch. **Decide on the exit status, never on the output** — git prints `Updating <old>..<new>` *after* `Aborting`, so a refusal ends in a line that reads exactly like a successful fast-forward. `--ff-only` never partially applies, so the checkout is unchanged and there is nothing to undo.
-
-**Do not stop the queue over a refusal.** Nothing in step 1's selection depends on the checkout — it is all `gh` — so carry the refusal forward and put it in front of the runner at the same moment you ask how many to dispatch (step 2), where they are already weighing what the batch costs. Three answers are legitimate and all three are the runner's: dispatch anyway onto the older base, clear the blocker and dispatch after it, or defer the batch. Take their answer rather than picking one, and never clear the blocker on their behalf — committing, stashing or switching branch is precisely the local work this step refuses to touch.
-
-**Resolve it before the first dispatch, never between two.** If the runner clears the blocker, re-read `HEAD` and dispatch. Updating mid-batch splits one batch across two bases, and the units already started keep the old one.
-
-**Then report the base as a distance from `origin/main`, not as a branch name** (step 8). "cut from `main`" reads identically whether `main` is level with the remote or six commits behind it, which is exactly how the 2026-08-30 batch looked fine right up until the units did not.
-
-**If a later step in this file also checks the base, this one supersedes the deciding half of it.** Issue #674 added such a step, written when surfacing was the policy; keep what it says about `dispatch` naming the base in its own success line, since that is a record written *after* the worktree exists and step 8 quotes it, and drop its instruction to surface and ask, which is what this step replaces.
+**Then report the base as a distance from `origin/main`, not as a branch name** (step 8), as `dispatch-base` says.
 
 ## Step 1 — Select the queue
 
@@ -153,7 +123,7 @@ Print every included PR with **number, title, author, whether it is the runner's
 
 Then **ask how many to dispatch**, recommending **2–3**. Do not assume "all of them", and do not offer "all" as the recommended option.
 
-Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours.
+Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run (or its `RWX: linux` status, when `.github/ci-backend` says `rwx`) rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours. Some of that need not land here at all: `ci.yml` is `workflow_dispatch`-able, so a unit working on **its own** branch can run the full matrix on GitHub's runners ([`docs/develop/ci-on-demand.md`](../../../docs/develop/ci-on-demand.md)). It relieves no gate — CLAUDE.md rule 2's run before a commit exists — and it buys nothing at all on someone else's PR, where the run already exists and is the unit's to read rather than to restart.
 
 **The count is a security decision, not only a cost one.** N units means N concurrent agents, N independent chances for the untrusted-content problem in step 5 to land, and N simultaneous `cargo build` / `nextest` / `xtask` runs over code nobody has read yet. That is what a "just do all of them" answer is really buying.
 
@@ -312,7 +282,9 @@ Every task states the same job:
 
 **Verification is the DEFAULT.** A unit that decides to skip it must say so explicitly, and give its reason, in its final message. Silent skipping is the dangerous direction — an unverified PR reported as resolved reads exactly like a verified one — so make it visible, the same discipline as never applying a silent cap.
 
-The feedback half needs **no skill of its own**: `CLAUDE.md` already governs it end to end — rule 2's `fmt`/`clippy` gates before any commit, rule 8's requirement to respond to every finding (fix it, or say why not), thread resolution, and the stale-approval mechanics. `/verify-pr` is invoked for the verification half only, and **stays unchanged and read-only** by this skill: nothing here edits it, and the unit must not either.
+**A red the unit meets is a finding with two exits, not a retry.** CLAUDE.md rule 6 puts a red met while working on something else in scope by default, and `/verify-pr`'s Phase 5 already says so — but a unit reaches that phase only after its gates have run, and it reads the task text first. So the template carries the one sentence, keyed to this skill's push rules: the unit reports which exit each red needs (fixed in this PR, or quarantined with an owner, an expiry issue and the `#[ignore = "quarantined: <owner>, #<issue>"]` mark), and on its own PR asks for the fix or the quarantine through the pre-push gate and pushes it on a yes, since the push scope below bounds what it may push unasked — listing the red under what remains until then, so a proposal never reads as an exit taken. Reported on 2026-10-01: units `/issue-queue` dispatched met seven flaky tests between them, re-ran each until green, and only reported them.
+
+The feedback half needs **no skill of its own**: `CLAUDE.md` already governs it end to end — the gates `cargo xtask affected-checks --run` selects before any commit (rules 2 and 5), rule 8's requirement to respond to every finding (fix it, or say why not), thread resolution, and the stale-approval mechanics. `/verify-pr` is invoked for the verification half only, and **stays unchanged and read-only** by this skill: nothing here edits it, and the unit must not either.
 
 ### Check the closing references against what the PR actually does
 
@@ -361,11 +333,11 @@ Derive it from `scan.sh`'s buckets, then write prose that names the real files:
 | `DEPS` | Read the version delta and the exact-pin comments in `Cargo.toml`; a lockfile-only bump still ships transitively. |
 | `SRC` | The catch-all for `src/*` that is neither protocol nor UI — **the most ordinary code PR in this repo, and the one most likely to get a lazy note.** Name the actual modules and the actual invariant each one could break. |
 | `UI_SNAPSHOT` | An `.insta` snapshot moved. Confirm the new bytes are the intended rendering, not a regression accepted by `cargo insta accept`. |
-| `CATALOG` | `tests/CATALOG.md` changed — check the ` [reel]` markers, since rule 4 makes that opt-in the difference between a clip and a silent omission. |
-| `PRD` / `CHANGELOG` | Prose-only surfaces. Check the fragment's category (`.feature` / `.bugfix` / `.breaking`) matches what shipped, and rule 12's bump policy. |
+| `CATALOG` | `tests/CATALOG.md` changed — check the ` [reel]` markers, since CLAUDE.md rule 4 makes that opt-in the difference between a clip and a silent omission. |
+| `PRD` / `CHANGELOG` | Prose-only surfaces. Check the fragment's category (`.feature` / `.bugfix` / `.breaking`) matches what shipped, and CLAUDE.md rule 12's bump policy. |
 | `OTHER` | Nothing classified it, so nothing suggests a risk. Read the paths yourself and say what they are — never leave the note empty because the bucket was. |
 | Destructive operations (worktree/branch removal, file deletion, reaping) | Scrutinise the safety gates. Be specific about **what could be destroyed if a gate is wrong** — name the path or ref, not "data loss". |
-| `DOCS` / `DOCS_DEVELOP` | Rules 10 and 11: no hard-wrapped prose; developer docs stay under `docs/develop/` and out of `site/sidebars.js`. |
+| `DOCS` / `DOCS_DEVELOP` | CLAUDE.md rules 10 and 11: no hard-wrapped prose; developer docs stay under `docs/develop/` and out of `docs/published.toml`; a new user page has a manifest entry whose title matches its first heading. |
 
 A PR usually hits more than one row. Merge them into prose rather than pasting the table.
 
@@ -400,9 +372,12 @@ WHAT TO DO
   reason. Never skip it silently.
 - ADDRESS OUTSTANDING FEEDBACK where there is any. Read every inline comment
   (`gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate`) and respond to
-  each finding: fix it, or say why not. CLAUDE.md governs this — rule 2's fmt and
-  clippy gates before any commit, rule 8's respond-to-every-finding, thread
-  resolution, and the stale-approval mechanics. Read CLAUDE.md first and follow it.
+  each finding: fix it, or say why not. CLAUDE.md governs this — rules 2 and
+  5's gates before any commit, run with `cargo xtask affected-checks --run`
+  (the full fmt, clippy and `cargo test-fast` gates for a change with any Rust,
+  build input or unmapped path in it; the tests that read the changed files
+  for a change that is only mapped text), rule 8's respond-to-every-finding,
+  thread resolution, and the stale-approval mechanics. Read CLAUDE.md first and follow it.
 - CHECK THE CLOSING REFERENCES against what the diff actually does. For each
   `Closes #N` / `Fixes #N` this PR declares, confirm the diff genuinely finishes
   issue N. Merging closes those issues automatically, so a reference that
@@ -410,6 +385,19 @@ WHAT TO DO
   multi-part issue should say `Refs #N`, not `Closes #N`. Report any mismatch as
   a finding, naming which issues the diff finishes and which it only advances.
   Do not silently rewrite the PR body.
+- A RED YOU MEET IS NOT CLEARED BY A RETRY (CLAUDE.md rule 6). A test or check
+  that fails in this PR's CI or in your own run, whoever caused it and even if
+  it passed when retried, has two exits and only two: fixed in this PR, or
+  quarantined (a named owner, an expiry issue, and
+  `#[ignore = "quarantined: <owner>, #<issue>"]` on the test). After rule 6's
+  isolation rerun, report each one as a finding saying which exit it needs and
+  whether it has taken one. /verify-pr's Phase 5 has the mechanics. Rerunning
+  it until green and mentioning it is neither exit. On your own PR, ask the
+  user for the fix or the quarantine through the pre-push gate below and push
+  it once they say yes; until it is pushed, list the red under what remains,
+  never as resolved. Before proposing a fix for a red this PR did not cause,
+  check whether an open PR already fixes it (`gh pr list --search '<test
+  name>'`); if one does, name it and leave the red to that PR.
 - END with what remains: what you verified, what you fixed, what is still open,
   and who it is waiting on.
 
@@ -421,6 +409,36 @@ head; do not stop there and report "merge result unverified". Resolve the
 conflicts where the intent of both sides is clear, verify the resolved tree, and
 state exactly which files you resolved and what you chose. Where the intent is
 NOT clear, stop and ask the user rather than guessing.
+
+WHERE THE COMPUTE GOES. /verify-pr builds locally, and on a loaded box that is
+the expensive part of this job. The first lever needs no permission at all:
+this PR already has a CI run, so READ it rather than reproducing it, which is
+what /verify-pr already does with e2e-deterministic.
+EVERY OTHER LEVER STARTS A RUN, AND STARTING A RUN IS KEYED TO AUTHORSHIP
+EXACTLY AS PUSHING IS — a rerun and a dispatch are the same act by two names.
+  <if authored by the runner:>
+    On YOUR branch you may start runs. `gh run rerun --failed <run-id>`
+    re-runs only what broke, with no commit. And the full matrix can run on
+    GitHub's runners instead of this box: ci.yml carries a bare
+    `workflow_dispatch:`, so `gh workflow run ci.yml --ref <headRefName>`
+    dispatches it — take the run id from the URL it prints, because a listing
+    on a branch with an open PR returns the PR's run, not yours. Reach for it
+    when the box is loaded, when a change needs build-macos (build-windows is
+    `if: false` until Windows ships, so a dispatch does not run it),
+    or as a sweep after your fixes. It relieves no gate: the gates
+    `cargo xtask affected-checks --run` selects run before a commit exists, so
+    they have already passed by the time there is anything to dispatch. Never
+    as a per-edit gate either, where a 9.5-minute median round trip would
+    stand in for a warm clippy of ~9-15s.
+    It covers neither lane 2 nor anything you have not pushed.
+  <if authored by anyone else:>
+    READ-ONLY. NEVER dispatch a workflow run against <login>'s branch and
+    NEVER rerun their jobs — not the failed ones, not any of them — for the
+    same reason you never push to it: it is their branch and their pull
+    request, and starting a run on it is an act on their PR that they did not
+    ask for. Read the run their own push already produced. If it is missing or
+    stale, that is a finding for your report, not a button for you to press.
+docs/develop/ci-on-demand.md has the detail.
 
 RISK NOTE: <one to three tailored sentences, per the table above>
 
@@ -556,3 +574,15 @@ Report the base too, as a distance from `origin/main` rather than a branch name:
 Also report, plainly: every PR skipped and why — closed since listing, become someone else's homework, or already under a live unit (name that unit) — every PR excluded at step 1, and the number dispatched against the number the user asked for if they differ.
 
 **Never write anything that implies results will report back here** — no "I'll let you know when they finish", no "waiting for the verdicts", no summary table with an empty Verdict column waiting to be filled. There is no mechanism behind any of those sentences. If the user wants a consolidated view later, they ask each pane, or re-attach to it.
+
+## Step 9 — End of run: dispatch the cleanup units
+
+**A review queue run ends with the end-of-run step defined once in [`code-cleanup`](../code-cleanup/SKILL.md), section "At the end of a dispatch run"**, exactly as `/issue-queue` runs end. Follow it from this pane rather than composing cleanup tasks here; it holds when the step starts, the second pass of [`dispatch-base`](../dispatch-base/SKILL.md), the off-limits list and the frequency guard.
+
+What this queue adds to it:
+
+- **It starts once every unit of this run has finished**: the PR it worked on merged, closed or waiting for a person, and the unit stopped. Read that from the PRs and the units' tabs rather than waiting for a report in this pane (step 8). If the runner leaves before then, the step does not run in this session; say so in step 8's report.
+- **The off-limits list is the one this run's tasks carried**, if the runner gave one.
+- **Report the cleanup units** as step 8 reports the review units, the modes the frequency guard skipped included.
+
+**The runner can skip this step for a run** by saying so; say in step 8's report that no cleanup units went out.

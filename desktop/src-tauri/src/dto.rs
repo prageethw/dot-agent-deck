@@ -7,10 +7,11 @@ use dot_agent_deck::agent_pty::{
     AgentRecord, TabMembership, clamp_pty_dims, is_valid_cwd, is_valid_display_name,
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
-use dot_agent_deck::daemon_client::Endpoint;
+use dot_agent_deck::authoring_seeds::AuthoringKind;
+use dot_agent_deck::daemon_client::{Endpoint, Incarnation};
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
-    AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, SendResult, Writable,
+    AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, Writable,
 };
 use dot_agent_deck::state::SessionStatus;
 use serde::{Deserialize, Serialize};
@@ -131,6 +132,130 @@ pub struct DesktopSnapshot {
     /// question, and an answer from here would be one the crate would have to
     /// keep in step with a stream it does not observe.
     pub observed: Vec<ObservedDeckDto>,
+    /// The applied selection is **All Decks** (#1083).
+    ///
+    /// Under All Decks the selected deck's snapshot is the local deck's, only
+    /// because the watcher and the tunnels need an endpoint. The webview's
+    /// single-deck screens read this to show "Select a deck" instead of that
+    /// content. It is on the snapshot rather than left to the webview's settings
+    /// read because it then arrives WITH the content it qualifies: a start with
+    /// All Decks stored cannot render local tiles while that read is in flight.
+    /// A property of the applied document, like [`Self::fleet`], so every
+    /// deck's snapshot carries the same value.
+    pub all_decks: bool,
+    /// PRD #1258 M4: this deck's host — disk per watched role, load per core,
+    /// memory and the sample's age — as its daemon reports it through
+    /// [`dot_agent_deck::daemon_client::DaemonClient::host_metrics`]. The
+    /// desktop measures nothing itself: for a remote deck these are the remote
+    /// machine's numbers.
+    ///
+    /// Absent when nothing was asked (a deck that is not connected) or the
+    /// request failed; the webview then keeps the last answer it had for a
+    /// connected deck. A daemon that does not report host metrics is
+    /// [`HostMetricsReportDto::NotAvailable`], never absent and never zeros.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_metrics: Option<HostMetricsReportDto>,
+}
+
+/// PRD #1258 M4: a deck's host sample as the webview reads it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum HostMetricsReportDto {
+    /// The daemon does not advertise `host-metrics` (an older build, or one on
+    /// a platform it cannot sample), so it was never asked.
+    NotAvailable,
+    Available {
+        metrics: HostMetricsDto,
+    },
+}
+
+/// PRD #1258 M4: the camelCase form of
+/// [`dot_agent_deck::daemon_protocol::HostMetrics`]. Every reading the daemon
+/// could not take is absent here too, so the webview shows `unknown` rather
+/// than a zero.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostMetricsDto {
+    pub disks: Vec<DiskUsageDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_per_cpu: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    /// PRD #1258: the daemon's level for the load and for available memory,
+    /// passed through as it judged them; absent from a daemon that predates
+    /// levels, which the webview shows uncoloured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
+    pub sampled_at_ms: u64,
+    /// How old the sample is as this snapshot leaves the bridge: the age the
+    /// daemon reported plus the time the bridge has held the answer since.
+    pub sample_age_ms: u64,
+}
+
+/// PRD #1258 M4: one watched role's filesystem, named by role, never by path.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskUsageDto {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// PRD #1258: the daemon's level for this filesystem's free space.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<dot_agent_deck::daemon_protocol::HealthLevel>,
+}
+
+impl HostMetricsReportDto {
+    /// Map the daemon's answer, adding `held` — how long the bridge has kept
+    /// it — to the sample's age so a cached answer does not claim to be as
+    /// fresh as when it arrived.
+    pub(crate) fn from_report(
+        report: &dot_agent_deck::daemon_client::HostMetricsReport,
+        held: std::time::Duration,
+    ) -> Self {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        match report {
+            HostMetricsReport::NotAvailable => Self::NotAvailable,
+            HostMetricsReport::Available(metrics) => Self::Available {
+                metrics: HostMetricsDto {
+                    // `DaemonClient::host_metrics` already refuses a reply
+                    // over these bounds; bounding again here keeps the
+                    // webview's work bounded for any report (audit A2).
+                    disks: metrics
+                        .disks
+                        .iter()
+                        .take(dot_agent_deck::daemon_protocol::MAX_DISK_ROLES)
+                        .map(|disk| DiskUsageDto {
+                            role: dot_agent_deck::submitted_prompt::truncate_on_char_boundary(
+                                &disk.role,
+                                dot_agent_deck::daemon_protocol::MAX_ROLE_BYTES,
+                            ),
+                            free_bytes: disk.free_bytes,
+                            total_bytes: disk.total_bytes,
+                            level: disk.level,
+                        })
+                        .collect(),
+                    load_per_cpu: metrics.load_per_cpu.filter(|load| load.is_finite()),
+                    cpu_count: metrics.cpu_count,
+                    memory_used_bytes: metrics.memory_used_bytes,
+                    memory_available_bytes: metrics.memory_available_bytes,
+                    load_level: metrics.load_level,
+                    memory_level: metrics.memory_level,
+                    sampled_at_ms: metrics.sampled_at_ms,
+                    sample_age_ms: metrics
+                        .sample_age_ms
+                        .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX)),
+                },
+            },
+        }
+    }
 }
 
 /// One deck the app connects to, named without having been heard from (PRD
@@ -152,6 +277,13 @@ pub struct ObservedDeckDto {
     /// than of the handshake. It decides whether the group is called "Local
     /// deck" or called by its address.
     pub deck_kind: &'static str,
+    /// A remote deck's name in the shared deck list — what `dot-agent-deck
+    /// connect <name>` takes (issue #1426). Absent for the local deck and for
+    /// a remote deck whose stored name is not a valid deck name, which is
+    /// then named by [`Self::label`]. A validated slug
+    /// ([`dot_agent_deck::deck_list::DeckName`]), so it needs no scrubbing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// One configured-but-unaddressed deck, as the fleet view renders it.
@@ -168,6 +300,10 @@ pub struct UnconfiguredDeckDto {
     /// [`crate::settings::SelectionFallback::NoRemoteSocket`], which says the
     /// same thing in the selector's.
     pub reason: String,
+    /// The row's name in the shared deck list, as [`ObservedDeckDto::name`]
+    /// carries a connectable deck's (issue #1426).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -210,6 +346,12 @@ pub struct DesktopConnection {
     pub deck_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The technical half of [`Self::error`] for an incompatible daemon: the
+    /// declared breaks by name, the protocol number on each side, the two
+    /// builds. The webview shows it behind a Technical details disclosure and
+    /// never in the sentence, which says only what a user can act on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
     pub client_protocol_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_protocol_version: Option<u32>,
@@ -220,9 +362,17 @@ pub struct DesktopConnection {
     pub daemon_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_agent_count: Option<usize>,
-    /// True when the ONLY thing that failed the handshake is the git-describe
-    /// build stamp — the protocol version agreed on both sides — so the webview
-    /// may offer Connect anyway (issue #801).
+    /// True when the protocol version agreed on both sides and a **declared
+    /// contract break** is what failed the handshake, so the webview may offer
+    /// Connect anyway (issue #801).
+    ///
+    /// **Named for what used to set it**, which was a git-describe build-stamp
+    /// difference the two builds' release digits did not excuse. Since #801 a
+    /// stamp difference sets this — and refuses — never: the classification is
+    /// over `daemon_protocol::CONTRACT_BREAKS`, which lives in the contract's own
+    /// source rather than in a tag. The name is kept because it is the key the
+    /// webview switches Connect anyway on, and renaming it across the bridge
+    /// would buy nothing this doc comment does not.
     ///
     /// Always emitted, including as `false`, because the webview branches on it
     /// to decide whether an override exists: an absent field and an incompatible
@@ -260,7 +410,7 @@ pub struct DesktopConnection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_fallback: Option<String>,
     /// Why the project-aware surfaces — choosing a project, preparing and
-    /// launching a workflow — are unavailable against this daemon (PRD #741 M8).
+    /// activating an orchestration — are unavailable against this daemon (PRD #741 M8).
     ///
     /// **The field that replaces the build stamp as the thing a screen acts
     /// on.** It is derived from what the daemon ADVERTISED in its `Hello` reply,
@@ -277,6 +427,156 @@ pub struct DesktopConnection {
     /// "no sentence" is exactly what absence should mean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_actions_reason: Option<String>,
+    /// Why the New agent flow cannot start anything on this deck (PRD #1223):
+    /// the deck does not advertise `list-directories`, and browsing is the
+    /// only way the flow chooses a directory. `None` means it can; omitted from
+    /// the wire when `None`, for [`Self::project_actions_reason`]'s reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_agent_reason: Option<String>,
+    /// Whether the deck honours the New agent directory browser's listing
+    /// options (issue #1240): it advertises `list-directories-options`, so the
+    /// browser offers Show hidden, lists symlinked directories and sends its
+    /// filter to the deck when the deck's own cap cut a listing short. Always on
+    /// the wire, like [`Self::build_stamp_mismatch_only`]: the dialog branches
+    /// on it to decide whether a control EXISTS.
+    pub listing_options: bool,
+    /// Whether to offer **Upgrade** for this deck (PRD #1487 D8), from
+    /// `daemon_upgrade::upgrade_offer` over the handshake's daemon version —
+    /// the one place the newer-only rule lives, so the webview never compares
+    /// versions itself. `offered` only when the daemon's release is older than
+    /// this app's; `unknown` when nothing answered or the version is unreadable.
+    pub upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer,
+    /// Why this deck is not connected, and the one control to offer for it
+    /// (issue #1490): **Start daemon** when no daemon is running there,
+    /// **Reconnect** when one is or when the app cannot tell. Decided by
+    /// `dot_agent_deck::daemon_start`; the webview only presents it.
+    ///
+    /// Present on every snapshot whose `status` is `disconnected` that the
+    /// live bridge builds, and absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnected_reason: Option<DisconnectedReasonDto>,
+    /// Issue #1637: agents whose hooks on this deck run an older
+    /// `dot-agent-deck` (or, issue #1157, a deck that could not install hooks),
+    /// from the daemon's `Hello` reply. Each carries the daemon's own remedy, so
+    /// this app and the TUI show the same words. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hook_binary_notices: Vec<HookBinaryNoticeDto>,
+    /// PRD #1666 part 2 (G-fix7c): on a connected snapshot, the daemon process
+    /// whose `ListAgents` reply its agents are — the same value each
+    /// [`DesktopAgent::incarnation`] carries, stated once for the deck so that
+    /// a restarted deck listing no agents still names its process. The webview
+    /// compares it with the one it last saw for the deck: another process is a
+    /// deck restart, and the agents listed before it are named in one notice.
+    /// Absent when the deck named none, and on a snapshot that is not
+    /// connected.
+    #[serde(skip_serializing_if = "Incarnation::is_unnamed")]
+    pub incarnation: Incarnation,
+}
+
+/// One hook-binary notice as the webview reads it (issue #1637). Every string
+/// is sanitized: a remote deck's daemon composed them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookBinaryNoticeDto {
+    pub binary: String,
+    pub agents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub daemon_version: String,
+    pub reason: dot_agent_deck::daemon_protocol::HookBinaryReason,
+    pub remedy: String,
+    /// The command the Copy button copies, exactly as shown. Dropped, not
+    /// cleaned, when it carries anything a display would hide or alter (a
+    /// control, bidi or line-separator character), so what is copied is
+    /// always what is displayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// Whether `command` can be shown and copied verbatim.
+fn is_copyable_command(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES
+        && !command.chars().any(|c| {
+            c.is_control()
+                || dot_agent_deck::untrusted_text::is_bidi_format_char(c)
+                || matches!(c, '\u{2028}' | '\u{2029}')
+        })
+}
+
+impl HookBinaryNoticeDto {
+    pub(crate) fn new(notice: &dot_agent_deck::daemon_protocol::HookBinaryNotice) -> Self {
+        let command = notice
+            .command
+            .as_deref()
+            .filter(|command| is_copyable_command(command))
+            .map(str::to_string);
+        let mut remedy = safe_display_text(&notice.remedy);
+        // A `Run:` whose command is dropped would end the strip with nothing
+        // to run, so it reads as the daemon's no-command advice instead.
+        if command.is_none() && remedy == dot_agent_deck::daemon_protocol::REMEDY_RUN {
+            remedy = dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL.to_string();
+        }
+        Self {
+            binary: safe_message(notice.binary.clone()),
+            agents: notice
+                .agents
+                .iter()
+                .map(|agent| safe_message(agent.clone()))
+                .collect(),
+            version: notice.version.clone().map(safe_message),
+            daemon_version: safe_message(notice.daemon_version.clone()),
+            reason: notice.reason,
+            remedy,
+            command,
+        }
+    }
+}
+
+/// [`DesktopConnection::disconnected_reason`] on the wire.
+///
+/// `kind` is the state (`not-running`, `running-not-connected`, `unknown`),
+/// `action` the control it earns (`start-daemon` or `reconnect`), `message`
+/// the sentence to show, `detail` the technical half for a disclosure, and
+/// `host` the machine the daemon runs on, as the confirm dialog names it
+/// ("this machine", or `user@host[:port]`). `failure` names the problem when
+/// `kind` is `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectedReasonDto {
+    pub kind: &'static str,
+    pub action: dot_agent_deck::daemon_start::DisconnectedAction,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<dot_agent_deck::daemon_start::StartFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub host: String,
+}
+
+impl DisconnectedReasonDto {
+    /// The DTO for `reason` on `endpoint`'s deck. Every string is sanitized:
+    /// the detail can quote what a remote printed.
+    pub(crate) fn new(
+        endpoint: &Endpoint,
+        reason: &dot_agent_deck::daemon_start::DisconnectedReason,
+    ) -> Self {
+        use dot_agent_deck::daemon_start::DisconnectedReason;
+        let host = dot_agent_deck::daemon_start::host_label(endpoint);
+        let (kind, failure) = match reason {
+            DisconnectedReason::NotRunning => ("not-running", None),
+            DisconnectedReason::RunningNotConnected => ("running-not-connected", None),
+            DisconnectedReason::Unknown(problem) => ("unknown", Some(problem.failure)),
+        };
+        Self {
+            kind,
+            action: reason.action(),
+            message: safe_message(reason.summary(&host)),
+            failure,
+            detail: reason.detail().map(safe_message),
+            host: safe_message(host),
+        }
+    }
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
@@ -313,7 +613,7 @@ pub(crate) fn selection_fields(
         Endpoint::Remote(_) => "remote",
     };
     let local_only = endpoint
-        .require_local("Stop deck")
+        .require_local("Stop daemon")
         .err()
         .map(|error| safe_display_text(error.to_string()));
     (kind, local_only, selected_deck().fallback)
@@ -434,7 +734,407 @@ pub struct DesktopAgent {
     /// comparison is actually made against is the webview.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawned_at_ms: Option<i64>,
+    /// Issue #714: why the agent is `blocked` — present only beside
+    /// `status: "blocked"`, copied from `SessionSnapshot.blocked`. Absent from an
+    /// older daemon, which never reports the status either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<DesktopBlocked>,
+    /// Issue #1678: the background work the agent left running after its turn
+    /// ended — commands and subagents still going, and since when — copied
+    /// from `SessionSnapshot.background`. The daemon computes it; nothing here
+    /// derives it from events or recounts it.
+    ///
+    /// Absent when there is nothing to show (no count above zero), when the
+    /// record carries no live snapshot, and from a daemon predating the field.
+    /// `since_ms` is NOT clamped here, for the reason `last_activity_ms` gives:
+    /// the webview owns the clock the comparison is made against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<DesktopBackground>,
+    /// PRD #1541: the keys that interrupt this agent's turn and edit its
+    /// prompt, **as the daemon served them** (`AgentRecord::prompt_keys`) —
+    /// copied through, bounded by [`map_prompt_keys`], and never resolved from
+    /// this crate's own registry, for the reason `cli_name` gives (issue #856).
+    ///
+    /// Absent when the daemon has no measured keys for the agent (Devin, an
+    /// unrecognised type), when it predates the field, or when what it sent
+    /// fails [`map_prompt_keys`]'s bounds. The voice surface refuses the
+    /// command with a reason in every one of those cases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_keys: Option<DesktopPromptKeys>,
+    /// Issue #1496: the authoring kind this agent was started as —
+    /// `dispatcher`, `schedule` or `schedule-issues` — **as the daemon recorded
+    /// it** (`AgentRecord::authoring_kind`), whichever client started it. The
+    /// dashboard's kind filter reads it: an authoring agent is otherwise an
+    /// ordinary dashboard pane, with nothing in `tab` to tell it apart.
+    ///
+    /// Absent for every other agent and from a daemon predating the field,
+    /// whose authoring agents the webview then shows as single agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoring_kind: Option<AuthoringKind>,
+    /// PRD #1666 §2.8: the daemon's summary of this agent's inbox
+    /// (`AgentRecord::inbox`), which the tile's `✉N` / `delivered` line is
+    /// drawn from. Absent from a daemon predating it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<DesktopInbox>,
+    /// PRD #1666 §2.8: the deck's notice explaining an `error` status — a
+    /// message it could not deliver — from the daemon's session record
+    /// (`SessionSnapshot::delivery_notice`). Present only beside
+    /// `status: "error"`, and scrubbed here like every other daemon text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_notice: Option<String>,
+    /// PRD #1631: the question this agent is waiting on
+    /// (`SessionSnapshot.pending_question`), every text field made safe to
+    /// show, with whether each option can be answered by voice. Absent when
+    /// the agent waits on nothing, and from a daemon that predates the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<DesktopPendingQuestion>,
+    /// PRD #1401: the pull request this agent's work produced, copied through
+    /// from `SessionSnapshot.pull_request`. Its fields are single words and its
+    /// enum values snake_case, so the core type is the webview's shape as is.
+    /// Absent when the record carries no `live` snapshot, the daemon knows of
+    /// no PR, or the daemon predates the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
     pub tab: DesktopTab,
+    /// PRD #1666 part 2 (G-fix4): the daemon process this row was listed by,
+    /// which the webview sends back with every action on the agent
+    /// (`StopAgent`, `StopOrchestration`, `RenameAgent`, an inbox action, a
+    /// voice answer, opening its terminal). The action is then sent only to that process: after a
+    /// restart, a successor that numbered an unrelated agent with this id is
+    /// sent nothing, and the action fails with
+    /// [`dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART`]. Absent
+    /// from a daemon that names no process, and then every action on the agent
+    /// is refused, an action sent without one included (G-fix5): such a
+    /// daemon cannot be told from its successor.
+    #[serde(skip_serializing_if = "Incarnation::is_unnamed")]
+    pub incarnation: Incarnation,
+}
+
+/// PRD #1666 §2.8: the webview's view of an `InboxSummary`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopInbox {
+    pub queued: usize,
+    pub fetched: usize,
+    pub undeliverable: usize,
+    /// When the agent last acknowledged a message, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_acked_at: Option<String>,
+    /// `native`, `turn_end`, `doorbell` or `none` — the daemon's wire value.
+    pub wake: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// PR #1735 fifth review (R5): nothing has woken the agent for its waiting
+    /// messages, so the tile shows them as waiting to wake.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub wake_stalled: bool,
+    /// PRD #1666 §6.5: the deck messages waiting on the user's Retry or
+    /// Cancel. Sender and subject are display copies.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<DesktopInboxAttention>,
+    /// PRD #1666 §11: `cli_too_old`, `adapter_too_old`, `not_armed`,
+    /// `refresh_failed`, `refresh_failed_pi` or `hooks_too_old`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
+    /// PRD #1666 part 2 §2.7: the command that fixes `integration`, a display
+    /// copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_command: Option<String>,
+    /// PRD #1666 §3: the deck's error recording receipts, a display copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipts_degraded: Option<String>,
+    /// PRD #1666 §7: delivered messages whose evidence pauses hand-outs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_paused: Option<usize>,
+    /// PRD #1666 part 3 (R-2): the refusal code the deck gave the agent's own
+    /// request for its messages, while messages wait for it
+    /// (`inbox_peer_unidentified`, …), a display copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_refused: Option<String>,
+    /// PRD #2050: the daemon's notice about a way the agent runs that the
+    /// deck cannot fully support (OpenCode 2 on its shared service, a silent
+    /// plugin, an OpenCode too old), as the sentence both clients show
+    /// (`dot_agent_deck::agent_notice::AgentNotice::display_text`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_notice: Option<String>,
+}
+
+/// PRD #1666 §6.4: one deck message a tile lists with its own Retry and
+/// Cancel.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopInboxAttention {
+    pub message_id: String,
+    pub revision: u64,
+    /// `uncertain`, `out_of_attempts`, `held_long` or `not_started`.
+    pub kind: String,
+    pub from_label: String,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
+/// PRD #1541: the webview's view of `agent_registry::PromptKeys` — the keys
+/// voice control presses to interrupt a turn, clear the prompt and delete what
+/// it typed. Field meanings are the daemon's; see `PromptKeys` there.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPromptKeys {
+    /// Write each step's bytes in order, pausing `pause_after_ms` after each.
+    pub interrupt: Vec<DesktopKeyStep>,
+    pub clear: DesktopClearKey,
+    pub delete_char: DesktopDeleteCharKey,
+}
+
+/// PRD #1541: one write of an interrupt sequence.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopKeyStep {
+    pub bytes: String,
+    pub pause_after_ms: u32,
+}
+
+/// PRD #1541: the key that clears the prompt and how many presses it needs.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopClearKey {
+    pub bytes: String,
+    /// `per_wrapped_row` or `per_line` — the daemon's wire value. A rule this
+    /// build does not know never reaches the webview: [`map_prompt_keys`]
+    /// drops the whole set instead.
+    pub presses: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_presses_per_write: Option<u32>,
+    /// How long to wait between two writes of one clear, when it takes more
+    /// than one; absent where back-to-back writes work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_between_writes_ms: Option<u32>,
+}
+
+/// PRD #1541: the key that deletes one character, and the longest write the
+/// agent keeps as typed text.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopDeleteCharKey {
+    pub bytes: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_literal_write_chars: Option<u32>,
+}
+
+/// PRD #1631: the webview's view of the daemon's
+/// [`dot_agent_deck::question::PendingQuestion`].
+///
+/// **Every text field is untrusted agent or model output**
+/// (`docs/develop/voice-first-design.md` §6): the daemon caps and strips it on
+/// arrival, and it goes through [`safe_display_text`] again here, because this
+/// is the seam every desktop reader takes it from — the panel, and the voice
+/// model's data turn. It is shown verbatim and never interpreted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPendingQuestion {
+    /// The daemon's id for the question — what an answer names, and what the
+    /// voice panel's staleness check compares.
+    pub id: String,
+    /// `permission`, `choice`, `plan`, `confirm` or `unknown`.
+    pub kind: String,
+    /// `held`, `keys`, `unsupported` or `unknown` — how the deck would answer.
+    pub channel: String,
+    pub questions: Vec<DesktopQuestion>,
+    /// What a permission or plan prompt is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<DesktopQuestionTool>,
+    /// Whether the deck can answer this question at all: its channel is one
+    /// the deck can use and at least one option is answerable.
+    pub answerable: bool,
+    /// The daemon's revision of the question (audit A4): which registration
+    /// of it an answer is bound to. The webview echoes it with the answer, so
+    /// a question replaced under the same id since it was read is refused
+    /// rather than answered with a choice made for the old one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+}
+
+/// The tool a [`DesktopPendingQuestion`] asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestionTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One question of a [`DesktopPendingQuestion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestion {
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub multi_select: bool,
+    pub options: Vec<DesktopQuestionOption>,
+}
+
+/// One option of a [`DesktopQuestion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestionOption {
+    /// 1-based, the number the agent shows beside it.
+    pub index: u32,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `allow_once`, `allow_always`, `deny`, `choice`, `free_text` or `unknown`.
+    pub role: String,
+    /// Whether the deck can send this option: not keyboard-only, a role this
+    /// build knows, and a question channel the deck can use.
+    pub answerable: bool,
+    /// For `allow_always`: what "always" covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// PR #1698: set when the number the agent draws beside this option is
+    /// not certain — every number it may be, lowest first — because the agent
+    /// may leave out an option before it, or this one. Such an option is
+    /// named by its label, never chosen by a number said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_numbers: Option<Vec<u32>>,
+}
+
+impl DesktopQuestionOption {
+    /// Whether the agent draws `index` beside this option whatever it leaves
+    /// out.
+    pub fn number_certain(&self) -> bool {
+        self.screen_numbers.is_none()
+    }
+}
+
+impl DesktopPendingQuestion {
+    /// The question `question_index` names, if there is one.
+    pub fn question(&self, question_index: u32) -> Option<&DesktopQuestion> {
+        self.questions.get(question_index as usize)
+    }
+}
+
+impl DesktopQuestion {
+    /// The option whose shown number is `index`, if there is one.
+    pub fn option(&self, index: u32) -> Option<&DesktopQuestionOption> {
+        self.options.iter().find(|option| option.index == index)
+    }
+}
+
+/// PRD #1631: [`DesktopPendingQuestion`] from the daemon's question.
+pub(crate) fn map_pending_question(
+    question: &dot_agent_deck::question::PendingQuestion,
+) -> DesktopPendingQuestion {
+    use dot_agent_deck::question::{AnswerChannel, OptionRole, QuestionKind};
+    let channel_answers = matches!(question.channel, AnswerChannel::Held | AnswerChannel::Keys);
+    let questions: Vec<DesktopQuestion> = question
+        .questions
+        .iter()
+        .map(|q| DesktopQuestion {
+            prompt: safe_display_text(&q.prompt),
+            header: q
+                .header
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|header| !header.is_empty()),
+            multi_select: q.multi_select,
+            options: q
+                .options
+                .iter()
+                .map(|option| DesktopQuestionOption {
+                    index: option.index,
+                    label: safe_display_text(&option.label),
+                    description: option
+                        .description
+                        .as_deref()
+                        .map(safe_display_text)
+                        .filter(|description| !description.is_empty()),
+                    role: match option.role {
+                        OptionRole::AllowOnce => "allow_once",
+                        OptionRole::AllowAlways => "allow_always",
+                        OptionRole::Deny => "deny",
+                        OptionRole::Choice => "choice",
+                        OptionRole::FreeText => "free_text",
+                        OptionRole::Unknown => "unknown",
+                    }
+                    .to_string(),
+                    answerable: channel_answers && option.answerable(),
+                    scope: option
+                        .scope
+                        .as_deref()
+                        .map(safe_display_text)
+                        .filter(|scope| !scope.is_empty()),
+                    screen_numbers: (!q.number_certain(option)).then(|| q.screen_numbers(option)),
+                })
+                .collect(),
+        })
+        .collect();
+    let answerable = questions
+        .iter()
+        .any(|q| q.options.iter().any(|option| option.answerable));
+    DesktopPendingQuestion {
+        id: question.id.clone(),
+        kind: match question.kind {
+            QuestionKind::Permission => "permission",
+            QuestionKind::Choice => "choice",
+            QuestionKind::Plan => "plan",
+            QuestionKind::Confirm => "confirm",
+            QuestionKind::Unknown => "unknown",
+        }
+        .to_string(),
+        channel: match question.channel {
+            AnswerChannel::Held => "held",
+            AnswerChannel::Keys => "keys",
+            AnswerChannel::Unsupported => "unsupported",
+            AnswerChannel::Unknown => "unknown",
+        }
+        .to_string(),
+        questions,
+        tool: question.tool.as_ref().map(|tool| DesktopQuestionTool {
+            name: safe_display_text(&tool.name),
+            detail: tool
+                .detail
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|detail| !detail.is_empty()),
+        }),
+        answerable,
+        revision: question.revision,
+    }
+}
+
+/// Issue #1678: the webview's view of a `BackgroundWork`. The background
+/// aggregate carries counts and an instant, not subagent ids or command lines.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopBackground {
+    /// Commands still running in their own session below the agent.
+    pub commands: u32,
+    /// Subagents started and not yet stopped.
+    pub subagents: u32,
+    /// When the oldest counted item started, epoch milliseconds on the
+    /// daemon's clock; absent when the daemon has no start for any of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+}
+
+/// Issue #714: the webview's view of a `BlockedReason`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopBlocked {
+    /// `usage_limit`, `credits_depleted` or `unknown` — the daemon's wire value.
+    pub kind: &'static str,
+    /// When the agent reported the block, epoch milliseconds.
+    pub detected_at_ms: i64,
+    /// The agent's own error message. Agent-controlled text, so scrubbed of
+    /// control and bidi characters at this seam ([`safe_display_text`]) before
+    /// the webview sees it, and rendered through `displayText` there as well.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the provider said the limit resets, epoch milliseconds — absent
+    /// when it did not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -495,17 +1195,75 @@ pub enum DesktopAction {
         #[serde(default)]
         start_if_missing: bool,
     },
+    /// Start one plain agent on the deck `deck_id` names (PRD #1223 M3).
     StartAgent {
+        /// The target deck's wire id — `connection.deckId`, the value
+        /// [`DeckScope::resolve`] accepts — and **required**, which is the
+        /// point. This arm used to read the applied selection through
+        /// `trusted_daemon()`, and under **All Decks** that resolves to the
+        /// local deck (#1083): the overview, the one screen that shows every
+        /// deck at once, would have started the agent on whichever deck
+        /// happened to be selected. A start with no deck is now refused at
+        /// decode rather than defaulted, so there is no selection-reading path
+        /// left to fall back to.
+        deck_id: String,
         command: Option<String>,
         cwd: Option<String>,
         display_name: Option<String>,
         rows: Option<u16>,
         cols: Option<u16>,
+        /// PRD #1223 M7: start an AUTHORING agent — the TUI's `schedule`,
+        /// `schedule: issues` or `dispatcher` option — whose seed the deck
+        /// composes and delivers once the agent is ready. Absent is a plain
+        /// agent, byte for byte what this action sent before.
+        ///
+        /// The crate's own closed enum rather than a string, so a kind this
+        /// build does not know fails the decode instead of reaching a deck as a
+        /// plain start with no seed — the failure the deck's capability gate
+        /// exists to prevent, one hop earlier.
+        #[serde(default)]
+        authoring_kind: Option<AuthoringKind>,
     },
-    StartWorkflow {
+    /// Start one of a project's orchestrations on the deck `deck_id` names,
+    /// the way the TUI's `Ctrl+n` does (PRD #1223 M6): no task prompt, the
+    /// form's Name as the run's title, and every role run with the command its
+    /// project config gives it — on the deck, which reads the config there.
+    ///
+    /// Not [`Self::ActivateOrchestration`], which is the Runs screen's launch and keeps
+    /// its own form rules (desktop profile commands, no Pi coordinator). The
+    /// two share the daemon verbs and the bridge's rollback
+    /// and coordinator-delivery machinery, and none of those form rules.
+    StartOrchestration {
+        /// The target deck's wire id, required for [`Self::StartAgent`]'s
+        /// reason.
+        deck_id: String,
+        /// The daemon-canonical project path the dialog's `ResolveProject`
+        /// answered with, **verbatim**.
+        path: String,
+        /// The orchestration name as that reply offered it, verbatim.
+        orchestration: String,
+        /// The run's title — the form's Name. Absent when the Name is empty,
+        /// which is the TUI's rule: the tab then takes the orchestration's name.
+        #[serde(default)]
+        display_title: Option<String>,
+        /// The `configRevision` the dialog resolved against, echoed to
+        /// `prepare-orchestration` as the Runs launch echoes it.
+        #[serde(default)]
+        config_revision: Option<String>,
+        rows: Option<u16>,
+        cols: Option<u16>,
+    },
+    ActivateOrchestration {
         /// The orchestration name, as offered by the daemon's
         /// `resolve-project` reply for `cwd`.
         name: String,
+        /// The run's title — the form's Name (issue #1044). Absent when the
+        /// Name is empty, which is the TUI's rule and
+        /// [`Self::StartOrchestration`]'s: the tab then takes the
+        /// orchestration's name. `#[serde(default)]`, so a webview built before
+        /// the field existed still launches, untitled.
+        #[serde(default)]
+        display_title: Option<String>,
         /// The daemon-**canonical** project path, exactly as
         /// `resolve-project` or `list-projects` spelled it. PRD #819 M6: the
         /// webview never derives this from its own environment and never
@@ -513,56 +1271,219 @@ pub enum DesktopAction {
         /// basename and an empty orchestration name is derived from that
         /// basename (PRD #220).
         cwd: String,
+        /// The coordinator's task, which may be empty (issue #1044): the
+        /// daemon then composes the context without a task section and the
+        /// coordinator waits for the user's instructions, as under the TUI.
         task_prompt: String,
-        roles: Vec<WorkflowRoleInput>,
+        roles: Vec<OrchestrationRoleInput>,
         rows: Option<u16>,
         cols: Option<u16>,
         /// The `configRevision` the webview last resolved against, echoed
-        /// through to `prepare-workflow`. `#[serde(default)]` and absent means
+        /// through to `prepare-orchestration`. `#[serde(default)]` and absent means
         /// "no expectation": a launch assembled without a resolve still works,
         /// it just does not get the staleness check.
         #[serde(default)]
         config_revision: Option<String>,
     },
     StopAgent {
+        /// The deck the agent runs on — `connection.deckId`, resolved with
+        /// [`DeckScope::resolve`] exactly as the start actions resolve theirs
+        /// (PRD #1223 U4). This arm read the applied selection until then, so
+        /// under **All Decks**, which resolves to the local deck (#1083), an
+        /// agent started on another deck from the overview could not be
+        /// stopped without switching the selection first. Required, for
+        /// [`Self::StartAgent`]'s reason: a stop with no deck is refused at
+        /// decode rather than defaulted.
+        deck_id: String,
         agent_id: String,
+        /// PRD #1666 part 2 (G-fix4): the row's
+        /// [`DesktopAgent::incarnation`], which the stop is bound to.
+        #[serde(default)]
+        incarnation: Incarnation,
+    },
+    /// PRD #1223 U4 — close a whole orchestration: stop every role the
+    /// webview's fleet entry lists for it, on the deck `deck_id` names,
+    /// concurrently. The TUI's Ctrl+W does the same over its tab's panes
+    /// (`close_panes_concurrently`); there is no orchestration-wide daemon
+    /// verb, and this adds none — it is `StopAgent` fanned out.
+    StopOrchestration {
+        deck_id: String,
+        roles: Vec<StopOrchestrationRole>,
     },
     StopDaemon {
         #[serde(default)]
         force: bool,
     },
-    RestartDaemon,
     /// Relax the build-stamp comparison for the rest of this app session and
-    /// hand back a freshly classified snapshot (issue #801). Carries no
-    /// payload: it is an assertion by the user, not a parameter, and it can
-    /// only ever relax the stamp check — the protocol check runs first and is
-    /// never bypassed.
-    AllowBuildMismatch,
+    /// hand back a freshly classified snapshot (issue #801). The allowance
+    /// itself is an assertion by the user, not a parameter, and it can only
+    /// ever relax the stamp check — the protocol check runs first and is never
+    /// bypassed.
+    AllowBuildMismatch {
+        /// The deck whose refusal the user pressed Connect anyway on (issue
+        /// #1472), resolved with [`DeckScope::resolve`]. The allowance is
+        /// app-wide either way; what this names is the deck the action
+        /// CONNECTS and reports on, so a refusal on a deck other than the
+        /// selected one is answered for that deck. Absent means the selected
+        /// deck, which is what every caller sent before.
+        #[serde(default)]
+        deck_id: Option<String>,
+    },
     RenameAgent {
         agent_id: String,
         #[serde(alias = "name")]
         display_name: String,
+        /// PRD #1666 part 2 (G-fix4): the row's
+        /// [`DesktopAgent::incarnation`]. Both the listing that reads the
+        /// agent's cwd and the relabel are bound to it.
+        #[serde(default)]
+        incarnation: Incarnation,
     },
     AttachTerminal {
         agent_id: String,
         on_output: JavaScriptChannelId,
+        /// PRD #1666 part 2 (G-fix5): the row's
+        /// [`DesktopAgent::incarnation`], which the attach is bound to. A
+        /// caller that sends none names no process, and is refused.
+        #[serde(default)]
+        incarnation: Incarnation,
     },
     DetachTerminal {
         session_id: String,
     },
-    SubmitText {
-        agent_id: String,
-        text: String,
-    },
+}
+
+/// One role a [`DesktopAction::StopOrchestration`] stops: the deck's agent id,
+/// and the name the confirmation showed — which is what a role whose stop could
+/// not be confirmed is reported as. The name is display text only; nothing is
+/// resolved by it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopOrchestrationRole {
+    pub agent_id: String,
+    pub name: String,
+    /// PRD #1666 part 2 (G-fix4): the row's [`DesktopAgent::incarnation`],
+    /// which this role's stop is bound to.
+    #[serde(default)]
+    pub incarnation: Incarnation,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkflowRoleInput {
+pub struct OrchestrationRoleInput {
     pub role: String,
     pub command: String,
     #[serde(default)]
     pub start: bool,
+}
+
+/// What `desktop_run_action` rejects with (PRD #1223 audit F6).
+///
+/// **A bare string for every failure but one**, exactly as before this type
+/// existed — `#[serde(untagged)]` serialises [`Self::Message`] as the string
+/// itself, so every existing `catch` on the webview side reads the same value it
+/// always read. The one exception is a launch whose rollback could not confirm
+/// that every role it touched is stopped: that failure is an object carrying
+/// the list as data, so the webview can put "these may still be running" in
+/// front of the reader without parsing it back out of the prose — where it is
+/// the LAST clause, after the primary error and every started role's name, and
+/// so the first thing a display clamp cuts.
+///
+/// Serialize-only, so `untagged`'s deserialisation cost (see
+/// `settings::StageSpec`) does not arise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopActionError {
+    Message(String),
+    LaunchCleanup(DesktopLaunchCleanupFailure),
+}
+
+/// What `desktop_set_settings` rejects with (issue #1350's review).
+///
+/// A plain sentence — exactly what every failure rejected with before — except
+/// for a save that failed **after** its deck edits reached the shared
+/// `remotes.toml`: that rejects with `{ message, written }`, where `written` is
+/// the settings as both files now hold them, so the webview can show what is
+/// actually on disk instead of either the edit it asked for or the document it
+/// had before. A save refused because the deck list changed outside the app
+/// (`SaveFailure::deck_list_conflict`) wrote nothing and rejects the same way,
+/// for the same reason: the window's copy is stale.
+/// `desktop/src/lib/settingsError.ts` is the webview's half.
+///
+/// Serialize-only, like [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopSettingsSaveError {
+    Message(String),
+    /// Boxed because it carries a whole `DesktopSettings` and is much the
+    /// larger arm, so `clippy::result_large_err` would otherwise object.
+    /// `untagged` serializes the box as its contents: the wire is unchanged.
+    Partial(Box<DesktopPartialSettingsSave>),
+}
+
+/// A save whose deck edits landed and whose `desktop.toml` write did not, or
+/// one refused as a deck-list conflict — see [`DesktopSettingsSaveError`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPartialSettingsSave {
+    /// The whole error, naming which half was saved, through [`safe_message`].
+    pub message: String,
+    /// The settings re-read from disk after the failure.
+    pub written: crate::settings::DesktopSettings,
+}
+
+impl From<String> for DesktopSettingsSaveError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// A failed launch that could not confirm its cleanup — see
+/// [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopLaunchCleanupFailure {
+    /// The whole error, as a string rejection would have carried it.
+    pub message: String,
+    /// Every role the launch started, or may have started, whose stop it could
+    /// not confirm — each through [`safe_message`]. Never empty: a launch
+    /// whose cleanup was confirmed rejects with a plain
+    /// [`DesktopActionError::Message`].
+    pub unconfirmed_stops: Vec<String>,
+}
+
+impl DesktopActionError {
+    /// The sentence either variant carries.
+    #[cfg(test)]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Message(message) => message,
+            Self::LaunchCleanup(failure) => &failure.message,
+        }
+    }
+
+    /// A launch failure, as the variant its cleanup calls for.
+    pub fn launch(message: String, unconfirmed_stops: Vec<String>) -> Self {
+        if unconfirmed_stops.is_empty() {
+            return Self::Message(message);
+        }
+        Self::LaunchCleanup(DesktopLaunchCleanupFailure {
+            message,
+            unconfirmed_stops: unconfirmed_stops.iter().map(safe_message).collect(),
+        })
+    }
+}
+
+impl From<String> for DesktopActionError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<&str> for DesktopActionError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -571,10 +1492,16 @@ pub struct DesktopActionResult {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// PRD #1666 part 2 (G-fix7): for a start, the daemon process that
+    /// answered it — the incarnation [`Self::agent_id`] (and every id in
+    /// [`Self::agent_ids`]) was minted by. Absent for an action that started
+    /// nothing; `null` for a start answered by a daemon that named no process.
+    /// The webview waits for, and opens, the agent with this pair, so a
+    /// restarted deck's agent under the same id is not taken for this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_incarnation: Option<Incarnation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub send_result: Option<SendResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalAttachResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -590,8 +1517,9 @@ pub struct TerminalAttachResult {
     pub generation: u64,
     pub reused: bool,
     /// PRD #882 — the geometry the daemon has APPLIED for this agent, which is
-    /// the smallest viewport among every client attached to it and so is not
-    /// necessarily the size this tile asked for.
+    /// decided by its viewer policy (the last-focused client's viewer size, else
+    /// the smallest viewport among every client attached to it, PRD #1105) and
+    /// so is not necessarily the size this tile asked for.
     ///
     /// The frontend sizes its xterm grid from this rather than from
     /// `FitAddon.fit()`. Absent only when talking to a daemon that predates the
@@ -649,8 +1577,8 @@ pub enum TerminalState {
 // kept the result as the ONLY copy. That breaks the principle the whole PRD
 // exists to establish — the daemon owns canonical identity — because the
 // desktop stores these values and later sends them back: `path` becomes
-// `PrepareWorkflow.cwd` and every `StartAgent.cwd`, an orchestration `name`
-// becomes `StartWorkflow.name`, a role `name` becomes the requested role and
+// `PrepareOrchestration.cwd` and every `StartAgent.cwd`, an orchestration `name`
+// becomes `ActivateOrchestration.name`, a role `name` becomes the requested role and
 // the pane's `display_name`, and `config_revision` is echoed back so a config
 // edited under the picker is refused. Two concrete failures followed:
 //
@@ -716,7 +1644,7 @@ pub struct DesktopProjectListing {
 pub struct DesktopProject {
     /// The daemon-canonical absolute path, **byte for byte**. This is the
     /// identity, and the exact string that goes back on `resolve-project`,
-    /// `prepare-workflow` and every `StartAgent.cwd`. The webview must never
+    /// `prepare-orchestration` and every `StartAgent.cwd`. The webview must never
     /// re-spell it — and, since the audit fix, neither does this seam.
     pub path: String,
     /// [`Self::path`] made safe to render. Never sent anywhere.
@@ -751,7 +1679,7 @@ pub struct DesktopResolvedProject {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopOrchestration {
-    /// **Verbatim** — this goes back as `PrepareWorkflow.orchestration`, and a
+    /// **Verbatim** — this goes back as `PrepareOrchestration.orchestration`, and a
     /// name the daemon offered must be a name the daemon can find again.
     pub name: String,
     /// [`Self::name`] made safe to render.
@@ -763,7 +1691,7 @@ pub struct DesktopOrchestration {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopOrchestrationRole {
-    /// **Verbatim** — `order_workflow_roles` matches the requested roles against
+    /// **Verbatim** — `order_orchestration_roles` matches the requested roles against
     /// these by exact name, and the name becomes the pane's `display_name` and
     /// its `TabMembership.role_name`.
     pub name: String,
@@ -817,7 +1745,7 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
     //
     // PRD #819 Greptile P2(e): PLATFORM-AWARE, and it used to split on `/`
     // alone. Project resolution is not refused on Windows — only
-    // `PrepareWorkflow` is, with `unsupported-platform`, because only its
+    // `PrepareOrchestration` is, with `unsupported-platform`, because only its
     // publish carries an owner-only guarantee it cannot deliver there. So a
     // Windows client lists and resolves, and a canonical Windows path
     // (`\\?\C:\Users\dev\project`) contains no `/` at all: the whole path
@@ -843,6 +1771,262 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
     }
 }
 
+// ---------------------------------------------------------------------------
+// PRD #1223 M4 — the New agent dialog's two deck-targeted queries.
+//
+// Both answer about ONE named deck, and both can be answered "this deck cannot"
+// — a deck that predates the verb — which is a state the dialog degrades on
+// rather than an error, so it is a variant here rather than an `Err`. The
+// shapes follow the project DTOs above: every path is carried **verbatim**,
+// because it is what goes back to the daemon, and has a scrubbed display twin
+// beside it where it is rendered.
+// ---------------------------------------------------------------------------
+
+/// One directory of a deck's filesystem as that deck listed it, or the deck's
+/// answer that it has no listing verb.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopDirectoryListing {
+    Listing {
+        /// The daemon's canonical spelling of the directory, **byte for
+        /// byte** — for a typed path, what the flow carries from here on.
+        path: String,
+        /// `path` made safe to render. Never sent anywhere.
+        display_path: String,
+        /// The parent's canonical path as the daemon computed it, which is
+        /// what "up" sends. The webview never derives one by trimming `path`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+        entries: Vec<DesktopDirectoryEntry>,
+        /// The daemon's entry cap or time budget cut the listing short.
+        truncated: bool,
+    },
+    /// The deck does not advertise `list-directories` — a deck older than PRD
+    /// #1223. The dialog never asks such a deck (its connection carries
+    /// `newAgentReason`, which disables it at the deck step), so this is the
+    /// crate's own answer should one be asked anyway.
+    Unsupported,
+}
+
+/// One subdirectory in a [`DesktopDirectoryListing`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopDirectoryEntry {
+    /// The canonical path the daemon joined, **verbatim**: the string entering
+    /// this directory sends back.
+    pub path: String,
+    /// The entry's name, made safe to render. Display-only.
+    pub display_name: String,
+    /// It holds a `.dot-agent-deck.toml` the daemon's project reader would open.
+    pub is_project: bool,
+    /// Issue #1240: the entry is a symlink the daemon listed by its target, so
+    /// [`Self::path`] is where it leads and need not lie under the listing.
+    pub is_symlink: bool,
+}
+
+/// Issue #1240: what the New agent dialog asks a deck to widen or narrow about
+/// one listing. Every field defaults to off, which is the PRD #1223 listing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DesktopListingOptions {
+    /// List `.`-named directories too.
+    pub include_hidden: bool,
+    /// List symlinks to directories too, by their targets.
+    pub include_symlinks: bool,
+    /// Keep only directories whose name contains this, before the deck's cap.
+    pub filter: Option<String>,
+}
+
+impl DesktopDirectoryListing {
+    /// The listing variant, built from the daemon reply's parts.
+    ///
+    /// Takes parts rather than the root crate's reply type because the desktop
+    /// may not name that module: `xtask/linkage-check`'s rule 12 bounds which
+    /// root modules the production desktop reaches across, and the module that
+    /// owns the reply also owns a filesystem listing a client must never run.
+    pub(crate) fn listing(
+        path: String,
+        parent: Option<String>,
+        entries: impl IntoIterator<Item = (String, String, bool, bool)>,
+        truncated: bool,
+    ) -> Self {
+        Self::Listing {
+            display_path: display_only(&path),
+            path,
+            parent,
+            entries: entries
+                .into_iter()
+                .map(
+                    |(name, path, is_project, is_symlink)| DesktopDirectoryEntry {
+                        path,
+                        display_name: display_only(&name),
+                        is_project,
+                        is_symlink,
+                    },
+                )
+                .collect(),
+            truncated,
+        }
+    }
+}
+
+/// The orchestrations the New agent form can offer for one directory on one
+/// deck (PRD #1223 M6) — the deck's `ResolveProject` answer, or why there is
+/// nothing to offer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopNewAgentOrchestrations {
+    /// The directory is a project on that deck. Its `path` is the deck's
+    /// canonical spelling, which is what the launch sends.
+    Project(DesktopResolvedProject),
+    /// The deck refused it with `ResolveProject`'s generic `unresolved` code —
+    /// an ordinary directory, which is a normal answer here and not an error.
+    NotProject,
+    /// The deck cannot launch an orchestration from this flow, and `reason`
+    /// says why: it lacks the project verbs (the connection's
+    /// `projectActionsReason`) or cannot start a role with its configured
+    /// command. The form withholds its orchestration chips and shows this.
+    Unsupported { reason: String },
+}
+
+/// What the New agent form needs to know about one deck, or the deck's answer
+/// that it cannot say.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopNewAgentOptions {
+    /// The deck answered `new-agent-options` about itself.
+    Deck {
+        /// The deck host's configured `default_command`, **verbatim** — it is
+        /// the Command field's first prefill and goes back on the start.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_command: Option<String>,
+        /// The deck host's configured `default_dir` (PRD #1223), canonical and
+        /// already vetted by the deck — absent when unset or unusable. It is
+        /// never rendered from here: the form sends it back as the first
+        /// directory listing's path, and what the user reads is that
+        /// listing's own `displayPath`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_dir: Option<String>,
+        /// The agent registry the DECK was built with, in its order.
+        agents: Vec<DesktopAgentOption>,
+        /// The deck's own experimental flag.
+        experimental: bool,
+        /// The authoring kinds the deck can compose a seed for.
+        authoring_kinds: Vec<String>,
+        /// This deck's last New agent form command, plain or authoring: the
+        /// deck's own value when it keeps one (issue #1540), shared with the
+        /// TUI's form, and otherwise the one this app last started there.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_command: Option<String>,
+    },
+    /// The deck does not advertise `new-agent-options` — a deck older than PRD
+    /// #1223 — so nothing here comes from it.
+    Unsupported {
+        /// The agent registry compiled into THIS app, which is the only one
+        /// left to offer and is labelled as such by the form.
+        desktop_agents: Vec<DesktopAgentOption>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_command: Option<String>,
+    },
+}
+
+/// One entry of an agent registry, for the New agent form.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopAgentOption {
+    /// The registry's stable key (`claude`, `opencode`, …), verbatim.
+    pub id: String,
+    /// The registry's label, made safe to render.
+    pub display_name: String,
+    /// What choosing this agent writes into Command, **verbatim**.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_command: Option<String>,
+}
+
+impl DesktopAgentOption {
+    pub(crate) fn new(id: String, display_name: &str, default_command: Option<String>) -> Self {
+        Self {
+            id,
+            display_name: display_only(display_name),
+            default_command,
+        }
+    }
+}
+
+/// The agent registry compiled into this app, projected the way a deck
+/// projects its own for `new-agent-options`: each entry's first
+/// `detect_basenames` value as the id, its label, its default command, in
+/// registry order — and an entry with no basename left out rather than given an
+/// invented id.
+///
+/// This is the older-deck fallback's list and nothing else. A deck that answers
+/// the query supplies its own, because the agents a spawn can use are the ones
+/// the DECK's build knows.
+pub(crate) fn desktop_agent_registry() -> Vec<DesktopAgentOption> {
+    dot_agent_deck::agent_registry::ALL
+        .iter()
+        .filter_map(|spec| {
+            Some(DesktopAgentOption::new(
+                (*spec.detect_basenames.first()?).to_string(),
+                spec.label,
+                spec.default_command.map(str::to_string),
+            ))
+        })
+        .collect()
+}
+
+/// Which of the app's experimental surfaces this desktop process shows (issue
+/// #1198), for the webview to gate its render and navigation seams on.
+///
+/// Each field is ONE wrapper in the root crate's `features` module (CLAUDE.md
+/// #9), called in this process — so the flag is the desktop's own, read from
+/// this process's environment (`DOT_AGENT_DECK_EXPERIMENTAL`, or the file
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` names) with no project walk; see
+/// [`crate::init_features`]. It is deliberately NOT the per-deck
+/// `experimental` a deck reports in [`DesktopNewAgentOptions`]: these surfaces
+/// belong to the app, not to any one deck, and the app observes several.
+///
+/// All `false` is the shipped default. The overview, the agent overlay and
+/// Settings have no field because they are never gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopFeatures {
+    pub show_deck: bool,
+    pub show_projects: bool,
+    pub show_prompts: bool,
+    pub show_orchestrations: bool,
+    pub show_agent_profiles: bool,
+    pub show_agent_details: bool,
+}
+
+impl DesktopFeatures {
+    /// The surfaces the process-global flag shows. Read through the wrappers
+    /// on each call; the flag behind them is resolved once at startup.
+    pub(crate) fn current() -> Self {
+        use dot_agent_deck::features;
+        Self {
+            show_deck: features::show_desktop_deck(),
+            show_projects: features::show_desktop_projects(),
+            show_prompts: features::show_desktop_prompts(),
+            show_orchestrations: features::show_desktop_orchestrations(),
+            show_agent_profiles: features::show_desktop_agent_profiles(),
+            show_agent_details: features::show_desktop_agent_details(),
+        }
+    }
+}
+
 /// The STRING-SHAPE check the desktop may make on a path the **user** typed,
 /// before spending a daemon round trip on it.
 ///
@@ -854,7 +2038,7 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
 pub(crate) fn validate_pasted_project_path(path: &str) -> Result<(), String> {
     if !is_valid_orchestration_cwd(path) {
         return Err(
-            "enter an absolute directory path, without control characters, that the deck can see"
+            "enter an absolute directory path, without control characters, that the daemon can see"
                 .into(),
         );
     }
@@ -872,6 +2056,111 @@ fn agent_type_name(agent_type: &AgentType) -> &'static str {
     }
 }
 
+/// PRD #1541: the most steps an interrupt may take. The longest measured is
+/// two (OpenCode's `ESC`, pause, `ESC`).
+const PROMPT_KEY_MAX_STEPS: usize = 2;
+/// PRD #1541: the bytes of every interrupt step — one `ESC`, alone in its write.
+const PROMPT_KEY_INTERRUPT: &str = "\x1b";
+/// PRD #1541: the clear key — `Ctrl+U` (NAK).
+const PROMPT_KEY_CLEAR: &str = "\x15";
+/// PRD #1541: the keys that delete one character — `DEL`, or `Backspace` as
+/// `0x08`.
+const PROMPT_KEY_DELETE_CHAR: [&str; 2] = ["\x7f", "\x08"];
+/// PRD #1541: the most an interrupt may pause in total, summed over every step.
+const PROMPT_KEY_INTERRUPT_BUDGET_MS: u64 = 2_000;
+/// PRD #1541: the most a clear may pause in total between its writes.
+const PROMPT_KEY_CLEAR_BUDGET_MS: u64 = 3_000;
+/// PRD #1541: how many times the panel presses the clear key, by rule — a
+/// mirror of `VOICE_CLEAR_PRESSES` in `desktop/src/components/VoiceControlPanel.tsx`,
+/// which a clear's pause budget is computed against; the two must move
+/// together, and `the_clear_press_mirror_matches_the_panel` fails when they
+/// do not.
+const PROMPT_KEY_CLEAR_PRESSES_PER_LINE: u64 = 32;
+const PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW: u64 = 64;
+
+/// PRD #1541: the daemon's prompt keys as the webview receives them — or
+/// `None` when any part is out of bounds, so the voice surface refuses the
+/// command rather than pressing half a key set. There is no local fallback.
+///
+/// The bounds are this client's own promises, kept at the seam where the
+/// daemon's data enters, and they are an exact allowlist rather than a shape
+/// check: an interrupt is one or two steps of exactly one `ESC` each, the
+/// clear key is exactly `Ctrl+U`, and the delete key is exactly `DEL` or
+/// `0x08`. Anything else — text after a control byte, `Ctrl+C` or `Ctrl+D`,
+/// two `ESC`s in one write, an escape-encoded Enter or `Ctrl+C` (CSI-u), the
+/// clear key offered as the delete key — drops the set. So do pauses over
+/// budget (an interrupt's, summed, over 2 s; a clear's, over the writes the
+/// panel would make, over 3 s), a per-write cap of zero, and a clear rule this
+/// build does not know. A daemon owns the PTY these keys are written to, so
+/// the bounds protect the desktop's behaviour rather than the agent from its
+/// deck.
+pub(crate) fn map_prompt_keys(
+    keys: &dot_agent_deck::agent_registry::PromptKeys,
+) -> Option<DesktopPromptKeys> {
+    use dot_agent_deck::agent_registry::ClearPresses;
+
+    if keys.interrupt.is_empty() || keys.interrupt.len() > PROMPT_KEY_MAX_STEPS {
+        return None;
+    }
+    if keys
+        .interrupt
+        .iter()
+        .any(|step| step.bytes != PROMPT_KEY_INTERRUPT)
+    {
+        return None;
+    }
+    let interrupt_pause: u64 = keys
+        .interrupt
+        .iter()
+        .map(|step| u64::from(step.pause_after_ms))
+        .sum();
+    if interrupt_pause > PROMPT_KEY_INTERRUPT_BUDGET_MS {
+        return None;
+    }
+    if keys.clear.bytes != PROMPT_KEY_CLEAR
+        || !PROMPT_KEY_DELETE_CHAR.contains(&keys.delete_char.bytes.as_ref())
+    {
+        return None;
+    }
+    let (presses, total) = match keys.clear.presses {
+        ClearPresses::PerWrappedRow => {
+            ("per_wrapped_row", PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW)
+        }
+        ClearPresses::PerLine => ("per_line", PROMPT_KEY_CLEAR_PRESSES_PER_LINE),
+        ClearPresses::Unknown => return None,
+    };
+    let per_write = match keys.clear.max_presses_per_write {
+        Some(0) => return None,
+        Some(cap) => u64::from(cap),
+        None => total,
+    };
+    let clear_pause = (total.div_ceil(per_write) - 1)
+        * u64::from(keys.clear.pause_between_writes_ms.unwrap_or(0));
+    if clear_pause > PROMPT_KEY_CLEAR_BUDGET_MS {
+        return None;
+    }
+    Some(DesktopPromptKeys {
+        interrupt: keys
+            .interrupt
+            .iter()
+            .map(|step| DesktopKeyStep {
+                bytes: step.bytes.to_string(),
+                pause_after_ms: step.pause_after_ms,
+            })
+            .collect(),
+        clear: DesktopClearKey {
+            bytes: keys.clear.bytes.to_string(),
+            presses,
+            max_presses_per_write: keys.clear.max_presses_per_write,
+            pause_between_writes_ms: keys.clear.pause_between_writes_ms,
+        },
+        delete_char: DesktopDeleteCharKey {
+            bytes: keys.delete_char.bytes.to_string(),
+            max_literal_write_chars: keys.delete_char.max_literal_write_chars,
+        },
+    })
+}
+
 fn session_status_name(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Thinking => "thinking",
@@ -880,6 +2169,7 @@ fn session_status_name(status: &SessionStatus) -> &'static str {
         SessionStatus::WaitingForInput => "waiting_for_input",
         SessionStatus::Idle => "idle",
         SessionStatus::Error => "error",
+        SessionStatus::Blocked => "blocked",
         SessionStatus::Unknown => "unknown",
     }
 }
@@ -957,6 +2247,30 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.live_target.as_ref())
         .map(|target| write_lease_name(&target.writable));
     let last_activity_ms = live.and_then(|snapshot| snapshot.last_activity_ms);
+    let pull_request = live.and_then(|snapshot| snapshot.pull_request.clone());
+    // Issue #714: only beside the status it explains.
+    let blocked = live
+        .filter(|snapshot| snapshot.status == SessionStatus::Blocked)
+        .and_then(|snapshot| snapshot.blocked.as_ref())
+        .map(|reason| DesktopBlocked {
+            kind: reason.kind.as_wire(),
+            detected_at_ms: reason.detected_at_ms,
+            detail: reason
+                .detail
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|detail| !detail.is_empty()),
+            resets_at_ms: reason.resets_at_ms,
+        });
+    // Issue #1678: the daemon's aggregate, only when it has something to show.
+    let background = live
+        .and_then(|snapshot| snapshot.background)
+        .filter(|work| !work.is_empty())
+        .map(|work| DesktopBackground {
+            commands: work.commands,
+            subagents: work.subagents,
+            since_ms: work.since_ms,
+        });
     // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
     // when it spawned a process whether or not that process has ever emitted an
     // event.
@@ -966,7 +2280,76 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     // `agent_registry` — a fallback would reinstate the divergence the field
     // closes, and make the change cosmetic.
     let cli_name = record.cli_name;
+    // PRD #1541: the daemon's keys, bounded — never this crate's own registry.
+    let prompt_keys = record.prompt_keys.as_ref().and_then(map_prompt_keys);
     let tab = map_tab(record.tab_membership.as_ref());
+    // Inline rather than a helper naming `InboxSummary`'s module, which is the
+    // daemon's and outside what this crate reaches across (linkage-check rule 12).
+    let inbox = record.inbox.as_ref().map(|summary| DesktopInbox {
+        queued: summary.queued,
+        // PRD #1666 S11: a claimed job is taken and not yet acknowledged, which
+        // is what the card counts as fetched; the TUI counts it the same way.
+        fetched: summary.fetched + summary.claimed,
+        undeliverable: summary.undeliverable,
+        last_acked_at: summary.last_acked_at.map(|at| at.to_rfc3339()),
+        wake: serde_json::to_value(summary.wake)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "none".to_string()),
+        component: summary.component.as_deref().map(safe_display_text),
+        wake_stalled: summary.wake_stalled,
+        attention: summary
+            .notices
+            .attention
+            .iter()
+            .filter_map(|item| {
+                let kind = serde_json::to_value(item.kind).ok()?.as_str()?.to_string();
+                Some(DesktopInboxAttention {
+                    message_id: item.message_id.clone(),
+                    revision: item.revision,
+                    kind,
+                    from_label: safe_display_text(&item.from_label),
+                    subject: safe_display_text(&item.subject),
+                    task_id: item.task_id.clone(),
+                })
+            })
+            .collect(),
+        integration: summary
+            .notices
+            .integration
+            .and_then(|notice| serde_json::to_value(notice).ok())
+            .and_then(|value| value.as_str().map(str::to_string)),
+        integration_command: summary
+            .notices
+            .integration_command
+            .as_deref()
+            .map(safe_display_text),
+        receipts_degraded: summary
+            .notices
+            .receipts_degraded
+            .as_deref()
+            .map(safe_display_text),
+        evidence_paused: summary.notices.evidence_paused,
+        admission_refused: summary
+            .notices
+            .admission_refused
+            .as_deref()
+            .map(safe_display_text),
+        agent_notice: summary
+            .notices
+            .agent_notice
+            .as_ref()
+            .map(|notice| safe_display_text(notice.display_text()))
+            .filter(|text| !text.is_empty()),
+    });
+    let delivery_notice = live
+        .filter(|snapshot| snapshot.status == SessionStatus::Error)
+        .and_then(|snapshot| snapshot.delivery_notice.as_deref())
+        .map(safe_display_text)
+        .filter(|notice| !notice.is_empty());
+    let pending_question = live
+        .and_then(|snapshot| snapshot.pending_question.as_ref())
+        .map(map_pending_question);
 
     DesktopAgent {
         id: record.id,
@@ -984,7 +2367,18 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         write_lease,
         last_activity_ms,
         spawned_at_ms,
+        blocked,
+        background,
+        prompt_keys,
+        authoring_kind: record.authoring_kind,
+        inbox,
+        delivery_notice,
+        pending_question,
+        pull_request,
         tab,
+        // Stamped by the snapshot that lists this record, which knows which
+        // daemon process answered (`daemon_bridge::connected_snapshot`).
+        incarnation: Incarnation::default(),
     }
 }
 
@@ -1031,20 +2425,35 @@ pub(crate) fn safe_display_text(text: impl AsRef<str>) -> String {
 /// local deck was substituted — "that deck is gone" and "that deck has no
 /// socket path yet" are different things to tell a user, and neither is
 /// "connected to local".
+///
+/// `all_decks` is `true` under **All Decks**, where `endpoint` is the local
+/// deck only because the plumbing needs one (see
+/// `crate::settings::EndpointSettings::resolve`). It is what lets an operation
+/// that acts on one deck refuse instead of taking that local deck as the
+/// user's choice — [`DeckScope::one_selected`] (#1083).
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedDeck {
     pub(crate) endpoint: Endpoint,
     pub(crate) fallback: Option<String>,
+    pub(crate) all_decks: bool,
 }
 
 impl Default for SelectedDeck {
     fn default() -> Self {
         Self {
-            endpoint: Endpoint::local(),
+            endpoint: crate::local_deck::local_endpoint(),
             fallback: None,
+            all_decks: false,
         }
     }
 }
+
+/// Why an operation that acts on ONE deck refused to run under **All Decks**
+/// (#1083). The webview gates these operations behind its "Select a deck"
+/// state first, so this is the backstop a user should not normally see — and
+/// it says what to do rather than what went wrong, like that state does.
+pub(crate) const ALL_DECKS_NEEDS_ONE_DECK: &str =
+    "All daemons is selected, which is every daemon at once. Select a daemon to act on one.";
 
 /// The applied selection — the deck in force AND the set the fleet observes, as
 /// **one value under one lock** (PRD #742 M8).
@@ -1093,12 +2502,29 @@ struct AppliedSelection {
     selected: SelectedDeck,
     /// The decks the app CONNECTS to — watchers, tunnels, handshakes.
     observed: Vec<Endpoint>,
+    /// Bumped whenever a deck LEAVES [`Self::observed`] — the epoch a
+    /// [`DeckScope`] captures and revalidates against.
+    ///
+    /// Held in here rather than in a [`crate::generation::Generation`] of its
+    /// own precisely because of what this struct is for: a scope that read the
+    /// set from one place and the epoch from another could straddle a write and
+    /// hold a pair that never coexisted. One read answers both.
+    ///
+    /// **Only departures move it**, because only a departure can make an
+    /// in-flight operation unwanted. A save that *adds* a deck leaves every
+    /// existing scope valid, which is what keeps the common settings save from
+    /// failing an unrelated attach.
+    observed_generation: u64,
     /// The decks the app SHOWS but cannot connect to (PRD #742 M12). Held
     /// beside `observed` rather than folded into it because every reader of
     /// `observed` wants the connectable set and would spin a watcher against an
     /// endpoint that cannot exist; [`observed_fleet`] is the one reader that
     /// wants both, and it is the display set.
     unconfigured: Vec<crate::settings::UnconfiguredDeck>,
+    /// Each connectable remote row's name in the shared deck list, by the
+    /// identity of the endpoint it describes (issue #1426) — what
+    /// [`deck_name`] reads. Only rows with a usable name are here.
+    names: Vec<(dot_agent_deck::daemon_client::EndpointIdentity, String)>,
 }
 
 impl Default for AppliedSelection {
@@ -1109,8 +2535,10 @@ impl Default for AppliedSelection {
     fn default() -> Self {
         Self {
             selected: SelectedDeck::default(),
-            observed: vec![Endpoint::local()],
+            observed: vec![crate::local_deck::local_endpoint()],
             unconfigured: Vec::new(),
+            observed_generation: 0,
+            names: Vec::new(),
         }
     }
 }
@@ -1129,6 +2557,43 @@ impl Default for AppliedSelection {
 /// describing.
 static APPLIED_SELECTION: std::sync::RwLock<Option<AppliedSelection>> =
     std::sync::RwLock::new(None);
+
+/// Serializes the TESTS that write [`APPLIED_SELECTION`], or read it back and
+/// depend on the answer, wherever they live.
+///
+/// [`apply_settings_selection`] is a process-global write, so a test that makes
+/// one and asserts on what it reads back needs every other test's write to be
+/// outside its own window. So does a test that only publishes a terminal
+/// session: [`DeckScope::revalidate`] refuses a publish when the observed
+/// generation moved, and a sibling's write moves it. Under nextest each test
+/// owns its process and this is always free; under a plain `cargo test` the
+/// crate's tests are threads in one process and this is the only thing keeping
+/// those writes out of each other's windows.
+///
+/// It lives here rather than in [`tests`] because the writers do not: issue
+/// #1078 found eight tests across `endpoint_test::tests` and `lib::tests`
+/// writing the global without it, six of them by way of
+/// `lib::retarget_selection`, and then the `terminal::tests` that write or
+/// revalidate against it.
+///
+/// **It is one of three process-globals `cargo test --lib` raced on**, and it
+/// is the only one a lock serialises. The other two are removed rather than
+/// locked: the local deck's address, which tests move with
+/// [`crate::local_deck`]'s per-thread seam instead of the process-wide
+/// `DOT_AGENT_DECK_ATTACH_SOCKET` that every production read resolved; and the
+/// process umask, which the tests that run a real attach server no longer flip
+/// (`crate::test_listener`).
+///
+/// **Async-aware on purpose**: most of the writers are `#[tokio::test]`s that hold the
+/// selection across an `.await`, and a `std::sync::MutexGuard` doing that is
+/// `clippy::await_holding_lock` — an error under the workspace's `-D warnings`.
+/// It also has no poisoning, so a test that panics mid-selection releases the
+/// lock rather than turning its own failure into one in every sibling.
+///
+/// So take it with `.lock().await` from an async test and `blocking_lock()`
+/// from a synchronous one — the latter panics in an async context.
+#[cfg(test)]
+pub(crate) static SELECTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The applied selection, as **one** read.
 ///
@@ -1166,15 +2631,257 @@ pub(crate) fn apply_settings_selection(
         fallback: resolved
             .fallback
             .map(|fallback| safe_display_text(fallback.to_string())),
+        all_decks: settings.selects_all_decks(),
     };
+    let observed = settings.connectable_endpoints();
     if let Ok(mut slot) = APPLIED_SELECTION.write() {
+        // The previous value is read **under the write lock**, so the compare
+        // and the bump are one critical section. Reading it through
+        // `applied_selection()` first would let two concurrent saves both see
+        // epoch G and both write G+1 while describing different fleets, and a
+        // scope captured at that G+1 would then revalidate against the other
+        // save's — the one case where a monotonic counter can repeat a value
+        // that means two things.
+        let previous = slot.clone().unwrap_or_default();
+        let departed = previous.observed.iter().any(|before| {
+            let key = before.identity();
+            !observed.iter().any(|kept| kept.identity() == key)
+        });
         *slot = Some(AppliedSelection {
             selected: deck.clone(),
-            observed: settings.connectable_endpoints(),
+            observed,
             unconfigured: settings.unconfigured_decks(),
+            observed_generation: previous.observed_generation + u64::from(departed),
+            names: deck_names(settings),
         });
     }
     deck
+}
+
+/// The deck **one operation** acts on, captured once before its first await.
+///
+/// # The defect class this exists to close
+///
+/// The applied selection is mutable process state, so reading it is a question
+/// about *now* — and an operation that reads it twice with an await in between
+/// asks that question twice and can get two answers. Three instances shipped,
+/// all with the same shape and none of them noticed by three security audits
+/// aimed at the subject matter rather than at the shape:
+///
+/// - `DesktopAction::StopAgent` read [`selected_endpoint`] before
+///   `DaemonLinks::trusted` and **again** after `stop_agent(…).await` returned,
+///   using the second read to pick which deck's session to detach. Move the
+///   selection while the request is in flight and the daemon stops deck A's
+///   `planner` while the cleanup detaches deck **B's** same-id session. Agent
+///   ids are per-daemon monotonic integers, so the collision is the ordinary
+///   case rather than a contrived one.
+/// - `crate::terminal::attach` validated its `deck_id` against
+///   [`observed_decks`], then waited for a process-wide gate and performed the
+///   handshake and stream attach with no further check — so an attach queued
+///   behind a slower one could publish a session for a deck the user removed
+///   while it waited.
+/// - `crate::daemon_bridge::bootstrap` read the selection three times across
+///   two awaits: once for the snapshot that decides whether to lazy-spawn, once
+///   for the address to spawn at, and once for the snapshot it answers with.
+///
+/// # The mechanism
+///
+/// An operation captures a scope **once**, before its first await, and every
+/// later step — including cleanup after an await — reads [`Self::endpoint`] or
+/// [`Self::identity`] and never the applied selection again. Where the
+/// operation also *publishes* something durable, it calls [`Self::revalidate`]
+/// at the publication point.
+///
+/// This is deliberately the same answer [`crate::generation`] gives for
+/// `DaemonLinks` and `EndpointTunnels`, one layer up: that module guards a
+/// *cache entry* against a teardown, and this guards an *operation's notion of
+/// which deck it is* against the selection moving underneath it.
+///
+/// # What it does not do
+///
+/// It cannot stop a function from capturing two scopes, and nothing here is
+/// compiler-enforced. What it buys is that the captured value and the live
+/// value are different expressions — `scope.endpoint()` versus
+/// `selected_endpoint()` — so mixing them is visible at the call site instead
+/// of reading like one idea. `crate::selection_capture` pins the count of raw
+/// reads so a new one has to be added deliberately.
+#[derive(Debug, Clone)]
+pub(crate) struct DeckScope {
+    endpoint: Endpoint,
+    /// [`AppliedSelection::observed_generation`] as it stood at capture.
+    observed_generation: u64,
+}
+
+impl DeckScope {
+    /// The selected deck, captured for this operation.
+    ///
+    /// The selected deck is **not** necessarily in the observed set — see
+    /// [`observed_fleet`], which prepends it for exactly that reason — so this
+    /// makes no membership claim. [`Self::revalidate`] is still meaningful for
+    /// it, because what that asks is whether the fleet moved, not whether this
+    /// deck was ever in it.
+    pub(crate) fn selected() -> Self {
+        let applied = applied_selection();
+        Self {
+            endpoint: applied.selected.endpoint,
+            observed_generation: applied.observed_generation,
+        }
+    }
+
+    /// The selected deck, captured for an operation that acts on **one** deck
+    /// and has no deck of its own to name — or a refusal under **All Decks**.
+    ///
+    /// [`Self::selected`] answers All Decks with the local deck, which is right
+    /// for the plumbing that needs an endpoint and wrong for an operation: a
+    /// project listing, a workflow launch or a keystroke sent there would land
+    /// on this machine's deck because the user chose *every* deck (#1083). So
+    /// this refuses with [`ALL_DECKS_NEEDS_ONE_DECK`] instead, before any deck
+    /// is contacted. ONE read, so the flag and the endpoint describe the same
+    /// applied selection.
+    pub(crate) fn one_selected() -> Result<Self, String> {
+        let applied = applied_selection();
+        if applied.selected.all_decks {
+            return Err(ALL_DECKS_NEEDS_ONE_DECK.to_string());
+        }
+        Ok(Self {
+            endpoint: applied.selected.endpoint,
+            observed_generation: applied.observed_generation,
+        })
+    }
+
+    /// The deck one wire id names, or the selected deck when the caller named
+    /// none.
+    ///
+    /// # Why this is not `trusted_daemon`
+    ///
+    /// `crate::daemon_bridge::trusted_daemon` resolves [`selected_endpoint`] —
+    /// the applied selection, read at the instant the call runs. Every terminal
+    /// verb went through it, so an attach declared for an agent on build-box
+    /// reached whatever deck happened to be selected when the command was
+    /// dispatched, and agent ids are per-daemon monotonic integers: it found a
+    /// `planner` there and streamed it. That is issue
+    /// [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s whole
+    /// shape at the one layer where it decides which machine the bytes come
+    /// from.
+    ///
+    /// # The resolution is against the OBSERVED set, and that is a security
+    /// boundary rather than a lookup detail
+    ///
+    /// A deck id from the webview is untrusted input. Matching it against the
+    /// observed set means the only endpoints reachable are the ones the applied
+    /// settings document already tells this app to connect to, so a malformed
+    /// or stale id yields a refusal rather than a connection: there is no path
+    /// here by which a value from the webview becomes an address.
+    ///
+    /// `None` keeps the previous behaviour for a caller that names no deck.
+    /// No production webview path sends one — the webview's own attach always
+    /// names the deck it is attaching to — but callers in this tree do:
+    /// `DesktopAction::AttachTerminal` is the legacy declarative attach path
+    /// and passes `None`, for which it legitimately means "the selected
+    /// deck". That action is not reachable from the frontend today, which
+    /// defines the variant in its action union and dispatches it from
+    /// nowhere. `Option` is kept because the parameter is optional on the IPC
+    /// boundary, so absence must mean something defined rather than an error
+    /// the user cannot act on.
+    pub(crate) fn resolve(deck_id: Option<&str>) -> Result<Self, String> {
+        // ONE read, so the endpoint and the epoch describe the same fleet.
+        let applied = applied_selection();
+        let Some(deck_id) = deck_id else {
+            return Ok(Self {
+                endpoint: applied.selected.endpoint,
+                observed_generation: applied.observed_generation,
+            });
+        };
+        let endpoint = applied
+            .observed
+            .into_iter()
+            .find(|endpoint| deck_wire_id(endpoint) == deck_id)
+            .ok_or_else(|| {
+                format!(
+                    "that daemon is not one this app is observing: {}",
+                    safe_message(deck_id)
+                )
+            })?;
+        Ok(Self {
+            endpoint,
+            observed_generation: applied.observed_generation,
+        })
+    }
+
+    /// The deck this operation acts on. Every step after the capture reads this
+    /// rather than the applied selection.
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// [`Self::endpoint`]'s key — what both `DaemonLinks` and `EndpointTunnels`
+    /// are indexed by, and what a session records.
+    pub(crate) fn identity(&self) -> dot_agent_deck::daemon_client::EndpointIdentity {
+        self.endpoint.identity()
+    }
+
+    /// Is this scope still the fleet's, or did a deck leave while the operation
+    /// was in flight?
+    ///
+    /// Called at the point an operation publishes something that outlives it —
+    /// a terminal session, a lease, a watcher. An operation with nothing to
+    /// publish (a one-shot daemon request whose only later step is cleanup on
+    /// its *own* captured deck) does not need it: capturing once is already
+    /// enough for that shape.
+    ///
+    /// # ONE check, and it is the epoch rather than membership
+    ///
+    /// Membership answers "is that deck there **now**", which a deck that left
+    /// and came back passes — and a returning deck's link and transport are
+    /// from a later epoch than the one this operation established against, so
+    /// publishing into it would install a session over a tunnel the teardown
+    /// already released. The epoch distinguishes the two and membership cannot,
+    /// which is why membership below only picks the wording.
+    ///
+    /// # It is conservative, and here is the cost
+    ///
+    /// The epoch does not say *which* deck departed, so removing deck E refuses
+    /// an in-flight attach on unrelated deck D. That costs one refused attach
+    /// on a settings save that happened to land inside one, which the webview
+    /// recovers from by attaching again; the precise answer would need per-deck
+    /// departure history, and a removal is a deliberate, rare user act. This is
+    /// the same trade [`crate::generation`]'s module docs take for the same
+    /// reason.
+    pub(crate) fn revalidate(&self) -> Result<(), String> {
+        let applied = applied_selection();
+        if applied.observed_generation == self.observed_generation {
+            return Ok(());
+        }
+        let key = self.endpoint.identity();
+        let still_observed = applied
+            .observed
+            .iter()
+            .any(|observed| observed.identity() == key);
+        let deck = safe_display_text(self.endpoint.describe());
+        Err(if still_observed {
+            format!(
+                "the fleet changed while this operation was in flight, so nothing was published for {deck}"
+            )
+        } else {
+            format!("that daemon left the fleet while this operation was in flight: {deck}")
+        })
+    }
+
+    /// A scope over `endpoint` captured **now**, for a test pinning something
+    /// other than this boundary.
+    ///
+    /// It revalidates for as long as no deck leaves the observed set after it
+    /// is taken, which is what a test about (say) registry eviction wants: the
+    /// boundary stays armed rather than being stubbed out, and it simply has
+    /// nothing to object to. A test about the boundary itself captures one of
+    /// these and *then* moves the fleet.
+    #[cfg(test)]
+    pub(crate) fn capturing(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            observed_generation: applied_selection().observed_generation,
+        }
+    }
 }
 
 /// Every deck the app CONNECTS to under the applied document (PRD #742 M3).
@@ -1187,6 +2894,10 @@ pub(crate) fn apply_settings_selection(
 /// **Not the fleet the screen shows.** A configured row with no socket path is
 /// deliberately absent here and present in [`observed_fleet`]; see
 /// [`unconfigured_decks`] for the other half and why the two are separate.
+///
+/// **Also a read of MUTABLE state.** A caller resolving one deck out of this
+/// set for an operation wants [`DeckScope::resolve`], which takes the set and
+/// the epoch in one read so the pair cannot straddle a save.
 pub(crate) fn observed_decks() -> Vec<Endpoint> {
     applied_selection().observed
 }
@@ -1223,6 +2934,11 @@ pub(crate) fn selected_deck() -> SelectedDeck {
 /// A function rather than a constant so the selection has exactly one source,
 /// and so the call sites that must refuse a remote deck — the Stop and Replace
 /// actions — are written against an [`Endpoint`] rather than against a path.
+///
+/// **This is a read of MUTABLE state, so it answers "now" and not "the deck my
+/// operation is about".** An operation that keeps using the deck after an await
+/// — cleanup included — captures a [`DeckScope`] instead; see that type for the
+/// three shipped defects that are all this function called twice.
 pub(crate) fn selected_endpoint() -> Endpoint {
     selected_deck().endpoint
 }
@@ -1298,6 +3014,7 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
             deck_id: unconfigured_deck_id(&deck.id),
             label: safe_display_text(deck.label),
             reason: UNCONFIGURED_DECK_REASON.to_string(),
+            name: deck.name.map(|name| name.as_str().to_string()),
         })
         .collect()
 }
@@ -1320,6 +3037,41 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
 /// `fleet` with nothing here to name it would otherwise be an unnameable group.
 /// Deriving from here cannot produce one — every entry carries its own name —
 /// and the next arrival restates all three.
+/// The name a deck the fleet observes has in the shared deck list (issue
+/// #1426), under the applied document — `None` for the local deck and for a
+/// remote row with no usable name.
+///
+/// Matched by [`EndpointIdentity`], the fleet's own key, never by
+/// `describe()`, for [`deck_is_observed`]'s reason.
+pub(crate) fn deck_name(endpoint: &Endpoint) -> Option<String> {
+    let key = endpoint.identity();
+    applied_selection()
+        .names
+        .into_iter()
+        .find(|(identity, _)| *identity == key)
+        .map(|(_, name)| name)
+}
+
+/// Every connectable remote row's name, keyed by its endpoint's identity.
+fn deck_names(
+    settings: &crate::settings::DesktopSettings,
+) -> Vec<(dot_agent_deck::daemon_client::EndpointIdentity, String)> {
+    settings
+        .endpoints
+        .iter()
+        .flat_map(|endpoints| endpoints.remote.iter())
+        .filter_map(|row| {
+            let name = row.name.as_ref()?.as_str().to_string();
+            Some((Endpoint::Remote(row.endpoint()?).identity(), name))
+        })
+        .collect()
+}
+
+/// Whether the applied selection is All Decks — [`DesktopSnapshot::all_decks`].
+pub(crate) fn all_decks_applied() -> bool {
+    selected_deck().all_decks
+}
+
 pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
     observed_decks()
         .iter()
@@ -1327,6 +3079,7 @@ pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
             deck_id: deck_wire_id(endpoint),
             label: deck_path_text(endpoint),
             deck_kind: selection_fields(endpoint).0,
+            name: deck_name(endpoint),
         })
         .collect()
 }
@@ -1337,7 +3090,8 @@ pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
 /// [`crate::settings::SelectionFallback::NoRemoteSocket`] states in the
 /// selector's — deliberately the settings panel's own vocabulary rather than a
 /// third one, because a user who sees this is being sent to that panel.
-const UNCONFIGURED_DECK_REASON: &str = "Not configured yet — press Test connection in Settings.";
+pub(crate) const UNCONFIGURED_DECK_REASON: &str =
+    "Not configured yet — press Test connection in Settings.";
 
 /// The observed fleet as [`DesktopSnapshot::fleet`] carries it — every observed
 /// deck's [`deck_wire_id`], selected deck first, never empty (PRD #742 M5).
@@ -1411,6 +3165,7 @@ pub(crate) fn disconnected_snapshot(
             socket_path: deck_path_text(endpoint),
             deck_id: deck_wire_id(endpoint),
             error: Some(safe_message(error)),
+            error_detail: None,
             client_protocol_version: PROTOCOL_VERSION,
             server_protocol_version: None,
             client_build_version: dot_agent_deck::build_id::local_build_id(),
@@ -1424,6 +3179,12 @@ pub(crate) fn disconnected_snapshot(
             // Nothing was advertised because nothing answered. A disconnected
             // screen is already saying the only thing there is to say.
             project_actions_reason: None,
+            new_agent_reason: None,
+            listing_options: false,
+            upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
+            disconnected_reason: None,
+            hook_binary_notices: Vec::new(),
+            incarnation: Incarnation::default(),
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
@@ -1433,7 +3194,73 @@ pub(crate) fn disconnected_snapshot(
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
+        all_decks: all_decks_applied(),
+        // Nothing answered, so nothing was asked.
+        host_metrics: None,
     }
+}
+
+/// What `desktop_start_daemon` resolves with (issue #1490): `outcome` is
+/// `started` or `already-running`, `host` the machine the daemon runs on as
+/// the user reads it, and `snapshot` the deck, now connected.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartDaemonResultDto {
+    pub outcome: &'static str,
+    pub host: String,
+    pub snapshot: DesktopSnapshot,
+}
+
+/// What `desktop_start_daemon` rejects with (issue #1490): a bare sentence for
+/// every failure but a start that failed, which rejects with
+/// `{ message, failure, detail }` so the technical half — the spawn error, what
+/// ssh printed — reaches a disclosure instead of being dropped (PR #1623
+/// review). `desktop/src/lib/actionError.ts`'s `StartDaemonError` is the
+/// webview's half. Serialize-only, like [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopStartDaemonError {
+    Message(String),
+    Failed(DesktopStartFailure),
+}
+
+impl From<String> for DesktopStartDaemonError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// A start that failed — see [`DesktopStartDaemonError`]. Every string
+/// through [`safe_message`]: the detail can quote what a remote printed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopStartFailure {
+    pub message: String,
+    pub failure: dot_agent_deck::daemon_start::StartFailure,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl DesktopStartFailure {
+    pub(crate) fn new(problem: &dot_agent_deck::daemon_start::StartProblem) -> Self {
+        Self {
+            message: safe_message(&problem.message),
+            failure: problem.failure,
+            detail: problem.detail.as_deref().map(safe_message),
+        }
+    }
+}
+
+/// [`disconnected_snapshot`], carrying why the deck is not connected and the
+/// control that earns (issue #1490).
+pub(crate) fn disconnected_snapshot_because(
+    endpoint: &Endpoint,
+    error: impl AsRef<str>,
+    reason: &dot_agent_deck::daemon_start::DisconnectedReason,
+) -> DesktopSnapshot {
+    let mut snapshot = disconnected_snapshot(endpoint, error);
+    snapshot.connection.disconnected_reason = Some(DisconnectedReasonDto::new(endpoint, reason));
+    snapshot
 }
 
 pub(crate) fn validate_agent_id(agent_id: &str) -> Result<(), String> {
@@ -1524,25 +3351,28 @@ pub(crate) fn mint_desktop_pane_id() -> String {
     pane_id
 }
 
-pub(crate) fn validate_workflow_shape(
+pub(crate) fn validate_orchestration_shape(
     name: &str,
     cwd: &str,
-    roles: &[WorkflowRoleInput],
+    roles: &[OrchestrationRoleInput],
     rows: u16,
     cols: u16,
 ) -> Result<(u16, u16), String> {
-    const MAX_WORKFLOW_ROLES: usize = 16;
+    const MAX_ORCHESTRATION_ROLES: usize = 16;
     if !is_valid_display_name(name) {
         return Err(
-            "workflow name is invalid, oversized, empty, or contains control characters".into(),
+            "orchestration name is invalid, oversized, empty, or contains control characters"
+                .into(),
         );
     }
     if !is_valid_orchestration_cwd(cwd) {
-        return Err("workflow cwd must be a valid absolute path without control characters".into());
+        return Err(
+            "orchestration cwd must be a valid absolute path without control characters".into(),
+        );
     }
-    if roles.is_empty() || roles.len() > MAX_WORKFLOW_ROLES {
+    if roles.is_empty() || roles.len() > MAX_ORCHESTRATION_ROLES {
         return Err(format!(
-            "workflow roles must contain 1..={MAX_WORKFLOW_ROLES} entries"
+            "orchestration roles must contain 1..={MAX_ORCHESTRATION_ROLES} entries"
         ));
     }
     let mut names = HashSet::with_capacity(roles.len());
@@ -1550,13 +3380,13 @@ pub(crate) fn validate_workflow_shape(
     for role in roles {
         if !is_valid_display_name(&role.role) {
             return Err(format!(
-                "invalid workflow role name: {}",
+                "invalid orchestration role name: {}",
                 safe_message(&role.role)
             ));
         }
         if !names.insert(role.role.as_str()) {
             return Err(format!(
-                "duplicate workflow role: {}",
+                "duplicate orchestration role: {}",
                 safe_message(&role.role)
             ));
         }
@@ -1565,16 +3395,18 @@ pub(crate) fn validate_workflow_shape(
     }
     if start_count != 1 {
         return Err(format!(
-            "workflow must define exactly one start role (found {start_count})"
+            "orchestration must define exactly one start role (found {start_count})"
         ));
     }
     validate_dimensions(rows, cols)
 }
 
-pub(crate) fn ensure_desktop_workflow_platform_supported(target_os: &str) -> Result<(), String> {
+pub(crate) fn ensure_desktop_orchestration_platform_supported(
+    target_os: &str,
+) -> Result<(), String> {
     if target_os == "windows" {
         return Err(
-            "desktop workflow launch is unavailable on Windows in this preview because profile commands are POSIX-shell quoted; use the TUI or launch commands manually until native Windows command construction is implemented"
+            "desktop orchestration activation is unavailable on Windows in this preview because profile commands are POSIX-shell quoted; use the TUI or run commands manually until native Windows command construction is implemented"
                 .into(),
         );
     }
@@ -1583,16 +3415,109 @@ pub(crate) fn ensure_desktop_workflow_platform_supported(target_os: &str) -> Res
 
 #[cfg(test)]
 mod tests {
+
+    /// Scenario (PRD #1258 M4): a daemon's host answer reaches the webview as
+    /// the camelCase `hostMetrics` shape, with absent readings omitted rather
+    /// than zeroed, the daemon's health levels passed through beside their
+    /// numbers (and absent where it sent none), and the time the bridge held
+    /// the answer added to its age; an incapable daemon is `not-available`.
+    #[test]
+    fn host_metrics_dto_keeps_absence_and_ages_a_held_answer() {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        let metrics: dot_agent_deck::daemon_protocol::HostMetrics =
+            serde_json::from_value(serde_json::json!({
+                "disks": [{"role": "working_root", "free_bytes": 10, "total_bytes": 20,
+                           "level": "warn"},
+                          {"role": "temp_root"}],
+                "cpu_count": 8,
+                "memory_level": "critical",
+                "sampled_at_ms": 1_700_000_000_000_u64,
+                "sample_age_ms": 1500
+            }))
+            .unwrap();
+        let dto = HostMetricsReportDto::from_report(
+            &HostMetricsReport::Available(metrics),
+            std::time::Duration::from_millis(250),
+        );
+        assert_eq!(
+            serde_json::to_value(&dto).unwrap(),
+            serde_json::json!({
+                "status": "available",
+                "metrics": {
+                    "disks": [{"role": "working_root", "freeBytes": 10, "totalBytes": 20,
+                               "level": "warn"},
+                              {"role": "temp_root"}],
+                    "cpuCount": 8,
+                    "memoryLevel": "critical",
+                    "sampledAtMs": 1_700_000_000_000_u64,
+                    "sampleAgeMs": 1750
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(HostMetricsReportDto::from_report(
+                &HostMetricsReport::NotAvailable,
+                std::time::Duration::ZERO
+            ))
+            .unwrap(),
+            serde_json::json!({"status": "not-available"})
+        );
+    }
+
+    /// Scenario (PRD #1258 audit A2): a report carrying more roles than the
+    /// client's bound, one of them far longer than a role may be, reaches the
+    /// webview as at most the bound's number of roles, each clamped on a
+    /// character boundary.
+    #[test]
+    fn host_metrics_dto_bounds_a_hostile_report() {
+        use dot_agent_deck::daemon_client::HostMetricsReport;
+        use dot_agent_deck::daemon_protocol::{
+            DiskUsage, HostMetrics, MAX_DISK_ROLES, MAX_ROLE_BYTES,
+        };
+        let mut disks = vec![DiskUsage {
+            role: "é".repeat(10_000),
+            free_bytes: None,
+            total_bytes: None,
+            level: None,
+        }];
+        disks.extend((0..1000).map(|i| DiskUsage {
+            role: format!("role{i}"),
+            free_bytes: None,
+            total_bytes: None,
+            level: None,
+        }));
+        let dto = HostMetricsReportDto::from_report(
+            &HostMetricsReport::Available(HostMetrics {
+                disks,
+                load_per_cpu: None,
+                cpu_count: None,
+                memory_used_bytes: None,
+                memory_available_bytes: None,
+                load_level: None,
+                memory_level: None,
+                sampled_at_ms: 1,
+                sample_age_ms: 0,
+            }),
+            std::time::Duration::ZERO,
+        );
+        let HostMetricsReportDto::Available { metrics } = dto else {
+            panic!("available");
+        };
+        assert_eq!(metrics.disks.len(), MAX_DISK_ROLES);
+        let first = &metrics.disks[0].role;
+        assert!(
+            first.len() <= MAX_ROLE_BYTES + '…'.len_utf8(),
+            "{}",
+            first.len()
+        );
+        assert!(first.ends_with('…'));
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------------
     // PRD #741 M7 — the selection, and the two things it decides on screen
     // -----------------------------------------------------------------------
-
-    /// The applied selection is a process-global, so every test that writes it
-    /// takes this first and puts it back. Under nextest each test owns its
-    /// process and the lock is free.
-    static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A document whose `[endpoints]` selection names a connectable remote row.
     fn selecting_a_remote_deck() -> crate::settings::DesktopSettings {
@@ -1624,9 +3549,7 @@ mod tests {
         settings: &crate::settings::DesktopSettings,
         body: impl FnOnce() -> T,
     ) -> T {
-        let guard = SELECTION_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let guard = SELECTION_LOCK.blocking_lock();
         apply_settings_selection(settings);
         let result = body();
         apply_settings_selection(&crate::settings::DesktopSettings::default());
@@ -1704,6 +3627,97 @@ mod tests {
             assert!(
                 stated.iter().all(|deck| !deck.deck_id.starts_with("deck-")),
                 "an unconfigured id must never look like a real one: {stated:?}"
+            );
+        });
+    }
+
+    /// Issue #1426: the fleet on the wire carries each remote deck's name from
+    /// the shared deck list, beside the address label and the key — a named
+    /// connectable deck, a named socketless one, a remote with no usable name
+    /// (no `name` at all) and the local deck (never one).
+    #[test]
+    fn the_wire_fleet_carries_each_remote_deck_s_name() {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::deck_list::DeckName;
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let row = |id: &str, host: &str, name: Option<&str>, socket: bool| {
+            let mut row = RemoteEndpointSettings::new(
+                EndpointId::parse(id).expect("a valid id"),
+                Hostname::parse(host).expect("a valid host"),
+            );
+            row.name = name.map(|name| DeckName::parse(name).expect("a valid name"));
+            if socket {
+                row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+            }
+            row
+        };
+        let settings = crate::settings::DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![
+                    row(
+                        "named0000000001",
+                        "build-box.example.com",
+                        Some("build-box"),
+                        true,
+                    ),
+                    row("plain0000000001", "plain.example.com", None, true),
+                    row("halfway00000001", "relay.example.com", Some("relay"), false),
+                ],
+                selection: Selection::All,
+            }),
+            ..crate::settings::DesktopSettings::default()
+        };
+
+        with_selection(&settings, || {
+            let named: Vec<(&str, String, Option<String>)> = observed_fleet_decks()
+                .into_iter()
+                .map(|entry| (entry.deck_kind, entry.label, entry.name))
+                .collect();
+            assert_eq!(
+                named.iter().filter(|(kind, _, _)| *kind == "local").count(),
+                1
+            );
+            assert!(
+                named
+                    .iter()
+                    .filter(|(kind, _, _)| *kind == "local")
+                    .all(|(_, _, name)| name.is_none()),
+                "the local deck has no registry name: {named:?}"
+            );
+            let remote: Vec<_> = named
+                .iter()
+                .filter(|(kind, _, _)| *kind == "remote")
+                .map(|(_, label, name)| (label.as_str(), name.as_deref()))
+                .collect();
+            assert_eq!(
+                remote,
+                [
+                    ("build-box.example.com", Some("build-box")),
+                    ("plain.example.com", None),
+                ],
+                "the label stays the address; the name rides beside it"
+            );
+
+            let unconfigured = unconfigured_fleet();
+            assert_eq!(unconfigured.len(), 1);
+            assert_eq!(unconfigured[0].label, "relay.example.com");
+            assert_eq!(unconfigured[0].name.as_deref(), Some("relay"));
+
+            let json = serde_json::to_value(observed_fleet_decks()).expect("serializes");
+            let names: Vec<_> = json
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|entry| entry.get("name").cloned())
+                .collect();
+            assert!(
+                names.contains(&Some(serde_json::json!("build-box"))),
+                "sent as `name`: {json}"
+            );
+            assert!(
+                names.contains(&None),
+                "absent, not null, without one: {json}"
             );
         });
     }
@@ -1813,11 +3827,11 @@ mod tests {
         );
         let reason = local_only.expect("a remote deck must say why Stop and Replace are off");
         assert!(
-            reason.contains("Stop deck") && reason.contains("deploy@build-box"),
+            reason.contains("Stop daemon") && reason.contains("deploy@build-box"),
             "the explanation must name the operation and the deck: {reason}"
         );
         assert!(
-            reason.contains("not the machine that deck runs on"),
+            reason.contains("not the machine that daemon runs on"),
             "the explanation is `Endpoint::require_local`'s, not a second one written here: \
              {reason}"
         );
@@ -2073,6 +4087,8 @@ mod tests {
             rows: 32,
             cols: 120,
             live: Some(SessionSnapshot {
+                output_set_status: false,
+                subagent_wait: None,
                 status: SessionStatus::Working,
                 agent_type: Some(AgentType::Codex),
                 active_tool: Some(ActiveTool {
@@ -2091,17 +4107,26 @@ mod tests {
                 model: None,
                 last_activity_ms: None,
                 agent_report_activity_seen: false,
+                blocked: None,
+                hook_generation: None,
+                delivery_notice: None,
+                pending_question: None,
+                pull_request: None,
+                pull_request_revision: None,
+                background: None,
+                background_revision: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
             // Codex, and `codex` is what a codex daemon resolves.
-            daemon_boot_id: None,
-            registration_generation: None,
             cli_name: Some("codex".into()),
+            prompt_keys: None,
             crashed: None,
             outstanding_delegation: None,
-            silence_watch: None,
             delegation_commission: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            inbox: None,
         }
     }
 
@@ -2115,6 +4140,98 @@ mod tests {
         assert_eq!(value["status"], "working");
         assert_eq!(value["activeTool"]["name"], "shell");
         assert_eq!(value["tab"]["kind"], "mode");
+    }
+
+    /// Scenario: Map a daemon record with queued and fetched messages into the desktop DTO; its inbox counts must survive for the card badge.
+    #[test]
+    fn agent_mapping_preserves_the_inbox_summary_for_cards() {
+        let mut record = fixture_record();
+        record.inbox = Some(dot_agent_deck::inbox_hub::InboxSummary {
+            queued: 2,
+            fetched: 1,
+            claimed: 0,
+            undeliverable: 1,
+            last_acked_at: None,
+            wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
+            component: None,
+            wake_stalled: false,
+            notices: Default::default(),
+        });
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["inbox"]["queued"], 2,
+            "desktop DTO lost queued inbox messages: {value}"
+        );
+        assert_eq!(value["inbox"]["fetched"], 1);
+        assert_eq!(value["inbox"]["undeliverable"], 1);
+        assert_eq!(value["inbox"]["wake"], "doorbell");
+        assert!(
+            value["inbox"].get("attention").is_none(),
+            "absent while empty"
+        );
+    }
+
+    /// Scenario: Map a daemon record whose card notices carry the daemon's OpenCode notice — and one of a kind this build does not know, with a control character in it — into the desktop DTO; the tile gets each sentence as a display copy (PRD #2050).
+    #[test]
+    fn agent_mapping_carries_the_agent_notice_sentence() {
+        let notice = |json: serde_json::Value| {
+            let mut record = fixture_record();
+            record.inbox = Some(
+                serde_json::from_value(serde_json::json!({
+                    "queued": 0, "fetched": 0, "undeliverable": 0, "wake": "none",
+                    "agent_notice": json,
+                }))
+                .unwrap(),
+            );
+            serde_json::to_value(map_agent(record)).unwrap()["inbox"]["agentNotice"].clone()
+        };
+        let shared = dot_agent_deck::agent_notice::AgentNotice::opencode_shared_service();
+        assert_eq!(
+            notice(serde_json::to_value(&shared).unwrap()),
+            dot_agent_deck::agent_notice::OPENCODE_SHARED_SERVICE
+        );
+        assert_eq!(
+            notice(serde_json::json!({"kind": "newer_kind", "text": "do\u{1b}[31m this"})),
+            "do[31m this"
+        );
+    }
+
+    /// Scenario: Map a daemon record whose inbox summary lists an uncertain delivery, an integration notice, failed receipts, paused hand-outs and a refused request of the agent's own into the desktop DTO; each survives, by its wire spelling, for the tile's notice row and its Retry and Cancel rows.
+    #[test]
+    fn agent_mapping_carries_the_inbox_card_notices() {
+        let mut record = fixture_record();
+        record.inbox = Some(
+            serde_json::from_value(serde_json::json!({
+                "queued": 0, "fetched": 1, "undeliverable": 0, "wake": "native",
+                "attention": [{"message_id": "m-k3xzq2ab-0f3c9a71d2e4b850", "revision": 6,
+                    "kind": "out_of_attempts", "from_label": "the orchestrator\u{1b}[31m",
+                    "subject": "review"}],
+                "integration": "not_armed",
+                "receipts_degraded": "disk full",
+                "evidence_paused": 3,
+                "admission_refused": "inbox_nested_agent"
+            }))
+            .unwrap(),
+        );
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        let inbox = &value["inbox"];
+        assert_eq!(
+            inbox["attention"][0]["messageId"],
+            "m-k3xzq2ab-0f3c9a71d2e4b850"
+        );
+        assert_eq!(inbox["attention"][0]["revision"], 6);
+        assert_eq!(inbox["attention"][0]["kind"], "out_of_attempts");
+        assert!(
+            !inbox["attention"][0]["fromLabel"]
+                .as_str()
+                .unwrap()
+                .contains('\u{1b}'),
+            "display copies only: {inbox}"
+        );
+        assert_eq!(inbox["integration"], "not_armed");
+        assert_eq!(inbox["receiptsDegraded"], "disk full");
+        assert_eq!(inbox["evidencePaused"], 3);
+        assert_eq!(inbox["admissionRefused"], "inbox_nested_agent");
     }
 
     /// Issue #856: the CLI column is the DAEMON's answer, copied through
@@ -2157,6 +4274,350 @@ mod tests {
         assert!(value.get("cliName").is_none());
     }
 
+    fn key_step(
+        bytes: &'static str,
+        pause_after_ms: u32,
+    ) -> dot_agent_deck::agent_registry::KeyStep {
+        dot_agent_deck::agent_registry::KeyStep {
+            bytes: std::borrow::Cow::Borrowed(bytes),
+            pause_after_ms,
+        }
+    }
+
+    fn registry_keys(agent_type: AgentType) -> dot_agent_deck::agent_registry::PromptKeys {
+        dot_agent_deck::agent_registry::spec(&agent_type)
+            .prompt_keys
+            .clone()
+            .expect("a measured agent carries prompt keys")
+    }
+
+    /// PRD #1541: the daemon's prompt keys reach the webview in its camelCase
+    /// vocabulary, with the bytes unchanged and an absent limit absent.
+    #[test]
+    fn prompt_keys_are_copied_from_the_daemon_in_the_webview_shape() {
+        let mut record = fixture_record();
+        record.prompt_keys = Some(registry_keys(AgentType::ClaudeCode));
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["promptKeys"],
+            serde_json::json!({
+                "interrupt": [{"bytes": "\u{1b}", "pauseAfterMs": 0}],
+                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "maxPressesPerWrite": 32, "pauseBetweenWritesMs": 1000},
+                "deleteChar": {"bytes": "\u{7f}", "maxLiteralWriteChars": 800},
+            })
+        );
+
+        let mut record = fixture_record();
+        record.prompt_keys = Some(registry_keys(AgentType::OpenCode));
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["promptKeys"]["interrupt"],
+            serde_json::json!([
+                {"bytes": "\u{1b}", "pauseAfterMs": 300},
+                {"bytes": "\u{1b}", "pauseAfterMs": 0},
+            ])
+        );
+        assert_eq!(value["promptKeys"]["clear"]["presses"], "per_line");
+        assert!(
+            value["promptKeys"]["clear"]
+                .get("maxPressesPerWrite")
+                .is_none()
+        );
+        assert!(
+            value["promptKeys"]["clear"]
+                .get("pauseBetweenWritesMs")
+                .is_none()
+        );
+        assert!(
+            value["promptKeys"]["deleteChar"]
+                .get("maxLiteralWriteChars")
+                .is_none()
+        );
+    }
+
+    /// PRD #1541: a record the daemon served no keys for has none in the
+    /// webview — even for an agent type this crate's own registry has keys
+    /// for. A local fallback would answer for a deck whose agent versions this
+    /// build never measured (the #856 principle).
+    #[test]
+    fn absent_prompt_keys_are_never_filled_from_the_local_registry() {
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::ClaudeCode);
+        record.live = None;
+        record.prompt_keys = None;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["agentType"], "claude_code");
+        assert!(value.get("promptKeys").is_none());
+    }
+
+    /// PRD #1541: a key set that breaks one of the desktop's own promises is
+    /// dropped whole, so the voice surface refuses rather than pressing part of
+    /// it.
+    #[test]
+    fn out_of_bounds_prompt_keys_are_dropped_whole() {
+        use dot_agent_deck::agent_registry::{ClearPresses, KeyStep};
+        use std::borrow::Cow;
+
+        type Breaker = Box<dyn Fn(&mut dot_agent_deck::agent_registry::PromptKeys)>;
+        let cases: Vec<(&str, Breaker)> = vec![
+            (
+                "Ctrl+C in clear",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x15\x03")),
+            ),
+            (
+                "Ctrl+C in an interrupt step",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![KeyStep {
+                        bytes: Cow::Borrowed("\x03"),
+                        pause_after_ms: 0,
+                    }]);
+                }),
+            ),
+            (
+                "empty delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("")),
+            ),
+            (
+                "text, not a key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("rm -rf ~ && echo")),
+            ),
+            (
+                "a key that submits",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x7f\r")),
+            ),
+            (
+                "a key longer than the bound",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x1b[1;2;3;4;5;6;7;8")),
+            ),
+            (
+                "no interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(Vec::new())),
+            ),
+            (
+                "too many steps",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![
+                        KeyStep {
+                            bytes: Cow::Borrowed("\x1b"),
+                            pause_after_ms: 0
+                        };
+                        5
+                    ]);
+                }),
+            ),
+            (
+                "a long pause",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![KeyStep {
+                        bytes: Cow::Borrowed("\x1b"),
+                        pause_after_ms: 60_000,
+                    }]);
+                }),
+            ),
+            (
+                "an unknown clear rule",
+                Box::new(|k| k.clear.presses = ClearPresses::Unknown),
+            ),
+            (
+                "zero presses per write",
+                Box::new(|k| k.clear.max_presses_per_write = Some(0)),
+            ),
+            (
+                "a long pause between clear writes",
+                Box::new(|k| k.clear.pause_between_writes_ms = Some(60_000)),
+            ),
+            // A-B1: the allowlist is exact, so a key that merely starts with
+            // a control byte is not enough.
+            (
+                "text after the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x15INJECTED")),
+            ),
+            (
+                "text after the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x7fINJECTED")),
+            ),
+            (
+                "Ctrl+D as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x04")),
+            ),
+            (
+                "Ctrl+D as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x04", 0)])),
+            ),
+            (
+                "two ESCs in one interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b\x1b", 0)])),
+            ),
+            (
+                "a CSI-u Enter as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b[13u", 0)])),
+            ),
+            (
+                "a CSI-u Ctrl+C as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b[99;5u", 0)])),
+            ),
+            (
+                "a CSI-u Enter as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x1b[13u")),
+            ),
+            (
+                "the clear key as the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x15")),
+            ),
+            (
+                "the delete key as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x7f")),
+            ),
+            (
+                "ESC as the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x1b")),
+            ),
+            (
+                "a good step after a bad one",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![key_step("\x1b", 300), key_step("\x1b[13u", 0)]);
+                }),
+            ),
+            (
+                "three ESC steps",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b", 0); 3])),
+            ),
+            // A-S1: pauses are budgeted in aggregate, not only per step.
+            (
+                "an interrupt pausing over 2 s in total",
+                Box::new(|k| {
+                    k.interrupt =
+                        Cow::Owned(vec![key_step("\x1b", 1_500), key_step("\x1b", 1_500)]);
+                }),
+            ),
+            (
+                "a clear of one press per write, 2 s apart",
+                Box::new(|k| {
+                    k.clear.max_presses_per_write = Some(1);
+                    k.clear.pause_between_writes_ms = Some(2_000);
+                }),
+            ),
+            (
+                "a clear pausing just over 3 s in total",
+                Box::new(|k| {
+                    // 64 presses in writes of 16 is four writes, three pauses.
+                    k.clear.max_presses_per_write = Some(16);
+                    k.clear.pause_between_writes_ms = Some(1_001);
+                }),
+            ),
+        ];
+        for (name, break_it) in cases {
+            let mut keys = registry_keys(AgentType::ClaudeCode);
+            break_it(&mut keys);
+            assert_eq!(map_prompt_keys(&keys), None, "{name} must drop the key set");
+        }
+        // And the untouched set passes, so the cases above fail for their own
+        // reason.
+        assert!(map_prompt_keys(&registry_keys(AgentType::ClaudeCode)).is_some());
+    }
+
+    /// PRD #1541 A-B1/A-S1: the values just inside the allowlist and the
+    /// budgets pass, so the bounds are exactly where the docs put them.
+    #[test]
+    fn prompt_keys_at_the_edge_of_the_bounds_pass() {
+        use dot_agent_deck::agent_registry::ClearPresses;
+        use std::borrow::Cow;
+
+        let mut keys = registry_keys(AgentType::ClaudeCode);
+        keys.delete_char.bytes = Cow::Borrowed("\x08");
+        assert!(map_prompt_keys(&keys).is_some(), "0x08 deletes a character");
+
+        let mut keys = registry_keys(AgentType::OpenCode);
+        keys.interrupt = Cow::Owned(vec![key_step("\x1b", 1_000), key_step("\x1b", 1_000)]);
+        assert!(map_prompt_keys(&keys).is_some(), "2 s of interrupt pause");
+
+        let mut keys = registry_keys(AgentType::ClaudeCode);
+        keys.clear.max_presses_per_write = Some(16);
+        keys.clear.pause_between_writes_ms = Some(1_000);
+        assert!(map_prompt_keys(&keys).is_some(), "3 s of clear pause");
+
+        // One write never pauses, however long the pause it names.
+        let mut keys = registry_keys(AgentType::OpenCode);
+        keys.clear.presses = ClearPresses::PerLine;
+        keys.clear.max_presses_per_write = Some(32);
+        keys.clear.pause_between_writes_ms = Some(60_000);
+        assert!(map_prompt_keys(&keys).is_some(), "a one-write clear");
+        keys.clear.max_presses_per_write = Some(31);
+        assert_eq!(
+            map_prompt_keys(&keys),
+            None,
+            "per_line is budgeted at 32 presses"
+        );
+    }
+
+    /// PRD #1541 A-B1: every key set this tree's registry serves passes the
+    /// allowlist, so a deck built from the same tree is never refused.
+    #[test]
+    fn every_registry_key_set_passes_the_allowlist() {
+        for agent in dot_agent_deck::agent_registry::ALL {
+            if let Some(keys) = agent.prompt_keys.as_ref() {
+                assert!(
+                    map_prompt_keys(keys).is_some(),
+                    "{}'s keys must pass the desktop's allowlist",
+                    agent.label
+                );
+            }
+        }
+    }
+
+    /// PRD #1541 R-S2: the clear budget's press counts mirror the panel's
+    /// `VOICE_CLEAR_PRESSES`, so the budget is computed against the presses
+    /// the panel actually makes.
+    #[test]
+    fn the_clear_press_mirror_matches_the_panel() {
+        let panel = include_str!("../../src/components/VoiceControlPanel.tsx");
+        let declaration = panel
+            .lines()
+            .find(|line| line.starts_with("export const VOICE_CLEAR_PRESSES"))
+            .expect("the panel declares VOICE_CLEAR_PRESSES on one line");
+        let count = |rule: &str| -> u64 {
+            let at = declaration
+                .find(&format!("{rule}: "))
+                .unwrap_or_else(|| panic!("VOICE_CLEAR_PRESSES names {rule}"));
+            declaration[at + rule.len() + 2..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("VOICE_CLEAR_PRESSES gives {rule} a number"))
+        };
+        assert_eq!(count("per_line"), PROMPT_KEY_CLEAR_PRESSES_PER_LINE);
+        assert_eq!(
+            count("per_wrapped_row"),
+            PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW
+        );
+    }
+
+    /// PRD #1541: the browser fixture's prompt keys
+    /// (`desktop/src/data/prompt-keys.json`) are what a deck built from this
+    /// tree serves — every measured agent, keyed by its wire type, in the
+    /// webview's shape — so `?fixture=1` previews the real keys rather than a
+    /// copy that drifted.
+    #[test]
+    fn the_browser_fixture_prompt_keys_match_the_registry() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/data/prompt-keys.json"))
+                .expect("the fixture is JSON");
+        let mut expected = serde_json::Map::new();
+        for agent in dot_agent_deck::agent_registry::ALL {
+            if let Some(keys) = agent.prompt_keys.as_ref() {
+                expected.insert(
+                    agent_type_name(&agent.agent_type).to_string(),
+                    serde_json::to_value(
+                        map_prompt_keys(keys).expect("registry keys are in bounds"),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        assert_eq!(fixture, serde_json::Value::Object(expected));
+    }
+
     #[test]
     fn record_without_hook_state_is_still_running() {
         let mut record = fixture_record();
@@ -2183,6 +4644,102 @@ mod tests {
         // `agent_mapping_surfaces_the_spawn_instant_unchanged` for the present
         // case, which keeps `live` untouched).
         assert!(mapped.spawned_at_ms.is_none());
+    }
+
+    /// Issue #714: a quota-blocked session maps to its own `"blocked"` status,
+    /// its reason rides beside it with the agent-controlled detail scrubbed of
+    /// control and bidi characters, and the reason never outlives the status.
+    #[test]
+    fn blocked_status_maps_to_blocked_with_reason() {
+        assert_eq!(session_status_name(&SessionStatus::Blocked), "blocked");
+        let mut record = fixture_record();
+        let live = record
+            .live
+            .as_mut()
+            .expect("fixture carries a live snapshot");
+        live.status = SessionStatus::Blocked;
+        live.blocked = Some(dot_agent_deck::state::BlockedReason {
+            kind: dot_agent_deck::state::BlockedKind::CreditsDepleted,
+            detected_at_ms: 1_700_000_000_000,
+            detail: Some("purchase \u{202e}more\u{7} credits".to_string()),
+            resets_at_ms: Some(1_700_000_360_000),
+        });
+        let mapped = map_agent(record.clone());
+        assert_eq!(mapped.status, "blocked");
+        let blocked = mapped.blocked.as_ref().expect("reason carried");
+        assert_eq!(blocked.kind, "credits_depleted");
+        assert_eq!(blocked.detected_at_ms, 1_700_000_000_000);
+        assert_eq!(blocked.detail.as_deref(), Some("purchase more credits"));
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(value["blocked"]["kind"], "credits_depleted");
+        assert_eq!(value["blocked"]["detectedAtMs"], 1_700_000_000_000_i64);
+        assert_eq!(value["blocked"]["resetsAtMs"], 1_700_000_360_000_i64);
+
+        // A reason beside any other status is not reported.
+        record.live.as_mut().unwrap().status = SessionStatus::Thinking;
+        let mapped = map_agent(record);
+        assert!(mapped.blocked.is_none());
+        assert!(
+            serde_json::to_value(&mapped)
+                .unwrap()
+                .get("blocked")
+                .is_none()
+        );
+    }
+
+    /// Issue #1678: the daemon's background aggregate reaches the webview as
+    /// counts and an instant under `background`, unclamped; an empty aggregate
+    /// (the daemon's explicit clear) and a record with no live snapshot both
+    /// leave the key off the wire.
+    #[test]
+    fn background_work_maps_from_the_live_snapshot() {
+        let mut record = fixture_record();
+        let live = record.live.as_mut().unwrap();
+        live.status = SessionStatus::Idle;
+        live.background = Some(dot_agent_deck::event::BackgroundWork {
+            commands: 2,
+            subagents: 1,
+            since_ms: Some(1_756_684_800_123),
+        });
+        live.background_revision = Some(7);
+        let mapped = map_agent(record.clone());
+        assert_eq!(
+            mapped.background,
+            Some(DesktopBackground {
+                commands: 2,
+                subagents: 1,
+                since_ms: Some(1_756_684_800_123),
+            })
+        );
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(
+            value["background"],
+            serde_json::json!({ "commands": 2, "subagents": 1, "sinceMs": 1_756_684_800_123i64 })
+        );
+
+        // No start instant: the key is omitted, the counts stay.
+        record.live.as_mut().unwrap().background = Some(dot_agent_deck::event::BackgroundWork {
+            commands: 0,
+            subagents: 3,
+            since_ms: None,
+        });
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert_eq!(
+            value["background"],
+            serde_json::json!({ "commands": 0, "subagents": 3 })
+        );
+
+        // The daemon's explicit clear shows nothing.
+        record.live.as_mut().unwrap().background =
+            Some(dot_agent_deck::event::BackgroundWork::default());
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert!(value.get("background").is_none());
+
+        // Nor does a record with no live snapshot, or an older daemon's.
+        record.live.as_mut().unwrap().background = None;
+        assert!(map_agent(record.clone()).background.is_none());
+        record.live = None;
+        assert!(map_agent(record).background.is_none());
     }
 
     /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
@@ -2258,6 +4815,22 @@ mod tests {
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(value["spawnedAtMs"], 1_756_684_800_123i64);
         assert!(value.get("lastActivityMs").is_none());
+    }
+
+    /// Issue #1496: the authoring kind the daemon recorded reaches the webview
+    /// as `authoringKind`, in the daemon's kebab-case spelling the dashboard's
+    /// kind filter matches on, and an agent with none carries no key at all.
+    #[test]
+    fn agent_mapping_surfaces_the_recorded_authoring_kind() {
+        let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
+        assert!(value.get("authoringKind").is_none(), "{value}");
+
+        for kind in AuthoringKind::ALL {
+            let mut record = fixture_record();
+            record.authoring_kind = Some(kind);
+            let value = serde_json::to_value(map_agent(record)).unwrap();
+            assert_eq!(value["authoringKind"], kind.as_str());
+        }
     }
 
     /// The absent case for both, pinned in the SERIALIZED shape: the keys are
@@ -2355,6 +4928,7 @@ mod tests {
     fn profile_start_action_uses_camel_case_fields() {
         let action: DesktopAction = serde_json::from_value(serde_json::json!({
             "type": "start_agent",
+            "deckId": "deck-000000000000dec1",
             "command": "codex --model gpt-5.6-sol",
             "cwd": "/tmp/project",
             "displayName": "builder",
@@ -2365,35 +4939,174 @@ mod tests {
         assert!(matches!(
             action,
             DesktopAction::StartAgent {
+                deck_id,
                 display_name: Some(name),
                 rows: Some(30),
                 cols: Some(110),
                 ..
-            } if name == "builder"
+            } if name == "builder" && deck_id == "deck-000000000000dec1"
         ));
     }
 
+    /// Scenario: the webview sends a `start_agent` that names no deck. It must
+    /// fail to decode — PRD #1223 M3 made `deckId` required so that a start can
+    /// never fall back to the applied selection, which under All Decks is the
+    /// local deck whatever the user was looking at (#1083).
     #[test]
-    fn restart_daemon_action_has_no_force_field() {
-        let action: DesktopAction = serde_json::from_value(serde_json::json!({
-            "type": "restart_daemon"
-        }))
-        .unwrap();
-        assert!(matches!(action, DesktopAction::RestartDaemon));
+    fn a_start_agent_action_without_a_deck_is_refused_at_decode() {
+        let refused = serde_json::from_value::<DesktopAction>(serde_json::json!({
+            "type": "start_agent",
+            "command": "codex"
+        }));
+        let error = match refused {
+            Ok(_) => panic!("a start with no deck must not decode"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("deckId"),
+            "the refusal names the field: {error}"
+        );
+    }
+
+    /// Scenario: the webview sends `start_agent` with an `authoringKind` (PRD
+    /// #1223 M7). Each of the three kinds decodes to the crate's own enum, an
+    /// absent one decodes as a plain start, and a kind this build does not know
+    /// fails the decode rather than reaching a deck as a plain start with no
+    /// seed.
+    #[test]
+    fn a_start_agent_action_carries_a_closed_authoring_kind() {
+        let decode = |kind: Option<&str>| {
+            let mut action = serde_json::json!({
+                "type": "start_agent",
+                "deckId": "deck-000000000000dec1",
+                "command": "claude",
+                "cwd": "/srv/repo",
+            });
+            if let Some(kind) = kind {
+                action["authoringKind"] = kind.into();
+            }
+            serde_json::from_value::<DesktopAction>(action)
+        };
+        for kind in AuthoringKind::ALL {
+            assert!(
+                matches!(
+                    decode(Some(kind.as_str())),
+                    Ok(DesktopAction::StartAgent { authoring_kind: Some(decoded), .. }) if decoded == kind
+                ),
+                "{} decodes",
+                kind.as_str()
+            );
+        }
+        assert!(matches!(
+            decode(None),
+            Ok(DesktopAction::StartAgent {
+                authoring_kind: None,
+                ..
+            })
+        ));
+        assert!(
+            decode(Some("orchestration")).is_err(),
+            "an unknown kind is refused at decode"
+        );
+    }
+
+    /// Scenario: the webview sends `start_orchestration` (PRD #1223 M6). The
+    /// deck, path and orchestration are required — a launch with no deck is
+    /// refused at decode rather than defaulted to the selection — and the run
+    /// title and config revision are optional and carried verbatim.
+    #[test]
+    fn a_start_orchestration_action_names_its_deck_and_carries_its_title() {
+        let decoded = serde_json::from_value::<DesktopAction>(serde_json::json!({
+            "type": "start_orchestration",
+            "deckId": "deck-000000000000dec1",
+            "path": "/srv/repo",
+            "orchestration": "loop",
+            "displayTitle": "repo-orchestrator-2",
+            "configRevision": "fnv1a128-00",
+        }));
+        assert!(matches!(
+            decoded,
+            Ok(DesktopAction::StartOrchestration {
+                ref deck_id,
+                ref path,
+                ref orchestration,
+                display_title: Some(ref title),
+                config_revision: Some(ref revision),
+                rows: None,
+                cols: None,
+            }) if deck_id == "deck-000000000000dec1"
+                && path == "/srv/repo"
+                && orchestration == "loop"
+                && title == "repo-orchestrator-2"
+                && revision == "fnv1a128-00"
+        ));
+        assert!(matches!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "start_orchestration",
+                "deckId": "deck-000000000000dec1",
+                "path": "/srv/repo",
+                "orchestration": "loop",
+            })),
+            Ok(DesktopAction::StartOrchestration {
+                display_title: None,
+                config_revision: None,
+                ..
+            })
+        ));
+        assert!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "start_orchestration",
+                "path": "/srv/repo",
+                "orchestration": "loop",
+            }))
+            .is_err(),
+            "a launch with no deck is refused at decode"
+        );
+    }
+
+    /// PRD #1487 M5: Replace daemon is `desktop_upgrade_daemon` on the local
+    /// deck now, so the action it used to be is gone — refused at decode
+    /// rather than quietly running the old stop-and-respawn path.
+    #[test]
+    fn restart_daemon_is_no_longer_an_action() {
+        assert!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "restart_daemon"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
-    fn allow_build_mismatch_action_carries_no_payload() {
+    fn allow_build_mismatch_action_needs_no_payload() {
         let action: DesktopAction = serde_json::from_value(serde_json::json!({
             "type": "allow_build_mismatch"
         }))
         .unwrap();
-        assert!(matches!(action, DesktopAction::AllowBuildMismatch));
+        assert!(matches!(
+            action,
+            DesktopAction::AllowBuildMismatch { deck_id: None }
+        ));
+    }
+
+    /// Issue #1472: the overview names the deck the button was pressed on.
+    #[test]
+    fn allow_build_mismatch_action_carries_the_deck_it_was_pressed_on() {
+        let action: DesktopAction = serde_json::from_value(serde_json::json!({
+            "type": "allow_build_mismatch",
+            "deckId": "remote:prod"
+        }))
+        .unwrap();
+        assert!(matches!(
+            action,
+            DesktopAction::AllowBuildMismatch { deck_id: Some(ref deck) } if deck == "remote:prod"
+        ));
     }
 
     #[test]
     fn disconnected_snapshot_is_fixture_safe_and_sanitized() {
-        let snapshot = disconnected_snapshot(&Endpoint::local(), "offline\u{1b}[31m");
+        let snapshot =
+            disconnected_snapshot(&crate::local_deck::local_endpoint(), "offline\u{1b}[31m");
         assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
         assert_eq!(snapshot.connection.error.as_deref(), Some("offline[31m"));
         assert!(snapshot.agents.is_empty());
@@ -2416,36 +5129,36 @@ mod tests {
     }
 
     #[test]
-    fn workflow_shape_requires_unique_roles_and_one_start() {
+    fn orchestration_shape_requires_unique_roles_and_one_start() {
         let roles = vec![
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "planner".into(),
                 command: "codex --model gpt-5.6-sol".into(),
                 start: true,
             },
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "builder".into(),
                 command: "codex --model gpt-5.6-sol".into(),
                 start: false,
             },
         ];
         assert_eq!(
-            validate_workflow_shape("loop", "/tmp/project", &roles, 50, 200).unwrap(),
+            validate_orchestration_shape("loop", "/tmp/project", &roles, 50, 200).unwrap(),
             (50, 200)
         );
         let mut duplicate = roles.clone();
         duplicate[1].role = "planner".into();
-        assert!(validate_workflow_shape("loop", "/tmp/project", &duplicate, 50, 200).is_err());
+        assert!(validate_orchestration_shape("loop", "/tmp/project", &duplicate, 50, 200).is_err());
         let mut no_start = roles;
         no_start[0].start = false;
-        assert!(validate_workflow_shape("loop", "/tmp/project", &no_start, 50, 200).is_err());
+        assert!(validate_orchestration_shape("loop", "/tmp/project", &no_start, 50, 200).is_err());
     }
 
     #[test]
-    fn desktop_workflow_platform_guard_blocks_windows_only() {
-        assert!(ensure_desktop_workflow_platform_supported("macos").is_ok());
-        assert!(ensure_desktop_workflow_platform_supported("linux").is_ok());
-        let error = ensure_desktop_workflow_platform_supported("windows").unwrap_err();
+    fn desktop_orchestration_platform_guard_blocks_windows_only() {
+        assert!(ensure_desktop_orchestration_platform_supported("macos").is_ok());
+        assert!(ensure_desktop_orchestration_platform_supported("linux").is_ok());
+        let error = ensure_desktop_orchestration_platform_supported("windows").unwrap_err();
         assert!(error.contains("unavailable on Windows"));
         assert!(error.contains("POSIX-shell quoted"));
     }
@@ -2471,7 +5184,7 @@ mod tests {
     /// Scenario: the daemon lists a project whose canonical path carries a
     /// strippable control character. The DTO must carry that path byte for
     /// byte — it is the string that goes back on `resolve-project`,
-    /// `prepare-workflow` and every `StartAgent.cwd` — while the display twin
+    /// `prepare-orchestration` and every `StartAgent.cwd` — while the display twin
     /// is scrubbed. `primary` is checked in the same test because the webview
     /// compares it against `path` to mark the active row: scrubbing one and not
     /// the other silently breaks that marker.
@@ -2532,7 +5245,7 @@ mod tests {
     /// must label it `project`, not with the whole path.
     ///
     /// PRD #819 Greptile P2(e). The basename used to be `path.rsplit('/')`, and
-    /// project resolution is NOT refused on Windows — only `PrepareWorkflow` is,
+    /// project resolution is NOT refused on Windows — only `PrepareOrchestration` is,
     /// with `unsupported-platform`, because only its publish carries an
     /// owner-only guarantee it cannot deliver there. So a Windows client lists
     /// and resolves, every segment fell out of the `/` split, and the whole path
@@ -2631,8 +5344,8 @@ mod tests {
 
     /// Scenario: an orchestration and one of its roles carry control
     /// characters. Both names are protocol identities — the orchestration's
-    /// goes back as `PrepareWorkflow.orchestration`, the role's is matched by
-    /// `order_workflow_roles` and becomes the pane's `display_name` — so both
+    /// goes back as `PrepareOrchestration.orchestration`, the role's is matched by
+    /// `order_orchestration_roles` and becomes the pane's `display_name` — so both
     /// cross verbatim, with escaped twins for the picker.
     #[test]
     fn orchestration_and_role_names_reach_the_daemon_unmodified() {
@@ -2659,25 +5372,84 @@ mod tests {
         assert!(orchestration.roles[0].start);
     }
 
+    /// Scenario (PRD #1223 audit F6): `desktop_run_action`'s rejection is the
+    /// bare string every webview `catch` already reads — including a launch
+    /// whose cleanup was confirmed — and only a launch that could not confirm
+    /// every stop rejects with an object carrying the roles as data.
+    #[test]
+    fn a_launch_rejection_carries_unconfirmed_stops_as_data_and_every_other_is_a_string() {
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::from("deck refused")).unwrap(),
+            serde_json::json!("deck refused")
+        );
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::launch(
+                "failed; stopped 2 already-started role(s)".into(),
+                Vec::new()
+            ))
+            .unwrap(),
+            serde_json::json!("failed; stopped 2 already-started role(s)"),
+            "a confirmed rollback needs no warning, so it keeps the string shape"
+        );
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::launch(
+                "failed; cleanup could not confirm stop".into(),
+                vec!["reviewer".into(), "plan\u{1b}ner".into()]
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "message": "failed; cleanup could not confirm stop",
+                "unconfirmedStops": ["reviewer", "planner"],
+            }),
+            "each role name goes through safe_message"
+        );
+    }
+
+    /// Issue #1350's review: `desktop_set_settings` rejects with a plain
+    /// string, as it always did, except for a save whose deck edits landed and
+    /// whose `desktop.toml` write did not — that one carries the settings as
+    /// they are on disk, for the webview to show.
+    #[test]
+    fn a_settings_rejection_is_a_string_unless_the_save_was_partial() {
+        assert_eq!(
+            serde_json::to_value(DesktopSettingsSaveError::from("disk full".to_string())).unwrap(),
+            serde_json::json!("disk full")
+        );
+        let written = crate::settings::DesktopSettings::default();
+        assert_eq!(
+            serde_json::to_value(DesktopSettingsSaveError::Partial(Box::new(
+                DesktopPartialSettingsSave {
+                    message: "the deck list was saved".into(),
+                    written: written.clone(),
+                }
+            )))
+            .unwrap(),
+            serde_json::json!({
+                "message": "the deck list was saved",
+                "written": serde_json::to_value(&written).unwrap(),
+            })
+        );
+    }
+
     /// Scenario: the longest name the daemon will project is one this crate's
     /// own launch validation accepts. This is the consumer half of the limit
     /// reconciliation — the daemon's `MAX_PROJECTED_LAUNCH_NAME_BYTES` is now
     /// `agent_pty::DISPLAY_NAME_MAX_LEN`, so the offered set is the launchable
-    /// set and `validate_workflow_shape` cannot refuse a name the picker
+    /// set and `validate_orchestration_shape` cannot refuse a name the picker
     /// offered on length alone.
     #[test]
     fn the_longest_projected_name_passes_desktop_launch_validation() {
         use dot_agent_deck::project_resolve::MAX_PROJECTED_LAUNCH_NAME_BYTES;
 
         let at_ceiling = "n".repeat(MAX_PROJECTED_LAUNCH_NAME_BYTES);
-        let roles = vec![WorkflowRoleInput {
+        let roles = vec![OrchestrationRoleInput {
             role: at_ceiling.clone(),
             command: "claude".into(),
             start: true,
         }];
         assert!(
-            validate_workflow_shape(&at_ceiling, "/tmp/project", &roles, 32, 120).is_ok(),
-            "a workflow and role name at the daemon's projection ceiling must be launchable"
+            validate_orchestration_shape(&at_ceiling, "/tmp/project", &roles, 32, 120).is_ok(),
+            "an orchestration and role name at the daemon's projection ceiling must be launchable"
         );
     }
 
@@ -2751,13 +5523,13 @@ mod tests {
     fn no_reader_assembles_a_fleet_from_two_different_saves() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let _guard = SELECTION_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = SELECTION_LOCK.blocking_lock();
 
         let one = selecting_a_remote_deck();
         let all = observing_all(&["build-box.example.com", "laptop.example.com"]);
-        // The two legal answers, each read while nothing else is writing.
+        // The two reference shapes, each read while nothing else is writing.
+        // The local endpoint's wire id may change during the loop if an old
+        // daemon's fallback socket appears or disappears on this host.
         apply_settings_selection(&one);
         let fleet_of_one = observed_fleet();
         apply_settings_selection(&all);
@@ -2783,9 +5555,12 @@ mod tests {
                     while WRITING.load(Ordering::SeqCst) {
                         let fleet = observed_fleet();
                         assert!(
-                            fleet == fleet_of_one || fleet == fleet_of_all,
+                            fleet == fleet_of_one
+                                || (fleet.len() == fleet_of_all.len()
+                                    && fleet[1..] == fleet_of_all[1..]),
                             "a fleet must describe ONE applied document: {fleet:?} is neither \
-                             {fleet_of_one:?} nor {fleet_of_all:?}"
+                             {fleet_of_one:?} nor the three-deck fleet with remote tail {:?}",
+                            &fleet_of_all[1..]
                         );
                     }
                 });
@@ -2793,5 +5568,160 @@ mod tests {
         });
 
         apply_settings_selection(&crate::settings::DesktopSettings::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1198 — the app-level experimental surfaces
+    // -----------------------------------------------------------------------
+
+    /// Serialises the tests that write the process-global `Features`. Under
+    /// nextest every test is its own process, so this only matters to a plain
+    /// `cargo test`, where they share one — the same shape as the root crate's
+    /// `tests/features.rs`. Nothing else in this crate's tests reads the flag.
+    static FEATURES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Puts back whatever `Features` a test found, even when it panics.
+    struct RestoreFeatures(dot_agent_deck::features::Features);
+
+    impl Drop for RestoreFeatures {
+        fn drop(&mut self) {
+            dot_agent_deck::features::set_for_test(self.0);
+        }
+    }
+
+    /// Every gated surface follows the one flag through its own wrapper: all
+    /// hidden while it is off — the shipped default — and all shown once it is
+    /// on, with no surface left behind in either direction.
+    #[test]
+    fn desktop_features_follow_the_experimental_flag() {
+        use dot_agent_deck::features::{self, Features};
+        let _lock = FEATURES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreFeatures(features::current());
+
+        features::set_for_test(Features::test_with(false));
+        assert_eq!(
+            DesktopFeatures::current(),
+            DesktopFeatures {
+                show_deck: false,
+                show_projects: false,
+                show_prompts: false,
+                show_orchestrations: false,
+                show_agent_profiles: false,
+                show_agent_details: false,
+            }
+        );
+
+        features::set_for_test(Features::test_with(true));
+        assert_eq!(
+            DesktopFeatures::current(),
+            DesktopFeatures {
+                show_deck: true,
+                show_projects: true,
+                show_prompts: true,
+                show_orchestrations: true,
+                show_agent_profiles: true,
+                show_agent_details: true,
+            }
+        );
+    }
+
+    /// The wire shape the webview's `DesktopFeaturesDto` reads: camelCase keys,
+    /// one per gated surface, and nothing else.
+    #[test]
+    fn desktop_features_serialise_in_camel_case() {
+        let value = serde_json::to_value(DesktopFeatures {
+            show_deck: true,
+            show_projects: false,
+            show_prompts: true,
+            show_orchestrations: false,
+            show_agent_profiles: true,
+            show_agent_details: false,
+        })
+        .expect("serialises");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "showDeck": true,
+                "showProjects": false,
+                "showPrompts": true,
+                "showOrchestrations": false,
+                "showAgentProfiles": true,
+                "showAgentDetails": false,
+            })
+        );
+    }
+
+    /// PR #1623 review: a failed start rejects with its failure kind and its
+    /// technical detail beside the sentence, every string scrubbed; any other
+    /// rejection stays the bare string every `catch` already reads.
+    #[test]
+    fn a_failed_start_rejects_with_its_detail() {
+        use dot_agent_deck::daemon_start::{StartFailure, StartProblem};
+        let failed = DesktopStartDaemonError::Failed(DesktopStartFailure::new(&StartProblem {
+            failure: StartFailure::StartFailed,
+            message: "Could not start the daemon on this machine.".into(),
+            detail: Some("spawn: \u{7}No such file or directory".into()),
+        }));
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap(),
+            serde_json::json!({
+                "message": "Could not start the daemon on this machine.",
+                "failure": "start-failed",
+                "detail": "spawn: No such file or directory",
+            })
+        );
+        let plain = DesktopStartDaemonError::from("not observed".to_string());
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!("not observed")
+        );
+    }
+
+    /// Issue #1637 audit A3: a notice whose command carries a newline (a
+    /// hidden second command) or a bidi override reaches the webview with no
+    /// command at all, so there is nothing to copy; a newline in the remedy's
+    /// words is removed from what is shown. A clean command passes verbatim.
+    #[test]
+    fn a_hook_notice_command_that_display_would_alter_is_dropped() {
+        use dot_agent_deck::daemon_protocol::{HookBinaryNotice, HookBinaryReason};
+        let notice = |remedy: &str, command: Option<&str>| HookBinaryNotice {
+            binary: "/opt/old/dot-agent-deck".into(),
+            agents: vec!["Codex".into()],
+            version: Some("0.45.0".into()),
+            daemon_version: "0.46.0".into(),
+            reason: HookBinaryReason::Older,
+            remedy: remedy.into(),
+            command: command.map(str::to_string),
+        };
+        for hostile in [
+            "brew upgrade dot-agent-deck\ntouch /tmp/hook-notice-marker",
+            "brew upgrade dot-agent-deck\r",
+            "brew upgrade \u{202E}kced-tnega-tod",
+            "brew upgrade dot-agent-deck\u{2028}touch x",
+        ] {
+            let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(hostile)));
+            assert_eq!(dto.command, None, "{hostile:?}");
+            // Never a bare `Run:`: the dropped command's lead-in becomes the
+            // daemon's no-command advice.
+            assert_eq!(
+                dto.remedy,
+                dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL,
+                "{hostile:?}"
+            );
+        }
+        let over_cap = format!(
+            "/{} hooks install",
+            "a".repeat(dot_agent_deck::daemon_protocol::MAX_NOTICE_COMMAND_BYTES)
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some(&over_cap)));
+        assert_eq!(dto.command, None);
+        assert_eq!(
+            dto.remedy,
+            dot_agent_deck::daemon_protocol::REMEDY_UPGRADE_OR_REINSTALL
+        );
+        let dto = HookBinaryNoticeDto::new(&notice("Run:\ntouch /tmp/x", None));
+        assert!(!dto.remedy.contains('\n'), "{:?}", dto.remedy);
+        let dto = HookBinaryNoticeDto::new(&notice("Run:", Some("brew upgrade dot-agent-deck")));
+        assert_eq!(dto.command.as_deref(), Some("brew upgrade dot-agent-deck"));
     }
 }

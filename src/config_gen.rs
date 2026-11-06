@@ -74,10 +74,15 @@ mod tests {
     #[test]
     fn prompt_contains_key_sections() {
         let prompt = config_gen_prompt("/tmp/test");
-        assert!(prompt.contains("[[modes]]"));
-        assert!(prompt.contains("[[modes.panes]]"));
-        assert!(prompt.contains("[[modes.rules]]"));
         assert!(prompt.contains(".dot-agent-deck.toml"));
+        assert!(prompt.contains("[[orchestrations]]"));
+        // Issue #1199: the generator must never be taught to write a
+        // `[[modes]]` block (it would only be ignored with a warning) — nor
+        // its panes or rules.
+        assert!(!prompt.contains("[[modes.panes]]"));
+        assert!(!prompt.contains("[[modes.rules]]"));
+        assert!(!prompt.contains("reactive_panes"));
+        assert!(!prompt.contains("init_command"));
     }
 
     #[test]
@@ -194,6 +199,87 @@ mod tests {
                 "role `{}` is missing the missing-context backstop sentence",
                 role.name
             );
+        }
+    }
+
+    /// Issue #551: the deck-operation rules every project otherwise relearns by
+    /// incident. A blocked worker that waits on the user or delegates sideways
+    /// stalls the run, so every role reports and stops instead.
+    #[test]
+    fn every_worker_role_reports_instead_of_waiting_or_delegating() {
+        let lib = role_library();
+        for role in &lib.role {
+            for clause in [
+                "Do not stop to ask the user anything and do not delegate to other roles",
+                "say so in your work-done summary and stop",
+                "Open that summary with one line naming the task and its outcome",
+            ] {
+                assert!(
+                    role.prompt_template.contains(clause),
+                    "role `{}` is missing the deck-operation clause {clause:?}",
+                    role.name
+                );
+            }
+        }
+    }
+
+    /// Issue #1947: agents in an orchestration message only its orchestrator,
+    /// never another worker, and so do agents outside it.
+    #[test]
+    fn every_worker_role_messages_only_its_orchestrator() {
+        let lib = role_library();
+        for role in &lib.role {
+            assert!(
+                role.prompt_template
+                    .contains("Message only your orchestrator, never another worker"),
+                "role `{}` is missing the messaging convention",
+                role.name
+            );
+        }
+    }
+
+    /// Issue #551: workers share one checkout, so a role that changes files
+    /// must neither move the branch from under another agent nor sweep that
+    /// agent's changes into its own commit.
+    #[test]
+    fn roles_that_change_files_protect_the_shared_checkout() {
+        let lib = role_library();
+        for name in ["coder", "tester", "documenter", "release"] {
+            let role = lib
+                .role
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("role `{name}` present"));
+            for clause in [
+                "if the task names the branch or commit to work from",
+                "confirm you are on it before",
+                "report that and stop rather than switching, stashing or resetting",
+                "Never discard changes you did not make",
+                "stage the files you changed by name",
+                "check what is staged before you commit",
+            ] {
+                assert!(
+                    role.prompt_template.contains(clause),
+                    "role `{name}` is missing the shared-checkout clause {clause:?}"
+                );
+            }
+        }
+        for name in ["reviewer", "auditor"] {
+            let role = lib
+                .role
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("role `{name}` present"));
+            for clause in [
+                "if the task names the branch or commit to work from",
+                "confirm you are on it before",
+                "report that and stop rather than switching",
+            ] {
+                assert!(
+                    role.prompt_template.contains(clause),
+                    "role `{name}` is missing the branch-check clause {clause:?}"
+                );
+            }
         }
     }
 

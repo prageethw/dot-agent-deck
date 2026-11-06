@@ -28,8 +28,8 @@
 //! before its `AppState` role/orchestrator maps are published. A real `pi`
 //! shell-script shim on `$PATH` immediately calls `get-seed` then
 //! `delegate --to coder` the moment it boots; a `cat` stand-in for the
-//! worker echoes whatever the daemon injects into its PTY, so a delivered
-//! pointer is directly observable in its scrollback.
+//! worker holds its pane open; a delivered delegate is observable as a task
+//! in the worker's inbox (PRD #1666: the deck posts it, it never types it).
 //!
 //! Pre-fix: nothing holds Pi back — it starts and races its delegate call
 //! while the gate (armed for the WORKER's registration, which Pi's own
@@ -38,9 +38,9 @@
 //! `StartAgent` cannot even be issued by `TabManager`'s synchronous loop
 //! until the worker's spawn call returns — which this test holds open
 //! indefinitely via the gate — so the seed cannot be consumed while the
-//! gate is held, and exactly one delegate pointer arrives once it releases.
+//! gate is held, and exactly one delegated task reaches the worker's inbox once it releases.
 //!
-//! Assertions are outcome-based (seed-consumption timing, final pointer
+//! Assertions are outcome-based (seed-consumption timing, final inbox
 //! count), not a pin on which role spawns first — see `src/tab.rs`'s
 //! `delegate_039_pi_last_spawn_order_keeps_pane_ids_declaration_indexed`
 //! for the separate, spawn-order-agnostic pane-id-indexing guard.
@@ -64,6 +64,8 @@ use dot_agent_deck::tab::TabManager;
 use spec::spec;
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 const START_ROLE: &str = "orchestrator";
 const WORKER_ROLE: &str = "coder";
@@ -193,79 +195,6 @@ fn path_with_shim_and_built_deck(shim_dir: &Path) -> String {
     )
 }
 
-fn count_needle(haystack: &[u8], needle: &[u8]) -> usize {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return 0;
-    }
-    haystack
-        .windows(needle.len())
-        .filter(|w| *w == needle)
-        .count()
-}
-
-async fn wait_for_snapshot_needle(
-    registry: &AgentPtyRegistry,
-    agent_id: &str,
-    needle: &[u8],
-    timeout: Duration,
-) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Ok(snap) = registry.snapshot(agent_id)
-            && snap.windows(needle.len()).any(|w| w == needle)
-        {
-            return snap;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return registry.snapshot(agent_id).unwrap_or_default();
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// PRD #365 M2: at the time this test was written, the real
-/// `EmbeddedPaneController`/`TabManager` still allocated its own LOCAL
-/// `pane_id` client-side (`allocate_id()`), which no longer matched what
-/// the daemon actually registered the agent under
-/// (`daemon/pane-id/001`), so looking the worker up BY that stale local
-/// pane_id (the old `wait_for_agent_id_for_pane`) timed out. `allocate_id()`
-/// is now retired — `create_pane_with_options` adopts the daemon-returned
-/// `AttachResponse.pane_id` instead — but the role-based lookup below
-/// remains correct and is kept as-is: `dot-agent-deck delegate --to coder`
-/// resolves its target entirely server-side, by ROLE
-/// (`tab_membership`/`pane_role_map`), never by the client's own pane_id,
-/// so finding the worker's real agent id by role identity is the faithful
-/// way to observe this test's mechanism regardless of pane_id's source.
-async fn wait_for_agent_id_for_role(
-    registry: &AgentPtyRegistry,
-    orchestration_name: &str,
-    role_index: usize,
-    timeout: Duration,
-) -> String {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let records = registry.agent_records();
-        if let Some(rec) = records.iter().find(|r| {
-            matches!(
-                &r.tab_membership,
-                Some(dot_agent_deck::agent_pty::TabMembership::Orchestration {
-                    name,
-                    role_index: idx,
-                    ..
-                }) if name == orchestration_name && *idx == role_index
-            )
-        }) {
-            return rec.id.clone();
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "daemon registry never surfaced an agent for orchestration {orchestration_name:?} role_index {role_index}"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// Scenario: Open an orchestration whose config declares a Pi start role
 /// FIRST and a `coder` worker SECOND (the ordering PR #93 says the daemon
 /// must not let bite) through a real `TabManager` + `EmbeddedPaneController`
@@ -274,11 +203,11 @@ async fn wait_for_agent_id_for_role(
 /// stand-in is spawned but before its role/orchestrator maps publish. While
 /// held, assert the pi shim's `get-seed` call has NOT produced its marker
 /// file — proof the seed was not consumed. After release, assert the
-/// marker now holds the exact seed text and the worker's PTY scrollback
-/// contains the delegate pointer EXACTLY once (a duplicate would reproduce
+/// marker now holds the exact seed text and the worker's inbox
+/// holds the delegated task EXACTLY once (a duplicate would reproduce
 /// upstream #330's harm; the RED failure mode this pins is the opposite —
 /// today the marker appears almost immediately regardless of the gate, and
-/// the worker's scrollback ends up with ZERO pointers because the delegate
+/// the worker's inbox ends up with ZERO tasks because the delegate
 /// raced ahead of the worker's own registration).
 #[spec("orchestration/delegate/039")]
 #[test]
@@ -491,54 +420,34 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
          never received its native seed even after the worker was safely registered"
     );
 
-    // Outcome 2: exactly one delegate pointer reaches the worker's PTY.
-    // Zero is the pre-fix loss this test pins (the delegate raced ahead of
-    // the worker's registration and `delegate_targets` resolved nothing);
-    // two or more would reproduce upstream #330's duplicate-arming harm a
-    // retry-on-failure "fix" could reintroduce. Waited with real settle
-    // time after the first sighting so a stray SECOND delivery (e.g. a
-    // buggy fallback re-arm) has a chance to land before the count is read.
-    let worker_agent_id = wait_for_agent_id_for_role(
-        &daemon.pty_registry,
-        ORCHESTRATION_NAME,
-        WORKER_ROLE_INDEX,
-        Duration::from_secs(5),
-    )
-    .await;
-    let pointer = common::expected_delegate_pointer(
-        cwd.path(),
-        WORKER_ROLE,
-        &role_pane_ids[WORKER_ROLE_INDEX],
-    );
-    let first_sighting = wait_for_snapshot_needle(
-        &daemon.pty_registry,
-        &worker_agent_id,
-        &pointer,
-        Duration::from_secs(5),
-    )
-    .await;
+    // Outcome 2: exactly one delegated task reaches the worker's inbox (PRD
+    // #1666: the deck posts the task to the worker's inbox rather than typing a
+    // pointer into its PTY, so the inbox is where the delegate is observable).
+    // Zero is the pre-fix loss this test pins (the delegate raced ahead of the
+    // worker's registration and `delegate_targets` resolved nothing); two or
+    // more would reproduce upstream #330's duplicate-arming harm a
+    // retry-on-failure "fix" could reintroduce. Waited with real settle time
+    // after the first sighting so a stray SECOND post (e.g. a buggy fallback
+    // re-arm) has a chance to land before the count is read. The task text is
+    // the seed the pi shim passed to `delegate --task`.
+    let worker_pane = role_pane_ids[WORKER_ROLE_INDEX].clone();
+    let attach = daemon.attach_path.clone();
     assert!(
-        first_sighting
-            .windows(pointer.len())
-            .any(|w| w == pointer.as_slice()),
-        "the worker's `cat` PTY never showed the delegate pointer within 5s of the gate \
+        inbox_view::wait_for(&attach, &worker_pane, SEED_TEXT, Duration::from_secs(5)),
+        "the worker's inbox never received the delegated task within 5s of the gate \
          releasing — the delegate that fork #92 P1 causes to race ahead and be dropped never \
-         arrived, even after the worker was safely registered; snapshot = {:?}",
-        String::from_utf8_lossy(&first_sighting)
+         arrived, even after the worker was safely registered; inbox = {:?}",
+        inbox_view::messages(&attach, &worker_pane)
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let settled = daemon
-        .pty_registry
-        .snapshot(&worker_agent_id)
-        .unwrap_or_default();
-    let pointer_count = count_needle(&settled, &pointer);
+    let delegated = inbox_view::count_containing(&attach, &worker_pane, SEED_TEXT);
     assert_eq!(
-        pointer_count,
+        delegated,
         1,
-        "the worker's PTY must show the delegate pointer EXACTLY once — 0 is fork #92 P1's \
+        "the worker's inbox must hold the delegated task EXACTLY once — 0 is fork #92 P1's \
          startup-race loss (the delegate raced ahead of the worker's own registration and \
          resolved to nothing), 2+ would be upstream #330's duplicate-arming harm reappearing \
-         under a naive retry/defer fix; snapshot = {:?}",
-        String::from_utf8_lossy(&settled)
+         under a naive retry/defer fix; inbox = {:?}",
+        inbox_view::messages(&attach, &worker_pane)
     );
 }

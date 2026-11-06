@@ -1,51 +1,24 @@
-#![cfg(all(feature = "e2e", feature = "e2e-live"))]
+#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
-//! PTY-attached coverage for the daemon's delegated-worker detectors. The
-//! synthetic idle case opens the `orch-deck` fixture's live `cat` role panes and
-//! injects a Delegate over its hook socket; the real-agent cases restore an
-//! orchestration whose interactive Claude Haiku orchestrator delegates to a
-//! silent worker. They prove both the long idle nudge and the earlier no-event
-//! notice reach the visible orchestrator surface, with the latter becoming an
-//! actionable response turn without human input.
+//! PTY-attached coverage for delegated-worker inbox notices. A synthetic
+//! consumer fetches and visibly renders the overdue notice; interactive Haiku
+//! orchestrators act on undelivered and waiting-for-input notices without a
+//! human keystroke.
 
 mod common;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
+#[path = "support/inbox_route.rs"]
+mod route;
 
-use std::cell::{Cell, RefCell};
-use std::path::Path;
+use std::cell::Cell;
 use std::time::Duration;
 
-use common::{TuiDeck, commit_fixture};
+use common::TuiDeck;
 use dot_agent_deck::config;
-use dot_agent_deck::daemon_protocol::TabMembership;
-use dot_agent_deck::event::{DaemonMessage, DelegateSignal};
 use spec::spec;
-
-/// Observation budget for `idle_worker_011`'s two grid waits, deliberately
-/// held at the **pre-PR-#82 value of 20s** rather than following
-/// `common::OBSERVATION_BUDGET` (30s).
-///
-/// Fork issue #81's last open item is characterising this test: is it runner
-/// starvation, or a real defect somewhere in the hook-ingestion → role-lookup
-/// → timer → daemon-delivery → render pipeline? That question can only be
-/// answered from a failure captured *with a diagnostic attached*, and the two
-/// changes landed in the wrong order — PR #82 widened these waits 20s → 30s
-/// (against the issue's own review, which said not to widen before
-/// instrumenting), and PR #116 added [`idle_timeout_diagnostics`] only
-/// afterwards. The result was a detector aimed at a signal that had already
-/// been turned down, leaving the item open on evidence that may never arrive.
-///
-/// Narrowing back restores the original failure rate now that the diagnostic
-/// exists on both timeout paths. This is cheap to run as an experiment
-/// because the `e2e` job is `continue-on-error: true`, so a recurrence is
-/// non-blocking noise rather than a merge gate.
-///
-/// **Resolving this constant is the point, not keeping it.** If a run fires
-/// with a diagnostic dump, fix what it names and delete this in favour of
-/// `OBSERVATION_BUDGET`. If a stretch of runs stays green, that is evidence
-/// too — 20s was never the problem — and it should go the same way. It is
-/// scoped to this one test on purpose: `OBSERVATION_BUDGET` is shared by 134
-/// sites and none of them are under investigation.
-const IDLE_DETECTION_BUDGET: Duration = Duration::from_secs(20);
 
 const REAL_ORCHESTRATION_NAME: &str = "idle-worker-real";
 const REAL_ORCHESTRATOR_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -54,18 +27,6 @@ const SILENCE_ACTION_FILE: &str = "delegate-silence-action-85bc9576.txt";
 const SILENCE_ACTION_CONTENT: &str = "DELEGATE_SILENCE_NOTICE_ACTED_ON_85BC9576";
 const INITIAL_WAIT_RESPONSE: &str = "INITIAL_DELEGATION_WAITING_85BC9576";
 const SILENCE_ACTION_RESPONSE: &str = "SILENCE_NOTICE_ACTION_COMPLETE_85BC9576";
-
-/// The daemon-authored opening clause of `compose_idle_worker_prompt`.
-///
-/// The bare `has not responded` this used to match was **not** proof of
-/// provenance: a real orchestrator can write those words itself while
-/// explaining why it is waiting on a worker, so the needle could be satisfied
-/// by the very model whose input it is supposed to be verifying. The
-/// parenthetical is the anchor — the prompt declares itself a daemon report
-/// and explicitly not a message from a person or an agent, which a model
-/// narrating its own state has no reason to emit verbatim.
-const IDLE_DAEMON_CLAUSE: &str = "has not responded with work-done (dot-agent-deck daemon report, \
-                                  not a message from a person or an agent)";
 
 /// The second daemon-specific anchor: the role name is wrapped in unforgeable
 /// untrusted-data markers (PRD #126 M1 audit finding 1), so matching the
@@ -87,7 +48,7 @@ fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
 /// prompt is ONE long line: the pane wraps it at whatever column the pane happens
 /// to sit at, and a needle straddling that column is absent from the row-joined
 /// snapshot even though every character of it is on screen. Only
-/// [`IDLE_DAEMON_CLAUSE`] *opens* the line and would be safe to match raw; the
+/// The daemon clause opens the line and would be safe to match raw; the
 /// untrusted-role label sits deep in the text and can land anywhere.
 ///
 /// NOT a wrap-tolerant whole-grid search: this crops to the pane column via
@@ -141,99 +102,14 @@ fn wait_for_wrapped_pane_string(
     }
 }
 
-/// Fork issue #81: timeout-path diagnostic for `idle_worker_011`. Reads the
-/// daemon's ground-truth PTY scrollback for both role panes directly over
-/// the attach socket (`AttachRequest::Snapshot`, via
-/// `common::pane_search_key_on`) — independent of whatever
-/// `wait_for_wrapped_grid_string` happened to have scrolled into the polled
-/// vt100 viewport — so a failure can tell apart:
-///   - the delegate never reaching dispatch (no pointer text ever written to
-///     the worker's own scrollback: the hook was dropped, the pane/role
-///     gate in `AppState::handle_delegate` rejected it, or the fan-out write
-///     itself failed);
-///   - the delegate reaching the worker but the detector never firing (the
-///     daemon-report clause never appears in the orchestrator's scrollback
-///     AT ALL, not just in the current viewport: the idle timer or its
-///     delivery write is broken);
-///   - the detector firing with the wrong content (the clause is present in
-///     scrollback but the role label is missing: a data-shape bug, not a
-///     timing one);
-///   - the detector firing correctly in scrollback but never showing up in
-///     the polled viewport (a render/scroll lag under CI contention, not a
-///     pipeline defect).
-///
-/// Read-only: issues no keystrokes and asserts nothing itself, so it cannot
-/// perturb the budget or the outcome it is reporting on.
-fn idle_timeout_diagnostics(deck: &TuiDeck, waited_for: &str) -> String {
-    let socket = deck.attach_socket_path();
-    let records = common::agent_records_on(socket);
-    let orchestrator_id = records.iter().find_map(|r| match &r.tab_membership {
-        Some(TabMembership::Orchestration {
-            role_name,
-            is_start_role: true,
-            ..
-        }) if role_name == "orchestrator" => Some(r.id.clone()),
-        _ => None,
-    });
-    let worker_id = records.iter().find_map(|r| match &r.tab_membership {
-        Some(TabMembership::Orchestration { role_name, .. }) if role_name == "worker" => {
-            Some(r.id.clone())
-        }
-        _ => None,
-    });
-
-    let worker_scrollback = worker_id
-        .as_deref()
-        .map(|id| common::pane_search_key_on(socket, id))
-        .unwrap_or_default();
-    let orchestrator_scrollback = orchestrator_id
-        .as_deref()
-        .map(|id| common::pane_search_key_on(socket, id))
-        .unwrap_or_default();
-
-    let delegate_pointer_key =
-        common::search_key("Read .dot-agent-deck/worker-task-worker.md for your task.");
-    let delegate_accepted = worker_scrollback.contains(&delegate_pointer_key);
-    let daemon_clause_written =
-        orchestrator_scrollback.contains(&common::search_key(IDLE_DAEMON_CLAUSE));
-    let role_label_written =
-        orchestrator_scrollback.contains(&common::search_key(&idle_role_label("worker")));
-
-    let grid = deck.snapshot_grid();
-    let waited_for_in_viewport =
-        common::squeeze_wrapped_text(&grid).contains(&common::squeeze_wrapped_text(waited_for));
-
-    format!(
-        "idle_worker_011 timeout diagnostics (fork #81):\n\
-         - worker pane registered with the daemon: {worker_registered}\n\
-         - orchestrator pane registered with the daemon: {orchestrator_registered}\n\
-         - delegate accepted & dispatched to the worker (its file-pointer text \
-           was ever written to the worker pane's own scrollback): {delegate_accepted}\n\
-         - idle detector fired (the daemon-report clause was ever written to \
-           the orchestrator pane's own scrollback, at any point): {daemon_clause_written}\n\
-         - idle prompt ever carried the worker role label in that scrollback: \
-           {role_label_written}\n\
-         - what this wait needed ever appeared in the polled viewport at \
-           timeout: {waited_for_in_viewport}\n\
-         Final polled viewport:\n{grid}",
-        worker_registered = worker_id.is_some(),
-        orchestrator_registered = orchestrator_id.is_some(),
-    )
-}
-
-fn path_with_binary_dir() -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent directory");
-    format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
 fn real_agent_orchestration_config(orchestrator_command: &str) -> String {
+    real_agent_orchestration_config_with_worker(orchestrator_command, "cat")
+}
+
+fn real_agent_orchestration_config_with_worker(
+    orchestrator_command: &str,
+    worker_command: &str,
+) -> String {
     format!(
         "[[orchestrations]]\n\
          name = \"{REAL_ORCHESTRATION_NAME}\"\n\n\
@@ -243,7 +119,7 @@ fn real_agent_orchestration_config(orchestrator_command: &str) -> String {
          start = true\n\n\
          [[orchestrations.roles]]\n\
          name = \"{REAL_WORKER_ROLE}\"\n\
-         command = \"cat\"\n\
+         command = \"{worker_command}\"\n\
          clear = false\n"
     )
 }
@@ -280,122 +156,57 @@ fn real_agent_orchestration_session(
     toml::to_string_pretty(&session).expect("serialize real-agent orchestration session")
 }
 
-fn open_orchestration(deck: &TuiDeck) {
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.send_keys(b" "); // confirm current dir -> new-pane form
-    deck.wait_for_string("No mode");
-    deck.send_keys(b"\x1b[C"); // select [Orch: demo-orch]
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\r"); // submit (Command is hidden)
-}
-
-fn orchestration_panes(deck: &TuiDeck) -> (String, String) {
-    let panes = RefCell::new(None);
-    let ready = common::wait_until(Duration::from_secs(10), || {
-        let records = common::agent_records_on(deck.attach_socket_path());
-        let orchestrator = records
-            .iter()
-            .find_map(|record| match &record.tab_membership {
-                Some(TabMembership::Orchestration {
-                    role_name,
-                    is_start_role: true,
-                    ..
-                }) if role_name == "orchestrator" => record.pane_id_env.clone(),
-                _ => None,
-            });
-        let worker = records
-            .iter()
-            .find_map(|record| match &record.tab_membership {
-                Some(TabMembership::Orchestration { role_name, .. }) if role_name == "worker" => {
-                    record.pane_id_env.clone()
-                }
-                _ => None,
-            });
-        if let (Some(orchestrator), Some(worker)) = (orchestrator, worker) {
-            *panes.borrow_mut() = Some((orchestrator, worker));
-            return true;
-        }
-        false
-    });
-    assert!(
-        ready,
-        "orchestration role panes were not registered within 10s; records = {:?}",
-        common::agent_records_on(deck.attach_socket_path())
-    );
-    panes
-        .into_inner()
-        .expect("ready role-pane poll stores both pane ids")
-}
-
-/// Scenario: Launch the real TUI and its lazy daemon with a tiny worker-response timeout, open the two-role `orch-deck` fixture, and inject a Delegate from the orchestrator pane to the live `cat` worker over the hook socket. The worker never sends work-done, so the rendered orchestration surface must visibly carry the daemon-report clause and the worker role inside its untrusted-role-label markers after the timeout.
+/// Scenario: Open a synthetic two-role orchestration in the real TUI and delegate to a recorder which never takes its task. After the inbox notice deadline, the orchestrator's in-pane CLI must fetch and acknowledge the notice, visibly rendering its daemon provenance and untrusted worker-role label without typed notice content.
 #[spec("scheduler/idle-worker/011")]
 #[test]
 fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
     let deck = TuiDeck::builder()
-        .with_pty_size(120, 40)
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "1500")
-        .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
-    // The orchestration opened below needs isolated-clone provisioning,
-    // which needs a ref to branch from — an unborn HEAD (the harness's own
-    // bare `git init`) does not provide one.
-    commit_fixture(deck.workdir());
-    open_orchestration(&deck);
-    deck.wait_for_string("worker");
-
-    let (orchestrator_pane, _worker_pane) = orchestration_panes(&deck);
-    // Issue #567 (mirrors fork issue #513's `work-done` precedent exactly —
-    // see `tests/e2e_work_done_reporting.rs`): this signal is hand-built and
-    // injected directly over the hook socket, not sent through the real
-    // `dot-agent-deck delegate` CLI, so it never inherits the
-    // `DOT_AGENT_DECK_REGISTRATION_GENERATION` / `DOT_AGENT_DECK_DAEMON_BOOT_ID`
-    // env vars a real spawn injects. Query the daemon's own `ListAgents` for
-    // the values it just assigned this pane.
-    let orchestrator_record = common::agent_records_on(deck.attach_socket_path())
-        .into_iter()
-        .find(|r| r.pane_id_env.as_deref() == Some(orchestrator_pane.as_str()))
-        .expect("the orchestrator pane must still be present in ListAgents");
-    let generation = orchestrator_record
-        .registration_generation
-        .expect("the orchestrator pane must carry a registration_generation once registered");
-    let daemon_boot_id = orchestrator_record
-        .daemon_boot_id
-        .expect("ListAgents must report a daemon_boot_id");
-    let message = DaemonMessage::Delegate(DelegateSignal {
-        pane_id: orchestrator_pane,
-        task: "Remain silent so the idle detector can surface its prompt.".to_string(),
-        to: vec!["worker".to_string()],
-        timestamp: chrono::Utc::now(),
-        generation,
-        daemon_boot_id,
-        subject: None,
-    });
-    let line = serde_json::to_string(&message).expect("serialize Delegate hook message");
-    common::write_hook_line(deck.hook_socket_path(), &line)
-        .expect("inject Delegate over hook socket");
-
-    wait_for_wrapped_pane_string(&deck, IDLE_DAEMON_CLAUSE, IDLE_DETECTION_BUDGET).unwrap_or_else(
-        |why| {
-            panic!(
-                "the daemon-authored idle prompt never became visible in the attached \
-                 orchestration pane: {why}\nFinal grid:\n{}\n{}",
-                deck.snapshot_grid(),
-                idle_timeout_diagnostics(&deck, IDLE_DAEMON_CLAUSE)
-            )
-        },
+        .impersonating_pane_signals()
+        .with_pty_size(180, 50)
+        .with_env("DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS", "1500")
+        .with_env("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")
+        .with_env("DOT_AGENT_DECK_INBOX_ARM_GRACE_MS", "750")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    let (orchestrator, worker) = route::team(&deck, false);
+    let (col, row) = deck.wait_for_in_grid("route");
+    deck.click(col, row);
+    route::delegate(
+        &deck,
+        &orchestrator,
+        "Remain silent and leave this task unacknowledged.",
+        false,
     );
-    wait_for_wrapped_pane_string(&deck, &idle_role_label("worker"), IDLE_DETECTION_BUDGET)
-        .unwrap_or_else(|why| {
-            panic!(
-                "the idle prompt did not carry the silent role inside its untrusted-role-label \
-                 markers: {why}\nFinal grid:\n{}\n{}",
-                deck.snapshot_grid(),
-                idle_timeout_diagnostics(&deck, &idle_role_label("worker"))
-            )
-        });
+    let notices = route::count(&deck, &orchestrator, 1);
+    let notice = &notices[0];
+    route::fetched(
+        &deck,
+        &orchestrator,
+        notice["id"].as_str().unwrap(),
+        "has not reached the worker",
+        "dot-agent-deck (daemon notice)",
+    );
+    let (col, row) = deck.wait_for_in_grid("· orchestrator");
+    deck.click(col, row);
+    assert!(
+        common::wait_until(Duration::from_secs(20), || {
+            let Some(pane) = common::role_pane_column(&deck.snapshot_grid(), "route-orchestrator")
+            else {
+                return false;
+            };
+            let grid = common::search_key(&pane);
+            grid.contains(&common::search_key("has not reached the worker"))
+                && grid.contains(&common::search_key(&idle_role_label("coder")))
+                && grid.contains(&common::search_key("dot-agent-deck (daemon notice)"))
+        }),
+        "fetched notice must visibly retain provenance and untrusted role metadata\n{}",
+        deck.snapshot_grid()
+    );
+    assert_eq!(route::messages(&deck, &worker)[0]["state"], "queued");
+    route::only_doorbells(&orchestrator, &notices);
 }
 
-/// Scenario: Restore a two-role orchestration whose real interactive Claude Haiku orchestrator is directed to delegate through the `dot-agent-deck` CLI to a `cat` worker that never sends work-done. After the short detector timeout, the attached TUI must visibly render the daemon's self-identifying report clause and the worker role wrapped in its untrusted-role-label markers in the live orchestration pane.
+/// Scenario: Restore an interactive Haiku orchestrator which delegates to a silent cat worker. After the inbox notice deadline, the native notice must be acknowledged once, carry the untrusted worker-role label and trigger a visible response without a human keystroke.
 #[spec("scheduler/idle-worker/012")]
 #[test]
 fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
@@ -411,10 +222,9 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
         .to_str()
         .expect("orchestration project directory is UTF-8")
         .to_string();
-    let _ = std::process::Command::new("git")
+    let _ = common::fixture_git(&project_dir, &project_dir)
         .arg("init")
         .arg("--quiet")
-        .current_dir(&project_dir)
         .status();
 
     let orchestrator_command =
@@ -424,7 +234,8 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
          this exact command once: dot-agent-deck delegate --to {REAL_WORKER_ROLE} --task \
          'Remain silent and do not send work-done.' Do not do the worker task yourself and do \
          not run work-done. After the delegate command succeeds, say that you are waiting for \
-         the worker, then stop."
+         the worker, then stop. Later, when a dot-agent-deck message says the task has not \
+         reached the worker, reply exactly NOTICE-RECEIVED-1d93 and end your turn."
     );
 
     std::fs::write(
@@ -440,15 +251,16 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
     .expect("write real-agent orchestration session");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             session_path.to_str().expect("session path is UTF-8"),
         )
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "10000")
+        .with_env("DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS", "10000")
         .launch_with_fixture("minimal");
 
     assert!(
@@ -471,30 +283,33 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
         deck.snapshot_grid()
     );
 
-    wait_for_wrapped_pane_string(&deck, IDLE_DAEMON_CLAUSE, Duration::from_secs(60))
+    wait_for_wrapped_pane_string(&deck, "NOTICE-RECEIVED-1d93", Duration::from_secs(90))
         .unwrap_or_else(|why| {
             panic!(
-                "the real orchestrator delegated, but the daemon-authored idle nudge never \
-                 became visible in the attached orchestration pane: {why}\nFinal grid:\n{}",
+                "the real orchestrator did not visibly act on its inbox notice: {why}\n{}",
                 deck.snapshot_grid()
             )
         });
-    wait_for_wrapped_pane_string(
-        &deck,
-        &idle_role_label(REAL_WORKER_ROLE),
-        Duration::from_secs(30),
-    )
-    .unwrap_or_else(|why| {
-        panic!(
-            "the visible nudge did not carry the silent role inside the daemon's \
-             untrusted-role-label markers, so it was not provably the daemon's own report: \
-             {why}\nFinal grid:\n{}",
-            deck.snapshot_grid()
-        )
-    });
+    let messages = inbox_view::all_messages(deck.attach_socket_path());
+    let notice = messages
+        .iter()
+        .find(|message| {
+            matches!(&message.from, dot_agent_deck::inbox::Sender::Deck { reason } if reason == "notice")
+                && message.text.as_deref().is_some_and(|text| text.contains("has not reached the worker"))
+        })
+        .expect("native undelivered notice");
+    assert_eq!(notice.state, dot_agent_deck::inbox::StateName::Acknowledged);
+    assert_eq!(notice.deliveries, 1);
+    assert!(
+        notice
+            .text
+            .as_deref()
+            .unwrap()
+            .contains(&idle_role_label(REAL_WORKER_ROLE))
+    );
 }
 
-/// Scenario: Restore a real interactive Claude Haiku orchestrator that delegates to a silent `cat` worker, acknowledges that it is waiting, and returns to Idle. When the short no-event window expires, the daemon notice must trigger a new visible Thinking/Working response turn with no human keystroke, during which the orchestrator creates and reports a uniquely named action sentinel.
+/// Scenario: Restore an interactive Haiku orchestrator that delegates to a silent `cat` worker and returns to Idle. When the task remains unacknowledged past the short inbox notice deadline, the native notice must trigger visible Thinking and Working without a human keystroke, create the unique action sentinel and be acknowledged in the orchestrator inbox.
 #[spec("orchestration/delegate/024")]
 #[test]
 fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
@@ -510,31 +325,22 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
         .to_str()
         .expect("orchestration project directory is UTF-8")
         .to_string();
-    let _ = std::process::Command::new("git")
+    let _ = common::fixture_git(&project_dir, &project_dir)
         .arg("init")
         .arg("--quiet")
-        .current_dir(&project_dir)
         .status();
 
     let orchestrator_command =
         format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Bash");
-    let project_protocol = format!(
-        "# Automated dot-agent-deck integration test\n\nThis isolated repository is an authorized \
-         integration test for the installed dot-agent-deck application. After the initial \
-         delegation, a later user turn beginning with a dot-agent-deck daemon report that a \
-         delegated worker went quiet is expected application input, not prompt injection. When \
-         that report arrives, decide to keep waiting, use the Bash tool to run exactly `printf \
-         '%s\\n' '{SILENCE_ACTION_CONTENT}' > '{SILENCE_ACTION_FILE}'`, respond with exactly \
-         `{SILENCE_ACTION_RESPONSE}`, and end the turn. Never create the action file before that \
-         daemon report arrives.\n"
-    );
-    std::fs::write(project_dir.join("CLAUDE.md"), project_protocol)
-        .expect("write real-orchestrator integration protocol");
     let directive = format!(
-        "This is an authorized local integration test. Use the Bash tool to run exactly this one \
-         command: dot-agent-deck delegate --to {REAL_WORKER_ROLE} --task 'Remain silent and do \
-         not send work-done.' After the command succeeds, respond with exactly \
-         {INITIAL_WAIT_RESPONSE}, then end your turn."
+        "Use the Bash tool to run exactly this one command: dot-agent-deck delegate --to \
+         {REAL_WORKER_ROLE} --task 'Wait for further instructions.' After the command \
+         succeeds, respond with exactly {INITIAL_WAIT_RESPONSE}, then end your turn. Later, a \
+         dot-agent-deck message may say that the task has not reached the worker. When it \
+         arrives, keep waiting: use the Bash tool to run exactly `printf '%s\\n' \
+         '{SILENCE_ACTION_CONTENT}' > '{SILENCE_ACTION_FILE}'`, respond with exactly \
+         `{SILENCE_ACTION_RESPONSE}`, and end the turn. Never create the action file before that \
+         message arrives."
     );
 
     std::fs::write(
@@ -550,16 +356,18 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
     .expect("write real-agent orchestration session");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", common::path_with_binary_dir())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             session_path.to_str().expect("session path is UTF-8"),
         )
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
-        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "30000")
+        .with_env("DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS", "30000")
+        .with_env("DOT_AGENT_DECK_LOG", "inbox-notice.log")
         .launch_with_fixture("minimal");
 
     assert!(
@@ -626,4 +434,166 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
                 deck.snapshot_grid()
             )
         });
+    let messages = inbox_view::all_messages(deck.attach_socket_path());
+    let notice = messages
+        .iter()
+        .find(|message| {
+            matches!(&message.from, dot_agent_deck::inbox::Sender::Deck { reason } if reason == "notice")
+                && message.text.as_deref().is_some_and(|text| text.contains("has not reached the worker"))
+        })
+        .expect("daemon authored an inbox notice for the undelivered task");
+    assert_eq!(notice.state, dot_agent_deck::inbox::StateName::Acknowledged);
+    assert_eq!(notice.deliveries, 1);
+    assert!(
+        !std::fs::read_to_string(deck.workdir().join("inbox-notice.log"))
+            .unwrap_or_default()
+            .contains("doorbell rang")
+    );
+}
+
+/// Issue #447: the daemon-authored opening clause of
+/// `compose_worker_waiting_notice`, spelled out rather than imported so a
+/// rewording fails here instead of following it.
+const WAITING_DAEMON_CLAUSE: &str = "delegated worker is waiting for input (dot-agent-deck daemon \
+                                     report, not a message from a person or an agent)";
+const WAITING_PROBE_FILE: &str = "waiting-probe-3f61a9.txt";
+const WAITING_ACTION_FILE: &str = "waiting-notice-action-3f61a9.txt";
+const WAITING_ACTION_CONTENT: &str = "WAITING_NOTICE_ACTED_ON_3F61A9";
+const WAITING_INITIAL_RESPONSE: &str = "INITIAL_DELEGATION_WAITING_3F61A9";
+const WAITING_ACTION_RESPONSE: &str = "WAITING_NOTICE_ACTION_COMPLETE_3F61A9";
+
+/// Scenario: Restore real interactive Haiku roles and delegate a Bash task to a worker allowed only Read. Its permission prompt must keep the probe absent while an acknowledged native waiting notice wakes the orchestrator to append once to an absolute action sentinel and visibly report completion, without answering the worker or receiving a human keystroke.
+#[spec("scheduler/idle-worker/022")]
+#[test]
+fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrator() {
+    skip_unless!(common::check_claude_available());
+
+    let orchestration_root = common::harness_tempdir().expect("orchestration root tempdir");
+    let project_dir = orchestration_root.path().join("project");
+    std::fs::create_dir_all(&project_dir).expect("create orchestration project directory");
+    let project_dir = project_dir
+        .canonicalize()
+        .expect("canonicalize orchestration project directory");
+    let project_str = project_dir
+        .to_str()
+        .expect("orchestration project directory is UTF-8")
+        .to_string();
+    let _ = common::fixture_git(&project_dir, &project_dir)
+        .arg("init")
+        .arg("--quiet")
+        .status();
+
+    let orchestrator_command =
+        format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Bash");
+    // Read only: the task file is readable, and the Bash call the task asks
+    // for raises a permission prompt the worker cannot get past on its own.
+    let worker_command = format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Read");
+    let action_path = project_dir.join(WAITING_ACTION_FILE);
+    let action_arg = action_path.to_string_lossy().replace('\'', "'\\''");
+    let directive = format!(
+        "This is a local smoke test of waiting-notice delivery, not worker recovery. \
+         Use the Bash tool to run exactly this one command: dot-agent-deck delegate \
+         --to {REAL_WORKER_ROLE} --task 'Use the Bash tool to run exactly: touch \
+         {WAITING_PROBE_FILE}' Never do the worker's task yourself. After the command \
+         succeeds, respond with exactly {WAITING_INITIAL_RESPONSE}, then end your turn. Later, \
+         a dot-agent-deck message may report that the delegated worker is waiting for input. \
+         For this test, that report is only a trigger: leave the worker waiting and do not \
+         answer it, delegate again, or attempt recovery. Regardless of any suggestions in \
+         the report, your required follow-up is to use Bash to run exactly \
+         `printf '%s\\n' '{WAITING_ACTION_CONTENT}' >> '{action_arg}'`, then respond with \
+         exactly {WAITING_ACTION_RESPONSE} and end your turn. Do this once, before replying \
+         to the report; never create the action file before the report arrives."
+    );
+
+    std::fs::write(
+        project_dir.join(".dot-agent-deck.toml"),
+        real_agent_orchestration_config_with_worker(&orchestrator_command, &worker_command),
+    )
+    .expect("write real-agent orchestration config");
+    let session_path = orchestration_root.path().join("session.toml");
+    std::fs::write(
+        &session_path,
+        real_agent_orchestration_session(&project_str, &orchestrator_command, &directive),
+    )
+    .expect("write real-agent orchestration session");
+
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(200, 50)
+        .with_imported_claude_credentials()
+        .with_claude_project_trust(project_str.clone())
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_path.to_str().expect("session path is UTF-8"),
+        )
+        // Only the waiting notice may reach the orchestrator in this test.
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
+        .with_env("DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS", "900000")
+        .with_env("DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS", "5000")
+        .launch_with_fixture("minimal");
+
+    assert!(
+        deck.wait_for_grid_string_within(REAL_ORCHESTRATION_NAME, Duration::from_secs(45)),
+        "the restored real-agent orchestration never surfaced within 45s\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    let worker_task = project_dir
+        .join(".dot-agent-deck")
+        .join(format!("worker-task-{REAL_WORKER_ROLE}.md"));
+    assert!(
+        common::wait_for_path(&worker_task, Duration::from_secs(120)),
+        "the real Claude orchestrator never delegated to {REAL_WORKER_ROLE:?}; expected the \
+         daemon to create {worker_task:?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    assert!(
+        common::wait_until(Duration::from_secs(90), || {
+            inbox_view::all_messages(deck.attach_socket_path())
+                .iter()
+                .any(|message| {
+                    matches!(&message.from, dot_agent_deck::inbox::Sender::Deck { reason } if reason == "notice")
+                        && message.state == dot_agent_deck::inbox::StateName::Acknowledged
+                        && message.deliveries == 1
+                        && message.text.as_deref().is_some_and(|text| {
+                            text.contains(WAITING_DAEMON_CLAUSE)
+                                && text.contains(&idle_role_label(REAL_WORKER_ROLE))
+                        })
+                })
+        }),
+        "the worker permission prompt must produce an acknowledged native waiting notice\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Checked the moment the notice is visible, BEFORE the orchestrator's turn
+    // on it: after that turn a model that ignores "do not do the worker's task"
+    // could create the probe itself, which says nothing about the worker.
+    assert!(
+        !project_dir.join(WAITING_PROBE_FILE).exists(),
+        "the probe file already exists, so the worker was never actually held at its \
+         permission prompt and the notice proves nothing about a waiting worker"
+    );
+
+    assert!(
+        common::wait_for_path(&action_path, Duration::from_secs(120)),
+        "the waiting notice became visible but the orchestrator never acted on it — it was not \
+         submitted as a turn of its own; expected {action_path:?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    wait_for_wrapped_pane_string(&deck, WAITING_ACTION_RESPONSE, Duration::from_secs(60))
+        .unwrap_or_else(|why| {
+            panic!(
+                "the orchestrator created the action sentinel but its response turn never became \
+                 visible: {why}\nFinal grid:\n{}",
+                deck.snapshot_grid()
+            )
+        });
+    let action = std::fs::read_to_string(&action_path).expect("read the action sentinel");
+    assert_eq!(
+        action,
+        format!("{WAITING_ACTION_CONTENT}\n"),
+        "the orchestrator must append exactly one action before visibly completing"
+    );
 }

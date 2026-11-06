@@ -3,6 +3,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::event::AgentType;
+use crate::inbox::{OrchestrationSubscriptions, RoleSubscriptions, Subscriptions};
 
 pub const CONFIG_FILE_NAME: &str = ".dot-agent-deck.toml";
 
@@ -95,7 +96,19 @@ impl std::error::Error for ProjectConfigError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "RawProjectConfig")]
 pub struct ProjectConfig {
-    pub modes: Vec<ModeConfig>,
+    /// Issue #1199: the file declared a `[[modes]]` block. Workspace modes were
+    /// removed, and the block is now ignored rather than rejected — a hard error
+    /// would break every config written before the removal, and ignoring it
+    /// silently would leave the user wondering where their mode went. So the
+    /// parse layer accepts ANY `[[modes]]` shape (invalid regexes, zero reactive
+    /// panes, unknown keys) and records only that one was there; the surfaces a
+    /// user looks at — the New Agent form's status line and `dot-agent-deck
+    /// validate` — turn this into a warning.
+    ///
+    /// Deliberately not warned about inside [`load_project_config`]: the daemon
+    /// re-reads this file on every delegate and every scheduled spawn, so a
+    /// warning there would repeat for as long as the block stays in the file.
+    pub legacy_modes_declared: bool,
     pub orchestrations: Vec<OrchestrationConfig>,
     /// PRD #126: how long the daemon waits for a delegated worker to send
     /// `work-done` before injecting an idle prompt into the orchestrator's
@@ -120,10 +133,61 @@ pub struct ProjectConfig {
     ///   task, so it is treated as a misconfiguration rather than honored.
     ///
     /// ⚠️ TOML placement: this is a **top-level scalar**, so it must appear
-    /// *before* the first table header (`[[modes]]` / `[[orchestrations]]`).
+    /// *before* the first table header (`[[orchestrations]]`).
     /// Appended at the end of the file it would silently become a key of the
     /// last table and be ignored.
     pub worker_response_timeout_minutes: u64,
+    /// PRD #1666: the topics and offer pools this file subscribes its panes
+    /// to — `subscribe` on an orchestration and on a role, `take_offers` on a
+    /// role, `subscribe` under `[dispatch]`. Kept beside the orchestrations
+    /// rather than on them, index-aligned, so the many places that build a
+    /// role or an orchestration by hand need not know about the inbox.
+    pub inbox: InboxConfig,
+}
+
+/// PRD #1666: what [`ProjectConfig::inbox`] holds, as written (after
+/// `extends`). [`ProjectConfig::subscriptions`] keys it by orchestration name
+/// for the daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InboxConfig {
+    /// One entry per [`ProjectConfig::orchestrations`] entry, same order.
+    pub orchestrations: Vec<OrchestrationSubscriptions>,
+    /// `[dispatch] subscribe`: the topics a pane that dispatched a unit
+    /// receives from that unit's tree.
+    pub dispatch: Vec<String>,
+}
+
+impl ProjectConfig {
+    /// The subscriptions by orchestration name, for scope resolution. Two
+    /// blocks that share a name (a validation warning) subscribe to the
+    /// union of theirs.
+    pub fn subscriptions(&self) -> Subscriptions {
+        let mut out = Subscriptions {
+            dispatch: self.inbox.dispatch.clone(),
+            ..Subscriptions::default()
+        };
+        for (orchestration, subs) in self.orchestrations.iter().zip(&self.inbox.orchestrations) {
+            let entry = out
+                .orchestrations
+                .entry(orchestration.name.clone())
+                .or_default();
+            union(&mut entry.subscribe, &subs.subscribe);
+            for (role, role_subs) in &subs.roles {
+                let into = entry.roles.entry(role.clone()).or_default();
+                union(&mut into.subscribe, &role_subs.subscribe);
+                union(&mut into.take_offers, &role_subs.take_offers);
+            }
+        }
+        out
+    }
+}
+
+fn union(into: &mut Vec<String>, from: &[String]) {
+    for item in from {
+        if !into.contains(item) {
+            into.push(item.clone());
+        }
+    }
 }
 
 /// PRD #126: two hours — long enough that a worker chewing through a real
@@ -133,73 +197,6 @@ pub const DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES: u64 = 120;
 
 fn default_worker_response_timeout_minutes() -> u64 {
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModeConfig {
-    pub name: String,
-    /// Issue #308: what agent this mode's **agent pane** runs, when the command
-    /// entered for it cannot reveal that by itself.
-    ///
-    /// The agent pane's command is typed in the new-pane form rather than
-    /// written here, so this key does not name a command — it answers the one
-    /// question the command may be unable to: `devbox run codex-big`,
-    /// `mise exec -- codex` or a bespoke `run-codex.sh` all resolve to a
-    /// *launcher* basename, and [`crate::event::AgentType::from_command`]
-    /// correctly refuses to guess what is behind it.
-    ///
-    /// Resolved by [`Self::declared_agent_type`] through
-    /// [`crate::agent_registry::resolve_declared_agent`] — the same rule
-    /// `wrap --agent` applies, so an unrecognized name yields the neutral
-    /// [`crate::event::AgentType::None`] rather than a guess. Absent (the
-    /// default, and every config written before this key existed) means "infer
-    /// from the command", i.e. exactly the previous behavior.
-    ///
-    /// Deliberately on `[[modes]]` and NOT on `[[modes.panes]]`: the persistent
-    /// side panes run tools, not agents, and never pass through the seam this
-    /// declaration steers.
-    #[serde(default)]
-    pub agent: Option<String>,
-    #[serde(default)]
-    pub init_command: Option<String>,
-    /// PRD #127 M3.1: a prompt auto-delivered to the mode's **agent** pane
-    /// once the agent signals readiness (gated like orchestrations), as
-    /// opposed to `init_command` which targets the side panes. Optional;
-    /// `None` (the default, and existing configs without it) delivers nothing.
-    /// This is the generic primitive the Phase-3 "schedule" creation mode
-    /// builds on — a `[[modes]]` entry that carries a `seed_prompt`.
-    #[serde(default)]
-    pub seed_prompt: Option<String>,
-    #[serde(default)]
-    pub panes: Vec<ModePersistentPane>,
-    #[serde(default)]
-    pub rules: Vec<ModeRule>,
-    #[serde(default = "default_reactive_panes")]
-    pub reactive_panes: usize,
-}
-
-fn default_reactive_panes() -> usize {
-    2
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModePersistentPane {
-    pub command: String,
-    pub name: Option<String>,
-    #[serde(default = "default_pane_watch")]
-    pub watch: bool,
-}
-
-fn default_pane_watch() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModeRule {
-    pub pattern: String,
-    #[serde(default)]
-    pub watch: bool,
-    pub interval: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,7 +243,71 @@ pub struct SynthesisRoleSlot {
     pub is_start_role: bool,
 }
 
+/// Issue #523: THE rule for which role of an orchestration is its orchestrator
+/// — the pane that is focused when the tab opens, receives the orchestrator
+/// context and prompt, is registered in `AppState::orchestrator_pane_ids` and
+/// so may `delegate`, and is marked `(orchestrator)` in `daemon status`.
+///
+/// The first role with `start = true`, else the role NAMED `orchestrator`,
+/// else role 0. `roles` empty answers 0, which indexes nothing; callers only
+/// ask it of an orchestration with roles.
+///
+/// The flag outranks the name because the flag is the declaration: the docs,
+/// `validate` and the desktop's launch all say `start = true` marks the
+/// orchestrator, so for every config `validate` accepts (exactly one flag) the
+/// answer is simply that role. The name is only a fallback for a config that
+/// sets no flag at all.
+///
+/// Every caller reads this one function. Before #523 there were three answers
+/// — the daemon's dispatched spawn tried the name FIRST, the `Ctrl+n` tab read
+/// the bare flag for delegate permission, and the same tab fell back to role 0
+/// with no name fallback for focus and prompt delivery — so one toml opened
+/// with a different orchestrator depending on which path started it. Taking
+/// the roles through two accessors lets the config's roles and the spawn
+/// path's `RoleSpawn`s share it.
+pub fn orchestrator_index<T>(
+    roles: &[T],
+    name: impl Fn(&T) -> &str,
+    is_start: impl Fn(&T) -> bool,
+) -> usize {
+    roles
+        .iter()
+        .position(&is_start)
+        .or_else(|| roles.iter().position(|r| name(r) == "orchestrator"))
+        .unwrap_or(0)
+}
+
 impl OrchestrationConfig {
+    /// Index into `roles` of this orchestration's orchestrator — see
+    /// [`orchestrator_index`], the one rule every path reads.
+    pub fn orchestrator_role_index(&self) -> usize {
+        orchestrator_index(&self.roles, |r| r.name.as_str(), |r| r.start)
+    }
+
+    /// The orchestrator role itself; `None` only for an orchestration with no
+    /// roles.
+    pub fn orchestrator_role(&self) -> Option<&OrchestrationRoleConfig> {
+        self.roles.get(self.orchestrator_role_index())
+    }
+
+    /// Issue #523 review: the seat of a LIVE orchestration being rebuilt from
+    /// the daemon's role memberships (reconnect hydration, the live surface).
+    /// `flagged` are the `role_index`es whose membership carries
+    /// `is_start_role` — what the daemon actually registered as the
+    /// orchestrator. The first of them in range wins; with none, the config's
+    /// rule ([`Self::orchestrator_role_index`]).
+    ///
+    /// The daemon's answer outranks the config's because it is the one
+    /// `delegate` is checked against: a tab seated anywhere else would focus,
+    /// and TUI-side mirror, one role while the daemon lets a different one
+    /// delegate.
+    pub fn live_orchestrator_seat(&self, flagged: impl IntoIterator<Item = usize>) -> usize {
+        flagged
+            .into_iter()
+            .find(|index| *index < self.roles.len())
+            .unwrap_or_else(|| self.orchestrator_role_index())
+    }
+
     /// PRD #111: synthesise a minimal `OrchestrationConfig` from
     /// daemon-supplied bucket metadata when the local
     /// `.dot-agent-deck.toml` cannot be loaded (laptop TUI reconnecting
@@ -381,12 +442,25 @@ fn default_clear() -> bool {
 
 #[derive(Debug, Deserialize)]
 struct RawProjectConfig {
+    /// Issue #1199: kept only so a leftover `[[modes]]` block can be detected
+    /// and reported. `toml::Value` accepts any shape, so a block that the old
+    /// `ModeConfig` would have rejected still parses — the point is that the
+    /// removal never turns a config that loaded yesterday into a parse error.
     #[serde(default)]
-    modes: Vec<ModeConfig>,
+    modes: Option<toml::Value>,
     #[serde(default)]
     orchestrations: Vec<RawOrchestration>,
     #[serde(default = "default_worker_response_timeout_minutes")]
     worker_response_timeout_minutes: u64,
+    /// PRD #1666: `[dispatch] subscribe`.
+    #[serde(default)]
+    dispatch: Option<RawDispatch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDispatch {
+    #[serde(default)]
+    subscribe: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -409,6 +483,10 @@ struct RawOrchestration {
     /// file does not contain would be a rule nobody could read off the file.
     #[serde(default)]
     extends: Option<String>,
+    /// PRD #1666: topics every role of this orchestration receives. Omitted in
+    /// a block that `extends` another, the parent's apply.
+    #[serde(default)]
+    subscribe: Option<Vec<String>>,
     #[serde(default)]
     roles: Vec<RawRole>,
 }
@@ -442,16 +520,27 @@ struct RawRole {
     prompt_template: Option<String>,
     #[serde(default)]
     clear: Option<bool>,
+    /// PRD #1666: topics this role receives, beyond its orchestration's.
+    #[serde(default)]
+    subscribe: Option<Vec<String>>,
+    /// PRD #1666: the offer pools this role takes jobs from.
+    #[serde(default)]
+    take_offers: Option<Vec<String>>,
 }
 
 impl TryFrom<RawProjectConfig> for ProjectConfig {
     type Error = String;
 
     fn try_from(raw: RawProjectConfig) -> Result<Self, Self::Error> {
+        let (orchestrations, subscriptions) = resolve_orchestrations(&raw.orchestrations)?;
         Ok(ProjectConfig {
-            modes: raw.modes,
-            orchestrations: resolve_orchestrations(&raw.orchestrations)?,
+            legacy_modes_declared: raw.modes.is_some(),
+            orchestrations,
             worker_response_timeout_minutes: raw.worker_response_timeout_minutes,
+            inbox: InboxConfig {
+                orchestrations: subscriptions,
+                dispatch: raw.dispatch.and_then(|d| d.subscribe).unwrap_or_default(),
+            },
         })
     }
 }
@@ -464,15 +553,19 @@ impl TryFrom<RawProjectConfig> for ProjectConfig {
 /// symptom ("orchestration must have at least 2 roles") names neither the typo
 /// nor the file it is in. Loud beats plausible here, and every caller already
 /// distinguishes an unparseable config from an absent one.
-fn resolve_orchestrations(raw: &[RawOrchestration]) -> Result<Vec<OrchestrationConfig>, String> {
-    let mut resolved: Vec<Option<OrchestrationConfig>> = vec![None; raw.len()];
+type ResolvedOrchestration = (OrchestrationConfig, OrchestrationSubscriptions);
+
+fn resolve_orchestrations(
+    raw: &[RawOrchestration],
+) -> Result<(Vec<OrchestrationConfig>, Vec<OrchestrationSubscriptions>), String> {
+    let mut resolved: Vec<Option<ResolvedOrchestration>> = vec![None; raw.len()];
     for i in 0..raw.len() {
         resolve_orchestration_at(raw, i, &mut resolved, &mut Vec::new())?;
     }
     Ok(resolved
         .into_iter()
         .map(|o| o.expect("every index was just resolved"))
-        .collect())
+        .unzip())
 }
 
 /// Resolve one block, resolving its parent first. `stack` carries the chain
@@ -481,7 +574,7 @@ fn resolve_orchestrations(raw: &[RawOrchestration]) -> Result<Vec<OrchestrationC
 fn resolve_orchestration_at(
     raw: &[RawOrchestration],
     index: usize,
-    resolved: &mut Vec<Option<OrchestrationConfig>>,
+    resolved: &mut Vec<Option<ResolvedOrchestration>>,
     stack: &mut Vec<usize>,
 ) -> Result<(), String> {
     if resolved[index].is_some() {
@@ -501,73 +594,101 @@ fn resolve_orchestration_at(
     }
 
     let this = &raw[index];
-    let base: Vec<OrchestrationRoleConfig> = match &this.extends {
-        None => Vec::new(),
-        Some(parent) => {
-            // An unnamed block's `name` is still `""` here — `load_project_config`
-            // normalises it to the cwd basename only AFTER this runs — so an
-            // empty `extends` would silently adopt the first unnamed block as a
-            // parent. Refused rather than allowed, because the rule this module
-            // documents is that a block with no `name` cannot be one, and an
-            // empty value is a typo in every case where it is not.
-            if parent.trim().is_empty() {
-                return Err(format!(
-                    "orchestration '{}' has an empty `extends`. Name the orchestration to inherit \
+    let (base, base_subscriptions): (Vec<OrchestrationRoleConfig>, OrchestrationSubscriptions) =
+        match &this.extends {
+            None => Default::default(),
+            Some(parent) => {
+                // An unnamed block's `name` is still `""` here — `load_project_config`
+                // normalises it to the cwd basename only AFTER this runs — so an
+                // empty `extends` would silently adopt the first unnamed block as a
+                // parent. Refused rather than allowed, because the rule this module
+                // documents is that a block with no `name` cannot be one, and an
+                // empty value is a typo in every case where it is not.
+                if parent.trim().is_empty() {
+                    return Err(format!(
+                        "orchestration '{}' has an empty `extends`. Name the orchestration to inherit \
                      from, or drop the key.",
-                    this.name
-                ));
-            }
-            // Duplicate orchestration names are only a WARNING in
-            // `validate_config`, so a file can legally carry two blocks called
-            // `mixed` — and `position` would silently inherit from whichever was
-            // written first. Without `extends` a duplicate name is merely
-            // confusing (two chips wearing one label); with it, it silently
-            // decides WHICH AGENTS RUN, which is the same position-decides-in-
-            // silence failure issue #704 is about. Refuse instead (Greptile P1 on
-            // PR #711).
-            if raw.iter().filter(|o| o.name == *parent).count() > 1 {
-                return Err(format!(
-                    "orchestration '{}' extends '{parent}', but '{parent}' names more than one \
+                        this.name
+                    ));
+                }
+                // Duplicate orchestration names are only a WARNING in
+                // `validate_config`, so a file can legally carry two blocks called
+                // `mixed` — and `position` would silently inherit from whichever was
+                // written first. Without `extends` a duplicate name is merely
+                // confusing (two chips wearing one label); with it, it silently
+                // decides WHICH AGENTS RUN, which is the same position-decides-in-
+                // silence failure issue #704 is about. Refuse instead (Greptile P1 on
+                // PR #711).
+                if raw.iter().filter(|o| o.name == *parent).count() > 1 {
+                    return Err(format!(
+                        "orchestration '{}' extends '{parent}', but '{parent}' names more than one \
                      `[[orchestrations]]` block in this file, so which one it inherits would be \
                      decided by their order. Give them distinct names.",
-                    this.name
-                ));
-            }
-            let parent_index = raw.iter().position(|o| o.name == *parent).ok_or_else(|| {
-                let defined: Vec<&str> = raw
-                    .iter()
-                    .filter(|o| !o.name.is_empty())
-                    .map(|o| o.name.as_str())
-                    .collect();
-                format!(
-                    "orchestration '{}' extends '{parent}', which is not defined in this \
+                        this.name
+                    ));
+                }
+                let parent_index = raw.iter().position(|o| o.name == *parent).ok_or_else(|| {
+                    let defined: Vec<&str> = raw
+                        .iter()
+                        .filter(|o| !o.name.is_empty())
+                        .map(|o| o.name.as_str())
+                        .collect();
+                    format!(
+                        "orchestration '{}' extends '{parent}', which is not defined in this \
                          file{}",
-                    this.name,
-                    if defined.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (defined: {})", defined.join(", "))
-                    }
-                )
-            })?;
-            stack.push(index);
-            let outcome = resolve_orchestration_at(raw, parent_index, resolved, stack);
-            stack.pop();
-            outcome?;
-            resolved[parent_index]
-                .as_ref()
-                .expect("the parent was just resolved")
-                .roles
-                .clone()
-        }
-    };
+                        this.name,
+                        if defined.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (defined: {})", defined.join(", "))
+                        }
+                    )
+                })?;
+                stack.push(index);
+                let outcome = resolve_orchestration_at(raw, parent_index, resolved, stack);
+                stack.pop();
+                outcome?;
+                let (parent, parent_subscriptions) = resolved[parent_index]
+                    .as_ref()
+                    .expect("the parent was just resolved");
+                (parent.roles.clone(), parent_subscriptions.clone())
+            }
+        };
 
-    resolved[index] = Some(OrchestrationConfig {
-        name: this.name.clone(),
-        default: this.default,
-        roles: apply_role_patches(&this.name, base, &this.roles)?,
-    });
+    let roles = apply_role_patches(&this.name, base, &this.roles)?;
+    let subscriptions = apply_subscription_patches(base_subscriptions, this);
+    resolved[index] = Some((
+        OrchestrationConfig {
+            name: this.name.clone(),
+            default: this.default,
+            roles,
+        },
+        subscriptions,
+    ));
     Ok(())
+}
+
+/// PRD #1666: this block's `subscribe` and its roles' `subscribe` and
+/// `take_offers` over the ones it inherited. The same patch rule as a role's
+/// other fields: an omitted key keeps the parent's value, a written one
+/// replaces it (an empty list clears it).
+fn apply_subscription_patches(
+    mut inherited: OrchestrationSubscriptions,
+    this: &RawOrchestration,
+) -> OrchestrationSubscriptions {
+    if let Some(subscribe) = &this.subscribe {
+        inherited.subscribe = subscribe.clone();
+    }
+    for role in &this.roles {
+        let entry: &mut RoleSubscriptions = inherited.roles.entry(role.name.clone()).or_default();
+        if let Some(subscribe) = &role.subscribe {
+            entry.subscribe = subscribe.clone();
+        }
+        if let Some(take_offers) = &role.take_offers {
+            entry.take_offers = take_offers.clone();
+        }
+    }
+    inherited
 }
 
 /// Merge this block's roles onto the ones it inherited.
@@ -639,9 +760,8 @@ fn apply_role_patches(
 
 /// Issue #308: resolve a config-declared agent name to an [`AgentType`].
 ///
-/// The shared body behind [`OrchestrationRoleConfig::declared_agent_type`] and
-/// [`ModeConfig::declared_agent_type`], so both surfaces answer a given name
-/// identically — and, through
+/// The body behind [`OrchestrationRoleConfig::declared_agent_type`], which
+/// answers a given name identically — through
 /// [`crate::agent_registry::resolve_declared_agent`], identically to
 /// `wrap --agent <name>`.
 ///
@@ -697,27 +817,6 @@ impl OrchestrationRoleConfig {
     pub fn resolved_agent_type(&self) -> Option<AgentType> {
         self.declared_agent_type()
             .or_else(|| AgentType::from_command(Some(&self.command)))
-    }
-}
-
-impl ModeConfig {
-    /// This mode's DECLARED agent-pane type — see [`declared_agent_type`] for
-    /// what each of the three answers means. `None` when the mode declares
-    /// nothing.
-    pub fn declared_agent_type(&self) -> Option<AgentType> {
-        declared_agent_type(self.agent.as_deref())
-    }
-
-    /// What agent this mode's agent pane runs, given the `command` the user
-    /// entered for it: the declaration if the mode made one, otherwise the type
-    /// derived from that command.
-    ///
-    /// A mode's agent command is typed in the new-pane form rather than stored
-    /// in the config, so unlike [`OrchestrationRoleConfig::resolved_agent_type`]
-    /// this takes the command as an argument.
-    pub fn resolved_agent_type(&self, command: &str) -> Option<AgentType> {
-        self.declared_agent_type()
-            .or_else(|| AgentType::from_command(Some(command)))
     }
 }
 
@@ -991,6 +1090,45 @@ pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectC
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #523 review (Qodo, PR #1388): a live orchestration rebuilt from
+    /// the daemon's memberships is seated where the DAEMON registered its
+    /// orchestrator, which can differ from what the config would seat (a
+    /// restored tab honouring a saved cursor, PRD #89 F3). The config's rule
+    /// is only the fallback for memberships that flag nothing in range.
+    #[test]
+    fn live_orchestrator_seat_follows_the_daemons_memberships() {
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        let config = OrchestrationConfig {
+            name: "team".to_string(),
+            default: false,
+            roles: vec![role("orchestrator", true), role("coder", false)],
+        };
+        assert_eq!(
+            config.live_orchestrator_seat([1]),
+            1,
+            "the daemon seated `coder`"
+        );
+        assert_eq!(
+            config.live_orchestrator_seat([]),
+            0,
+            "nothing flagged: the config's rule"
+        );
+        assert_eq!(
+            config.live_orchestrator_seat([7]),
+            0,
+            "out of range: the config's rule"
+        );
+    }
+
     use super::*;
 
     // --- Issue #704: which orchestration a run opens when none was named ---
@@ -1476,172 +1614,6 @@ agent = \"claude\"
     }
 
     #[test]
-    fn parse_valid_full_config() {
-        let toml = r#"
-[[modes]]
-name = "kubernetes-operations"
-shell_init = "devbox shell"
-
-[[modes.panes]]
-command = "kubectl get applications -n argocd -w"
-name = "ArgoCD Apps"
-
-[[modes.panes]]
-command = "kubectl get events -A -w"
-name = "Events"
-
-[[modes.rules]]
-pattern = "kubectl\\s+.*(describe|explain)"
-watch = false
-
-[[modes.rules]]
-pattern = "kubectl\\s+.*(get|top|logs)"
-watch = true
-interval = 2
-
-[[modes.rules]]
-pattern = "helm\\s+.*(status|list)"
-watch = false
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes.len(), 1);
-
-        let mode = &config.modes[0];
-        assert_eq!(mode.name, "kubernetes-operations");
-        assert_eq!(mode.panes.len(), 2);
-        assert_eq!(
-            mode.panes[0].command,
-            "kubectl get applications -n argocd -w"
-        );
-        assert_eq!(mode.panes[0].name.as_deref(), Some("ArgoCD Apps"));
-        assert_eq!(mode.panes[1].command, "kubectl get events -A -w");
-        assert_eq!(mode.panes[1].name.as_deref(), Some("Events"));
-        assert_eq!(mode.rules.len(), 3);
-        assert_eq!(mode.rules[0].pattern, "kubectl\\s+.*(describe|explain)");
-        assert!(!mode.rules[0].watch);
-        assert!(mode.rules[0].interval.is_none());
-        assert_eq!(mode.rules[1].pattern, "kubectl\\s+.*(get|top|logs)");
-        assert!(mode.rules[1].watch);
-        assert_eq!(mode.rules[1].interval, Some(2));
-        assert!(!mode.rules[2].watch);
-    }
-
-    #[test]
-    fn parse_minimal_config() {
-        let toml = r#"
-[[modes]]
-name = "minimal"
-
-[[modes.panes]]
-command = "echo hello"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        let mode = &config.modes[0];
-        assert_eq!(mode.name, "minimal");
-        assert_eq!(mode.panes.len(), 1);
-        assert!(mode.rules.is_empty());
-    }
-
-    // PRD #127 M3.1 — `seed_prompt` is an optional mode field: present →
-    // parsed, absent → None (existing configs without it keep parsing).
-    #[test]
-    fn seed_prompt_parses_when_present() {
-        let toml = r#"
-[[modes]]
-name = "seeded"
-seed_prompt = "do the thing"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes[0].seed_prompt.as_deref(), Some("do the thing"));
-    }
-
-    #[test]
-    fn seed_prompt_defaults_to_none_when_absent() {
-        let toml = r#"
-[[modes]]
-name = "plain"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(config.modes[0].seed_prompt.is_none());
-    }
-
-    #[test]
-    fn watch_defaults_to_false() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.rules]]
-pattern = "some pattern"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        let rule = &config.modes[0].rules[0];
-        assert!(!rule.watch);
-        assert!(rule.interval.is_none());
-    }
-
-    #[test]
-    fn pane_watch_defaults_to_true() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.panes]]
-command = "kubectl get pods"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(config.modes[0].panes[0].watch);
-    }
-
-    #[test]
-    fn pane_watch_can_be_set_to_false() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.panes]]
-command = "kubectl get pods -w"
-watch = false
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(!config.modes[0].panes[0].watch);
-    }
-
-    #[test]
-    fn pane_name_defaults_to_none() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.panes]]
-command = "cargo test"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(config.modes[0].panes[0].name.is_none());
-    }
-
-    #[test]
-    fn reactive_panes_defaults_to_two() {
-        let toml = r#"
-[[modes]]
-name = "test"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes[0].reactive_panes, 2);
-    }
-
-    #[test]
-    fn reactive_panes_configurable() {
-        let toml = r#"
-[[modes]]
-name = "test"
-reactive_panes = 4
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes[0].reactive_panes, 4);
-    }
-
-    #[test]
     fn parse_full_orchestration_config() {
         let toml = r#"
 [[orchestrations]]
@@ -1684,7 +1656,7 @@ clear = false
     }
 
     #[test]
-    fn parse_orchestration_alongside_modes() {
+    fn legacy_modes_block_is_ignored_alongside_orchestrations() {
         let toml = r#"
 [[modes]]
 name = "dev"
@@ -1705,8 +1677,16 @@ name = "reviewer"
 command = "claude"
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes.len(), 1);
-        assert_eq!(config.orchestrations.len(), 1);
+        assert!(
+            config.legacy_modes_declared,
+            "a leftover [[modes]] block must be recorded so the TUI and validate can warn"
+        );
+        assert_eq!(
+            config.orchestrations.len(),
+            1,
+            "issue #1199: the ignored [[modes]] block must not cost the file its orchestrations"
+        );
+        assert_eq!(config.orchestrations[0].name, "review");
     }
 
     #[test]
@@ -1919,8 +1899,10 @@ command = "claude"
         assert!(!config.orchestrations[0].roles[0].start);
     }
 
+    /// Issue #1199: a config that declares only workspace modes still loads —
+    /// warn and continue, never a parse error — and simply has nothing to open.
     #[test]
-    fn modes_only_config_still_works() {
+    fn legacy_modes_only_config_still_parses() {
         let toml = r#"
 [[modes]]
 name = "dev"
@@ -1929,8 +1911,41 @@ name = "dev"
 command = "echo hi"
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes.len(), 1);
+        assert!(config.legacy_modes_declared);
         assert!(config.orchestrations.is_empty());
+    }
+
+    /// Issue #1199: the tolerance is for ANY `[[modes]]` shape, including ones the
+    /// removed `ModeConfig` would have rejected — an invalid rule regex, a rule
+    /// missing its required `pattern`, zero reactive panes, unknown keys. A block
+    /// that used to be a validate error must not become a parse error now.
+    #[test]
+    fn legacy_modes_block_of_any_shape_is_tolerated() {
+        let toml = r#"
+[[modes]]
+name = "broken"
+reactive_panes = 0
+not_a_real_key = [1, 2, 3]
+
+[[modes.rules]]
+pattern = 'kubectl\s+(unclosed'
+
+[[modes.rules]]
+watch = true
+
+[[orchestrations]]
+name = "kept"
+
+[[orchestrations.roles]]
+name = "a"
+command = "claude"
+start = true
+"#;
+        let config: ProjectConfig =
+            toml::from_str(toml).expect("a legacy [[modes]] block must parse");
+        assert!(config.legacy_modes_declared);
+        assert_eq!(config.orchestrations.len(), 1);
+        assert_eq!(config.orchestrations[0].name, "kept");
     }
 
     #[test]
@@ -1949,21 +1964,8 @@ name = "b"
 command = "claude"
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(config.modes.is_empty());
+        assert!(!config.legacy_modes_declared);
         assert_eq!(config.orchestrations.len(), 1);
-    }
-
-    #[test]
-    fn missing_required_pattern_is_error() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.rules]]
-watch = true
-"#;
-        let result: Result<ProjectConfig, _> = toml::from_str(toml);
-        assert!(result.is_err());
     }
 
     // ---- Issue #308: the config-declared agent type -------------------------
@@ -1984,11 +1986,6 @@ watch = true
             .into_iter()
             .next()
             .expect("one role")
-    }
-
-    fn mode_of(toml_src: &str) -> ModeConfig {
-        let config: ProjectConfig = toml::from_str(toml_src).expect("mode config parses");
-        config.modes.into_iter().next().expect("one mode")
     }
 
     fn role_with(agent_line: &str) -> OrchestrationRoleConfig {
@@ -2117,46 +2114,6 @@ agent = "codx"
                 "`agent = \"{name}\"` must resolve identically to `wrap --agent {name}`"
             );
         }
-    }
-
-    /// The mode surface carries the same key with the same rules — but on
-    /// `[[modes]]`, whose agent pane command is typed in the new-pane form, so
-    /// the resolution takes that command as an argument.
-    #[test]
-    fn declared_mode_agent_applies_to_the_typed_agent_pane_command() {
-        let declared = mode_of(
-            r#"
-[[modes]]
-name = "declared-codex-mode"
-agent = "codex"
-reactive_panes = 0
-"#,
-        );
-        assert_eq!(declared.declared_agent_type(), Some(AgentType::Codex));
-        assert_eq!(
-            declared.resolved_agent_type("devbox run codex-big"),
-            Some(AgentType::Codex),
-            "the declaration is what identifies a launcher the form typed in"
-        );
-
-        let plain = mode_of(
-            r#"
-[[modes]]
-name = "plain"
-reactive_panes = 0
-"#,
-        );
-        assert_eq!(plain.declared_agent_type(), None);
-        assert_eq!(
-            plain.resolved_agent_type("devbox run codex-big"),
-            None,
-            "an undeclared mode is unchanged: a launcher still resolves to nothing"
-        );
-        assert_eq!(
-            plain.resolved_agent_type("codex"),
-            Some(AgentType::Codex),
-            "…and an inferable command still derives"
-        );
     }
 
     /// Issue #308 follow-up: a `.dot-agent-deck.toml` that merely FAILS TO

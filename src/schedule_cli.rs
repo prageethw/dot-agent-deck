@@ -79,11 +79,9 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
         match &args.command {
             Some(cmd) if !cmd.trim().is_empty() => {}
             _ => {
-                return Err(
-                    "--command is required: a scheduled task needs an agent command \
+                return Err("--command is required: a schedule needs an agent command \
                      (e.g. claude) to act on its prompt"
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
     }
@@ -338,7 +336,7 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
 /// not happen for a writer-produced file) renders as `next: <invalid cron>`.
 pub fn format_list(tasks: &[ScheduledTask]) -> String {
     if tasks.is_empty() {
-        return "No scheduled tasks.".to_string();
+        return "No schedules.".to_string();
     }
     use chrono::Local;
     let mut out = String::new();
@@ -449,6 +447,7 @@ mod tests {
             triage: false,
             repo_allowlist: None,
             dry_run: false,
+            claim: Default::default(),
         });
         let err = add(&mut tasks, args).expect_err("shape + repo must be refused");
         assert!(
@@ -680,6 +679,7 @@ mod tests {
                 triage,
                 repo_allowlist: None,
                 dry_run: false,
+                claim: Default::default(),
             }),
         }
     }
@@ -768,6 +768,7 @@ mod tests {
                 triage,
                 repo_allowlist: None,
                 dry_run: false,
+                claim: Default::default(),
             });
             assert!(add(&mut tasks, args).is_err());
             assert!(tasks.is_empty());
@@ -843,6 +844,7 @@ mod tests {
     // targets the absolute path it is given and drops its temp file next to
     // that path, never under the process cwd.
     #[test]
+    #[serial_test::serial]
     fn write_atomic_targets_absolute_path_not_cwd() {
         // Serialize cwd mutation against any other test that fiddles with it.
         static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

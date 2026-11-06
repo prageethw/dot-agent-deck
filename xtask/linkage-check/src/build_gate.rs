@@ -24,7 +24,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -360,16 +360,7 @@ fn expired_wait_budget_runs_ungated_rather_than_waiting_forever() {
     }
     let pool = tempfile::tempdir().expect("pool dir");
     // Occupy the single slot for far longer than the waiter's budget.
-    let mut holder = Command::new("bash")
-        .arg(build_gate())
-        .args(["--pool", "t", "--jobs", "1", "--", "sleep", "60"])
-        .env("DAD_BUILD_GATE_DIR", pool.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the slot holder");
-    // Let the holder actually take the slot before the waiter starts.
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    let mut holder = spawn_slot_holder(pool.path());
 
     let began = std::time::Instant::now();
     let out = Command::new("bash")
@@ -414,15 +405,7 @@ fn a_sigkilled_holder_leaves_no_stale_slot() {
         return;
     }
     let pool = tempfile::tempdir().expect("pool dir");
-    let mut holder = Command::new("bash")
-        .arg(build_gate())
-        .args(["--pool", "t", "--jobs", "1", "--", "sleep", "60"])
-        .env("DAD_BUILD_GATE_DIR", pool.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the slot holder");
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    let mut holder = spawn_slot_holder(pool.path());
 
     // SIGKILL the whole holder tree. The lock lives on an open descriptor that
     // `flock` passes down to its child, so the slot is only free once every
@@ -455,6 +438,51 @@ fn a_sigkilled_holder_leaves_no_stale_slot() {
         waited < std::time::Duration::from_secs(10),
         "took {waited:?} to reclaim a slot whose holder was killed"
     );
+}
+
+/// Start a gate that takes pool `t`'s single slot and keeps it for 60 s, and
+/// return only once it provably holds that slot.
+///
+/// Both callers used to sleep a fixed 800 ms and hope `bash` and `flock` had
+/// got that far. With that guess cut to 0 ms the waiter in
+/// `expired_wait_budget_runs_ungated_rather_than_waiting_forever` took the slot
+/// itself and failed 3 runs of 3, so the margin was all the test had. The held
+/// command writes a marker, which proves it is running; a non-blocking `flock`
+/// on the slot then proves it is running UNDER the lock rather than on one of
+/// the gate's ungated rungs.
+fn spawn_slot_holder(pool: &Path) -> Child {
+    let running = pool.join("holder-is-running");
+    let holder = Command::new("bash")
+        .arg(build_gate())
+        .args(["--pool", "t", "--jobs", "1", "--", "bash", "-c"])
+        .arg("touch \"$1\" && exec sleep 60")
+        .arg("slot-holder")
+        .arg(&running)
+        .env("DAD_BUILD_GATE_DIR", pool)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the slot holder");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !running.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot holder's command did not start within 20s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let slot_free = Command::new("flock")
+        .arg("-n")
+        .arg(pool.join("t").join("slot.0"))
+        .arg("true")
+        .status()
+        .expect("probe the holder's slot")
+        .success();
+    assert!(
+        !slot_free,
+        "the slot holder is running but not under the slot's lock"
+    );
+    holder
 }
 
 /// SIGKILL every process still holding a descriptor on one of this pool's slot
@@ -851,6 +879,66 @@ fn cargo_config_routes_linux_links_through_the_gate() {
             "{} is not executable; cargo would fail every link on Linux",
             script.display()
         );
+    }
+}
+
+/// Issues #864 / #927: split debug info halves `target/` and the peak link's
+/// memory on Linux. `unpacked` is not a value rustc accepts on Windows MSVC
+/// (`-Csplit-debuginfo=unpacked is unstable on this platform`), so the flag
+/// has to stay scoped to the Linux triple: moved into `[profile.dev]` or
+/// `[build]`, it would fail every Windows dev build.
+#[test]
+fn cargo_config_splits_debuginfo_for_the_linux_triple_only() {
+    let cfg: toml_edit::DocumentMut = fs::read_to_string(repo_root().join(".cargo/config.toml"))
+        .expect("read .cargo/config.toml")
+        .parse()
+        .expect(".cargo/config.toml parses");
+    let flags: Vec<&str> = cfg["target"]["x86_64-unknown-linux-gnu"]["rustflags"]
+        .as_array()
+        .expect("the Linux triple carries a rustflags array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        flags
+            .windows(2)
+            .any(|w| w == ["-C", "split-debuginfo=unpacked"]),
+        "the Linux triple's rustflags no longer split debug info: {flags:?}"
+    );
+    assert!(
+        cfg.get("build").and_then(|b| b.get("rustflags")).is_none(),
+        "`[build] rustflags` applies to every target, Windows included"
+    );
+    // Any other `[target.<triple-or-cfg>]` table could match a Windows target.
+    let targets = cfg.get("target").and_then(|t| t.as_table_like());
+    for (key, table) in targets.into_iter().flat_map(|t| t.iter()) {
+        if key == "x86_64-unknown-linux-gnu" {
+            continue;
+        }
+        let flags = table
+            .get("rustflags")
+            .map(|f| f.to_string())
+            .unwrap_or_default();
+        assert!(
+            !flags.contains("split-debuginfo"),
+            "`[target.{key}] rustflags` splits debug info outside the Linux triple: {flags}"
+        );
+    }
+
+    // A profile can set it in either file, and a profile applies to every target.
+    let manifest: toml_edit::DocumentMut = fs::read_to_string(repo_root().join("Cargo.toml"))
+        .expect("read Cargo.toml")
+        .parse()
+        .expect("Cargo.toml parses");
+    for (file, doc) in [("Cargo.toml", &manifest), (".cargo/config.toml", &cfg)] {
+        let profiles = doc.get("profile").and_then(|p| p.as_table_like());
+        for (name, profile) in profiles.into_iter().flat_map(|p| p.iter()) {
+            assert!(
+                profile.get("split-debuginfo").is_none(),
+                "{file}'s `[profile.{name}] split-debuginfo` applies on Windows too, where \
+                 rustc refuses `unpacked`; keep it in .cargo/config.toml's Linux triple"
+            );
+        }
     }
 }
 

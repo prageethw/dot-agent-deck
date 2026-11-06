@@ -1,16 +1,18 @@
 #![cfg(feature = "e2e")]
 
 //! L2 REAL-agent proof for the orchestrator spawn-time seed delivery
-//! (upstream issue #424, CLAUDE.md rule 4). Every `orchestration/seed/*`
-//! test up to `010` drives `deliver_orchestrator_prompt` in-process against
-//! an injected clock and a `SendResultPaneController` double standing in for
-//! the PTY — proof the client-side retry/confirmation *logic* is correct,
-//! never proof a real Claude Code process ever received the seed pointer,
-//! read the file it names, and acted on it. #424's own bug (a fixed 500ms
-//! readiness buffer outrun by 5 MCP servers and a 10.9 KB `SessionStart`
-//! hook) could only ever be caught by a test that drives a real startup —
-//! `grep -rln "skip_unless" tests/e2e_*.rs | xargs grep -ln "Acknowledge
-//! your role\|orchestrator-context.md"` returned nothing before this file.
+//! (upstream issue #424, CLAUDE.md rule 4). Synthetic tests can show that a seed
+//! was queued and acknowledged, never that a real Claude Code process read the
+//! file the seed names and acted on it. #424's own bug (a fixed 500ms readiness
+//! buffer outrun by 5 MCP servers and a 10.9 KB `SessionStart` hook) could only
+//! ever be caught by a test that drives a real startup.
+//!
+//! Upstream-sync net merge (2026-11-05): the seed is no longer typed into the
+//! pane. PRD #1666 posts it as the first message of the orchestrator pane's
+//! inbox and the agent takes it with `inbox fetch`, so step 1 below observes the
+//! inbox (a message ACKNOWLEDGED by this very agent) instead of a native
+//! `UserPromptSubmit` event carrying the old literal pointer text, which no
+//! longer exists anywhere in `src/`. Step 2 is unchanged.
 //!
 //! Uses the `orch-seed-remit-real` fixture: an orchestration whose
 //! orchestrator (start) role is a REAL interactive `claude --model
@@ -23,10 +25,9 @@
 //!
 //! The assertion chain proves the full contract, not just that bytes
 //! reached a PTY (exactly the insufficiency #424 itself exists to fix):
-//!   1. A native `UserPromptSubmit`-mapped `Thinking` hook event, carrying
-//!      the literal pointer text naming `orchestrator-context.md`, proves
-//!      the spawn-time seed was genuinely SUBMITTED inside the real Claude
-//!      Code session (never a synthetic/fabricated event).
+//!   1. A message in the orchestrator pane's inbox, bound to this agent and
+//!      ACKNOWLEDGED, proves the spawn-time seed was genuinely consumed by
+//!      the real Claude Code session (never a synthetic/fabricated event).
 //!   2. The sentinel token appearing in the pane's cumulative output proves
 //!      the agent genuinely READ the file the pointer named and ACTED on
 //!      its content, rather than merely having text typed at it.
@@ -39,11 +40,13 @@
 //! 4 — run once, never looped.
 
 mod common;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::time::Duration;
 
 use common::{TuiDeck, commit_fixture};
-use dot_agent_deck::event::{AgentType, EventType};
+use dot_agent_deck::inbox::StateName;
 use spec::spec;
 
 /// The fixed, uniquely-named token the fixture's `prompt_template` directs
@@ -54,13 +57,6 @@ use spec::spec;
 /// its appearance in the pane cannot be coincidental, without needing
 /// runtime randomness this test has no use for.
 const SEED_SENTINEL: &str = "ORCH-SEED-011-REMIT-OK-6d29f4";
-
-/// The exact spawn-time pointer text `deliver_orchestrator_prompt`
-/// (`src/ui.rs`) submits into the orchestrator's pane — kept in lockstep
-/// with `ORCHESTRATOR_CONTEXT_POINTER` there. Matched as a `user_prompt`
-/// substring on the native hook event below, so this test breaks loudly
-/// (not silently) if the production pointer text ever changes.
-const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
 /// `orch-seed-remit-real` fixture. Mirrors
@@ -105,7 +101,7 @@ fn orchestrator_agent_record(socket: &std::path::Path) -> dot_agent_deck::agent_
         })
 }
 
-/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Haiku Claude Code process, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path with no test intervention, and assert two things in order: a native `UserPromptSubmit`-mapped `Thinking` hook event carrying the literal pointer text proves the seed was genuinely submitted inside the real session, and the fixture's fixed sentinel token appearing in the pane's output proves the agent actually read `.dot-agent-deck/orchestrator-context.md` and acted on it — the full contract, not just bytes on a PTY.
+/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Haiku Claude Code process and let the daemon deliver the spawn-time seed through the inbox with no test intervention. Assert in order that the orchestrator pane's inbox holds a message acknowledged by that agent, and that the agent then echoes a uniquely-named sentinel token its `prompt_template` directed it to output, proving it read `.dot-agent-deck/orchestrator-context.md` and acted on it.
 #[spec("orchestration/seed/011")]
 #[test]
 fn orchestration_seed_011_real_claude_orchestrator_reads_and_acts_on_remit() {
@@ -126,10 +122,9 @@ fn orchestration_seed_011_real_claude_orchestrator_reads_and_acts_on_remit() {
         // seed pointer below isn't swallowed answering them.
         .with_claude_trust_workdir()
         .launch_with_fixture("orch-seed-remit-real");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let socket = deck.attach_socket_path().to_path_buf();
-    let events = deck.subscribe_events();
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up, orchestrator focused
@@ -145,28 +140,29 @@ fn orchestration_seed_011_real_claude_orchestrator_reads_and_acts_on_remit() {
         deck.snapshot_grid()
     );
 
-    let agent_id = orchestrator_agent_record(&socket).id;
+    let record = orchestrator_agent_record(&socket);
+    let agent_id = record.id.clone();
+    let pane = record
+        .pane_id_env
+        .clone()
+        .expect("the orchestrator role pane's agent record must carry its pane id");
 
-    // Step 1 of the contract: native proof the spawn-time pointer was
-    // genuinely SUBMITTED inside the real session — Claude Code's own
-    // UserPromptSubmit hook, mapped to EventType::Thinking
-    // (`src/hook.rs:111` / `src/state.rs`), carrying the literal pointer
-    // text as `user_prompt`. Never a fabricated/synthetic event.
-    let submitted = events.wait_for(
-        |event| {
-            event.event_type == EventType::Thinking
-                && event.agent_type == AgentType::ClaudeCode
-                && event.agent_id.as_deref() == Some(agent_id.as_str())
-                && event
-                    .user_prompt
-                    .as_deref()
-                    .is_some_and(|prompt| prompt.contains(DELIVERED_POINTER))
-        },
-        Duration::from_secs(60),
-    );
-    eprintln!(
-        "orchestration_seed_011: native UserPromptSubmit observed at {:?} carrying the pointer: {:?}",
-        submitted.timestamp, submitted.user_prompt
+    // Step 1 of the contract: the spawn-time seed is a message in the
+    // orchestrator pane's inbox (PRD #1666), and the real session consumed it:
+    // a message bound to THIS agent reaches `Acknowledged`. The state is read
+    // back from the daemon, not inferred from the pane.
+    let acknowledged = common::wait_until(Duration::from_secs(60), || {
+        inbox_view::messages(&socket, &pane).iter().any(|message| {
+            message.state == StateName::Acknowledged
+                && message.bind_agent.as_deref() == Some(agent_id.as_str())
+        })
+    });
+    assert!(
+        acknowledged,
+        "the real Claude orchestrator never acknowledged a seed message in its inbox within 60s \
+         of becoming input-ready; inbox = {:?}\nFinal grid:\n{}",
+        inbox_view::messages(&socket, &pane),
+        deck.snapshot_grid()
     );
 
     // Step 2 of the contract: the agent genuinely READ the file the pointer
@@ -177,8 +173,8 @@ fn orchestration_seed_011_real_claude_orchestrator_reads_and_acts_on_remit() {
     assert!(
         deck.wait_for_stream_string_within(SEED_SENTINEL, Duration::from_secs(90)),
         "the real Claude orchestrator never echoed the sentinel token {SEED_SENTINEL:?} within \
-         90s of the spawn-time seed pointer being submitted — the pointer reached the session \
-         (see the native event above) but the agent never demonstrably read \
+         90s of acknowledging its seed message — the seed reached the session (see the inbox \
+         assertion above) but the agent never demonstrably read \
          `.dot-agent-deck/orchestrator-context.md` and acted on it.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );

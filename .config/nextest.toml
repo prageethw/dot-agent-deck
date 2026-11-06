@@ -77,6 +77,86 @@
 # test-ordering defect for the length of issue #818, and a green cap is
 # indistinguishable from a fix.
 
+# Issue #959: there is deliberately NO override for
+# `live_014_spawn_time_is_observed_and_additive` (`src/daemon_protocol.rs`, spec
+# `session/live/014`), and this records why, because a window carve-out is what
+# the evidence said NOT to add and the next person to meet a red here will be
+# tempted by one.
+#
+# It was killed once by the default 3 x 60s window on `build-macos`, at
+# `time="180.616"` in run 34326700831's `nextest-macos-attempt-1` artifact. What
+# settles that it STALLED rather than ran slowly is the same run's attempt-2
+# artifact — a job-level re-run of the identical SHA, no code change — in which
+# this test took **0.194s**. On the Linux `build` job of that run it took 0.115s.
+# 180.616s against 0.194s on the same runner image is 931x. Nor was the machine
+# slow: across the 2440 tests both attempts recorded, the median fail/pass
+# duration ratio is 1.40 and the 90th percentile 2.25, exactly one other test
+# over a second was more than 2x slower (1.608s -> 3.239s), and 1535 other tests
+# started AND finished inside the 180.6s window. The runner was scheduling work
+# normally throughout — one test stalled, not the machine.
+#
+# A wider window could not have helped, and that is now a fact rather than a
+# principle: the stall is an unbounded wait, so a carve-out only moves when the
+# kill lands. The cause was found by REPRODUCING it on a real runner — 4500
+# executions of this test, three at a time, on `macos-latest`: **18 stalled**
+# (about 1 in 250, against roughly 1 in 450 observed in CI), while the same
+# 4500 on `ubuntu-latest` stalled **0** times. All 18 stopped at the same phase
+# marker, `shutdown_all (adopted agent)`, with the stack in
+# `AgentPtyRegistry::force_kill_and_reap_all`'s `try_wait` poll loop and the
+# child in macOS `ps` state `?<Es` — "trying to exit" — every single time. The
+# test, not the window, was the thing to change: its adopted half held both ends
+# of a PTY nobody read while a bare `sleep` wrote a usage line to it and exited.
+# `agent_pty::spawn` does not leave a PTY in that state — it drops the slave as
+# soon as `spawn_command` returns, and `spawn_agent` starts a `pump_reader`
+# thread that drains the master for the agent's whole life — which is what the
+# fix makes the test do too. Dropping the pair took the same 4500-execution
+# stress on the same runner type from 18 stalls to 0.
+#
+# The shape needs FOUR things at once, isolated on `macos-latest` by varying one
+# at a time against the same `killpg(SIGKILL)` + `try_wait` loop. Each row is a
+# standalone reproduction, not the test:
+#
+#   variant                                            macOS      ubuntu
+#   as the test was: bare `sleep`, both ends held      40 / 40     0 / 40
+#   `/usr/bin/true` instead (writes nothing)            0 / 800    0 / 800
+#   master dropped before the kill                      0 / 800    0 / 800
+#   slave dropped before the kill                       0 / 800    0 / 800
+#   a thread draining the master                        0 / 800    0 / 800
+#   `sleep 300`, still running when killed              0 / 800    0 / 800
+#
+# So: a child that WRITES to a PTY, that NOBODY drains, whose BOTH ends are still
+# open, and that is EXITING of its own accord when the kill lands. Remove any one
+# and the stall disappears entirely. That last condition is also the likeliest
+# reading of why the real test stalled on only 0.4% of executions while the
+# standalone shape stalls on all of them: the test's own markers put just ~1.3 ms
+# between the spawn and the kill, so the SIGKILL normally wins the race and the
+# child never reaches its own exit — the `sleep 300` row is exactly that case.
+# See the comment at that line.
+#
+# The TIER is not the lever either, which is the other thing #959 asked. This
+# test forks a real PTY child, but so do at least 76 of the 1838
+# `#[test]`/`#[tokio::test]` functions under `src/` — counted as bodies
+# containing `.spawn_agent(` or `spawn_command(`, which misses every one that
+# forks through a helper, so 76 is a floor rather than a figure. Moving this one
+# test to the e2e tier would have left the other 75 on the same three required
+# jobs, would not have touched the actual defect, and would have deleted the only
+# part of it that proves its property — that the daemon records the instant it
+# forked the child rather than minting a value at snapshot time, which needs a
+# real fork.
+#
+# The phase markers that named the stall site are still in the test, and they are
+# why this comment can be specific. nextest stores a timed-out test's
+# stdout/stderr and drops a passing test's (`store-success-output` is at its
+# default of false below), so they are invisible on the green path and name the
+# last phase entered on the red one — including in the JUnit artifact each build
+# job uploads per attempt, whose `<failure type="test timeout"/>` carries no
+# message of its own. That last part is why the FIRST occurrence told nobody
+# anything, and it was verified against nextest 0.9.143 rather than assumed.
+#
+# So if this test ever goes red on a timeout again, read its captured stderr
+# first: the phase it names is the wait that hung, and `force_kill_and_reap_all`
+# still has no deadline of its own.
+
 [test-groups]
 pty-e2e = { max-threads = 2 }
 
@@ -98,9 +178,9 @@ fail-fast = false
 # TWO THINGS THIS FILE DELIBERATELY DOES NOT DO (issue #785). No credentialed
 # e2e job exists any more — issue #502 took lane 2 out of CI entirely — so the
 # run that can write a credential into this report is a LOCAL
-# `cargo test-e2e-live`. (Other workflows do hold secrets; the Codex
-# issue-labeler even reaches a real agent. None of them runs nextest or writes
-# this file.)
+# `cargo test-e2e-live`. (Other workflows do hold secrets; the agent PR
+# reviewer even reaches a real agent. None of them runs nextest or writes this
+# file.)
 #
 #   * `store-success-output` stays at its default of FALSE, so a `SKIP: <reason>`
 #     line never reaches the report — a runtime skip is a *successful* test, not
@@ -122,6 +202,19 @@ fail-fast = false
 # flaky/failed test list into the run summary, so the path has to be the real one.
 path = "junit.xml"
 
+# `orchestration/delegate/012` compares a 650 ms stand-in readiness window
+# against a 1000 ms buffer, with a strict 500–900 ms measurement precondition.
+# A contended fast run observed 2.895 s with 88% I/O starvation; the same
+# test passed alone in 3.360 s. Reserve this run's pool
+# for the measurement and run it before the nested-compile tests (priority 25),
+# rather than widening its timing band or retrying a failed assertion. Keep it
+# below the live dispatch reservation (priority 50). Other processes can still
+# starve the host, so the original assertions remain the evidence.
+[[profile.default.overrides]]
+filter = 'test(delegate_012_slow_agent_toggle_proves_delivery_and_submission)'
+threads-required = "num-test-threads"
+priority = 40
+
 # PRD #140 M5.1: `orchestration/route/001` boots SIX interactive Haiku panes
 # across two orchestration tabs and drives two concurrent
 # delegate -> work -> work-done chains through them, so its honest wall clock
@@ -132,6 +225,85 @@ path = "junit.xml"
 [[profile.default.overrides]]
 filter = 'test(route_001_two_tabs_same_cwd_do_not_cross_deliver)'
 slow-timeout = { period = "60s", terminate-after = 8 }
+
+# Issue #699: `opencode_auto_submits_daemon_injected_prompt` now waits in named
+# phases, each with its own bound: the OpenCode preflight probe (60s), the
+# composer paint (90s), the injected prompt rendering (20s) and the reply (90s).
+# Each fails with a message naming what was not ready, but their sum is 260s,
+# past the default 3 x 60s kill window, and under load the phases really do
+# stretch — measured 2026-09-28 with 64 CPU hogs on 16 cores on top of ~40-50 of
+# ambient load, the preflight took up to 67s, the composer painted up to 43s
+# after spawn, and a passing run took up to 149s. Being killed there costs
+# exactly the message this issue added, so a slow run would read as a hang
+# again. 6 x 60s leaves ~100s over the phase bounds for spawn, teardown and the
+# preflight overrunning its own figure as it did above. Scoped by name; still
+# bounded.
+#
+# The filter tracks the TEST FUNCTION name, so it must be updated in lockstep
+# with any rename — a stale filter matches nothing and silently drops this test
+# back to the 3 x 60s default.
+[[profile.default.overrides]]
+filter = 'test(opencode_auto_submits_daemon_injected_prompt)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+# PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
+# `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
+# `io full` near 70%, its isolated retry spent over 120s in the preflight, ran
+# the scenario green in about 40s, and was then still regenerating its paired
+# `.md` (a `DOT_AGENT_DECK_RECORD=1` run's success path) when the default
+# 3 x 60s window SIGKILLed it, reporting a bare TIMEOUT for a passing test. The
+# preflight now has a ceiling, `load_scaled(CODEX_PREFLIGHT_BASE)`, which is
+# 60s on a quiet box and 360s at the most it scales. 8 x 60s sits above that
+# ceiling, so a wedged preflight reports its own message before the kill,
+# and above the starved run's observed ~200s (preflight, scenario, teardown and
+# paired doc) with room to spare. Scoped by name; still bounded.
+#
+# The filter tracks the TEST FUNCTION name, so it must be updated in lockstep
+# with any rename — a stale filter matches nothing and silently drops this test
+# back to the 3 x 60s default.
+[[profile.default.overrides]]
+filter = 'test(codex_hooks_001_real_interactive_turn_reaches_idle_without_exit)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
+# Issue #1381: the two real-OpenCode `clear = true` delegates in
+# `tests/e2e_delegate_respawn_readiness.rs` wait in phases whose own bounds sum
+# well past the default 3 x 60s kill window. Being killed there costs each
+# phase's own failure message and grid. Measured on 2026-10-03, a passing
+# `/046` took 73-256s, and one run that was not starved (load-context
+# QUIET/CONTENDED) was killed at 180s with nothing reported. Each window
+# below is the test's phase bounds plus room for the preflight and teardown.
+# Scoped by name; still bounded. The filters track the test FUNCTION names,
+# so rename them in lockstep.
+#
+# `/015`: scratch install and boot, a clear delegate and visible native work.
+# Keep the finite nine-minute window for slow local model turns and diagnostics.
+[[profile.default.overrides]]
+filter = 'test(delegate_015_real_opencode_worker_acts_on_clear_true_delegate)'
+slow-timeout = { period = "60s", terminate-after = 9 }
+
+# `/046`: a task queued before a real replacement boots, then visible work.
+# Its fixture's 600s lifetime exceeds this seven-minute diagnostic window.
+[[profile.default.overrides]]
+filter = 'test(delegate_046_real_opencode_consumes_boot_queued_task_in_place)'
+slow-timeout = { period = "60s", terminate-after = 7 }
+
+# Native OpenCode turns include the real delegate's completion report. Allow
+# time for the explicit 120s screen/status bounds to fail with their evidence;
+# the scratch fixture lives 600s and each test is capped at six minutes.
+[[profile.default.overrides]]
+filter = 'binary(e2e_inbox_opencode_live)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+# Issue #1094: the real-Claude `pane restart` / `pane spawn` tests boot up to
+# two interactive Claude generations and run one delegated turn in sequential
+# waits whose own bounds, the harness's fixed 30s ones included, sum to about
+# 730s for the restart test on a quiet box (585s for the spawn test). Passing
+# runs took 17-41s, but the first run that stalled in a wait was killed at the
+# default 180s with no message and no grid. 13 x 60s sits above that sum, and
+# the tests raise their daemon's lifetime to 900s so it outlives this window.
+[[profile.default.overrides]]
+filter = 'binary(e2e_pane_verbs_real_agent)'
+slow-timeout = { period = "60s", terminate-after = 13 }
 
 # PRD #220: `prompt/new-pane/016` drives a REAL interactive agent through a
 # dispatch turn, then waits for the daemon's `git worktree add` to land on disk.
@@ -158,6 +330,34 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(dispatch_return_006_real_single_agent_reports_to_the_dispatcher)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# The close scenario adds a third interactive turn after the real dispatch and
+# completion, so retain its own assertion diagnostics on a loaded host. Its
+# pane/daemon lifetime cap is pinned to the same 900s in the test helper.
+[[profile.default.overrides]]
+filter = 'test(close_verb_008_real_dispatcher_closes_its_reported_single_unit)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+# Issue #1616: `scheduler/dispatch/028` waits in five phases on a real
+# interactive Haiku — the first turn starting (90s), its output (90s), the card
+# settling Idle (120s), the follow-up's turn starting (60s) and its output
+# (90s) — about 450s plus the deck's start-up, past the default 3 x 60s kill
+# window, which would cost the delivery log and pane each phase prints on
+# failure (Greptile on PR #1618). Passing runs took 25-35s. The test pins its
+# deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` to 600s, above this window.
+[[profile.default.overrides]]
+filter = 'test(dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude)'
+slow-timeout = { period = "60s", terminate-after = 9 }
+
+# `mode/live/003` runs two sequential real interactive Haiku turns on a
+# full-screen claude, one in each of two decks attached to the same daemon. Its
+# waits sum to about 490s at worst: the first deck's start-up (90s), a turn
+# (30s composer + 20s typing + 90s turn), the control and the detach (~45s);
+# then the second deck's attach and focus (~40s) and a second turn (140s).
+# Typical runs take about 20s; 10 x 60s leaves the worst case room to report.
+[[profile.default.overrides]]
+filter = 'test(mode_live_003_reattached_fullscreen_claude_does_not_claim_nothing_to_scroll)'
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 # PRD #220: `orchestration/dispatch/002` dispatches an orchestration whose THREE
 # roles are all real interactive Haiku agents, then waits for every one of them to
@@ -236,8 +436,10 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # before it can take the pool, so it is deliberately scheduled first and its
 # reservation then costs only its own runtime. Ordering THIS test above it
 # would make that drain wait out a multi-minute compile — the exact cost that
-# comment exists to avoid. 25 keeps this one second, and in lane 1, where
-# `dispatch_015` is `e2e-live`-gated and not compiled at all, second is first.
+# comment exists to avoid. 25 keeps this one below every exclusive
+# reservation (`dispatch_015` at 50, `delegate_012` at 40). In lane 1, where
+# `dispatch_015` is `e2e-live`-gated and not compiled at all, that puts it
+# second, behind `delegate_012`'s run.
 #
 # THE COST, PLAINLY: the nested compile now overlaps the WHOLE tier instead of
 # only its tail. On the run measured in most detail (34304601686) it overlapped
@@ -248,8 +450,8 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # machine's cores; the tests already known to be contention-sensitive keep
 # their own carve-outs above.
 #
-# `slow-timeout` is REVISITED AND KEPT at 120s x 10, which is what issue #928
-# asked for rather than what it guessed. The cold case has NOT gone away — a
+# `slow-timeout` was REVISITED AND KEPT at 120s x 10 by issue #928, which is
+# what that issue asked for rather than what it guessed (raised since; below). The cold case has NOT gone away — a
 # runner whose cache did not restore (4 of the 16 runs whose cache status was
 # checked reported "No cache found") or a fresh worktree still pays the full
 # dependency build — and the observed spread across those 13 runs is 71.9s to
@@ -263,10 +465,21 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # separates "the injection never reached the binary" from "the build did not
 # finish" (same reasoning as the overrides above). Widened here rather than
 # globally, and still bounded so a wedged build cannot run forever.
+#
+# RAISED FROM 10 TO 20 (PRD #1631), on a measurement rather than a guess. On a
+# 16-core dev box whose IO was saturated by other worktrees' builds, the test was
+# killed at 1200s in a broad `cargo test-e2e` run, and passed when run alone in
+# 1283s while its own load-context heartbeat logged `io full` at 59-73% of every
+# minute (at a 1-minute load of only 11-38). That is the IO half of the 6x spread
+# the test file's table records, and it is past the old 1200s with nothing else
+# of the suite running. 2400s is ~1.9x that isolated pass, for a broad run that
+# adds the rest of the tier's IO to it. What it costs is only on a WEDGED build,
+# which now takes 40 minutes rather than 20 to be killed; a passing run pays
+# nothing for it, and CI's observed range (71.9-369.9s) is far inside either.
 [[profile.default.overrides]]
 filter = 'test(version_001_injected_build_env_reaches_the_binary)'
 priority = 25
-slow-timeout = { period = "120s", terminate-after = 10 }
+slow-timeout = { period = "120s", terminate-after = 20 }
 
 # `devin/live/001` boots a THIRD-PARTY interactive TUI (the Devin CLI) inside a
 # pane and must wait for it to become ready before it can type anything —
@@ -300,7 +513,7 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 # be updated in lockstep with any rename — a stale filter matches nothing and
 # silently drops this test back to the 3 x 60s default, killing it mid-wait.
 [[profile.default.overrides]]
-filter = 'test(shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working)'
+filter = 'test(shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_background)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
 # PRD #386, PR #390 maintainer review (Finding 4, "worth considering for 005
@@ -473,6 +686,49 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 filter = 'binary(/^e2e_/) - test(/^common::harness_unit_tests::/)'
 test-group = 'pty-e2e'
 
+# Issues #1491 and #1492:
+# `voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend`
+# (desktop crate, `desktop/src-tauri/tests/voice_phrase_fixtures.rs`) is ONE
+# test that sends every fixture in `phrase_fixtures.toml` to the real Commands
+# backend one after another, at about a second each, so its wall clock grows
+# with the manifest. Both issues met the default 3 x 60s killing it, which cost
+# the run its per-fixture summary: #1491 at 168 fixtures (166s and 181s locally)
+# and #1492 at 177 (188.7s with plain `cargo test`, ~1.07s a fixture). The
+# manifest held 246 when the two met, so ~263s before any slow answer, each of
+# which can add the backend's own 15s timeout. It reaches a model only with
+# `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` and a developer's key; otherwise it
+# validates the manifest and returns at once. 8 x 60s = 480s is still bounded,
+# so a backend that hangs on every fixture is killed.
+#
+# The filter tracks the TEST FUNCTION name, so a rename must update it.
+[[profile.default.overrides]]
+filter = 'test(voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
+# `codex/worker/001` drives a REAL Codex orchestration worker through a
+# delegated task and its `work-done`. Alone it takes 26-110s; beside other
+# real-agent tests it was killed at the default 3 x 60s with no diagnostics (met
+# on PR #1523). Its window is 5 x 60s = 300s and NOT the ~407s its own waits
+# add up to, because 300s is the most it can use: the worker is spawned through
+# an in-process registry whose lifetime reaper reads the test process's own
+# `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, pinned to the 300s harness default
+# before `main` (`tests/common/child_lifetime_bound.rs`), so the wrapped Codex
+# is reaped at 300s whatever this says (Qodo on PR #1523). The filter tracks the
+# TEST FUNCTION name and must follow any rename.
+[[profile.default.overrides]]
+filter = 'test(codex_worker_001_real_worker_receives_delegate_and_signals_work_done)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Two real-agent turns plus readiness and bounded upgrade/reconnect waits can
+# exceed the default 180s kill window. Let the scenario report its own failed
+# phase and grid; this changes neither its assertion waits nor retry policy.
+# Its five sequential agent waits alone can take 600s (5 x AGENT_WAIT), so the
+# allowance is 840s, and the fixture daemon's lifetime (900s, in the test) is
+# longer than that, so the daemon outlives the test's own failure report.
+[[profile.default.overrides]]
+filter = 'test(remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts)'
+slow-timeout = { period = "60s", terminate-after = 14 }
+
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
 # `tests/common/mod.rs`). That tree is gitignored dev-time state, so
@@ -481,3 +737,68 @@ test-group = 'pty-e2e'
 # `cargo test-e2e` invocations on one checkout aren't a real-world
 # workflow, and the per-test path with atomic writes means a
 # last-writer-wins outcome is fine for local debugging.
+
+# Issue #524: `orchestration/delegate/049` runs its waits one after another —
+# 20 s for the roles, 30 s for the first pointer, 20 s for each of two natural
+# exits, and 90 s for the respawned `clear = true` worker's pointer, which is
+# written only when the delegate's readiness wait gives up (measured 30.0 s).
+# Those bounds alone sum to the default 180 s kill window, so a run slow enough
+# to approach them would be killed before its last assertion could say which
+# pointer was missing (Qodo, #1525). Measured 32 s on a quiet box.
+[[profile.default.overrides]]
+filter = 'test(delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_delivered)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Issue #1396 (met while verifying it): `project/launch/003` drives a REAL
+# interactive Haiku coordinator, and its own declared waits run far past the
+# default 3 x 60 s kill: up to 180 s for the agent's `SessionStart`, up to 180 s
+# for its pane to settle, 240 s for the sentinel report and 30 s for the soft
+# on-screen check — about 630 s before the deck's own launch. It passes in
+# ~20 s when the agent answers promptly (measured twice on 2026-10-04), and it
+# was killed at exactly 180 s twice in a row the same morning, once on a QUIET
+# box (`[load-context] … QUIET`), with nothing in its output saying which wait
+# it was in, because nextest's kill lands before any of the test's own
+# assertion messages can. 11 x 60 s covers the declared budget, so a slow agent
+# finishes inside it and a stalled one fails with the message that names the
+# phase that hung. The test pins its deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`
+# to 720 s to match, since the harness default of 300 s would end the daemon
+# first. Tracks the TEST FUNCTION name; update it in lockstep with a rename, or
+# this silently stops applying.
+[[profile.default.overrides]]
+filter = 'test(project_launch_003_a_real_coordinator_reads_the_daemon_published_context)'
+slow-timeout = { period = "60s", terminate-after = 11 }
+
+# The Pi chain-smoke cases must report their own failed phase before nextest
+# kills them. pi/001 has 45s worker settling + 120s sentinel + 60s work-done
+# + 30s status = 255s of sequential waits, plus daemon/setup overhead; pi/002
+# has 120s sentinel + 60s work-done plus delegate/setup. Five 60s periods give
+# both diagnostics time to run. The shortened waits also stay inside the
+# in-process agents' existing 300s lifetime cap; raising nextest alone past that
+# cap would leave a worker reaped before its declared waits finished.
+# These filters track function names; update them together with any rename.
+[[profile.default.overrides]]
+filter = 'test(chain_smoke_pi_001_orchestrator_delegates_to_real_worker) | test(chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Claude already specifies an exact Bash command, but its three 30s TUI
+# readiness waits + 120s turn + 10s proof wait can take 220s, before launch
+# overhead. Keep its failure grid/file evidence ahead of nextest's kill too.
+[[profile.default.overrides]]
+filter = 'test(claude_001_thinking_working_idle)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# PRD #1631: real question tests have bounded agent startup, prompt submission,
+# permission paint, answer delivery and completion waits; /004 and /005 run
+# two sequential turns. Preserve their assertion diagnostics on a loaded host.
+# Their daemon's self-exit cap, `QUESTION_DAEMON_MAX_LIFETIME_SECS` in
+# `tests/common/questions.rs` (780 s), sits above this 720 s window and the
+# 360 s one below, so the daemon cannot leave before the test is killed; raise
+# either window past it and the cap has to move too.
+[[profile.default.overrides]]
+filter = 'test(/^question_live_00[1-5]_/)'
+slow-timeout = { period = "60s", terminate-after = 12 }
+
+# Offline Pi still boots Node and loads the two extensions before its dialog.
+[[profile.default.overrides]]
+filter = 'test(question_live_006_pi_extension_select_without_model)'
+slow-timeout = { period = "60s", terminate-after = 6 }

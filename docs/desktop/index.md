@@ -1,0 +1,115 @@
+# Desktop App
+
+The desktop app is a graphical client of the same daemon the TUI talks to. The daemon owns every agent, whichever client started it: an agent started in the TUI appears on the desktop Dashboard, and one started from the desktop app appears as a card in the TUI. Quitting the desktop app leaves your agents running, as detaching the TUI does.
+
+The desktop app is an **alpha**. Its downloads are named `dot-agent-deck-desktop-alpha-*` and are not covered by the support expectations of the CLI. Builds exist for macOS on Apple Silicon (`.dmg`) and Linux amd64 (`.deb`) only. [Installation → Desktop app](../installation.md#desktop-app) says what to download and how to install it.
+
+## Before you start: a daemon
+
+The desktop app is a client of a daemon. When no daemon is running on this machine, the app can start one: open the app, and the Dashboard's **Local daemon** section says **Daemon disconnected** and `No daemon is running on this machine.` with a **Start daemon** button. Press it and confirm, and the section connects. You can also start a daemon yourself before you open the app:
+
+- Run the TUI, `dot-agent-deck`. It starts a daemon if none is running.
+- Run `dot-agent-deck daemon serve` in a terminal. It runs in the foreground, and exits on its own about 30 seconds after it last had a client, an agent or an enabled schedule, so open the app within that window. `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve` keeps it up until you stop it.
+
+**Check it worked:** the Dashboard shows a section named **Local daemon** listing its agents (or **No agents are running yet**), and the **DAEMONS** counter at the top reads `1/1`. A section that says **Daemon disconnected** offers one button: **Start daemon** when no daemon is running there, or **Reconnect** when a daemon is running but the app is not connected to it. See [Dashboard → When a daemon is not there](dashboard.md#when-a-daemon-is-not-there) for the other states.
+
+While the desktop app is connected it counts as a client, so the daemon stays up under it. [Installation → How the desktop app gets a daemon](../installation.md#how-the-desktop-app-gets-a-daemon) has the details.
+
+The app looks for the daemon at the same default address the TUI uses. If you run the TUI with `DOT_AGENT_DECK_ATTACH_SOCKET` pointing at another socket, launch the app with the same variable in its environment.
+
+## What you can do in it
+
+The rail on the left has two entries, **Dashboard** and **Settings**, and the **Voice** button sits at the bottom of the window.
+
+| Task | Where | Page |
+| --- | --- | --- |
+| See every agent on one or more daemons, with its status | **Dashboard** | [Dashboard](dashboard.md) |
+| Open an agent's live terminal and type into it | Click its row on the Dashboard | [Dashboard → The agent pane](dashboard.md#the-agent-pane) |
+| Start an agent, an orchestration, a dispatcher or a schedule-authoring agent | **New agent** on the Dashboard, or `Ctrl+N` / `⌘N` | [New Agent](new-agent.md) |
+| Read an agent's pull request on GitHub, inside the app | The pull request badge on its row or in its pane | [Dashboard → Pull requests](dashboard.md#pull-requests) |
+| Stop an agent, or every role of an orchestration | The stop control on a row, **Close** on an orchestration | [Dashboard → Closing agents and orchestrations](dashboard.md#closing-agents-and-orchestrations) |
+| Watch a daemon on another machine over ssh | **Settings → Daemons** | [Daemons](daemons.md) |
+| Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |
+| Upgrade a remote daemon that runs an older release than the app | **Upgrade** on its section of the Dashboard | [Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon) |
+| Upgrade the app to a newer release, and the `dot-agent-deck` CLI on this machine with it when that is behind too | The upgrade button at the bottom of the rail, or **Upgrade…** on the Dashboard's banner | [Upgrade the app](#upgrade-the-app) |
+| Upgrade the `dot-agent-deck` CLI and the daemon on this machine while the app is current | **Upgrade** on the **Local daemon** section of the Dashboard | [Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine) |
+| Change the appearance or the zoom level | **Settings → Appearance**, **Settings → Zoom** | [Settings](settings.md) |
+| Sign out of GitHub in the app's pull request page | **Settings → GitHub** | [Settings → GitHub](settings.md#github) |
+| Drive the app by voice | **Voice** button, **Settings → Voice** | [Voice Control](voice.md) |
+
+## What the TUI has and the desktop app does not
+
+These are TUI-only:
+
+- The [Schedules manager](../scheduled-tasks.md). The desktop app can start a schedule-authoring agent from **New agent**, but cannot list, edit or run schedules. Use the TUI or the `dot-agent-deck schedule` CLI.
+- Generating `.dot-agent-deck.toml` with `g`, filtering agents with `/`, renaming an agent, and [customising keybindings](../keyboard-shortcuts.md).
+- Saving and restoring the workspace, and the quit dialog's **Detach** / **Stop**.
+- Installing the deck on a remote machine (`dot-agent-deck remote add`). Once it is installed, the desktop app can [start a daemon there](daemons.md#start-a-daemon-from-the-app) and [upgrade it](daemons.md#upgrade-a-remote-daemon) to the app's version.
+
+The desktop app has two things the TUI does not: one Dashboard over several daemons at once, and voice control.
+
+## Upgrade the app
+
+The app checks for a newer release when it starts and every 6 hours while it runs. When the app itself is behind, two things appear:
+
+- an upgrade button, an arrow in a circle, at the bottom of the rail, on every screen. Hovering it shows, for example, `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)`.
+- a banner with the same text at the top of the Dashboard, with an **Upgrade…** button and a dismiss button. Dismissing it hides it until a newer release appears or the app restarts; the rail button stays.
+
+Once the app has upgraded itself, it still runs the old version until it restarts, so it does not offer that upgrade again. Instead, the banner and the rail button say `Agent Deck v<new> is installed. Relaunch to run it.`, the banner's button reads **Relaunch…**, and the dialog they open shows the upgrade's result with a **Relaunch** button.
+
+Nothing appears while the app is current, or while the app cannot reach GitHub. When the app is current but the `dot-agent-deck` CLI on this machine is behind, which is the copy the TUI, your terminal commands and your agents' hooks run, the **Local daemon** section of the Dashboard offers **Upgrade** instead ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)).
+
+The TUI checks on the same schedule and shows a notice at the right end of its footer, such as `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)`, for the CLI it runs or for this app; pressing `u` there opens its own upgrade dialog, which covers both, with the same plans and the same one-copy-at-a-time questions ([Installation → Upgrade from the TUI](../installation.md#upgrade-from-the-tui)). `dot-agent-deck upgrade` in a terminal shows the same plans too.
+
+### The upgrade dialog
+
+The rail button and **Upgrade…** open a dialog titled **Upgrade to v<new>**, with the app's plan: which version you have, how the app was installed, and what upgrading it does, including whether the download's build provenance will be checked (it is when the [GitHub CLI](https://cli.github.com/) is installed and logged in; the checksum is always checked). When the `dot-agent-deck` CLI on this machine is behind too, the CLI's plan follows the app's, and the dialog says `The dot-agent-deck CLI here is behind too, so it follows Agent Deck, …`, so that one upgrade keeps the app, the CLI and the daemon on one release. When the only `dot-agent-deck` on this machine is the one inside the app, there is no CLI step: it is upgraded with the app. [Installation → What upgrading does for each install method](../installation.md#what-upgrading-does-for-each-install-method) lists every case. The **Local daemon** section's **Upgrade** opens the same dialog.
+
+![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: the plan for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, below it the plan for the dot-agent-deck CLI installed with Homebrew, saying upgrading runs brew update, then brew upgrade dot-agent-deck, the line The dot-agent-deck CLI here is behind too, so it follows Agent Deck, and the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
+
+1. The dialog asks, for example, `Upgrade Agent Deck (desktop app) to v0.47.0?`. Press **Upgrade**, or **Cancel**. **Cancel** has the focus, as in the TUI, so `Enter` alone never upgrades anything. Nothing changes until you press **Upgrade**: **Cancel**, `Escape` or a click outside the dialog before then close it having done nothing.
+2. While it upgrades, the plan says **Upgrading…** and the dialog cannot be closed. The dialog keeps the plan it opened with: a check that finishes while it is open does not change it, and **Upgrade** carries out exactly the plan shown.
+3. The result appears under the plan. When the CLI is behind too, the dialog then asks about it, for example `Upgrade dot-agent-deck CLI to v0.47.0?`, with its own **Cancel**, and upgrades it with its own install method: `brew upgrade` for Homebrew, on a Mac or on Linux, or a checked download for a downloaded binary.
+4. **Close** closes the dialog; the app then checks again. When the app was replaced, the dialog also offers **Relaunch**, and the relaunched app restarts the daemon on this machine onto the new release, asking first when agents are running. When the app was not replaced but the CLI was upgraded, **Close** goes on to the daemon on this machine if it runs an older release than the app, and asks `Upgrade the daemon on this machine?` before restarting it, as the **Local daemon** section's **Upgrade** does ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)).
+
+A copy that cannot be upgraded from the app, such as an app in a folder you cannot write, or a CLI installed with Nix, built from source or installed by another system package, says what to do instead, and is not asked about. Most commands shown in the dialog have a copy button beside them.
+
+### What you see on each outcome
+
+| Copy | What you see | What to do |
+| --- | --- | --- |
+| The app, from a `.dmg` in a folder you can write | `Replaced <path> with v<new>. Quit and reopen Agent Deck to run it.`, and a **Relaunch** button | Press **Relaunch** to restart the app on the new version, or quit and reopen it later. Your agents keep running, as when you quit the app. |
+| The app, from a `.dmg` in a folder you cannot write, or an unsigned app | Why it cannot be replaced, and `Download <link>, open it, and drag Agent Deck.app into <folder>, replacing the old one.` | Do that, then reopen the app. |
+| The app, from the `.deb` | Your system's password prompt, then `Installed v<new>.`, and a **Relaunch** button | Press **Relaunch** to restart the app on the new version, or quit and reopen it later. |
+| The app, from the `.deb`, when you dismiss the password prompt or it fails | `` `pkexec …` failed: … ``, then `It was downloaded and checked, but not installed. Install it with:` and a `sudo apt install …` command | Run the command in a terminal, then quit and reopen the app. If the system has no graphical password prompt, the dialog shows the command straight away. |
+| The app, from the `.deb`, when the install does not finish within 15 minutes and cannot be stopped | `` `pkexec …` failed: … ``, then `The install did not finish in time and may still be running, …` and a `dpkg -s agent-deck` command | Wait a few minutes, then run the command to see which version is installed. The dialog does not offer the app again until you restart it. |
+| The app, from the `.deb`, when the install fails after the password prompt | `` `pkexec …` failed: … ``, then `The install did not complete, so the agent-deck package may be partly installed.` and what the package is now | When the package is at the new version, quit and reopen the app. Otherwise run the `sudo apt install …` command shown, then quit and reopen the app. |
+| The CLI, from Homebrew | `` `brew upgrade dot-agent-deck` finished; it now reports v<new>. `` | Nothing. |
+| The CLI, from Homebrew, before the formula carries the new release | `` `brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v<old>, not v<new>: Homebrew's tap does not carry v<new> yet, even after `brew update`. Once it does, refresh it and upgrade again: `` and the command to run, such as `/opt/homebrew/bin/brew update && /opt/homebrew/bin/brew upgrade dot-agent-deck`, with the `brew` the upgrade ran | Nothing was upgraded, and the CLI stays on offer. Run the command a little later, or press **Upgrade** again. |
+| The CLI, from Homebrew, when refreshing the tap fails | `` `brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v<old>, not v<new>. Homebrew's copy of the tap may predate v<new>, and refreshing it failed: … `` and the command to run, such as `/opt/homebrew/bin/brew update && /opt/homebrew/bin/brew upgrade dot-agent-deck`, with the `brew` the upgrade ran | Nothing was upgraded. Fix what the error names, usually the network, then run the command. |
+| The CLI, a downloaded binary | `Upgraded <path> to v<new>.`, or, in a directory you cannot write, the password prompt on Linux and then `Installed v<new>.` | Nothing. Where the password prompt is dismissed, fails or is not available, run the command the dialog shows. |
+
+After a CLI is installed, its result goes on to say what your agents' hooks call now, for example `Claude Code and Codex hooks now run this copy (v<new>). Restart agents that were already running so they use them.` When the hooks still call another copy, or could not be checked, the result names the command to run, with a **Copy** button, and says to restart the affected agents; after a download you still have to install, it says `Agent hooks were not updated.` and gives the command to run once it is installed. [Installation → Your agents' hooks after an upgrade](../installation.md#your-agents-hooks-after-an-upgrade) lists each result; the TUI and `dot-agent-deck upgrade` show the same ones.
+
+If **Relaunch** fails, the dialog shows why under its buttons; quit the app and open it again yourself. For any other failure, the copy's section shows the error and says whether anything changed; [Installation → When an upgrade fails](../installation.md#when-an-upgrade-fails) lists the messages and what to do.
+
+Upgrading does not stop the daemon or its agents. When the restarted app finds the daemon on this machine running the older release, it restarts the daemon onto its own version, asking first when agents are running ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)). If the Dashboard says **Incompatible daemon** after the app restarts, see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release). A remote daemon is not upgraded from this dialog; use its **Upgrade** button ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)).
+
+## Features behind the `experimental` flag
+
+Some desktop surfaces are hidden unless the `experimental` flag is on, and these pages do not describe them. If you see one of these on someone else's screen and not on yours, that is why:
+
+- The **Daemons** entry in the rail and the Dashboard's **Open daemons** button, which lead to a multi-pane screen. The **Stop** and **Replace daemon** controls, renaming an agent, the command palette (`Ctrl+K` / `⌘K`), the shortcut sheet (`?`) and the output **Reader** are on that screen, so they are hidden with it.
+- The **Projects**, **Prompts**, **Orchestrations** and **Agent Profiles** entries in the rail.
+
+**How the desktop app reads the flag.** From its own environment, once, when it starts: set `DOT_AGENT_DECK_EXPERIMENTAL=1` in the environment the app is launched from, or set `DOT_AGENT_DECK_FEATURES_CONFIG` to the path of a `.dot-agent-deck.toml` whose `[features]` table sets `experimental = true`. When both are set, `DOT_AGENT_DECK_EXPERIMENTAL` wins. Unlike the TUI and the daemon, the desktop app does not look for a `.dot-agent-deck.toml` in any directory, and it does not notice a change until it is restarted. An app launched from the macOS Dock or Finder, or from a Linux desktop menu, does not inherit variables exported in your shell profile; on Linux, start it from a terminal instead: `DOT_AGENT_DECK_EXPERIMENTAL=1 dot-agent-deck-desktop`.
+
+One flag reaches the desktop app from the daemon instead: the **schedule: issues** chip in **New agent** appears only when the **daemon** you are creating the agent on has `experimental` on, as the TUI's does.
+
+## When something goes wrong
+
+- **Nothing on the Dashboard, or a daemon section with a title instead of agents:** see [Dashboard → When a daemon is not there](dashboard.md#when-a-daemon-is-not-there).
+- **A remote daemon will not connect:** press **Test connection** in **Settings → Daemons** and follow the sentence it prints; [Daemons → Test connection](daemons.md#test-connection) lists every result.
+- **The app says it cannot read its settings file:** see [Settings → The settings file](settings.md#the-settings-file).
+- **Messages from the app itself:** the desktop app prints its diagnostics to standard error. On Linux, run `dot-agent-deck-desktop` from a terminal to see them.
+- **Collecting a log for a bug report:** the app writes no log file of its own, so start the daemon it connects to with logging turned on. See [Troubleshooting → With the desktop app](../troubleshooting.md#with-the-desktop-app).

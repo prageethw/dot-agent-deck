@@ -32,7 +32,7 @@
 //! 500ms poll catch the rising edge well before the command finishes.
 //!
 //! Cost note (Decision 23): one Haiku-4.5 interactive turn, one Bash tool
-//! call. Local-only (Decision 8) and real-agent (rule 5 exception (a)):
+//! call. Local-only (Decision 8) and real-agent (lane 2, CLAUDE.md rule 5):
 //! gated on the `e2e` feature so CI's `cargo test-fast` never compiles it,
 //! and this file's real-agent tier has no CI credentials, so a local run is
 //! the only way to exercise it at all.
@@ -147,6 +147,294 @@ fn poll_process_table(
 }
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+
+fn background_live_fixture(suffix: &str) -> (TuiDeck, common::EventSub, String) {
+    let deck = TuiDeck::builder()
+        .with_imported_claude_credentials()
+        .launch_with_fixture("minimal");
+    assert!(deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)));
+    let cwd = deck.workdir().to_path_buf();
+    let mut paths = vec![cwd.to_string_lossy().into_owned()];
+    if let Ok(canonical) = cwd.canonicalize() {
+        paths.push(canonical.to_string_lossy().into_owned());
+    }
+    common::seed_claude_trust_in_home(deck.home_dir(), &paths).unwrap();
+    let events = deck.subscribe_events();
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\t");
+    deck.send_keys(suffix.as_bytes());
+    deck.send_keys(b"\t");
+    deck.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash Agent").as_bytes());
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    assert!(
+        deck.wait_for_grid_string_within("? for shortcuts", Duration::from_secs(120)),
+        "interactive Claude not ready:\n{}",
+        deck.snapshot_grid()
+    );
+    let id = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| {
+            r.display_name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(suffix))
+        })
+        .unwrap()
+        .id;
+    (deck, events, id)
+}
+
+/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded, then ask for one Bash run_in_background ping writing a unique sentinel. After its native Stop the rendered card stays Idle with one background command; kill only that command found in this test's descendant tree and watch the indicator disappear.
+#[spec("status/background/007")]
+#[test]
+fn background_007_real_background_command_clears_after_scoped_kill() {
+    skip_unless!(common::check_claude_available());
+    const SENTINEL_BG: &str = "background-007-ping-d960348b.txt";
+    let (deck, events, agent_id) = background_live_fixture("background-007-haiku");
+    // PRD #1666: the absolute path, so the model need not infer its directory.
+    let sentinel_path = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL_BG);
+    let prompt = format!(
+        "Use Bash exactly once as your first action, with run_in_background=true, to execute exactly: ping -c 180 127.0.0.1 > '{}' 2>&1. Do not use timeout. Do not call TaskOutput, wait, inspect or stop the command. Immediately finish your turn with the single word STARTED after Bash returns the background task id.",
+        sentinel_path.display()
+    );
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_BG);
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::ToolStart
+                && event.tool_name.as_deref() == Some("Bash")
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    assert!(
+        common::wait_for_path(&deck.workdir().join(SENTINEL_BG), Duration::from_secs(10)),
+        "real command must write the sentinel"
+    );
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid.contains("Idle")
+            && grid.contains("Background: 1 command")
+            && !grid.contains("Working")),
+        "ended turn and live command must both be visible:\n{}",
+        deck.snapshot_grid()
+    );
+
+    let root = std::process::id() as i32;
+    let table = process_table(&[root]).expect("Unix process sample");
+    let own_pids: Vec<_> = descendants(&table, root)
+        .into_iter()
+        .map(|row| row.pid)
+        .collect();
+    let argv = command_lines_of(&own_pids);
+    let shell = descendants(&table, root)
+        .into_iter()
+        .find(|row| {
+            row.session_leader
+                && !row.has_controlling_tty
+                && argv
+                    .get(&row.pid)
+                    .is_some_and(|line| line.contains(SENTINEL_BG))
+        })
+        .expect("a detached command in this test's own process tree carries the unique sentinel");
+    let ping = command_lines_of(
+        &descendants(&table, shell.pid)
+            .into_iter()
+            .map(|row| row.pid)
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .find(|(_, line)| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|executable| executable.ends_with("ping"))
+    })
+    .expect("the background shell has a real live ping")
+    .0;
+    dot_agent_deck::platform::proc::force_kill_pid(ping as u32).expect("kill this test's own ping");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| grid.contains("Idle")
+            && !grid.contains("Background:")),
+        "indicator did not clear after command ended:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Ask real interactive Haiku Claude to launch one Haiku subagent doing three exact slow Bash steps against unique absolute start/completion sentinel paths in the fixture directory, then end the main turn immediately. The rendered card reads Idle with one background subagent (and may also count its commands), and loses the indicator only after that paired subagent's terminal hook and completion sentinel.
+#[spec("status/background/008")]
+#[test]
+fn background_008_real_background_subagent_clears_on_paired_stop() {
+    skip_unless!(common::check_claude_available());
+    const SENTINEL_BG: &str = "background-008-subagent-72841dca.txt";
+    let (deck, events, agent_id) = background_live_fixture("background-008-haiku");
+    let sentinel = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL_BG);
+    let completion_sentinel = sentinel.with_extension("txt.done");
+    let quote_path =
+        |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    let first_command = format!(
+        "printf started > {}; ping -c 20 127.0.0.1 > /dev/null",
+        quote_path(&sentinel)
+    );
+    let middle_command = "ping -c 20 127.0.0.1 > /dev/null";
+    let last_command = format!(
+        "ping -c 20 127.0.0.1 > /dev/null; printf done > {}",
+        quote_path(&completion_sentinel)
+    );
+    let prompt = format!(
+        "First call Agent exactly once: general-purpose, model=haiku, run_in_background=true. Pass this prompt verbatim: Use Bash for three sequential calls with timeout=90000 and run_in_background=false. Set command exactly to (1) `{first_command}` (2) `{middle_command}` (3) `{last_command}`. Write at these absolute sentinel paths; do not substitute /tmp/claude or another location. Do not alter commands, delegate or call other tools. Finish with DONE after call 3. End subagent prompt. After Agent returns immediately finish your main turn with STARTED. Do not wait, inspect, call TaskOutput or use other tools."
+    );
+    // The absolute path can wrap inside its basename in Claude's input box;
+    // use a short directive token to confirm the prompt rendered completely.
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, "timeout=90000");
+    let started = events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::SubagentStart
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    let subagent = started
+        .metadata
+        .get(dot_agent_deck::event::SUBAGENT_ID_METADATA_KEY)
+        .expect("native SubagentStart carries its identity")
+        .clone();
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && !event.is_from_subagent()
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    if !common::wait_for_path(&sentinel, Duration::from_secs(30)) {
+        let bash_calls: Vec<_> = events
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.agent_id.as_deref() == Some(&agent_id)
+                    && event.event_type == EventType::ToolStart
+                    && event.tool_name.as_deref() == Some("Bash")
+                    && event.timestamp >= submitted.timestamp
+            })
+            .map(|event| {
+                (
+                    event.session_id,
+                    event.cwd,
+                    event.metadata.get("bash_command").cloned(),
+                    event.tool_detail,
+                )
+            })
+            .collect();
+        panic!(
+            "{}",
+            common::redact_credentials_for_output(&format!(
+                "PRECONDITION NOT MET: subagent must really do its sentinel work at {} within 30s of main Stop. Expected first Bash command: {first_command}. Observed Bash hooks (session, cwd, full bash_command when supplied, tool_detail): {bash_calls:#?}\nFinal pane:\n{}",
+                sentinel.display(),
+                deck.snapshot_grid()
+            ))
+        );
+    }
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid.contains("Idle")
+            && grid
+                .lines()
+                .any(|line| line.contains("Background:") && line.contains("1 subagent"))
+            && !grid.contains("Working")),
+        "subagent part must survive unpaired internal stops:\n{}",
+        deck.snapshot_grid()
+    );
+    // Ignore Claude's unpaired internal stops: only this start's id ends
+    // the work being asserted, even when another stop arrives first.
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::SubagentStop
+                && event
+                    .metadata
+                    .get(dot_agent_deck::event::SUBAGENT_ID_METADATA_KEY)
+                    == Some(&subagent)
+        },
+        Duration::from_secs(180),
+    );
+    assert!(
+        common::wait_for_file_trimmed_eq(&completion_sentinel, "done", Duration::from_secs(10))
+            .is_ok(),
+        "subagent completion sentinel is required"
+    );
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| grid.contains("Idle")
+            && !grid.contains("Background:")),
+        "paired SubagentStop must clear indicator:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded, then submit, through the harness's Claude prompt helper, a one-line prompt of over 1,000 characters whose only instruction, at its very end, is to touch a uniquely named sentinel file. The helper pastes a prompt that long, and Claude Code shows `[Pasted text #1]` instead of the text; the helper must take that as the prompt sitting in the input, type its short follow-the-paste instruction after it, press Enter, see the hook report the prompt's own text, and the sentinel must appear — proof the whole pasted text, tail included, was submitted.
+#[spec("harness/claude-prompt/001")]
+#[test]
+fn claude_prompt_001_long_prompt_is_pasted_and_submitted_whole() {
+    skip_unless!(common::check_claude_available());
+    const SENTINEL: &str = "claude-prompt-001-paste-5e81c0d4.txt";
+    let (deck, events, agent_id) = background_live_fixture("claude-prompt-001-haiku");
+    // One line, well past the 800 characters at which Claude Code collapses a
+    // paste, with the only instruction after all of it: a prompt that arrived
+    // short of its end cannot create the sentinel.
+    let filler =
+        "This sentence is padding for a long pasted prompt and asks for nothing. ".repeat(15);
+    let prompt = format!(
+        "{filler}Ignore the padding above. Your only task: use Bash exactly once to run touch \
+         '{}', then reply DONE. Do not use any other tool.",
+        // PRD #1666: the absolute path, not "the current directory".
+        deck.workdir()
+            .canonicalize()
+            .expect("absolute fixture directory")
+            .join(SENTINEL)
+            .display()
+    );
+    assert!(
+        prompt.chars().count() > common::CLAUDE_TYPED_PROMPT_MAX_CHARS,
+        "the prompt must be long enough for the helper to paste it"
+    );
+    let (submitted, shown) = deck.submit_claude_prompt_shown(&events, &agent_id, &prompt, SENTINEL);
+    assert_eq!(
+        shown,
+        common::ClaudePromptShown::PastePlaceholder,
+        "PRECONDITION NOT MET: Claude Code showed the pasted prompt's text rather than a \
+         placeholder, so this run did not exercise a collapsed paste"
+    );
+    assert_eq!(submitted.agent_id.as_deref(), Some(agent_id.as_str()));
+    assert!(
+        common::wait_for_path(&deck.workdir().join(SENTINEL), Duration::from_secs(120)),
+        "the agent never created {SENTINEL}, the instruction at the end of the pasted prompt, \
+         so the submission did not carry the whole text.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 const PANE_NAME_SUFFIX: &str = "shell-activity-005-haiku";
 /// Unique so the prompt unambiguously names one real file rather than
 /// leaving the model to invent a command — the sentinel + directive-prompt
@@ -155,7 +443,7 @@ const PANE_NAME_SUFFIX: &str = "shell-activity-005-haiku";
 const SENTINEL: &str = "shell-activity-005-sentinel-e4b7f1.txt";
 const SENTINEL_CONTENT: &str = "SHELL_ACTIVITY_005_OK";
 
-/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow (per-folder trust pre-seeded, `--allowedTools Bash`), then type a directive prompt naming a uniquely-named sentinel fixture file that instructs the agent to run `ping -c 20 127.0.0.1 > /dev/null` as its one Bash tool call. While that ~20s foreground command is in flight, assert — over a `SubscribeEvents` connection, never against the rendered badge — that the daemon's shell-activity monitor synthesizes a `ShellBusy` broadcast event for the pane.
+/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow (per-folder trust pre-seeded, `--allowedTools Bash`), then type a directive prompt naming a uniquely-named sentinel fixture file that instructs the agent to run `ping -c 20 127.0.0.1 > /dev/null` as its one Bash tool call, and confirm Claude Code accepted it (its `UserPromptSubmit` hook) so a lost prompt fails as that rather than as a missing tool call. While that ~20s foreground command is in flight, assert — over a `SubscribeEvents` connection, never against the rendered badge — that the daemon's shell-activity monitor synthesizes a `ShellBusy` broadcast event for the pane.
 #[spec("status/shell-activity/005")]
 #[test]
 fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
@@ -170,8 +458,8 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -201,7 +489,7 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");
@@ -231,14 +519,25 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
         .pane_id_env
         .expect("a real spawned pane must carry a pane_id_env — the daemon assigns it at spawn");
 
+    // PRD #1666: the absolute path, so the model need not infer its directory.
+    let sentinel = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL)
+        .display()
+        .to_string();
     let prompt = format!(
-        "There is a file named {SENTINEL} in the current directory. Use the Bash tool exactly \
-         once to run this single command: ping -c 20 127.0.0.1 > /dev/null; cat {SENTINEL}. Do \
-         not run any other command. After the tool call finishes, reply with only the exact \
+        "There is a file at {sentinel}. Use the Bash tool exactly once to run this single \
+         command: ping -c 20 127.0.0.1 > /dev/null; cat '{sentinel}'. Do not run any other \
+         command. After the tool call finishes, reply with only the exact \
          file contents and nothing else."
     );
-    deck.send_keys(prompt.as_bytes());
-    deck.send_keys(b"\r");
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL);
+    eprintln!(
+        "shell-activity-005: prompt submitted (Thinking) at {:?}",
+        submitted.timestamp
+    );
 
     // Precondition: the real Bash tool call actually started. This is the
     // native ToolStart hook event, not a fabricated one.
@@ -294,9 +593,8 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
 // ---------------------------------------------------------------------------
 // M6b, catalog `status/shell-activity/006` — the reported bug, reproduced as
 // the user actually sees it: a real Bash call crossing Claude Code's 120s
-// default timeout must keep the pane's rendered badge on `Working`, not the
-// stale `Idle` the bare `Stop -> EventType::Idle` mapping would otherwise
-// paint the instant the agent's turn ends at the cap.
+// default timeout must show the ended turn as `Idle` together with its
+// still-live command as `Background: 1 command`.
 // ---------------------------------------------------------------------------
 
 const PANE_NAME_SUFFIX_006: &str = "shell-activity-006-haiku";
@@ -323,10 +621,10 @@ const MEASURED_TOOL_START_TO_IDLE_SECS: u64 = 127;
 /// unreasonably long wait.
 const IDLE_WAIT_MARGIN_SECS: u64 = 30;
 
-/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow, then send a directive prompt instructing it to run `ping -c 200 127.0.0.1 > <sentinel> 2>&1` as its one Bash tool call under default Bash settings (no `timeout` parameter, no `run_in_background`), reproducing the >120s-cap bug exactly. After the native `ToolStart` hook fires, wait for the real, native `Idle` event (mapped from Claude Code's own `Stop` hook, never fabricated) so a PASS can only mean the bug path was genuinely exercised — a run where Claude ends the capped call with `ToolEnd` and no `Stop` fails loudly with a `PRECONDITION NOT MET` message rather than silently passing. Once the real `Idle` lands, switch to the dashboard and assert the pane's rendered card badge still reads `Working`, and that a live process carrying the sentinel (and a live `ping` beneath it) is still running.
+/// Scenario: Launch real interactive Haiku Claude with seeded trust and allowedTools Bash, then direct it to make one default-settings Bash call running a sentinel-tagged ping and finish its turn immediately when Bash returns. Require its real Stop-mapped Idle hook after the 120-second cap (PRECONDITION NOT MET if absent), then assert the rendered badge reads Idle with Background: 1 command while the sentinel-tagged shell and its ping remain live.
 #[spec("status/shell-activity/006")]
 #[test]
-fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working() {
+fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_background() {
     skip_unless!(common::check_claude_available());
 
     let deck = TuiDeck::builder()
@@ -338,8 +636,8 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -363,7 +661,7 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX_006.as_bytes());
     deck.send_keys(b"\t");
@@ -390,37 +688,51 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
         });
     let agent_id = record.id;
 
+    // PRD #1666: the absolute path, so the model need not infer its directory.
+    let sentinel_006 = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL_006)
+        .display()
+        .to_string();
     let prompt = format!(
-        "Call the Bash tool now, as your very first action, with no preceding text or \
-         explanation. Use the Bash tool exactly once, with default settings — do not pass a \
-         timeout parameter and do not set run_in_background — to run this single command: ping \
-         -c {PING_COUNT_006} 127.0.0.1 > {SENTINEL_006} 2>&1. Do not run any other command and do \
-         not alter this command in any way."
+        "Use Bash exactly once as your first action. Set command to exactly: ping \
+         -c {PING_COUNT_006} 127.0.0.1 > '{sentinel_006}' 2>&1. Omit both timeout and \
+         run_in_background; let Bash use its default foreground timeout and automatically \
+         move the command to the background if it reaches that timeout. This is a local \
+         loopback ping whose output must be written to the named file. As soon as Bash \
+         returns, immediately finish your turn with the single word STARTED. Do not call \
+         TaskOutput, wait, inspect files, stop the command, or use any other tool."
     );
-    deck.send_keys(prompt.as_bytes());
-    deck.send_keys(b"\r");
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_006);
+    eprintln!(
+        "shell-activity-006: prompt submitted (Thinking) at {:?}",
+        submitted.timestamp
+    );
 
     // Precondition: the real Bash tool call actually started, under default
-    // settings — the native ToolStart hook event, not a fabricated one. A
-    // timeout here is a harness flake (the model never issued the Bash tool
-    // call at all — only a SessionStart shows up in `observed events`), not a
-    // badge regression; the custom message says so explicitly so a red run
-    // here is never misread as BADGE WRONG.
+    // settings — the native ToolStart hook event, not a fabricated one. The
+    // prompt was acknowledged by `submit_claude_prompt`; include both native
+    // events and the pane on failure to distinguish prompt adherence, a tool
+    // permission prompt, and a hook-delivery failure.
     let tool_start = match events.try_wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id.as_str())
                 && event.event_type == EventType::ToolStart
                 && event.tool_name.as_deref() == Some("Bash")
+                && event.timestamp >= submitted.timestamp
         },
         Duration::from_secs(120),
     ) {
         Some(ev) => ev,
         None => panic!(
             "PRECONDITION NOT MET: no ToolStart/Bash event observed for agent {agent_id:?} \
-             within 120s — the model never issued the Bash tool call at all. This is a harness \
-             flake (prompt adherence), NOT a badge regression: rerun rather than reading this as \
-             BADGE WRONG. Observed events: {:#?}",
-            events.snapshot()
+             within 120s of the acknowledged prompt. Diagnose prompt adherence, tool \
+             permissions and hook delivery before reading this as a badge regression. \
+             Observed events: {:#?}\nFinal pane:\n{}",
+            events.snapshot(),
+            common::redact_credentials_for_output(&deck.snapshot_grid())
         ),
     };
     eprintln!(
@@ -428,21 +740,17 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
         tool_start.timestamp
     );
 
-    // The precondition this test exists to gate on. Roughly a third of runs
-    // reach the moment that actually exercises Defect A: the rest end with
-    // Claude Code's `ToolEnd` and no `Stop`, in which case the card never
-    // leaves `Working` and the badge assertion below would hold whether or
-    // not the fix works at all. Waiting for the real, native `Idle` (mapped
-    // from the agent's own `Stop` hook, never fabricated by this test) turns
-    // the old implicit timing assumption (ToolStart + a fixed offset) into an
-    // explicit causal one: this run only counts as a PASS of the bug path if
-    // the Idle that Defect A's fix has to correct actually landed.
+    // Require the real, native Stop after this call starts. The directive to
+    // finish immediately when Bash returns avoids leaving Claude to decide
+    // whether to poll the background task instead of ending its main turn.
     let idle_wait_timeout =
         Duration::from_secs(MEASURED_TOOL_START_TO_IDLE_SECS + IDLE_WAIT_MARGIN_SECS);
     let idle_event = events.try_wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id.as_str())
                 && event.event_type == EventType::Idle
+                && !event.is_from_subagent()
+                && event.timestamp >= tool_start.timestamp
         },
         idle_wait_timeout,
     );
@@ -450,13 +758,20 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
         panic!(
             "PRECONDITION NOT MET: no native Stop-mapped Idle event observed for pane \
              {PANE_NAME_SUFFIX_006:?} within {idle_wait_timeout:?} of ToolStart — this run never \
-             exercises the bug path (Claude Code most likely ended the capped Bash call with \
-             ToolEnd and no Stop, which is common — roughly 2 runs in 3 by the tester's own \
-             measurement). This is an inconclusive run, NOT a badge regression: rerun rather than \
-             reading this as BADGE WRONG. Observed events: {:#?}",
-            events.snapshot()
+             exercises the ended-turn bug path. Diagnose why Claude did not finish its \
+             turn after Bash returned. Observed events: {:#?}\nFinal pane:\n{}",
+            events.snapshot(),
+            deck.snapshot_grid()
         );
     };
+    assert!(
+        (idle_event.timestamp - tool_start.timestamp).num_milliseconds() >= 120_000,
+        "native Stop arrived before the 120s cap; this run did not exercise the capped \
+         foreground call: ToolStart={:?}, Idle={:?}\n{}",
+        tool_start.timestamp,
+        idle_event.timestamp,
+        deck.snapshot_grid()
+    );
     eprintln!(
         "shell-activity-006: native Idle observed at {:?}, {}ms after ToolStart — this run \
          genuinely exercises the bug path",
@@ -473,21 +788,17 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     deck.send_keys(b"\x04");
     deck.wait_for_string("Dir:");
 
-    // The load-bearing assertion: the badge must still read Working, not the
-    // stale Idle a bare `Stop -> EventType::Idle` mapping would have painted
-    // the instant the real Idle above landed — this IS the reported bug,
-    // reproduced or fixed, as the user sees it.
+    // The turn ended, while its command is still alive: both facts must be
+    // presented together rather than conflated into a Working badge.
     assert!(
-        deck.wait_for_grid_string_within("Working", Duration::from_secs(5)),
-        "the pane's badge did not read Working right after the native Idle landed — the \
-         reported bug (a >120s Bash call reads Idle while the command is still running) \
-         reproduced:\n{}",
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
+            && grid.contains("Background: 1 command")),
+        "after the real Stop the card must read Idle with Background: 1 command:\n{}",
         deck.snapshot_grid()
     );
     assert!(
-        !deck.snapshot_grid().contains("Idle"),
-        "the pane's badge read Idle alongside Working right after the native Idle landed — an \
-         inconsistent render:\n{}",
+        !deck.snapshot_grid().contains("Working"),
+        "the ended turn was incorrectly promoted to Working:\n{}",
         deck.snapshot_grid()
     );
 
@@ -500,10 +811,12 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     // concurrently running e2e test's own ping or MCP servers can never be
     // mistaken for this one's.
     // Issue #862: the sample reads command lines only for detached descendants
-    // of the roots it is given. This test's own pid is the right root: the deck
-    // binary, its daemon and the agent all `setsid` out of the test's session,
-    // so every process this assertion cares about is a detached descendant of it
-    // and gets its argv read, while nothing outside this test's tree does.
+    // of the roots it is given. This test's own pid is the right root: the
+    // Bash-tool shell this assertion cares about `setsid`s off the agent's
+    // terminal, so it is a detached descendant of it and gets its argv read,
+    // while nothing outside this test's tree does. (The agent itself leads a
+    // session on the pane's terminal, which since issue #1493 is not a
+    // boundary, so its own argv is not read — this test does not need it.)
     let root_pid = std::process::id() as i32;
     let table = poll_process_table(
         &[root_pid],
@@ -577,8 +890,8 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -600,7 +913,7 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX_007.as_bytes());
     deck.send_keys(b"\t");
@@ -629,6 +942,14 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // that finally succeeds.
     let claude_pid_cell: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
     let children_argv_cell: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    // Only a child seen in two samples at least `LASTING` apart counts. Claude
+    // Code starts short-lived processes at boot (`ssh … git@github.com`,
+    // `dpkg-query --search`, `git` fetches), and a precondition satisfied by one
+    // of those died before the sample below, ~3 s and a dashboard switch later,
+    // and failed the run about half the time.
+    const LASTING: Duration = Duration::from_secs(5);
+    let earlier_children: std::cell::RefCell<Option<(std::time::Instant, Vec<i32>)>> =
+        std::cell::RefCell::new(None);
     let found_children = common::wait_until(Duration::from_secs(30), || {
         // Issue #862: this test's own pid as the sample's root — see the same
         // note in `status/shell-activity/006` above for why that is the root
@@ -636,35 +957,70 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
         let Some(table) = process_table(&[root_pid]) else {
             return false;
         };
-        let Some(claude_row) = descendants(&table, root_pid).into_iter().find(|p| {
-            p.command_line
-                .read()
-                .is_some_and(|argv| argv.contains("claude") && argv.contains("--allowedTools"))
-        }) else {
+        // Read every descendant's argv here rather than through the sampler,
+        // which reads only session-boundary descendants of its root. The pane's
+        // Claude leads a session on the pane's own terminal, and since issue
+        // #1493 such a nested terminal is not a boundary, so the sampler no
+        // longer reads its command line.
+        let descendant_pids: Vec<i32> = descendants(&table, root_pid)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        let Some(claude_row_pid) = command_lines_of(&descendant_pids)
+            .into_iter()
+            .find(|(_, argv)| argv.contains("claude") && argv.contains("--allowedTools"))
+            .map(|(pid, _)| pid)
+        else {
             return false;
         };
         // Same as in `006`: the agent's own children share its session, so they
         // are below its boundary and the sampler never read their argv.
-        let children: Vec<String> = command_lines_of(
-            &descendants(&table, claude_row.pid)
-                .into_iter()
-                .map(|p| p.pid)
-                .collect::<Vec<_>>(),
-        )
-        .into_values()
-        .collect();
+        let child_pids: Vec<i32> = descendants(&table, claude_row_pid)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        let now = std::time::Instant::now();
+        let lasting: Vec<i32> = match earlier_children.borrow().as_ref() {
+            Some((at, earlier)) if now.duration_since(*at) >= LASTING => child_pids
+                .iter()
+                .copied()
+                .filter(|pid| earlier.contains(pid))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if lasting.is_empty() {
+            let mut earlier = earlier_children.borrow_mut();
+            if earlier
+                .as_ref()
+                .is_none_or(|(at, _)| now.duration_since(*at) >= LASTING)
+            {
+                *earlier = Some((now, child_pids));
+            }
+            return false;
+        }
+        let children: Vec<String> = command_lines_of(&lasting).into_values().collect();
         if children.is_empty() {
             return false;
         }
-        claude_pid_cell.set(Some(claude_row.pid));
+        claude_pid_cell.set(Some(claude_row_pid));
         *children_argv_cell.borrow_mut() = children;
         true
     });
-    assert!(
-        found_children,
-        "the real Claude pane never grew any live children (MCP servers, caffeinate) within \
-         30s — an agent with no children proves nothing about the no-false-positive claim"
-    );
+    // A precondition of the host, not an assertion about the deck: an agent
+    // with no lasting children proves nothing about the no-false-positive
+    // claim, and where Claude Code has no MCP server configured (and, on Linux,
+    // no `caffeinate`) it often has none. `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`
+    // turns this skip into a failure.
+    skip_unless!(if found_children {
+        Ok(())
+    } else {
+        Err(
+            "the real Claude pane grew no child that lasted 5 s within 30 s (no MCP server \
+             configured, no caffeinate) — an agent with no children proves nothing about the \
+             no-false-positive claim"
+                .to_string(),
+        )
+    });
     let claude_pid = claude_pid_cell
         .get()
         .expect("wait_until reported success so claude_pid_cell must be set");
@@ -719,11 +1075,15 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     )
     .into_values()
     .collect();
-    assert!(
-        !still_alive.is_empty(),
-        "the real Claude agent's children died out between the liveness check and the sample — \
-         rerun; this run proves nothing about the no-false-positive claim"
-    );
+    skip_unless!(if still_alive.is_empty() {
+        Err(
+            "the real Claude agent's children died out between the liveness check and the \
+             sample — this run proves nothing about the no-false-positive claim"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    });
     eprintln!(
         "shell-activity-007: {} children still alive at the sample point: {still_alive:?}",
         still_alive.len()

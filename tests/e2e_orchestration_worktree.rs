@@ -64,8 +64,7 @@ fn expected_owner(resolved_path: &std::path::Path) -> String {
 /// M2b) or gets its own (always). Asserts the OBSERVABLE path a user/tool
 /// would see, not a shared internal helper.
 fn git_common_dir(dir: &std::path::Path) -> PathBuf {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
+    let out = common::fixture_git(dir, dir)
         .args(["rev-parse", "--git-common-dir"])
         .output()
         .expect("git rev-parse --git-common-dir must spawn");
@@ -91,8 +90,7 @@ fn git_common_dir(dir: &std::path::Path) -> PathBuf {
 /// fix landed the isolated clone on the user's typed slug rather than
 /// silently staying on the source's HEAD branch.
 fn current_branch(dir: &std::path::Path) -> String {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
+    let out = common::fixture_git(dir, dir)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .expect("git rev-parse --abbrev-ref HEAD must spawn");
@@ -110,8 +108,7 @@ fn current_branch(dir: &std::path::Path) -> String {
 /// (when the source has one), never the local filesystem path a plain `git
 /// clone` defaults to.
 fn remote_origin_url(dir: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
+    let out = common::fixture_git(dir, dir)
         .args(["remote", "get-url", "origin"])
         .output()
         .expect("git remote get-url origin must spawn");
@@ -173,7 +170,7 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
     let fake_origin = "https://example.invalid/orch-clone-gate-fixture.git";
     run_git(&work, &["remote", "add", "origin", fake_origin]);
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // `open_orchestration_with_name` types the identical literal into Name —
     // both the creator/owner identity AND (via `sanitize_workspace_segment`)
@@ -306,8 +303,7 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
 /// directory's git state is byte-identical before and after an operation
 /// performed against a DIFFERENT orchestration's directory.
 fn head_sha(dir: &std::path::Path) -> String {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
+    let out = common::fixture_git(dir, dir)
         .args(["rev-parse", "HEAD"])
         .output()
         .expect("git rev-parse HEAD must spawn");
@@ -324,8 +320,7 @@ fn head_sha(dir: &std::path::Path) -> String {
 /// own repro used (`$ git rev-parse --is-shallow-repository` / `true`) to
 /// detect the shared-object-store corruption from failure #2.
 fn is_shallow_repository(dir: &std::path::Path) -> bool {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
+    let out = common::fixture_git(dir, dir)
         .args(["rev-parse", "--is-shallow-repository"])
         .output()
         .expect("git rev-parse --is-shallow-repository must spawn");
@@ -345,8 +340,7 @@ fn is_shallow_repository(dir: &std::path::Path) -> bool {
 /// SUCCESSFUL removal here would itself be the regression this test exists
 /// to catch, so the caller decides what the result means.
 fn attempt_worktree_remove(from_dir: &std::path::Path, target: &std::path::Path) -> (bool, String) {
-    let out = std::process::Command::new("git")
-        .current_dir(from_dir)
+    let out = common::fixture_git(from_dir, from_dir)
         // `--` before the path matches the end-of-options separator
         // `worktree_remove_argv` (`src/issue_dispatch.rs`) deliberately
         // carries — issue #325 auditor A7. Not exploitable here (every
@@ -423,7 +417,7 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
     let fake_origin = "https://example.invalid/orch-clone-gate-fixture.git";
     run_git(&work, &["remote", "add", "origin", fake_origin]);
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // `open_orchestration_with_name` types the identical literal into Name —
     // both the creator/owner identity AND (via `sanitize_workspace_segment`)
@@ -864,7 +858,7 @@ fn worktree_028_same_slug_different_name_concurrent_open_is_refused() {
     let work = deck.workdir().to_path_buf();
     commit_fixture(&work);
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let launch_dir_basename = work
         .file_name()
@@ -998,7 +992,7 @@ fn workspace_001_first_orchestration_gets_named_isolated_workspace() {
     let work = deck.workdir().to_path_buf();
     commit_fixture(&work);
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let launch_dir_basename = work
         .file_name()
@@ -1094,7 +1088,7 @@ fn workspace_002_naming_is_deterministic_from_name_alone_across_separate_runs() 
         let work = deck.workdir().to_path_buf();
         commit_fixture(&work);
 
-        deck.wait_for_string("No active sessions");
+        deck.wait_for_string("No active agents");
 
         *basename_out = work
             .file_name()
@@ -1199,7 +1193,7 @@ fn workspace_003_reopening_same_name_resumes_existing_workspace_preserving_local
     let work = deck.workdir().to_path_buf();
     commit_fixture(&work);
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let launch_dir_basename = work
         .file_name()
@@ -1271,7 +1265,7 @@ fn workspace_003_reopening_same_name_resumes_existing_workspace_preserving_local
     deck.wait_for_string("Close this tab and all its panes?");
     deck.send_keys(b"\x1b[B"); // Down -> select Close
     deck.send_keys(b"\r"); // Enter -> confirm
-    deck.wait_for_string("No active sessions"); // back to an empty Dashboard
+    deck.wait_for_string("No active agents"); // back to an empty Dashboard
 
     // The workspace directory itself must never be removed by closing its
     // tab (PRD fork#544 M6/M4c: persistence is a decision, not an absence).
@@ -1395,7 +1389,7 @@ fn workspace_004_resume_fetches_read_only_and_leaves_checked_out_branch_untouche
         ],
     );
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration_with_name(&deck, NAME);
     deck.wait_for_absence("New Agent");
@@ -1433,7 +1427,7 @@ fn workspace_004_resume_fetches_read_only_and_leaves_checked_out_branch_untouche
     deck.wait_for_string("Close this tab and all its panes?");
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Advance the real upstream repository while the workspace is closed —
     // extra commits the resumed workspace's own checked-out branch (its own
@@ -1498,8 +1492,7 @@ fn workspace_004_resume_fetches_read_only_and_leaves_checked_out_branch_untouche
     );
 
     let remote_tracking_ref = format!("refs/remotes/origin/{default_branch}");
-    let remote_tracking_head = std::process::Command::new("git")
-        .current_dir(&pwd)
+    let remote_tracking_head = common::fixture_git(&pwd, &pwd)
         .args(["rev-parse", &remote_tracking_ref])
         .output()
         .expect("git rev-parse must spawn");
@@ -1537,7 +1530,7 @@ fn workspace_005_reopening_name_held_by_live_orchestration_refuses_without_suffi
     let work = deck.workdir().to_path_buf();
     commit_fixture(&work);
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let launch_dir_basename = work
         .file_name()
@@ -1637,7 +1630,7 @@ fn workspace_018_model_a_isolated_clone_is_registered_so_tab_close_reports_kept(
     let work = deck.workdir().to_path_buf();
     commit_fixture(&work);
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let launch_dir_basename = work
         .file_name()
@@ -1669,7 +1662,7 @@ fn workspace_018_model_a_isolated_clone_is_registered_so_tab_close_reports_kept(
     deck.wait_for_string("Close this tab and all its panes?");
     deck.send_keys(b"\x1b[B"); // Down -> select Close
     deck.send_keys(b"\r"); // Enter -> confirm
-    deck.wait_for_string("No active sessions"); // back to an empty Dashboard
+    deck.wait_for_string("No active agents"); // back to an empty Dashboard
 
     // PRD fork#544 M6: this notice fires ONLY if the daemon's tab-close
     // cleanup handler found a registered entry for the workspace — proof

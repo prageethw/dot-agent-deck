@@ -16,10 +16,15 @@
 # The cross version is part of what is mirrored (issue #323): if it drifts from
 # `release.yml`'s, this job stops predicting the leg it exists to predict.
 #
-# KEPT DELIBERATELY, not temporary. It is scoped to PRs that touch `Cargo.toml` /
-# `Cargo.lock` / this file, so it costs nothing on unrelated PRs and fires exactly
-# when the dependency graph — the thing that can break a C-library cross-build —
-# actually changed. It is the only pre-tag coverage of that leg.
+# KEPT DELIBERATELY, not temporary. It runs for PRs that touch the build inputs
+# listed under `paths:` below (the root manifest, the lockfile, the vendored
+# crates, the cargo configuration and its host linker scripts, a toolchain file,
+# this file), so it costs
+# nothing on PRs that touch none of them. A change to the dependency graph — the
+# thing that can break a C-library cross-build — normally moves the lockfile;
+# many changes to those paths move no graph at all (a vendored crate's docs,
+# this file), and the check runs for them too. It is the only pre-tag coverage
+# of that leg.
 #
 # It cannot be replaced by a local check: a devbox/Nix toolchain makes `cross`
 # derive an invalid rustup toolchain name from `rustc --print sysroot`, a failure
@@ -38,28 +43,71 @@ on:
   # lets the check actually run on this branch's PR — which is the only moment it
   # is needed, since the point is to prove the aarch64 leg BEFORE tagging.
   #
-  # Scoped to PRs that touch the dependency graph or this file, so it does not
-  # add ~10 minutes of cross-compilation to every unrelated PR.
+  # Scoped to PRs that touch the manifest, the lockfile, the crates under
+  # `vendor/` (they are compiled into the binary), the cargo configuration (its
+  # host-target `linker` also links the build scripts the cross build compiles),
+  # that linker (`scripts/link-gate.sh`) and the `scripts/build-gate.sh` it runs, a
+  # toolchain file (it would override the toolchain this job installs) or this
+  # file, so it does not add ~10 minutes of cross-compilation to every unrelated
+  # PR. `scripts/ci-changes.sh`'s `cargo` case holds these paths for RWX, plus
+  # `.rwx/ci.yml`, which defines RWX's copy of this check.
   workflow_dispatch:
   pull_request:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "vendor/**"
+      - ".cargo/**"
+      - "scripts/link-gate.sh"
+      - "scripts/build-gate.sh"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
       - ".github/workflows/aarch64-crossbuild-check.yml"
 
 permissions:
   contents: read
 
 jobs:
+  # `.github/ci-backend` moves a pull request's Linux jobs to RWX
+  # (docs/develop/rwx.md); `.rwx/ci.yml` runs this check there under the same
+  # path filter. A dispatch always runs here.
+  backend:
+    runs-on: ubuntu-latest
+    outputs:
+      linux_backend: ${{ steps.backend.outputs.linux_backend }}
+    steps:
+      - id: backend
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # The PR's HEAD, not `github.sha` (the merge commit): RWX reads the
+          # file at the head, and both sides must make the same choice. Read
+          # at the merge commit, a PR cut before `main` switched to `rwx`
+          # would make GHA skip its Linux jobs while RWX, reading `gha` at
+          # the head, skipped its own, and nothing would run.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          backend=gha
+          if [ "$EVENT" = pull_request ]; then
+            file=$(gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/$REPO/contents/.github/ci-backend?ref=$SHA" 2>/dev/null \
+              | tr -d '[:space:]' || true)
+            [ "$file" = rwx ] && backend=rwx
+          fi
+          echo "linux_backend=$backend" | tee -a "$GITHUB_OUTPUT"
+
   aarch64-crossbuild:
+    needs: backend
+    if: needs.backend.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.0
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: aarch64-unknown-linux-gnu
       - name: Install cross

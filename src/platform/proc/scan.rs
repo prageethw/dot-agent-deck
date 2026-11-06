@@ -5,11 +5,7 @@
 //! Everything here is pure data and compiles on every platform. Only the act of
 //! *sampling* the machine is platform code: [`super::process_table`] is
 //! implemented in `unix.rs` and is an unconditional `None` in `windows.rs`,
-//! matching `foreground_pgid`'s existing contract. One narrow exception:
-//! [`descendant_shell_activity`]'s #644 `wrap`-detection reads this build's
-//! own binary identity (`crate::wrap::is_wrap_invocation`) to validate a
-//! candidate's argv, which does real I/O (`current_exe()`) rather than
-//! working purely off the sampled table — see that function's doc comment.
+//! matching `foreground_pgid`'s existing contract.
 //!
 //! ## Why the discriminator is structural
 //!
@@ -30,7 +26,26 @@
 //! has no controlling terminal either — every descendant matches and the pane
 //! pins at `Working` forever. [`ProcessInfo::has_controlling_tty`] is therefore
 //! recorded as corroborating evidence only; [`descendant_shell_activity`]
-//! compares session ids against **the agent's own** and never reads that field.
+//! compares session ids against **the agent's own** and never reads that field
+//! to call a process busy.
+//!
+//! ## A nested terminal is not a detached command (issue #1493)
+//!
+//! The one place that field IS read points the other way: it can only make a
+//! process count for LESS. `dot-agent-deck wrap` — how the deck launches Codex —
+//! starts its child on a pseudo-terminal of its own, so that child leads a
+//! session of its own *and* has a controlling terminal. To the plain session
+//! test that child is a detached descendant from the moment it starts, so every
+//! wrapped pane read busy for its whole life and its card sat at `Working` with
+//! no prompt sent (and went back to `Working` after every finished turn, because
+//! the monitor re-asserts a busy pane whose card reads `Idle`). A session leader
+//! that owns a terminal is a terminal session nested inside the pane — the same
+//! shape as `tmux`, `script` or `ssh -t` — not a command the agent sent off the
+//! pane's terminal, so its subtree is compared against ITS session instead
+//! ([`walk_with_reference_session`]). The measured shell-tool shape is
+//! unaffected: Claude Code's `setsid`-detached Bash-tool child has no
+//! controlling terminal (`tests/shell_activity.rs`), and in the container shape
+//! nothing has one, so nothing is re-rooted there either.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -185,39 +200,6 @@ pub const CLAUDE_BASH_TOOL_SHAPE: ShellToolShape = ShellToolShape {
 /// against a live agent of that kind, not that it looks plausible.
 pub const MEASURED_SHELL_TOOL_SHAPES: &[ShellToolShape] = &[CLAUDE_BASH_TOOL_SHAPE];
 
-/// Whether `argv` (a whole command line, never tokenised) is a genuine
-/// `dot-agent-deck wrap` invocation. Delegates to [`crate::wrap::is_wrap_invocation`]
-/// rather than duplicating its token check, so there is exactly one place
-/// that decides this — round 1 of issue #644 kept a laxer local copy that
-/// checked only "is the second whitespace token literally `wrap`", with no
-/// validation of the first token at all, which any pane command shaped
-/// `<anything> wrap …` (`git wrap …`, `npm wrap …`) satisfied for reasons
-/// having nothing to do with this deck (round 2, reviewer F3 / auditor F2).
-/// `wrap.rs`'s own check validates that the first token's basename is
-/// actually this deck's binary — either the literal
-/// [`crate::platform::paths::DEFAULT_BINARY_NAME`] or whatever
-/// `deck_binary_for_wrap()` resolves this build's own binary to, which is
-/// what keeps this matching a fork's renamed install (`worker-agent-deck`,
-/// CLAUDE.md rule 21) as well as an unrenamed one.
-fn argv_is_wrap_invocation(argv: &str) -> bool {
-    crate::wrap::is_wrap_invocation(argv)
-}
-
-/// `row`'s sampled command line as a `&str`, or `""` when the two-phase
-/// sampler (issue #862) never read one for this row — the overwhelming
-/// majority of rows on any tick, since only [`shell_tool_candidates`] gets a
-/// second-phase `ps` at all. An empty string never matches
-/// [`argv_is_wrap_invocation`] or [`ShellToolShape::matches`], so an
-/// unsampled row degrades to "not wrap" / "no shape match" rather than
-/// panicking or guessing — the same fail-safe direction this module already
-/// takes for an unreadable session id.
-fn sampled_argv(row: &ProcessInfo) -> &str {
-    match &row.command_line {
-        CommandLine::Read(argv) => argv.as_str(),
-        CommandLine::NotSampled | CommandLine::Unavailable => "",
-    }
-}
-
 /// Every transitive descendant of `root_pid` in `table`, each reported exactly
 /// once and never including `root_pid` itself.
 ///
@@ -257,64 +239,9 @@ pub fn descendants(table: &[ProcessInfo], root_pid: i32) -> Vec<&ProcessInfo> {
 /// sampled process table, or `None` when the table cannot answer.
 ///
 /// A pane is **busy** iff `root_pid` has a transitive descendant that is in a
-/// different POSIX session than the session it inherited — the load-bearing
-/// condition, one `getsid` comparison per candidate, immune to any change in
-/// what an agent puts on its command line.
-///
-/// One structural exemption (issue #644): when some node on the path from
-/// `root_pid` down to a candidate is itself a `dot-agent-deck wrap`
-/// invocation (verified via [`argv_is_wrap_invocation`]) and is still
-/// running in the baseline session at the point that node's own direct
-/// child diverges, that child — the interactive process `wrap` spawned — is
-/// not evidence of a detached command merely for leading a session of its
-/// own. `wrap` always allocates a fresh PTY for the interactive child it
-/// launches, and that child becomes the leader of *that* PTY's session as an
-/// ordinary consequence of spawning it, not because it backgrounded itself
-/// (true of every agent `wrap` launches interactively, not just Codex).
-///
-/// **This is not restricted to `root_pid` itself being `wrap` (round 1's
-/// original shape) or to depth 1** (round 2, reviewer/auditor finding F1):
-/// `wrap_launch_command`'s output is always multi-word, so
-/// `agent_pty::spawn` always routes it through `$SHELL -c '<wrap
-/// invocation>'`, never execs `wrap` directly. When that shell exec-replaces
-/// itself (bash/zsh, most of the time), `root_pid` ends up being `wrap`
-/// itself and the exemption fires at depth 1, same as round 1. When the
-/// shell *survives* instead — dash never exec-optimizes, and any shell
-/// leaves a surviving process for a `-c` string ending in a pipeline, list,
-/// or redirection, and `src/spawn.rs` pins `SHELL=/bin/sh` for every
-/// multi-word scheduler/issue-dispatch/orchestration-role command, so this
-/// is not a hypothetical topology — `root_pid` is the shell, `wrap` is its
-/// direct child (still in the shell's session, since a plain non-exec'd
-/// `-c` invocation allocates no new session of its own), and the agent's
-/// primary child sits one hop further down, in the fresh session `wrap`
-/// allocated for it. The walk therefore tracks, per queued node, whether
-/// *that* node's own process is a `wrap` invocation, and reads it from
-/// whichever node is the immediate parent of the diverging candidate — not
-/// only from `root_pid`.
-///
-/// This has to be conditioned on the parent actually being `wrap` and
-/// cannot be a bare "direct child, self-led session" rule: that exact shape
-/// is also what Claude Code's own genuinely-detached Bash-tool child looks
-/// like — its `root_pid` is the `claude` process itself (Claude Code is not
-/// a `wrap`-launched, [`IntegrationStrategy::Wrapper`](crate::agent_registry::IntegrationStrategy::Wrapper)
-/// agent, so neither `claude` nor its `$SHELL -c` wrapper, if any, is ever a
-/// `wrap` invocation), and its Bash-tool child is a **direct** child of it,
-/// `setsid`-ed into a session it leads itself — structurally identical to
-/// `wrap`'s primary child, and it is exactly the case
-/// [`CLAUDE_BASH_TOOL_SHAPE`]'s argv cross-check exists to confirm as busy.
-/// A blanket structural exemption at that shape would have silently
-/// re-introduced PRD #370's original defect for the one agent this signal
-/// was measured against.
-///
-/// Once exempted, `wrap`'s child's own session becomes the new baseline its
-/// descendants are compared against, so the rest of the agent's ordinary
-/// process tree (still living in the freshly allocated PTY session) is not
-/// penalized for the same, already-excused, hop — but a *further* divergence
-/// anywhere below that (a genuinely detached descendant one or more session
-/// changes deeper) still reads as busy. The exemption is also capped at
-/// **one rebase per root-to-leaf path**, tracked per queued node, so a
-/// pathological multi-hop `wrap`-launching-`wrap` chain cannot exempt more
-/// than the first hop on any single path.
+/// different POSIX session than `root_pid` itself — the load-bearing condition,
+/// one `getsid` comparison per candidate, immune to any change in what an agent
+/// puts on its command line.
 ///
 /// `shapes` is the optional argv cross-check. When it is empty the structural
 /// test stands alone (which is what the measurement says already excludes every
@@ -335,17 +262,16 @@ pub fn descendants(table: &[ProcessInfo], root_pid: i32) -> Vec<&ProcessInfo> {
 ///
 /// `None` means "no answer available": `root_pid` is not in the table (it
 /// exited, or the table was sampled from another PID namespace), its own
-/// session id could not be read, or — the per-row fail-safe, fork issue #160
-/// — at least one candidate descendant's session id could not be read and no
-/// other candidate resolved a confirmed `Some(true)`. `None` is deliberately
-/// not folded into `Some(false)` — the caller must be able to leave a pane's
-/// status alone rather than assert it is idle. A single unreadable row used to
-/// be `continue`d identically to a genuinely same-session row, so a candidate
-/// set where *every* row was unreadable fell through to a confident
-/// `Some(false)` — a total false negative, the worse failure direction (see
+/// session id could not be read, or -- the per-row fail-safe, fork issue #160
+/// -- at least one descendant's session id could not be read and no candidate
+/// resolved a confirmed `Some(true)`. `None` is deliberately not folded into
+/// `Some(false)` -- the caller must be able to leave a pane's status alone
+/// rather than assert it is idle. A single unreadable row is skipped by the
+/// walk exactly like a genuinely same-session row, so a table where *every*
+/// row was unreadable would otherwise fall through to a confident
+/// `Some(false)`, a total false negative, the worse failure direction (see
 /// `docs/develop/shell-activity-signal.md`). A confirmed-busy candidate still
-/// short-circuits `Some(true)` immediately, unreadable rows elsewhere in the
-/// set notwithstanding.
+/// short-circuits `Some(true)`, unreadable rows elsewhere notwithstanding.
 ///
 /// Note what this does **not** consult: [`ProcessInfo::has_controlling_tty`].
 /// A bare no-controlling-terminal test collapses in a container, where the
@@ -355,151 +281,77 @@ pub fn descendant_shell_activity(
     root_pid: i32,
     shapes: &[ShellToolShape],
 ) -> Option<bool> {
-    let detached = detached_descendants(table, root_pid)?;
-    // Fork issue #160's per-row fail-safe: a descendant whose own session id
-    // could not be read is unclassifiable, not "same session as root" —
-    // `detached_descendants`'s filter folds it into "not different" the same
-    // way it would fold a genuinely same-session row, so a candidate set where
-    // EVERY row is unreadable used to fall through to a confident `Some(false)`
-    // — a total false negative, the worse failure direction. Tracked
-    // separately here so that case reports `None` instead; a confirmed-busy
-    // candidate anywhere in the set still short-circuits `Some(true)` below,
-    // unreadable rows elsewhere notwithstanding.
-    let had_unreadable_candidate = descendants(table, root_pid)
+    let sessions = qualifying_command_sessions(table, root_pid, shapes)?;
+    if !sessions.is_empty() {
+        return Some(true);
+    }
+    // Fork issue #160 (C1), the per-row fail-safe: a descendant whose session id could
+    // not be read was skipped by the walk exactly like a same-session row, so when NO
+    // candidate resolved busy the answer is "unknown", not a confident idle. Without
+    // this, a table where every descendant row was unreadable read as `Some(false)` --
+    // a total false negative.
+    if descendants(table, root_pid)
         .into_iter()
-        .any(|row| row.session_id <= 0);
-    if detached.is_empty() {
-        return if had_unreadable_candidate {
-            None
-        } else {
-            Some(false)
-        };
-    }
-    // `detached_descendants` above already confirmed `root_pid` resolves to a
-    // row with a readable session id; re-resolve it here for its argv and
-    // session id, which that helper's own `Vec<i32>` return does not carry.
-    let root = table
-        .iter()
-        .find(|row| row.pid == root_pid)
-        .expect("detached_descendants already confirmed root_pid resolves");
-    let root_is_wrap = argv_is_wrap_invocation(sampled_argv(root));
-
-    let mut children: HashMap<i32, Vec<&ProcessInfo>> = HashMap::new();
-    for row in table {
-        children.entry(row.ppid).or_default().push(row);
-    }
-
-    let mut had_unreadable_candidate = false;
-    let mut visited: HashSet<i32> = HashSet::new();
-    visited.insert(root_pid);
-
-    // Each queued node carries: the session id its own children must be
-    // compared against; whether the process AT this node is a `wrap`
-    // invocation still running in that same baseline session (so its own
-    // direct child re-leading a session is the #644 shape, wherever in the
-    // tree this node sits — round 2, F1); and whether the #644 exemption has
-    // already fired once on the path leading here, so a pathological
-    // multi-hop `wrap`-launching-`wrap` chain cannot rebase more than once
-    // per root-to-leaf path.
-    let mut queue: VecDeque<(i32, i32, bool, bool)> = VecDeque::new();
-    queue.push_back((root_pid, root.session_id, root_is_wrap, false));
-
-    while let Some((parent_pid, baseline_session_id, parent_is_wrap, already_rebased)) =
-        queue.pop_front()
+        .any(|row| row.session_id <= 0)
     {
-        let Some(kids) = children.get(&parent_pid) else {
-            continue;
-        };
-        for candidate in kids {
-            if !visited.insert(candidate.pid) {
-                continue;
-            }
-            // Only worth checking a candidate's own argv for being a further
-            // `wrap` hop when it could actually matter: either it is a
-            // direct child of `root_pid` (root itself may not be `wrap` —
-            // the surviving-shell shape, F1 — so every direct child has to
-            // be checked regardless of `root_is_wrap`), or its parent is
-            // already a confirmed `wrap` node (a multi-hop chain). Every
-            // other branch of the tree — Claude's long-lived MCP children,
-            // an agent's ordinary descendants — never pays for this check.
-            let candidate_is_wrap = if parent_pid == root_pid || parent_is_wrap {
-                argv_is_wrap_invocation(sampled_argv(candidate))
-            } else {
-                false
-            };
-            // A row whose session id could not be read is unclassifiable,
-            // not "different" — counting it as different would turn an exit
-            // racing the sample into a false `Working`. It is tracked
-            // separately from "same session" so a set where every candidate
-            // is unreadable reports unknown rather than a confident idle
-            // (fork issue #160's per-row fail-safe) — a confirmed-busy
-            // candidate elsewhere in the set still wins immediately via the
-            // `return Some(true)` below, untouched. Its own (unreadable)
-            // session id cannot seed a baseline, so descendants keep
-            // inheriting the parent's.
-            if candidate.session_id <= 0 {
-                had_unreadable_candidate = true;
-                queue.push_back((
-                    candidate.pid,
-                    baseline_session_id,
-                    candidate_is_wrap,
-                    already_rebased,
-                ));
-                continue;
-            }
-            if candidate.session_id == baseline_session_id {
-                queue.push_back((
-                    candidate.pid,
-                    baseline_session_id,
-                    candidate_is_wrap,
-                    already_rebased,
-                ));
-                continue;
-            }
-            if !already_rebased && parent_is_wrap && candidate.session_id == candidate.pid {
-                // Issue #644: `wrap`'s own primary child re-leading the
-                // fresh PTY session it was spawned into — not evidence of a
-                // detached foreground command. Rebase its subtree onto its
-                // own session rather than penalizing the same hop again for
-                // every descendant that inherits it. Gated on `parent_is_wrap`
-                // — see this function's doc comment for why a bare
-                // "direct child, self-led session" match is not enough —
-                // and on `!already_rebased` so this can fire at most once
-                // per path.
-                queue.push_back((candidate.pid, candidate.session_id, candidate_is_wrap, true));
-                continue;
-            }
-            if !shapes.is_empty()
-                && !shapes
-                    .iter()
-                    .any(|shape| shape.matches(sampled_argv(candidate)))
-            {
-                queue.push_back((
-                    candidate.pid,
-                    baseline_session_id,
-                    candidate_is_wrap,
-                    already_rebased,
-                ));
-                continue;
-            }
-            return Some(true);
-        }
+        return None;
     }
-    // Argv can now also suppress a busy reading (the `wrap` exemption, issue
-    // #797), but the fail-safe direction holds: `Unavailable` or `NotSampled`
-    // reads as "" and so is neither a `wrap` invocation nor exempt.
+    Some(false)
+}
+
+/// Issue #1678: the distinct POSIX sessions below `root_pid` that
+/// [`descendant_shell_activity`] counts as busy — the background-command count
+/// a card shows after its agent's turn ended.
+///
+/// Exactly the candidates the bool path accepts, deduplicated by session id:
+/// with no `shapes`, every detached descendant's session (the structural test);
+/// with `shapes`, each session-boundary candidate ([`shell_tool_candidates`])
+/// whose command line carries one of them — the cross-check applied to EVERY
+/// candidate, so a matched session never admits an unmatched one beside it.
+/// A process tree inside one session counts once, and the walk re-roots at a
+/// nested terminal session as [`detached_descendants`] does, so a wrapped
+/// agent's inner PTY is never itself a command.
+///
+/// `None` has [`descendant_shell_activity`]'s meaning — no answer — and must not
+/// be read as zero. Same table, same columns: it reads no command line or
+/// `/proc` entry the bool path did not (issue #862).
+pub fn qualifying_command_sessions(
+    table: &[ProcessInfo],
+    root_pid: i32,
+    shapes: &[ShellToolShape],
+) -> Option<HashSet<i32>> {
+    let walk = walk_with_reference_session(table, root_pid)?;
+    // A row whose session id could not be read is unclassifiable, not
+    // "different" — counting it as different would turn an exit racing the
+    // sample into a false `Working`.
+    let detached = walk
+        .into_iter()
+        .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
+        .map(|(row, _)| row);
+    // The structural test has already answered. `shapes` is the optional argv
+    // cross-check on top of it, and an empty `shapes` means the caller asked for
+    // the structural test alone — in which case no command line is consulted at
+    // all, which is why a pane whose agent kind has never been measured costs no
+    // argv read even while it is busy.
+    if shapes.is_empty() {
+        return Some(detached.map(|row| row.session_id).collect());
+    }
+    let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
+    let mut sessions = HashSet::new();
     // The cross-check consults the SESSION-BOUNDARY subset, not every detached
     // descendant — see [`shell_tool_candidates`] for why that is both correct
     // for the measured shape and the difference between reading one command
-    // line and reading a whole build tree's.
-    for pid in shell_tool_candidates(table, root_pid)? {
-        let Some(candidate) = table.iter().find(|row| row.pid == pid) else {
-            continue;
-        };
+    // line and reading a whole build tree's. The walk hands back the rows
+    // themselves, so no per-candidate table search is needed.
+    for candidate in detached.filter(|row| {
+        session_of
+            .get(&row.ppid)
+            .is_none_or(|parent_session| *parent_session != row.session_id)
+    }) {
         match &candidate.command_line {
             CommandLine::Read(argv) => {
                 if shapes.iter().any(|shape| shape.matches(argv)) {
-                    return Some(true);
+                    sessions.insert(candidate.session_id);
                 }
             }
             // Wanted and not obtained. Ordinary and expected: the process
@@ -510,8 +362,8 @@ pub fn descendant_shell_activity(
             // Should be unreachable, and it is the one case worth a log line.
             // The sampler fills the command line for a superset of the pids
             // `shell_tool_candidates` reports (see `super::process_table`), and
-            // that is the very function this loop iterates, so reaching here
-            // means the table was sampled for different roots than it is being
+            // this loop visits that same boundary set, so reaching here means
+            // the table was sampled for different roots than it is being
             // classified for — which would suppress the signal *silently*, the
             // failure mode PRD #386 exists to end. Treated as "not a match"
             // rather than as a match, because inventing a busy reading from a
@@ -519,7 +371,7 @@ pub fn descendant_shell_activity(
             CommandLine::NotSampled => {
                 tracing::warn!(
                     root_pid,
-                    candidate_pid = pid,
+                    candidate_pid = candidate.pid,
                     "shell-activity: a detached descendant reached the argv cross-check with no \
                      command line sampled; the process-table sampler and the classifier disagree \
                      about which pids need one, so this pane's signal is suppressed"
@@ -528,10 +380,7 @@ pub fn descendant_shell_activity(
             }
         }
     }
-    if had_unreadable_candidate {
-        return None;
-    }
-    Some(false)
+    Some(sessions)
 }
 
 /// The **structural half** of [`descendant_shell_activity`] on its own: the pids
@@ -549,20 +398,69 @@ pub fn descendant_shell_activity(
 /// sampler reads argv for; [`command_line_targets`] widens it with the `wrap`
 /// parents (issue #797), so the two sets are deliberately not identical.
 pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
-    let root = table.iter().find(|row| row.pid == root_pid)?;
-    if root.session_id <= 0 {
-        return None;
-    }
     Some(
-        descendants(table, root_pid)
+        walk_with_reference_session(table, root_pid)?
             .into_iter()
             // A row whose session id could not be read is unclassifiable, not
             // "different" — counting it as different would turn an exit racing
             // the sample into a false `Working`.
-            .filter(|row| row.session_id > 0 && row.session_id != root.session_id)
-            .map(|row| row.pid)
+            .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
+            .map(|(row, _)| row.pid)
             .collect(),
     )
+}
+
+/// Is `row` a terminal session nested inside the pane — a session leader with a
+/// controlling terminal of its own, which is what `dot-agent-deck wrap` makes of
+/// the agent it hosts? See this module's docs (issue #1493).
+fn is_nested_terminal_session(row: &ProcessInfo) -> bool {
+    row.session_leader && row.has_controlling_tty && row.session_id > 0
+}
+
+/// [`descendants`] of `root_pid`, each paired with the session id it must be
+/// compared against: `root_pid`'s own, except below a nested terminal session
+/// ([`is_nested_terminal_session`]), whose subtree is compared against that
+/// session. A nested terminal session itself is reported with its own session as
+/// its reference, so it is never detached from itself. `None` has
+/// [`detached_descendants`]'s meaning.
+///
+/// Same visited-set walk as [`descendants`], for the same reason: it must
+/// terminate on a cycle.
+fn walk_with_reference_session(
+    table: &[ProcessInfo],
+    root_pid: i32,
+) -> Option<Vec<(&ProcessInfo, i32)>> {
+    let root = table.iter().find(|row| row.pid == root_pid)?;
+    if root.session_id <= 0 {
+        return None;
+    }
+    let mut children: HashMap<i32, Vec<&ProcessInfo>> = HashMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row);
+    }
+    let mut visited: HashSet<i32> = HashSet::new();
+    visited.insert(root_pid);
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    queue.push_back((root_pid, root.session_id));
+    let mut out = Vec::new();
+    while let Some((pid, reference)) = queue.pop_front() {
+        let Some(kids) = children.get(&pid) else {
+            continue;
+        };
+        for kid in kids {
+            if !visited.insert(kid.pid) {
+                continue;
+            }
+            let reference = if is_nested_terminal_session(kid) {
+                kid.session_id
+            } else {
+                reference
+            };
+            out.push((*kid, reference));
+            queue.push_back((kid.pid, reference));
+        }
+    }
+    Some(out)
 }
 
 /// The detached descendants of `root_pid` that the argv cross-check can actually
@@ -606,15 +504,12 @@ pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<
 /// boundary set alongside a non-empty detached set would read idle, exactly as a
 /// cross-check that matches nothing does.
 pub fn shell_tool_candidates(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
-    let root = table.iter().find(|row| row.pid == root_pid)?;
-    if root.session_id <= 0 {
-        return None;
-    }
     let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
     Some(
-        descendants(table, root_pid)
+        walk_with_reference_session(table, root_pid)?
             .into_iter()
-            .filter(|row| row.session_id > 0 && row.session_id != root.session_id)
+            .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
+            .map(|(row, _)| row)
             .filter(|row| {
                 session_of
                     .get(&row.ppid)
@@ -863,6 +758,17 @@ mod tests {
         }
     }
 
+    /// `row` with no controlling terminal: how a genuinely detached command (a
+    /// backgrounded tool, `setsid`) looks, as opposed to the pty-bearing session
+    /// leader `row` models. The fork's wrap tests below predate the structural
+    /// nested-terminal rule and used `row` for their "detached" processes.
+    fn without_tty(row: ProcessInfo) -> ProcessInfo {
+        ProcessInfo {
+            has_controlling_tty: false,
+            ..row
+        }
+    }
+
     /// PRD #386 M2, Open Question 2 — the argv cross-check is a *secondary*
     /// confirmation, so a candidate that is structurally busy must still be
     /// vetoed when a shape is supplied and does not match, and admitted when it
@@ -937,7 +843,12 @@ mod tests {
         // the discriminator to every session-id mismatch rather than just
         // the primary-child one.
         let mut with_detached_grandchild = healthy_codex_pane;
-        with_detached_grandchild.push(row(707600, 707572, 707600, "ping -c 200 127.0.0.1"));
+        with_detached_grandchild.push(without_tty(row(
+            707600,
+            707572,
+            707600,
+            "ping -c 200 127.0.0.1",
+        )));
         assert_eq!(
             descendant_shell_activity(&with_detached_grandchild, 707387, &[]),
             Some(true),
@@ -1015,7 +926,12 @@ mod tests {
         // restriction cannot simply exempt everything under a wrap-rooted
         // tree regardless of how deep it goes.
         let mut with_detached_grandchild = healthy_codex_pane_behind_a_surviving_shell;
-        with_detached_grandchild.push(row(800200, codex_bin, 800200, "ping -c 200 127.0.0.1"));
+        with_detached_grandchild.push(without_tty(row(
+            800200,
+            codex_bin,
+            800200,
+            "ping -c 200 127.0.0.1",
+        )));
         assert_eq!(
             descendant_shell_activity(&with_detached_grandchild, shell, &[]),
             Some(true),
@@ -1057,6 +973,53 @@ mod tests {
              session is genuine evidence of a detached foreground command, not the #644 \
              exemption's targeted shape (issue #644 round 2, reviewer F3 / auditor F2)"
         );
+    }
+
+    /// Issue #1493: `dot-agent-deck wrap` runs the agent it hosts on a
+    /// pseudo-terminal of its own, so the wrapped agent leads a session and owns
+    /// a terminal. That nested terminal must not read as a detached command —
+    /// it did, and pinned every wrapped Codex card at `Working` — while a
+    /// command the wrapped agent detaches off ITS terminal still reads busy, and
+    /// so does a detached command beside the wrapper (the control).
+    #[test]
+    fn a_nested_terminal_session_is_not_busy_but_what_it_detaches_is() {
+        let no_tty = |row: ProcessInfo| ProcessInfo {
+            has_controlling_tty: false,
+            ..row
+        };
+        // The pane's child is the wrapper; its child is the wrapped agent, in a
+        // session of its own on the wrapper's inner pty; the agent's helpers
+        // share the agent's session.
+        let wrapped = vec![
+            row(100, 1, 100, "dot-agent-deck wrap --agent codex -- codex"),
+            row(200, 100, 200, "codex"),
+            row(201, 200, 200, "codex mcp-helper"),
+        ];
+        assert_eq!(detached_descendants(&wrapped, 100), Some(vec![]));
+        assert_eq!(descendant_shell_activity(&wrapped, 100, &[]), Some(false));
+        assert_eq!(shell_tool_candidates(&wrapped, 100), Some(vec![]));
+
+        // The wrapped agent detaches a tool command off its terminal: busy.
+        let mut tool_running = wrapped.clone();
+        tool_running.push(no_tty(row(300, 200, 300, "/bin/bash -lc ls")));
+        tool_running.push(no_tty(row(301, 300, 300, "ls")));
+        assert_eq!(
+            detached_descendants(&tool_running, 100),
+            Some(vec![300, 301])
+        );
+        assert_eq!(
+            descendant_shell_activity(&tool_running, 100, &[]),
+            Some(true)
+        );
+        assert_eq!(shell_tool_candidates(&tool_running, 100), Some(vec![300]));
+
+        // Control: the same session leader WITHOUT a terminal is exactly the
+        // measured detached shell-tool shape, and stays busy.
+        let detached = vec![
+            row(100, 1, 100, "claude"),
+            no_tty(row(200, 100, 200, "/bin/zsh -c eval ls")),
+        ];
+        assert_eq!(descendant_shell_activity(&detached, 100, &[]), Some(true));
     }
 
     /// The two measured Claude Bash-tool variants: the usual one carrying the

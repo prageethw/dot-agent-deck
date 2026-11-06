@@ -1,16 +1,19 @@
 #![cfg(feature = "e2e")]
 
 //! L2 coverage for fork issue #314 / upstream #554: renaming or removing an
-//! orchestration from a project's `.dot-agent-deck.toml` while one of its
-//! tabs is live must surface on screen when the TUI reattaches to the
-//! still-running daemon. Today the reconnect-hydration loop in `run_tui`
-//! (`src/ui.rs`, the `else` arm beside the string `config drift or stale`)
-//! silently rebuilds the tab from a synthesised `OrchestrationConfig` and
-//! logs only a `tracing::info!` line the user never sees — unlike the
-//! snapshot-restore path in the same file, which warns and names the
-//! orchestration for the identical drift class. The sibling `cfg.is_none()`
-//! branch (a legitimate remote reconnect, PRD #111) must stay silent and is
-//! deliberately not exercised here.
+//! orchestration from a project's `.dot-agent-deck.toml` (or breaking the file)
+//! while one of its tabs is live must surface on screen when the TUI reattaches
+//! to the still-running daemon. Before the fix the reconnect-hydration loop in
+//! `run_tui` (`src/ui.rs`) silently rebuilt the tab from a synthesised
+//! `OrchestrationConfig` and logged only a `tracing::info!` line the user never
+//! sees. Upstream's design (`orchestration_config_drift_warning` and
+//! `surface_orchestration_config_drift`) surfaces it in three places: the tab's
+//! strip label gains a `!` prefix and a `[config drift]` suffix, the status line
+//! reads `Config drift: ...`, and the full message is printed when the deck
+//! exits. These tests pin the two on-screen ones; the exit text is pinned by
+//! `session/restore/020` (`tests/e2e_orchestration_config_drift.rs`), which also
+//! covers the `Absent` branch (a legitimate remote reconnect, PRD #111) that
+//! must stay silent and is deliberately not exercised here.
 
 mod common;
 
@@ -19,21 +22,38 @@ use std::time::Duration;
 use common::{TuiDeck, commit_fixture};
 use spec::spec;
 
-/// Substring the drift warning must carry once the fix lands: names the
-/// `orch-deck` fixture's orchestration and states it is no longer found in
-/// the local config. Deliberately more than the bare orchestration name —
-/// the tab title already renders `demo-orch` on screen today (the
-/// synthesised config keeps the daemon-known name), so a needle of just
-/// `"demo-orch"` would pass before the fix exists and not be a real RED.
-const DRIFT_WARNING_NEEDLE: &str = "orchestration 'demo-orch' not found in local config";
+/// Leading text of the status line set when a rebuilt orchestration tab no
+/// longer matches the local config (`Config drift: an orchestration tab marked
+/// ! … [config drift] no longer matches .dot-agent-deck.toml — details are
+/// printed on exit`). Only the head is matched, so a narrow terminal that
+/// truncates the tail still passes, and it is absent unless drift was detected,
+/// so it is a real RED before the fix exists.
+const DRIFT_STATUS_NEEDLE: &str = "Config drift:";
 
-/// Substring the fix for fork issue #320 must carry: names the local config
-/// file and states it failed to parse — the `LocalConfigState::Unparseable`
-/// branch, distinct from both `Absent` (silent, PRD #111) and the
-/// `DRIFT_WARNING_NEEDLE` "found == false" case above. Deliberately includes
-/// the filename so a needle of just "parse" or "invalid" could not pass by
-/// coincidentally matching some unrelated error string.
-const PARSE_WARNING_NEEDLE: &str = "local .dot-agent-deck.toml could not be parsed";
+/// The suffix the tab strip paints on a drifted orchestration tab. It outlives
+/// the status line (which expires), and it must sit on the same strip row as the
+/// orchestration's name so the right tab is the one marked.
+const DRIFT_TAB_MARKER: &str = "[config drift]";
+
+/// Assert that `deck` shows the drift the way upstream surfaces it: the status
+/// line first (it is the transient one, so it is waited for before the
+/// persistent marker), then a strip row naming `demo-orch` and carrying the
+/// marker. `what` describes the scenario for the panic message.
+fn assert_drift_surfaced(deck: &TuiDeck, what: &str) {
+    assert!(
+        deck.wait_for_grid_string_within(DRIFT_STATUS_NEEDLE, Duration::from_secs(10)),
+        "{what} must render the config-drift status line -- expected the \
+         substring {DRIFT_STATUS_NEEDLE:?} on the rendered grid within 10s, got:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.wait_until_grid(
+        "the rebuilt demo-orch tab carries the [config drift] marker",
+        |grid| {
+            grid.lines()
+                .any(|row| row.contains("demo-orch") && row.contains(DRIFT_TAB_MARKER))
+        },
+    );
+}
 
 /// PRD fork#544 M2b: isolation is now unconditional, so the orchestration
 /// opened by the tests below does not run in `deck.workdir()` itself — it
@@ -81,14 +101,14 @@ fn find_isolated_clone_dir(deck: &TuiDeck) -> std::path::PathBuf {
 /// `.dot-agent-deck.toml` on disk to rename the orchestration — the file
 /// still parses, it just no longer lists `demo-orch` (config drift, not a
 /// missing file). A second, fresh TUI client then attaches to the SAME
-/// still-running daemon and must render an in-session status-line warning
-/// naming `demo-orch` once hydration rebuilds the tab from the daemon's
-/// synthesised config.
+/// still-running daemon and, once hydration rebuilds the tab from the daemon's
+/// synthesised config, must mark the `demo-orch` tab `[config drift]` and
+/// explain it on the status line (`Config drift: ...`).
 #[spec("orchestration/hydration/001")]
 #[test]
 fn hydration_001_renamed_orchestration_warns_on_reattach() {
     let deck = TuiDeck::builder().launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The orchestration opened below needs isolated-clone provisioning,
     // which needs a ref to branch from — an unborn HEAD (the harness's own
@@ -148,14 +168,10 @@ command = "cat"
         .without_success_recording()
         .launch_with_fixture("minimal");
 
-    assert!(
-        reattached.wait_for_grid_string_within(DRIFT_WARNING_NEEDLE, Duration::from_secs(10)),
+    assert_drift_surfaced(
+        &reattached,
         "reattaching to a daemon whose live orchestration pane no longer \
-         matches the local .dot-agent-deck.toml (renamed out from under it) \
-         must render an on-screen drift warning naming the orchestration -- \
-         expected the substring {DRIFT_WARNING_NEEDLE:?} on the rendered \
-         grid within 10s, got:\n{}",
-        reattached.snapshot_grid()
+         matches the local .dot-agent-deck.toml (renamed out from under it)",
     );
 }
 
@@ -166,17 +182,17 @@ command = "cat"
 /// rename, which keeps the file valid. The file is not deleted, so the
 /// legitimate silent `Absent` / PRD #111 remote-reconnect case stays
 /// untouched. A second, fresh TUI client then attaches to the SAME
-/// still-running daemon and must render an in-session status-line warning
-/// naming the local config file as unparseable once hydration's
-/// `lookup_config` closure runs against it (fork issue #320: this was RED
-/// when written, because `lookup_config` mapped `Err(ProjectConfigError::Parse)`
-/// to `None`, taking the branch reserved for an absent file, so the broken
-/// edit was silent; closed by `6ef0269`, which introduces `LocalConfigState`).
+/// still-running daemon and must mark the `demo-orch` tab `[config drift]` and
+/// explain it on the status line, exactly as the rename does: a file that
+/// exists but fails to load falls back to the daemon's roles like an absent one,
+/// and must not be quiet like one (fork issue #320, upstream #554's `Unreadable`
+/// case; its exit-time text, `could not be loaded`, is pinned by
+/// `session/restore/020`).
 #[spec("orchestration/hydration/002")]
 #[test]
 fn hydration_002_unparseable_config_warns_on_reattach() {
     let deck = TuiDeck::builder().launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The orchestration opened below needs isolated-clone provisioning,
     // which needs a ref to branch from — an unborn HEAD (the harness's own
@@ -231,13 +247,10 @@ start = true
         .without_success_recording()
         .launch_with_fixture("minimal");
 
-    assert!(
-        reattached.wait_for_grid_string_within(PARSE_WARNING_NEEDLE, Duration::from_secs(10)),
+    assert_drift_surfaced(
+        &reattached,
         "reattaching to a daemon whose live orchestration pane's local \
          .dot-agent-deck.toml has been corrupted into invalid TOML (still \
-         present, just unparseable) must render an on-screen warning naming \
-         the local config file -- expected the substring \
-         {PARSE_WARNING_NEEDLE:?} on the rendered grid within 10s, got:\n{}",
-        reattached.snapshot_grid()
+         present, just unparseable)",
     );
 }

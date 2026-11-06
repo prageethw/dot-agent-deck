@@ -1,4 +1,5 @@
-//! Peer-credential PID discovery on a connected IPC stream (PRD #42 M2).
+//! Peer-credential discovery on a connected IPC stream (PRD #42 M2, extended
+//! by issue #1121 round two).
 //!
 //! Returns the PID of the process holding the *other* end of a connected
 //! [`crate::platform::ipc::IpcStream`]. The daemon-stop path (`daemon_stop.rs`,
@@ -25,9 +26,9 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub use unix::peer_pid;
+pub use unix::{peer_is_same_user, peer_pid, peer_uid_raw};
 #[cfg(windows)]
-pub use windows::peer_pid;
+pub use windows::{peer_is_same_user, peer_pid};
 
 #[cfg(test)]
 mod tests {

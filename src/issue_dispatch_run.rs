@@ -28,7 +28,13 @@
 //!      turn an already-correct worktree/label SKIP into a spurious
 //!      `IssueDispatchFailed`. Only when the label IS present does a further
 //!      `gh issue view --json comments` run, to look up the claimant for the
-//!      skip's rendered text — see [`fetch_claim_comment`].
+//!      skip's rendered text — see [`fetch_claim_comment`]. With `claim_gating`
+//!      in effect (upstream PRD #421 Phase 3, default OFF) another deck's live
+//!      `agent-deck/claimed` record on GitHub is a further skip, read only when
+//!      the first three leave the issue open, via
+//!      [`crate::issue_dispatch::dispatch_decision`]. A skip because the
+//!      worktree exists also refreshes this deck's own claim record once it is
+//!      half a TTL old.
 //!   4. **M2.2 / M2.3** — on dispatch, create the per-issue worktree on
 //!      `agent/issue-<n>` (creating the branch with `-b`, or attaching a branch
 //!      left behind by an earlier closed-without-PR run — B1) and [`spawn`] one
@@ -48,8 +54,15 @@
 //!      with the remaining issues. One issue never aborts the rest.
 //!   8. **M1.3 + PRD #421 M1.3** — per-issue success / skip / failure events are
 //!      surfaced through #127's existing [`Notifier`] seam (no parallel
-//!      notification system); a skip always names which of the four causes
-//!      fired.
+//!      notification system); a skip always names which cause
+//!      fired (worktree exists, open PR, `in-progress` label, another deck's
+//!      live claim, or a concurrent creator).
+//!   9. **PRD #421 Phase 2 (upstream's second claim system, kept beside the
+//!      `in-progress` claim of step 6)** — after a successful spawn, claim the
+//!      issue on GitHub: provision the `agent-deck/claimed` label just in time,
+//!      add it, and write or edit this deck's claimant comment. Best-effort and
+//!      never fatal, with one notification per issue whose claim fell short.
+//!      Nothing ever removes the label or the comment.
 //!
 //! All GitHub/git access goes through the `gh` / `git` binaries resolved from
 //! `PATH`, inheriting the daemon's environment — that is exactly what lets the
@@ -68,14 +81,14 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, TabMembership};
 use crate::config::IssueDispatchConfig;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
-    CLAIM_COMMENT_PREFIX, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
-    IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, TRIAGE_LABELS, TYPE_LABELS,
+    CLAIM_COMMENT_PREFIX, Claimant, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
+    IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, SkipCause, TRIAGE_LABELS, TYPE_LABELS,
     build_dispatch_prompt, claim_comment_body, derive_issue_paths, dispatch_decision,
     gh_current_login_argv, issue_comment_argv, issue_edit_add_label_argv, issue_edit_assignee_argv,
     issue_list_argv, issue_view_comments_argv, label_create_argv, parse_current_assignees,
     parsed_claim_from_comment_json, pr_list_for_issue_argv, validate_gh_login,
 };
-use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
+use crate::scheduler::{Notifier, NotifyEvent};
 use crate::spawn::{SpawnKind, SpawnRequest, spawn};
 use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_terminal_display};
 use crate::worktree_owner::Creator;
@@ -86,13 +99,13 @@ use crate::worktree_owner::Creator;
 
 /// Daemon-owned, in-memory map: per-issue worktree dir → the clone that owns it
 /// (preserved on cleanup). Shared between the fire-time dispatch flow (records
-/// the worktree the moment it is created — BEFORE the spawn's prompt-delivery
-/// wait returns) and the `StopAgent` handler (removes it on close).
+/// the worktree the moment it is created, before the spawn) and the `StopAgent`
+/// handler (removes it on close).
 ///
 /// Keyed by the **worktree path**, not the spawned agent id, on purpose: the
-/// spawn primitive only returns the registry id AFTER its readiness/delivery
-/// wait, so a tab closed promptly after the agent appears would race a
-/// per-agent-id record. The closing agent is instead matched to its worktree via
+/// spawn primitive only returns the registry id after the agent is registered
+/// and visible to a `StopAgent`, so a tab closed promptly after the agent
+/// appears would race a per-agent-id record. The closing agent is instead matched to its worktree via
 /// its [`AgentRecord`] (orchestration cwd / single-agent cwd) — available the
 /// instant the agent is registered. Wiped on daemon restart; a post-restart
 /// close finds no entry and leaves the worktree in place (reclaimed by the
@@ -267,7 +280,7 @@ pub fn agents_rooted_in_worktree(records: &[AgentRecord], worktree_dir: &Path) -
 /// KEEP, because the fail-safe direction for a deletion gate is to decline.
 pub async fn worktree_is_dirty(worktree_dir: &Path) -> Result<bool, String> {
     let worktree = worktree_dir.to_string_lossy();
-    let output = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await?;
+    let output = run_git_capture(&["-C", &worktree, "status", "--porcelain"]).await?;
     Ok(!output.trim().is_empty())
 }
 
@@ -340,8 +353,10 @@ pub async fn kept_worktree_preview(
 /// [`kept_worktree_preview`] with the dirty-probe as a parameter. Production
 /// has exactly one caller, which passes [`worktree_is_dirty`]; the parameter
 /// exists so a test can hand in a probe that never answers and reach the
-/// deadline arm by construction, instead of racing a real `git status` against
-/// a deadline short enough to usually win (fork issue #811).
+/// deadline arm by construction (fork issue #811, upstream issue #1449). A
+/// real `git status` cannot make the deadline win deterministically:
+/// `tokio::time::timeout` polls the probe before its timer, so a probe that
+/// has already finished when the timer fires beats even a 1ns deadline.
 async fn kept_worktree_preview_with(
     records: &[AgentRecord],
     worktrees: &WorktreeRegistry,
@@ -503,6 +518,17 @@ pub async fn remove_worktree(
     remover: &str,
 ) -> RemoveOutcome {
     let worktree = worktree_dir.to_string_lossy();
+    // PRD #1589 (upstream, auditor S5, adopted): the path and git's error text
+    // are producer values — a directory name may carry a newline or a terminal
+    // control — so each is escaped and bounded before it reaches the log.
+    // `remover` is sanitised separately, as before (issue #469).
+    let logged = |value: &str| {
+        crate::config_validation::escape_field_for_log(
+            value,
+            crate::daemon_stop::MAX_LOGGED_PATH_CHARS,
+        )
+    };
+    let shown_worktree = logged(&worktree);
     // An exhaustive match, not `if policy == …` chains (fix round 2, P3-10):
     // a future fourth `RemovalPolicy` variant now fails to compile here
     // instead of silently falling through to the destructive tail below.
@@ -516,29 +542,33 @@ pub async fn remove_worktree(
             // unconditionally; not even a dirty-status probe is run, since the
             // outcome is the same either way.
             tracing::info!(
-                worktree = %worktree_dir.display(),
+                worktree = %shown_worktree,
                 remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                 "dispatch: isolated clone kept in place (not a linked worktree; see RemovalPolicy::IsolatedClone)"
             );
             return RemoveOutcome::Kept(crate::event::KeptReason::IsolatedClone);
         }
         RemovalPolicy::KeepIfDirty => {
-            let status = probe_worktree_dirty(&worktree).await;
-            match status {
-                Ok(output) if !output.trim().is_empty() => {
+            // The ONE `git status --porcelain` this feature asks
+            // ([`worktree_is_dirty`], upstream's consolidation, adopted over
+            // the fork's own `probe_worktree_dirty`): the removal path and
+            // issue #717's close-confirmation preview cannot disagree about
+            // what "dirty" means, and it is bounded and hook/fsmonitor-free.
+            match worktree_is_dirty(worktree_dir).await {
+                Ok(true) => {
                     tracing::warn!(
-                        worktree = %worktree_dir.display(),
+                        worktree = %shown_worktree,
                         remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                         "dispatch: worktree has uncommitted changes; leaving in place"
                     );
                     return RemoveOutcome::Kept(crate::event::KeptReason::Dirty);
                 }
-                Ok(_) => {}
+                Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(
-                        worktree = %worktree_dir.display(),
+                        worktree = %shown_worktree,
                         remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                        error = %e,
+                        error = %logged(&e),
                         "dispatch: could not check worktree status; leaving in place"
                     );
                     return RemoveOutcome::Kept(crate::event::KeptReason::ProbeError);
@@ -548,16 +578,21 @@ pub async fn remove_worktree(
         RemovalPolicy::Force => {}
     }
 
+    // The fork's argv builder (the `--` end-of-options separator, issue #469 /
+    // #144 finding 4) run through upstream's `run_git_status` (issue #1181:
+    // ambient `GIT_DIR` neutralised, hooks and fsmonitor off, bounded; rule 13
+    // forbids a `git` program literal in this module's production half).
     let args = remove_worktree_argv(
         &clone_dir.to_string_lossy(),
         &worktree,
         policy == RemovalPolicy::Force,
     );
-    let res = run_status_args("git", &args).await;
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let res = run_git_status(&arg_refs).await;
     match res {
         Ok(()) => {
             tracing::info!(
-                worktree = %worktree_dir.display(),
+                worktree = %shown_worktree,
                 remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                 "dispatch: removed worktree (clone preserved)"
             );
@@ -565,13 +600,124 @@ pub async fn remove_worktree(
         }
         Err(e) => {
             tracing::warn!(
-                worktree = %worktree_dir.display(),
+                worktree = %shown_worktree,
                 remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                error = %e,
+                error = %logged(&e),
                 "dispatch: worktree cleanup failed"
             );
             RemoveOutcome::RemoveFailed(e)
         }
+    }
+}
+
+/// The `remover` ([`remove_worktree`]'s attribution string, issue #469) the
+/// `close` verb's removal path ([`remove_worktree_outcome`]) logs under.
+pub const CLOSE_VERB_REMOVER: &str = "close";
+
+/// PRD #1589 D6 (upstream): what [`remove_worktree_outcome`] did, with the
+/// ways a tree ends up kept told apart — [`KeptWorktree`] folds a failed
+/// status probe and a failed removal into one `confirmed_dirty: false`, which
+/// is enough for a warning and not for the `close` verb's report.
+///
+/// This is the `close` verb's typed VIEW of the fork's richer
+/// [`RemoveOutcome`] (the one implementation is [`remove_worktree`]); the two
+/// map onto each other through [`crate::event::KeptReason`] (ruling 48 of the
+/// 2026-11-05 upstream merge):
+///
+/// | `WorktreeRemoval`   | `RemoveOutcome`                                  | `KeptReason`      |
+/// |---------------------|--------------------------------------------------|-------------------|
+/// | `Removed`           | `Removed(remover)`                               | (none)            |
+/// | `KeptDirty`         | `Kept(KeptReason::Dirty)`                        | `Dirty`           |
+/// | `KeptCouldNotCheck` | `Kept(KeptReason::ProbeError)`                   | `ProbeError`      |
+/// | `RemoveFailed`      | `RemoveFailed(error)` / `Kept(RemovalFailed)`    | `RemovalFailed`   |
+/// | `KeptIsolatedClone` | `Kept(KeptReason::IsolatedClone)`                | `IsolatedClone`   |
+///
+/// `KeptIsolatedClone` is the one variant upstream's enum lacked: the fork's
+/// [`RemovalPolicy::IsolatedClone`] entries (PRD fork#325 M3) are never
+/// removed by this path at all, and folding that into `KeptCouldNotCheck`
+/// would tell the user a probe failed when none ran. The mapping is lossy in
+/// one direction only: `RemoveFailed` carries no error text here (upstream's
+/// type never did); a caller that needs the text uses [`remove_worktree`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeRemoval {
+    /// Removed; the clone and the branch are kept.
+    Removed,
+    /// Kept: `git status --porcelain` reported uncommitted work.
+    KeptDirty,
+    /// Kept: the status probe failed, so dirtiness is unknown.
+    KeptCouldNotCheck,
+    /// Kept: `git worktree remove` failed.
+    RemoveFailed,
+    /// Kept: the entry is an isolated clone ([`RemovalPolicy::IsolatedClone`]),
+    /// never removed by this path (fork PRD fork#325 M3).
+    KeptIsolatedClone,
+}
+
+impl WorktreeRemoval {
+    /// The issue #717 report of this outcome: `None` when the tree was
+    /// removed. `confirmed_dirty` is true only for [`Self::KeptDirty`].
+    pub fn kept(self, worktree_dir: &Path) -> Option<KeptWorktree> {
+        let path = worktree_dir.to_string_lossy().into_owned();
+        match self {
+            WorktreeRemoval::Removed => None,
+            WorktreeRemoval::KeptDirty => Some(KeptWorktree {
+                path,
+                confirmed_dirty: true,
+            }),
+            WorktreeRemoval::KeptCouldNotCheck
+            | WorktreeRemoval::RemoveFailed
+            | WorktreeRemoval::KeptIsolatedClone => Some(KeptWorktree {
+                path,
+                confirmed_dirty: false,
+            }),
+        }
+    }
+
+    /// Why the tree was kept, in the fork's wire vocabulary; `None` when it was
+    /// removed. This is the `WorktreeRemoval` -> [`crate::event::KeptReason`]
+    /// half of the mapping table above.
+    pub fn kept_reason(self) -> Option<crate::event::KeptReason> {
+        match self {
+            WorktreeRemoval::Removed => None,
+            WorktreeRemoval::KeptDirty => Some(crate::event::KeptReason::Dirty),
+            WorktreeRemoval::KeptCouldNotCheck => Some(crate::event::KeptReason::ProbeError),
+            WorktreeRemoval::RemoveFailed => Some(crate::event::KeptReason::RemovalFailed),
+            WorktreeRemoval::KeptIsolatedClone => Some(crate::event::KeptReason::IsolatedClone),
+        }
+    }
+
+    /// The `BroadcastMsg::WorktreeKept` payload for this outcome (the fork's
+    /// [`crate::event::WorktreeKeptNotice`], which stays the broadcast shape,
+    /// ruling 48): `None` when the tree was removed, `error: None` always (see
+    /// the type docs).
+    pub fn kept_notice(self, worktree_dir: &Path) -> Option<crate::event::WorktreeKeptNotice> {
+        self.kept_reason()
+            .map(|reason| crate::event::WorktreeKeptNotice {
+                path: worktree_dir.to_string_lossy().into_owned(),
+                reason,
+                error: None,
+            })
+    }
+}
+
+/// [`remove_worktree`], answering with the typed [`WorktreeRemoval`] and
+/// attributed to [`CLOSE_VERB_REMOVER`]. Adds nothing to the removal itself:
+/// the one implementation is [`remove_worktree`], so the `close` verb and the
+/// `StopAgent` tab-close path cannot disagree about when a tree is kept.
+pub async fn remove_worktree_outcome(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+) -> WorktreeRemoval {
+    use crate::event::KeptReason;
+    match remove_worktree(worktree_dir, clone_dir, policy, CLOSE_VERB_REMOVER).await {
+        RemoveOutcome::Removed(_) => WorktreeRemoval::Removed,
+        RemoveOutcome::Kept(KeptReason::Dirty) => WorktreeRemoval::KeptDirty,
+        RemoveOutcome::Kept(KeptReason::ProbeError) => WorktreeRemoval::KeptCouldNotCheck,
+        RemoveOutcome::Kept(KeptReason::RemovalFailed) | RemoveOutcome::RemoveFailed(_) => {
+            WorktreeRemoval::RemoveFailed
+        }
+        RemoveOutcome::Kept(KeptReason::IsolatedClone) => WorktreeRemoval::KeptIsolatedClone,
     }
 }
 
@@ -707,39 +853,386 @@ pub async fn run_issue_dispatch(
     // dispatched): already-claimed issues inside the cap are skipped, yielding a
     // clean "≤ max_per_run concurrent in-flight" ceiling (PRD concurrency model —
     // today's run only picks up slots yesterday's run vacated).
+    // PRD #421 M2.6(a) — the claim label is provisioned just in time: once per
+    // run, plus at most one re-attempt when a later label add fails while it has
+    // not succeeded, and only in a run that is about to write a claim, so a fire
+    // that dispatches nothing provisions no label (#483). Such a fire can still
+    // read claims, and edit this deck's own record from a worktree skip
+    // (PRD #421 M3.1).
+    let mut claim_run = ClaimRun::new(&local_hostname());
+
     for issue in issues.into_iter().take(cfg.max_per_run) {
-        // M3.2 — per-issue error boundary: one failure never aborts the rest.
-        if let Err(message) = dispatch_one_issue(
-            task_name,
-            &workspace,
-            prompt_template,
-            cfg,
-            default_command.as_deref(),
-            issue.number,
-            issue.in_progress_label,
-            &clone_dir,
-            registry,
-            worktrees,
-            notifier,
-            event_tx,
-            state,
-            login.as_deref(),
-        )
-        .await
-        {
-            notifier.notify(NotifyEvent::IssueDispatchFailed {
-                task: task_name.to_string(),
-                repo: cfg.repo.clone(),
-                issue: issue.number,
-                message,
-            });
+        let issue_number = issue.number;
+        let label_in_progress = issue.in_progress_label;
+        loop {
+            // M3.2 — per-issue error boundary: one failure never aborts the rest.
+            match dispatch_one_issue(
+                task_name,
+                &workspace,
+                prompt_template,
+                cfg,
+                default_command.as_deref(),
+                issue_number,
+                label_in_progress,
+                &clone_dir,
+                registry,
+                worktrees,
+                notifier,
+                event_tx,
+                state,
+                login.as_deref(),
+                &mut claim_run,
+            )
+            .await
+            {
+                Ok(IssueOutcome::Handled) => break,
+                // The claims are written before the success is surfaced, so
+                // "dispatched" is the issue's last word in this run: nothing
+                // writes to GitHub for it after that line. The `in-progress`
+                // claim (PRD #421 M1, rules 14/23) was already written inside
+                // `dispatch_one_issue`; this is upstream's second claim system
+                // (`agent-deck/claimed` label + claim record, ruling 36 keeps
+                // both).
+                Ok(IssueOutcome::Dispatched { claims_unchecked }) => {
+                    claim_issue_record(task_name, cfg, issue_number, &mut claim_run, notifier)
+                        .await;
+                    // M1.3 — surface the per-issue dispatch success.
+                    notifier.notify(NotifyEvent::IssueDispatched {
+                        task: task_name.to_string(),
+                        repo: cfg.repo.clone(),
+                        issue: issue_number,
+                        claims_unchecked,
+                    });
+                    break;
+                }
+                Err(message) => {
+                    notifier.notify(NotifyEvent::IssueDispatchFailed {
+                        task: task_name.to_string(),
+                        repo: cfg.repo.clone(),
+                        issue: issue_number,
+                        message,
+                    });
+                    break;
+                }
+                // PRD #1487 re-check, reviewer R3: not reported as a failure.
+                // Retried once the restart is called off; if it goes ahead, this
+                // issue and the rest of the run are the successor's next fire.
+                Ok(IssueOutcome::DeferredForRestart) => {
+                    tracing::info!(
+                        task = task_name,
+                        issue = issue_number,
+                        "issue dispatch deferred: the daemon is restarting"
+                    );
+                    if !registry.wait_for_admission().await {
+                        tracing::info!(
+                            task = task_name,
+                            "the daemon is going down; the rest of this run is left to its successor"
+                        );
+                        return;
+                    }
+                }
+            }
         }
     }
 }
 
-/// Process one candidate issue. `Ok(())` means it was dispatched OR skipped (a
-/// skip is surfaced here, not treated as an error); `Err` is a per-issue failure
-/// for the caller to surface through the notifier (M3.2).
+/// The `remover` ([`remove_worktree`]'s attribution string, issue #469) the
+/// restart-deferral path of [`settle_failed_issue_spawn`] logs under.
+const RESTART_DEFERRAL_REMOVER: &str = "issue-dispatch:restart-deferral";
+
+/// What happens to an issue's freshly created worktree when its spawn fails.
+///
+/// PRD #1487 re-check, reviewer R3: a restart's admission freeze is not a
+/// failure of this issue. A worktree left on disk would claim the issue on
+/// every later fire with no agent in it — a permanent loss — so the fresh,
+/// empty worktree is removed again and the issue deferred.
+///
+/// That removal can fail (a lock, permissions), and a failure must not read as
+/// a clean deferral (final audit F2). So before removing it the worktree is
+/// marked as abandoned by `creator` ([`crate::worktree_owner::mark_abandoned_spawn`]),
+/// and a failed removal is reported as this issue's failure, naming the
+/// directory. The mark is what lets the next attempt — this daemon's next
+/// fire, or the successor's — retry the removal ([`reclaim_abandoned_spawn`])
+/// instead of reading the leftover as the issue already being claimed. The
+/// mark is written only here, for the worktree this attempt created and
+/// recorded; a removal that succeeds deletes it with the worktree. Marking and
+/// removing run under the per-repository worktree lock, so a reclaimer — which
+/// removes only under that lock — never sees the mark of a removal still in
+/// progress. When that lock cannot be taken (it timed out, or the clone's lock
+/// path could not be resolved), nothing is removed: the worktree is only
+/// marked, and the issue reports a failure the next attempt recovers from by
+/// reclaiming it under the lock — so this removal can never overlap another
+/// dispatch's worktree operation.
+///
+/// Any other failure: no agent will ever close to trigger cleanup, so the
+/// registry entry is dropped here. The worktree dir itself is left on disk —
+/// the next fire's worktree-exists idempotency signal reclaims the issue.
+async fn settle_failed_issue_spawn(
+    e: crate::spawn::SpawnError,
+    worktrees: &WorktreeRegistry,
+    worktree_dir: &Path,
+    creator: Creator,
+) -> Result<IssueOutcome, String> {
+    if !matches!(e, crate::spawn::SpawnError::DaemonRestarting) {
+        take_worktree(worktrees, worktree_dir);
+        return Err(e.to_string());
+    }
+    // Only a worktree this attempt recorded is ours to remove.
+    let Some(entry) = take_worktree(worktrees, worktree_dir) else {
+        return Ok(IssueOutcome::DeferredForRestart);
+    };
+    let repo_lock = acquire_worktree_lock(&entry.clone_dir).await;
+    let marked = {
+        let dir = worktree_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::worktree_owner::mark_abandoned_spawn(&dir, &creator)
+        })
+        .await
+        .unwrap_or_else(|join| Err(join.to_string()))
+    };
+    // No lock, no removal: marked only, it is left for a reclaimer, which
+    // removes under the lock.
+    if repo_lock.is_none() {
+        return Err(match marked {
+            Ok(_) => format!(
+                "the daemon is restarting, so no agent was started, and the repository's \
+                 worktree lock could not be taken to remove the issue's new worktree {} again; \
+                 the next attempt retries the removal",
+                worktree_dir.display()
+            ),
+            Err(why) => format!(
+                "the daemon is restarting, so no agent was started, and the issue's new worktree \
+                 {} could neither be removed again (the repository's worktree lock could not be \
+                 taken) nor marked for a retry ({why}); remove it by hand to release the issue",
+                worktree_dir.display()
+            ),
+        });
+    }
+    // Ruling 58 of the 2026-11-05 upstream merge: the fork's `remove_worktree`
+    // answers with the richer `RemoveOutcome` (upstream's answered
+    // `Option<KeptWorktree>`, `None` = removed). The recorded policy is kept
+    // (`KeepIfDirty` for a dispatch, ruling 43), so a tree that somehow holds
+    // work is left in place and reported as not removed, never forced.
+    if matches!(
+        remove_worktree(
+            worktree_dir,
+            &entry.clone_dir,
+            entry.policy,
+            RESTART_DEFERRAL_REMOVER,
+        )
+        .await,
+        RemoveOutcome::Removed(_)
+    ) {
+        return Ok(IssueOutcome::DeferredForRestart);
+    }
+    Err(match marked {
+        Ok(_) => format!(
+            "the daemon is restarting, so no agent was started, and the issue's new worktree \
+             {} could not be removed again; the next attempt retries the removal",
+            worktree_dir.display()
+        ),
+        Err(why) => format!(
+            "the daemon is restarting, so no agent was started, and the issue's new worktree \
+             {} could not be removed again or marked for a retry ({why}); remove it by hand \
+             to release the issue",
+            worktree_dir.display()
+        ),
+    })
+}
+
+/// What [`reclaim_abandoned_spawn`] found at an issue's existing worktree.
+#[derive(Debug, PartialEq, Eq)]
+enum Reclaim {
+    /// Not a worktree this task abandoned for this issue, or something is
+    /// using it: the issue stays claimed.
+    NotAbandoned,
+    /// It was, and it has been removed — or another reclaimer removed it first:
+    /// the caller looks again, and the issue can be dispatched if it is gone.
+    Removed,
+    /// It was, and removing it failed again, or the per-repository lock that
+    /// guards the removal could not be taken: the issue's failure to report.
+    Failed(String),
+}
+
+/// Retry the removal [`settle_failed_issue_spawn`] could not finish, before the
+/// worktree-exists idempotency check reads the leftover as a claim (PRD #1487
+/// final audit F2).
+///
+/// Removes nothing it cannot attribute to that failed spawn: the worktree must
+/// carry the deck's ownership marker and an abandoned-spawn marker naming this
+/// task and issue, must not be recorded by a live dispatch in `worktrees`, and
+/// must have nothing in `agents` rooted in it — no live agent and no spawn
+/// still starting there ([`AgentPtyRegistry::dir_in_use`], asked afresh each
+/// time).
+///
+/// Those checks pass once without any lock, which is all most fires need: an
+/// unmarked worktree costs no lock wait. The removal itself then runs under
+/// the per-repository worktree lock [`create_worktree`] takes, and every check
+/// is made again under it, immediately before `git worktree remove` — with the
+/// abandoned-spawn generation required to be the exact one the first pass
+/// read. So two reclaimers (an old daemon and its successor, or two decks) can
+/// never both remove: the second finds the worktree gone, or re-created
+/// without the mark, or abandoned again under a new generation, and leaves it
+/// (PRD #1487, the F2 reclaim race). A lock that cannot be taken removes
+/// nothing.
+///
+/// Issue #1612: the last agent check is not a read followed by a removal. It
+/// takes a hold on the worktree in `agents` ([`AgentPtyRegistry::hold_dir_for_removal`])
+/// in the same acquisition that finds nothing rooted there, and keeps it
+/// through the removal; while it is held, every start this daemon is asked for
+/// inside the worktree is refused. So an agent started in the abandoned
+/// worktree is either seen by that check — its spawn is reserved before its
+/// child exists, long before its record is published — and keeps the worktree,
+/// or refused, and never has its directory removed under it.
+async fn reclaim_abandoned_spawn(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    creator: Creator,
+    worktrees: &WorktreeRegistry,
+    agents: &AgentPtyRegistry,
+) -> Reclaim {
+    reclaim_abandoned_spawn_paced(
+        worktree_dir,
+        clone_dir,
+        creator,
+        worktrees,
+        agents,
+        std::future::ready(()),
+        std::future::ready(()),
+    )
+    .await
+}
+
+/// [`reclaim_abandoned_spawn`], awaiting `before_lock` between the unlocked
+/// first pass and taking the lock — the window the regression tests hold open
+/// to let a second reclaimer remove and re-create the worktree — and
+/// `before_remove` between the last check and the removal, the window issue
+/// #1612's regression test holds open to start an agent in the worktree.
+async fn reclaim_abandoned_spawn_paced(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    creator: Creator,
+    worktrees: &WorktreeRegistry,
+    agents: &AgentPtyRegistry,
+    before_lock: impl std::future::Future<Output = ()>,
+    before_remove: impl std::future::Future<Output = ()>,
+) -> Reclaim {
+    let Some(generation) =
+        abandoned_generation_if_unused(worktree_dir, &creator, worktrees, agents).await
+    else {
+        return Reclaim::NotAbandoned;
+    };
+    before_lock.await;
+
+    let Some(_repo_lock) = acquire_worktree_lock(clone_dir).await else {
+        return Reclaim::Failed(format!(
+            "the issue's worktree {} was left by a spawn the daemon refused while restarting, \
+             and the repository's worktree lock that guards removing it could not be taken; \
+             the next attempt retries",
+            worktree_dir.display()
+        ));
+    };
+    // `Path::exists` is a blocking `stat`; the same probe (any error reads as
+    // absent) runs off the async workers (Qodo 4219656655).
+    if tokio::fs::metadata(worktree_dir).await.is_err() {
+        return Reclaim::Removed;
+    }
+    // Issue #1612: the final agent check, made as a hold that lasts until the
+    // removal below has finished — see `reclaim_abandoned_spawn`.
+    let Some(_removal_hold) = agents.hold_dir_for_removal(worktree_dir) else {
+        return Reclaim::NotAbandoned;
+    };
+    if abandoned_generation_if_unused(worktree_dir, &creator, worktrees, agents).await
+        != Some(generation)
+    {
+        return Reclaim::NotAbandoned;
+    }
+    before_remove.await;
+    // Rulings 42/43 and 58 of the 2026-11-05 upstream merge: `KeepIfDirty`,
+    // not upstream's `Force`. No agent ever ran in this tree, so a clean leftover
+    // is removed exactly as upstream does; but a tree that holds uncommitted
+    // work (somebody edited it between the refusal and this retry) is the
+    // user's, and discarding it would be a data-loss change, not a rule-24
+    // case 1-3. It is kept and reported, and the issue stays unclaimable until
+    // the work is resolved, which is what every other kept dispatch worktree on
+    // this fork does.
+    match remove_worktree(
+        worktree_dir,
+        clone_dir,
+        RemovalPolicy::KeepIfDirty,
+        RESTART_DEFERRAL_REMOVER,
+    )
+    .await
+    {
+        RemoveOutcome::Removed(_) => {
+            tracing::info!(
+                worktree = %worktree_dir.display(),
+                "issue-dispatch: removed a worktree left by a spawn refused during a restart"
+            );
+            Reclaim::Removed
+        }
+        RemoveOutcome::Kept(crate::event::KeptReason::Dirty) => Reclaim::Failed(format!(
+            "the issue's worktree {} was left by a spawn the daemon refused while restarting, \
+             and it now holds uncommitted changes, so it was kept; commit or discard them, or \
+             remove the worktree by hand, to release the issue",
+            worktree_dir.display()
+        )),
+        RemoveOutcome::Kept(_) | RemoveOutcome::RemoveFailed(_) => Reclaim::Failed(format!(
+            "the issue's worktree {} was left by a spawn the daemon refused while restarting, \
+             and removing it failed again; the next attempt retries",
+            worktree_dir.display()
+        )),
+    }
+}
+
+/// The generation of `creator`'s abandoned-spawn mark on `worktree_dir`, unless
+/// a live dispatch records the worktree or something in `agents` is rooted in
+/// it.
+async fn abandoned_generation_if_unused(
+    worktree_dir: &Path,
+    creator: &Creator,
+    worktrees: &WorktreeRegistry,
+    agents: &AgentPtyRegistry,
+) -> Option<String> {
+    let recorded = worktrees
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(worktree_dir);
+    if recorded || agents.dir_in_use(worktree_dir) {
+        return None;
+    }
+    let dir = worktree_dir.to_path_buf();
+    let creator = creator.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::worktree_owner::abandoned_spawn_generation(&dir, &creator)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// What [`dispatch_one_issue`] did with an issue it did not fail on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IssueOutcome {
+    /// Skipped as already claimed (the skip is surfaced there).
+    Handled,
+    /// An agent was spawned for the issue, so the caller claims it on GitHub
+    /// (PRD #421 M2.2) — never on any other outcome — and surfaces the
+    /// dispatch. `claims_unchecked` is why claim gating could not read the
+    /// issue's claims, which the dispatch line reports.
+    Dispatched { claims_unchecked: Option<String> },
+    /// PRD #1487 re-check, reviewer R3: refused because the daemon is
+    /// restarting. The issue's worktree was removed again, so the slot stays
+    /// open for the next attempt — this daemon's, if the restart is called
+    /// off, or the successor's next fire.
+    DeferredForRestart,
+}
+
+/// Process one candidate issue. `Ok(Dispatched)` means an agent was spawned,
+/// `Ok(Handled)` that it was skipped (a skip is surfaced here, not treated as
+/// an error), and
+/// `Ok(DeferredForRestart)` that the daemon refused the agent for now; `Err` is
+/// a per-issue failure for the caller to surface through the notifier (M3.2).
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_issue(
     task_name: &str,
@@ -759,16 +1252,17 @@ async fn dispatch_one_issue(
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
     login: Option<&str>,
-) -> Result<(), String> {
+    claim_run: &mut ClaimRun,
+) -> Result<IssueOutcome, String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
-    let notify_skip = |reason: SkipReason| {
+    let notify_skip = |cause: SkipCause| {
         notifier.notify(NotifyEvent::IssueDispatchSkipped {
             task: task_name.to_string(),
             repo: cfg.repo.clone(),
             issue,
             branch: paths.branch.clone(),
-            reason,
+            cause,
         });
     };
 
@@ -783,10 +1277,39 @@ async fn dispatch_one_issue(
     // correctness hazard: a transient `gh` failure would, via the per-issue
     // error boundary, turn this clean SKIP into a spurious IssueDispatchFailed
     // notification.
-    let worktree_exists = paths.worktree_dir.exists();
+    //
+    // Except for a leftover this task abandoned for this issue when its spawn
+    // was refused during a restart and the removal failed: that is retried
+    // here first, and only a worktree that is still there afterwards claims
+    // the issue (PRD #1487 final audit F2).
+    // `Path::exists` is a blocking `stat`: `tokio::fs::metadata` is the same
+    // probe (any error reads as absent) run off the async workers.
+    let mut worktree_exists = tokio::fs::metadata(&paths.worktree_dir).await.is_ok();
     if worktree_exists {
-        notify_skip(SkipReason::WorktreeExists);
-        return Ok(());
+        match reclaim_abandoned_spawn(
+            &paths.worktree_dir,
+            clone_dir,
+            Creator::issue_dispatch(task_name, issue),
+            worktrees,
+            registry,
+        )
+        .await
+        {
+            Reclaim::NotAbandoned => {
+                refresh_claim_on_worktree_skip(task_name, cfg, issue, claim_run).await;
+                notify_skip(SkipCause::WorktreeExists);
+                return Ok(IssueOutcome::Handled);
+            }
+            Reclaim::Failed(message) => return Err(message),
+            Reclaim::Removed => {
+                worktree_exists = tokio::fs::metadata(&paths.worktree_dir).await.is_ok()
+            }
+        }
+        if worktree_exists {
+            refresh_claim_on_worktree_skip(task_name, cfg, issue, claim_run).await;
+            notify_skip(SkipCause::WorktreeExists);
+            return Ok(IssueOutcome::Handled);
+        }
     }
 
     // SECONDARY (PRD #421 review C1) — the `in-progress` label, honoured
@@ -812,10 +1335,12 @@ async fn dispatch_one_issue(
         // failure, so it degrades to "no claimant recorded" rather than
         // propagating.
         let claimant = fetch_claim_comment(&cfg.repo, issue).await;
-        notify_skip(SkipReason::Labelled {
-            claimant: claimant.map(|c| c.raw),
-        });
-        return Ok(());
+        // Ruling 44: `SkipCause::LabelInProgress` carries the deck's own
+        // claim-comment text (`ParsedClaim::raw`, rendered through
+        // `sanitize_claimant_for_render`), `None` for a label a human or an
+        // external tool applied.
+        notify_skip(SkipCause::LabelInProgress(claimant.map(|c| c.raw)));
+        return Ok(IssueOutcome::Handled);
     }
 
     // TERTIARY — reached ONLY when neither the worktree nor the label
@@ -828,12 +1353,40 @@ async fn dispatch_one_issue(
     // rather than an inline `if`, so its truth table stays the single
     // source of truth for what "already claimed" means.
     let open_pr = issue_has_open_pr(&cfg.repo, issue).await?;
-    match dispatch_decision(worktree_exists, open_pr, label_in_progress) {
-        DispatchDecision::Skip => {
-            notify_skip(SkipReason::OpenPr);
-            return Ok(());
+
+    // QUATERNARY (PRD #421 M3.2, upstream's `claim_gating`, default OFF) —
+    // reached only when neither local signal skipped, so a GitHub failure here
+    // can never turn a clean skip into a failure: another deck's live claim.
+    // Read only with gating in effect, and a claim that cannot be read
+    // dispatches (fail toward a duplicate, never a wedge), which the dispatch
+    // line then says. A READ only: a dry run (below) stays write-free.
+    let mut claims_unchecked = None;
+    let claimant = if !open_pr && cfg.claim.gating_in_effect() {
+        match live_claim(task_name, &cfg.repo, issue, cfg.claim.ttl(), claim_run).await {
+            Ok(claimant) => claimant,
+            Err(error) => {
+                tracing::warn!(
+                    task = task_name,
+                    repo = cfg.repo,
+                    issue,
+                    error = %error,
+                    "issue-dispatch: the issue's claims could not be read; dispatching without them"
+                );
+                claims_unchecked = Some(error);
+                None
+            }
         }
-        DispatchDecision::Dispatch => {}
+    } else {
+        None
+    };
+    // `label_in_progress` is known-false here (the label skip returned above),
+    // so a `LabelInProgress` cause cannot come out of this call and there is no
+    // claimant to fill into it; the other causes carry no payload.
+    if let DispatchDecision::Skip(cause) =
+        dispatch_decision(worktree_exists, open_pr, label_in_progress, claimant)
+    {
+        notify_skip(cause);
+        return Ok(IssueOutcome::Handled);
     }
 
     // Issue #171 (auditor F2 fix, PR #753): a DRY RUN stops here, having made
@@ -858,7 +1411,7 @@ async fn dispatch_one_issue(
             repo: cfg.repo.clone(),
             issue,
         });
-        return Ok(());
+        return Ok(IssueOutcome::Handled);
     }
 
     // M2.2 — create the per-issue worktree on `agent/issue-<n>`. A concurrent
@@ -907,7 +1460,7 @@ async fn dispatch_one_issue(
         // `run_status` kill the timed-out child and gave this path its own
         // best-effort cleanup — see `run_status`'s and
         // `attempt_worktree_cleanup_async`'s doc comments for the trace).
-        // It is still folded into the same `SkipReason::ConcurrentCreator`
+        // It is still folded into the same `SkipCause::ConcurrentCreator`
         // skip as `AlreadyClaimed` rather than getting its own reason: a
         // genuine `TimedOut` here means OUR OWN add wedged and was killed,
         // not that a concurrent dispatch won a TOCTOU race, so the rendered
@@ -915,20 +1468,20 @@ async fn dispatch_one_issue(
         // cause in that one case. Known and left as-is per the
         // reviewer/auditor final pass (non-blocking, F1/A1): every later
         // fire still stops retrying the slug either way, `cleaned_up_by`
-        // (when `Some`) still frees it for reuse, and a distinct `SkipReason` +
+        // (when `Some`) still frees it for reuse, and a distinct `SkipCause` +
         // notification for this case is follow-up material rather than part
         // of this fix. The match stays exhaustive across all three so it
         // remains safe if any of them ever change again.
         WorktreeCreation::AlreadyClaimed
         | WorktreeCreation::BranchExists
         | WorktreeCreation::TimedOut { .. } => {
-            notify_skip(SkipReason::ConcurrentCreator);
-            return Ok(());
+            notify_skip(SkipCause::ConcurrentCreator);
+            return Ok(IssueOutcome::Handled);
         }
     }
 
-    // M2.4 — record the worktree for tab-close cleanup NOW, before the spawn's
-    // prompt-delivery wait. `spawn` registers the agent (visible to a `StopAgent`
+    // M2.4 — record the worktree for tab-close cleanup NOW, before the spawn.
+    // `spawn` registers the agent (visible to a `StopAgent`
     // from a fast client) well before it returns, so recording after the spawn
     // would race a prompt close. The close watcher matches the agent to this
     // worktree by its record's cwd, not by an agent id we don't have yet.
@@ -949,14 +1502,13 @@ async fn dispatch_one_issue(
     // M2.3 — spawn one agent into the worktree, delivering the substituted
     // prompt. `spawn` branches on the worktree's `.dot-agent-deck.toml`.
     //
-    // `detach_delivery = true`: the agent is still registered synchronously (so
-    // the idempotency/worktree state is consistent the moment this returns), but
-    // the prompt-delivery wait — which can sit out the multi-second `SessionStart`
-    // fallback for a hook-less command — runs in the background. This frees the
-    // scheduler's run-active window as soon as the dispatch WORK is done, so a
-    // re-fire right after a tab close (PRD #120 B1 / dispatch/008) isn't skipped
-    // behind the prior run's lingering delivery wait. The worktree-on-disk
-    // idempotency signal still serializes overlapping fires safely.
+    // `detach_delivery = true` has no effect since PRD #1666: the agent is
+    // registered and its prompt posted to the inbox before `spawn` returns, and
+    // nothing waits on the agent, so the scheduler's run-active window is freed
+    // as soon as the dispatch WORK is done (PRD #120 B1 / dispatch/008: a
+    // re-fire right after a tab close is not skipped behind a lingering
+    // delivery wait). The worktree-on-disk idempotency signal still serializes
+    // overlapping fires safely.
     // PRD #421 M2.2 — when triage is on, append the triage instruction to the
     // substituted prompt so the dispatched agent applies its own labels. Only
     // the issues actually dispatched here ever see it; a skipped issue never
@@ -984,25 +1536,26 @@ async fn dispatch_one_issue(
         // `created-by:` marker above (`create_worktree`), not a second
         // derivation of it.
         owner: Some(creator),
+        // PRD #1666 S5: labelled as the session's starting prompt.
+        seed_reason: Some("seed".to_string()),
     };
     let handle = match spawn(req, registry, notifier, event_tx, true, state).await {
         Ok(h) => h,
+        // No agent will ever close to trigger cleanup, so the registry entry is
+        // dropped here (the worktree dir itself is left on disk: the next fire's
+        // worktree-exists signal reclaims the issue), except that a spawn
+        // refused during a daemon restart is deferred and its fresh worktree
+        // removed again (PRD #1487, upstream's `settle_failed_issue_spawn`).
         Err(e) => {
-            // The spawn failed after the worktree was created/recorded: no
-            // agent will ever close to trigger cleanup, so drop the registry
-            // entry here. The worktree dir itself is left on disk — the next
-            // fire's worktree-exists idempotency signal reclaims the issue.
-            take_worktree(worktrees, &paths.worktree_dir);
-            return Err(e.to_string());
+            return settle_failed_issue_spawn(
+                e,
+                worktrees,
+                &paths.worktree_dir,
+                Creator::issue_dispatch(task_name, issue),
+            )
+            .await;
         }
     };
-
-    // M1.3 — surface the per-issue dispatch success.
-    notifier.notify(NotifyEvent::IssueDispatched {
-        task: task_name.to_string(),
-        repo: cfg.repo.clone(),
-        issue,
-    });
 
     // PRD fork#235 round 3: derive the claimant IDENTITY from the bound spawn
     // handle's `SpawnKind`, not from `task_name` alone — an orchestration
@@ -1037,7 +1590,15 @@ async fn dispatch_one_issue(
     // write) — so `claim_issue` never propagates. Review fix C3: it no
     // longer swallows the failure into `tracing::warn!` alone either — a
     // claim failure is now surfaced through the `Notifier` seam as its own
-    // distinguishable event (see [`claim_issue`]).
+    // distinguishable event (`NotifyEvent::IssueInProgressClaimFailed`, ruling
+    // 44; upstream's `IssueClaimFailed` is the OTHER claim system's event, see
+    // [`claim_issue`]).
+    //
+    // Ruling 36 of the 2026-11-05 upstream merge: BOTH claim systems run on a
+    // dispatch. This is the fork's `in-progress` claim (rules 14/23, written
+    // here, before the success is surfaced); upstream's `agent-deck/claimed`
+    // label + claim record is written by the caller on
+    // `IssueOutcome::Dispatched` ([`claim_issue_record`]).
     //
     // `cfg.dry_run` is always `false` by the time control reaches here — the
     // dry-run early return above (auditor F2 fix) sends every `dry_run` fire
@@ -1056,7 +1617,150 @@ async fn dispatch_one_issue(
     )
     .await;
 
-    Ok(())
+    // M1.3 — the caller claims the issue on GitHub (upstream's record) and then
+    // surfaces the success.
+    Ok(IssueOutcome::Dispatched { claims_unchecked })
+}
+
+/// PRD #421 M3.2 — the claimant whose record on `issue` is live, read from
+/// GitHub now: `None` when the issue does not carry [`CLAIM_LABEL`]
+/// (removing it by hand releases the claim) or no record on it is live. This
+/// deck's own records count as dead here — the worktree and open-PR checks,
+/// which skip before this runs, are their evidence — so a record gates here
+/// only when it is foreign, written by the repository's owner, a member or a
+/// collaborator, and edited within `ttl` of GitHub's clock ([`ClaimRun::now`]).
+/// Each read draws on the run's claim budget, and
+/// any failure, the budget running out included, is an `Err` the caller
+/// dispatches on.
+///
+/// [`CLAIM_LABEL`]: crate::issue_dispatch::CLAIM_LABEL
+async fn live_claim(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    ttl: chrono::Duration,
+    run: &mut ClaimRun,
+) -> Result<Option<Claimant>, String> {
+    let label = run.claim_label(repo, issue).await?;
+    if !label.present {
+        return Ok(None);
+    }
+    let records = run.claim_records(repo, issue).await?;
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let me = crate::issue_dispatch::ClaimIdentity {
+        user_id: run.account().await?,
+        task: task_name,
+        host_id: &run.host_id,
+    };
+    Ok(crate::issue_dispatch::live_claimant(
+        &records,
+        &me,
+        false,
+        label.added_at,
+        run.now(),
+        ttl,
+    ))
+}
+
+/// PRD #421 M3.1 — the owner's refresh, taken from the skip its own worktree
+/// causes: when this deck has a record on `issue` whose clock — its
+/// `updated_at` on GitHub, floored by when the label was first added — is at
+/// least half the TTL old, edit it with a new claim time, so the record stays
+/// live for as long as the work does. Runs whether or not gating is on (the
+/// switch turns off the gate, not the claim), never creates a record, and is
+/// best-effort: a failure is logged and the issue is skipped all the same.
+async fn refresh_claim_on_worktree_skip(
+    task_name: &str,
+    cfg: &IssueDispatchConfig,
+    issue: u64,
+    run: &mut ClaimRun,
+) {
+    // Issue #171 (fork): a DRY RUN never writes to GitHub, and editing this
+    // deck's own claim record is a write. The worktree-exists skip reaches this
+    // before the dry-run gate in `dispatch_one_issue`, so the gate is repeated
+    // here rather than assumed.
+    if cfg.dry_run {
+        return;
+    }
+    match refresh_own_claim(task_name, &cfg.repo, issue, cfg.claim.ttl_hours, run).await {
+        Ok(Some(comment_id)) => tracing::info!(
+            task = task_name,
+            repo = cfg.repo,
+            issue,
+            comment_id,
+            "issue-dispatch: claim record refreshed"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            task = task_name,
+            repo = cfg.repo,
+            issue,
+            error = %error,
+            "issue-dispatch: could not refresh the claim record"
+        ),
+    }
+}
+
+/// [`refresh_claim_on_worktree_skip`]'s work: `Ok(Some(id))` when the record
+/// `id` was edited, `Ok(None)` when there is no own record or it is not due.
+/// A record stating a lifetime other than `ttl_hours` is due whatever its age
+/// ([`claim_record_ttl_outdated`]), and every edit writes `ttl_hours` into it.
+///
+/// [`claim_record_ttl_outdated`]: crate::issue_dispatch::claim_record_ttl_outdated
+async fn refresh_own_claim(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    ttl_hours: u32,
+    run: &mut ClaimRun,
+) -> Result<Option<u64>, String> {
+    use crate::issue_dispatch::{
+        ClaimIdentity, claim_record_ttl_outdated, claim_refresh_due, edit_claim_record_argv,
+        next_claim_time, render_claim_record_with_ttl,
+    };
+    let ttl = chrono::Duration::hours(i64::from(ttl_hours));
+    let records = run.claim_records(repo, issue).await?;
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let user_id = run.account().await?;
+    let me = ClaimIdentity {
+        user_id,
+        task: task_name,
+        host_id: &run.host_id,
+    };
+    let Some(own) = records.into_iter().find(|found| found.is_own(&me)) else {
+        return Ok(None);
+    };
+    let now = run.now();
+    // The label floor can only make the record younger, so the events are
+    // read only when the record's own clock already says a refresh is due.
+    if !claim_record_ttl_outdated(&own.record, ttl_hours) {
+        if !claim_refresh_due(now, own.updated_at, ttl) {
+            return Ok(None);
+        }
+        let label = run.claim_label(repo, issue).await?;
+        if !claim_refresh_due(now, own.updated_at.max(label.added_at), ttl) {
+            return Ok(None);
+        }
+    }
+    // A new claim time, so the edit changes the body: GitHub leaves
+    // `updated_at` alone on an edit that repeats it.
+    let body = render_claim_record_with_ttl(
+        task_name,
+        &run.host_id,
+        next_claim_time(now, own.record.claimed_at),
+        ttl_hours,
+    );
+    run.call(
+        &edit_claim_record_argv(repo, own.comment_id, &body),
+        "refreshing the claim comment",
+        CLAIM_CALL_MAX_BYTES,
+    )
+    .await?;
+    Ok(Some(own.comment_id))
 }
 
 /// PRD #421 M1.0/M1.1 + PRD fork#235 M2: write the `in-progress` label,
@@ -1086,7 +1790,7 @@ async fn dispatch_one_issue(
 /// silently fails, and a second deck pointed at the same repo has neither the
 /// worktree nor the label signal to stop it duplicating the work — exactly
 /// what this PRD exists to prevent. A claim failure is now its own
-/// `NotifyEvent::IssueClaimFailed`, distinguishable from both a successful
+/// `NotifyEvent::IssueInProgressClaimFailed`, distinguishable from both a successful
 /// dispatch and an `IssueDispatchFailed`: the dispatch genuinely succeeded:
 /// only the claim could not be written. PRD fork#235 M2 extends the same
 /// discipline to the assignee write — worded distinctly from the label and
@@ -1135,7 +1839,7 @@ async fn claim_issue(
     let body = claim_comment_body(identity, &timestamp, login, None);
     let comment_argv = issue_comment_argv(repo, issue, &body);
     if let Err(e) = run_gh_write(dry_run, &comment_argv, "post the claim comment", repo).await {
-        notifier.notify(NotifyEvent::IssueClaimFailed {
+        notifier.notify(NotifyEvent::IssueInProgressClaimFailed {
             task: task_name.to_string(),
             repo: repo.to_string(),
             issue,
@@ -1145,7 +1849,7 @@ async fn claim_issue(
 
     let label_argv = issue_edit_add_label_argv(repo, issue, IN_PROGRESS_LABEL);
     if let Err(e) = run_gh_write(dry_run, &label_argv, "write the in-progress label", repo).await {
-        notifier.notify(NotifyEvent::IssueClaimFailed {
+        notifier.notify(NotifyEvent::IssueInProgressClaimFailed {
             task: task_name.to_string(),
             repo: repo.to_string(),
             issue,
@@ -1162,7 +1866,7 @@ async fn claim_issue(
         // needed.
         let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), &remove);
         if let Err(e) = run_gh_write(dry_run, &assignee_argv, "write the assignee", repo).await {
-            notifier.notify(NotifyEvent::IssueClaimFailed {
+            notifier.notify(NotifyEvent::IssueInProgressClaimFailed {
                 task: task_name.to_string(),
                 repo: repo.to_string(),
                 issue,
@@ -1176,7 +1880,7 @@ async fn claim_issue(
 /// log what WOULD have run (the full argv, so the log is actionable) and skip
 /// execution, reporting `Ok(())` rather than attempting anything. A dry run
 /// must never surface a write it never attempted as an
-/// `IssueClaimFailed`/label-ensure warning, so this always succeeds.
+/// `IssueInProgressClaimFailed`/label-ensure warning, so this always succeeds.
 async fn run_gh_write(
     dry_run: bool,
     argv: &[String],
@@ -1426,22 +2130,7 @@ fn canonical_workspace(working_dir: &str) -> Result<PathBuf, String> {
 async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Result<(), String> {
     if clone_dir.is_dir() {
         let clone = clone_dir.to_string_lossy();
-        let origin = run_capture_args("git", &["-C", &clone, "remote", "get-url", "origin"])
-            .await
-            .map_err(|e| {
-                format!(
-                    "clone dir {} has no usable git origin; refusing to refresh a foreign dir: {e}",
-                    clone_dir.display()
-                )
-            })?;
-        let origin = origin.trim();
-        if !origin_matches_repo(origin, repo) {
-            return Err(format!(
-                "clone dir {} has origin {origin:?}, which does not match configured repo \
-                 {repo:?}; refusing to fetch/pull (fail-closed)",
-                clone_dir.display()
-            ));
-        }
+        verify_clone_origin(clone_dir, repo).await?;
         if let Err(e) = refresh_clone(&clone).await {
             tracing::warn!(
                 clone = %clone_dir.display(),
@@ -1456,7 +2145,17 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
     }
     std::fs::create_dir_all(workspace)
         .map_err(|e| format!("failed to create workspace {}: {e}", workspace.display()))?;
-    run_status("gh", &["repo", "clone", repo, &clone_dir.to_string_lossy()]).await?;
+    let placed = clone_via_staging(clone_dir, |staging| async move {
+        run_status("gh", &["repo", "clone", repo, &staging.to_string_lossy()]).await
+    })
+    .await?;
+    // A clone another attempt put there first is not ours, so it gets the same
+    // L3 check a pre-existing directory does before anything uses it — two
+    // decks sharing a workspace and task name need not share a repo (Qodo,
+    // PR #1304).
+    if placed == StagedClone::LostRace {
+        verify_clone_origin(clone_dir, repo).await?;
+    }
     // Same hygiene on the fresh clone, so it holds across the first AND every
     // later fire.
     ensure_worktrees_excluded(clone_dir);
@@ -1703,7 +2402,6 @@ pub(crate) enum IsolatedCloneOutcome {
 /// desynchronize against, so this class of ambiguity cannot recur.
 pub(crate) fn resolve_git_toplevel(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let output = match run_capture_sync(
-        "git",
         &[
             "-C".to_string(),
             dir.to_string_lossy().into_owned(),
@@ -1990,7 +2688,6 @@ pub(crate) fn provision_isolated_clone_sync_resolved(
     // <k>=<v>`) is dramatically more dangerous than `worktree remove`'s, so
     // the same cheap defense belongs here at least as much.
     let clone_result = run_status_sync(
-        "git",
         &[
             "clone".to_string(),
             // Issue #325 reviewer P3-2 (fix round 3): pin the remote's name
@@ -2127,7 +2824,6 @@ pub(crate) fn provision_isolated_clone_sync_resolved(
     // cases.
     let default_branch = resolve_clone_default_branch(clone_dir);
     let branch_location = if run_status_sync(
-        "git",
         &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
         WORKTREE_GIT_TIMEOUT,
     )
@@ -2135,7 +2831,6 @@ pub(crate) fn provision_isolated_clone_sync_resolved(
     {
         crate::issue_dispatch::BranchLocation::Local
     } else if run_status_sync(
-        "git",
         &crate::issue_dispatch::isolated_clone_remote_branch_probe_argv(clone_dir, branch),
         WORKTREE_GIT_TIMEOUT,
     )
@@ -2146,7 +2841,6 @@ pub(crate) fn provision_isolated_clone_sync_resolved(
         crate::issue_dispatch::BranchLocation::Absent
     };
     let checkout_result = run_status_sync(
-        "git",
         &crate::issue_dispatch::isolated_clone_checkout_argv(clone_dir, branch, branch_location),
         WORKTREE_GIT_TIMEOUT,
     );
@@ -2198,7 +2892,6 @@ pub(crate) fn provision_isolated_clone_sync_resolved(
         // means this workspace starts from whatever `main` looked like at
         // clone time instead of the true HEAD.
         if let Err(err) = run_status_sync(
-            "git",
             &[
                 "-C".to_string(),
                 clone_dir.to_string_lossy().into_owned(),
@@ -2366,7 +3059,6 @@ fn clone_destination_predates_attempt(error_text: &str) -> bool {
 /// point the clone's `origin` at.
 fn read_source_origin_url(source_dir: &Path) -> Option<String> {
     run_capture_sync(
-        "git",
         &[
             "-C".to_string(),
             source_dir.to_string_lossy().into_owned(),
@@ -2435,8 +3127,7 @@ const ISOLATED_CLONE_NO_ORIGIN_SENTINEL: &str = "dot-agent-deck://no-origin-conf
 /// guards against a source origin URL beginning with `-` being read as an
 /// option.
 fn point_isolated_clone_origin(clone_dir: &Path, url: &str) -> Option<String> {
-    match std::process::Command::new("git")
-        .current_dir(clone_dir)
+    match crate::git_env::git_at(clone_dir)
         .args(["remote", "set-url", "--", "origin", url])
         .output()
     {
@@ -2471,8 +3162,7 @@ fn point_isolated_clone_origin(clone_dir: &Path, url: &str) -> Option<String> {
 /// this used to discard its result with `let _ = …`; returns
 /// `Some(warning)` on failure instead.
 fn remove_isolated_clone_origin_default(clone_dir: &Path) -> Option<String> {
-    match std::process::Command::new("git")
-        .current_dir(clone_dir)
+    match crate::git_env::git_at(clone_dir)
         .args(["remote", "remove", "origin"])
         .output()
     {
@@ -2496,8 +3186,7 @@ fn remove_isolated_clone_origin_default(clone_dir: &Path) -> Option<String> {
 /// [`remove_stray_default_branch`] below has nothing it can safely name to
 /// clean up, never a hard failure of provisioning itself.
 fn resolve_clone_default_branch(clone_dir: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .current_dir(clone_dir)
+    let out = crate::git_env::git_at(clone_dir)
         .args(["symbolic-ref", "--short", "-q", "HEAD"])
         .output()
         .ok()?;
@@ -2538,8 +3227,7 @@ fn resolve_clone_default_branch(clone_dir: &Path) -> Option<String> {
 /// sweep — the exact same safe fallback an unresolvable gate anywhere else
 /// in the tightened rule already produces.
 fn remove_stray_default_branch(clone_dir: &Path, original_branch: &str) {
-    let out = std::process::Command::new("git")
-        .current_dir(clone_dir)
+    let out = crate::git_env::git_at(clone_dir)
         .args(["branch", "-d", "--", original_branch])
         .output();
     match out {
@@ -2622,6 +3310,121 @@ pub(crate) fn attempt_isolated_clone_cleanup(clone_dir: &Path, remover: &str) ->
     }
 }
 
+/// L3 (fail-closed): the check a clone directory this fire did not create must
+/// pass before it is used — a readable `origin` consistent with `repo`.
+async fn verify_clone_origin(clone_dir: &Path, repo: &str) -> Result<(), String> {
+    let clone = clone_dir.to_string_lossy();
+    let origin = run_git_capture(&["-C", &clone, "remote", "get-url", "origin"])
+        .await
+        .map_err(|e| {
+            format!(
+                "clone dir {} has no usable git origin; refusing to refresh a foreign dir: {e}",
+                clone_dir.display()
+            )
+        })?;
+    let origin = origin.trim();
+    if !origin_matches_repo(origin, repo) {
+        return Err(format!(
+            "clone dir {} has origin {origin:?}, which does not match configured repo \
+             {repo:?}; refusing to fetch/pull (fail-closed)",
+            clone_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// How [`clone_via_staging`] ended when it did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedClone {
+    /// This call's clone is now at `clone_dir`.
+    Placed,
+    /// Another attempt put a directory at `clone_dir` first; this call's copy
+    /// was discarded, and the caller must vet what is there before using it.
+    LostRace,
+}
+
+/// Clone into a staging sibling of `clone_dir`, and move it into place only
+/// once the clone has succeeded.
+///
+/// A clone that stops partway — killed at [`SUBPROCESS_TIMEOUT`] (issue #692),
+/// or cut short by the daemon itself dying — would otherwise leave `clone_dir`
+/// on disk, and every later fire takes an existing directory for a finished
+/// clone: it checks the origin, tries a refresh that can only fail, and never
+/// clones again, so the schedule could not recover without someone deleting the
+/// directory by hand. Staged, `clone_dir` exists only as a complete clone.
+/// Raised by Greptile on PR #1304.
+///
+/// **The staging name is unique to this call** (process id plus a
+/// per-process counter), so two attempts at the same clone — two tasks sharing
+/// a workspace, or two daemons — never clear or rename each other's work in
+/// progress (raised by Qodo on PR #1304). The cost is that a staging directory
+/// orphaned by a daemon that died mid-clone is not reclaimed automatically; it
+/// is inert, because nothing reads a `.cloning-*` sibling as a clone. If
+/// another attempt finished first, `rename` onto its non-empty directory fails;
+/// this attempt's copy is discarded and [`StagedClone::LostRace`] tells the
+/// caller that what now sits at `clone_dir` was put there by somebody else.
+///
+/// The staging directory is a sibling so the final `rename` stays on one
+/// filesystem and is atomic. Moving a fresh clone is safe because it has no
+/// linked worktrees yet (`.worktrees/` is created later), and a linked worktree
+/// is what would record the clone's absolute path. The filesystem calls go
+/// through `tokio::fs`, which runs them off the async workers, because removing
+/// a partial clone walks every file it has.
+async fn clone_via_staging<F, Fut>(clone_dir: &Path, clone: F) -> Result<StagedClone, String>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = clone_dir
+        .file_name()
+        .ok_or_else(|| format!("clone dir {} has no file name", clone_dir.display()))?;
+    let mut staging_name = name.to_os_string();
+    staging_name.push(format!(
+        ".cloning-{}-{}",
+        std::process::id(),
+        ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let staging = clone_dir.with_file_name(staging_name);
+    let discard = |path: PathBuf| async move {
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                staging = %path.display(),
+                error = %e,
+                "issue-dispatch: could not remove a partial clone's staging directory"
+            ),
+        }
+    };
+    if let Err(e) = clone(staging.clone()).await {
+        discard(staging).await;
+        return Err(e);
+    }
+    match tokio::fs::rename(&staging, clone_dir).await {
+        Ok(()) => Ok(StagedClone::Placed),
+        Err(e) => {
+            if tokio::fs::metadata(clone_dir)
+                .await
+                .is_ok_and(|meta| meta.is_dir())
+            {
+                discard(staging).await;
+                return Ok(StagedClone::LostRace);
+            }
+            // Discarded here too, because every call stages under a new name:
+            // a rename that keeps failing would otherwise leave one complete
+            // copy of the repository per fire (Qodo, PR #1304).
+            let err = format!(
+                "cloned into {} but could not move it to {}: {e}",
+                staging.display(),
+                clone_dir.display()
+            );
+            discard(staging).await;
+            Err(err)
+        }
+    }
+}
+
 /// Keep the per-issue worktrees dir (`<clone>/.worktrees/`) out of the clone's
 /// `git status` WITHOUT touching the user's tracked files: append `.worktrees/`
 /// to the clone's LOCAL exclude file (`<clone>/.git/info/exclude`) — never a
@@ -2678,8 +3481,21 @@ fn ensure_worktrees_excluded(clone_dir: &Path) {
 /// S3: refresh an existing clone in place — `git fetch` then `git pull --ff-only`.
 /// The caller treats any failure here as non-fatal (warn + continue).
 async fn refresh_clone(clone: &str) -> Result<(), String> {
-    run_status("git", &["-C", clone, "fetch"]).await?;
-    run_status("git", &["-C", clone, "pull", "--ff-only"]).await
+    run_git_status(&["-C", clone, "fetch"]).await?;
+    let pulled = run_git_status(&["-C", clone, "pull", "--ff-only"]).await;
+    // Auditor A-06 (upstream sync): the bounded run's process-group kill can cut
+    // a fast-forward mid-checkout and leave `.git/index.lock`, after which every
+    // later `pull` fails "non-fatally" and dispatch keeps cutting worktrees from
+    // a stale HEAD. Name the lock, so the caller's warn says why.
+    let lock = Path::new(clone).join(".git").join("index.lock");
+    match pulled {
+        Err(e) if lock.exists() => Err(format!(
+            "{e} ({} exists: a git run in this clone was killed mid-checkout; remove it once \
+             no git process is using the clone)",
+            lock.display()
+        )),
+        other => other,
+    }
 }
 
 /// L3: whether an existing clone's `origin` is consistent with the configured
@@ -2766,6 +3582,527 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
         .as_array()
         .ok_or_else(|| "`gh pr list` did not return a JSON array".to_string())?;
     Ok(!arr.is_empty())
+}
+
+/// The default bound on ONE `gh` call of the claim (PRD #421 amendment item 9),
+/// independent of [`SUBPROCESS_TIMEOUT`]. A claim call is an API request, small
+/// next to a clone, and the claim runs between one issue's dispatch and
+/// the next issue's, so a hung call here holds up every issue after it: the
+/// bound is what keeps a stuck claim from delaying the rest of the run by
+/// more than a few of these.
+const CLAIM_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overrides [`CLAIM_CALL_TIMEOUT`], in milliseconds — what lets a test drive
+/// the timeout without a 30-second wait. A value that is not a positive
+/// integer is ignored.
+const CLAIM_CALL_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS";
+
+/// The most `gh api --paginate` may print for one issue's comments, or its
+/// events, before the call is killed (PRD #421 amendment item 10). Far above
+/// what a typical issue's comments print, and low enough that a runaway
+/// listing's captured output stays bounded in the daemon's memory.
+const CLAIM_COMMENTS_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most any other claim call may print on stdout before it is killed. What
+/// those calls print is one small JSON object (the account, the written
+/// comment), a line, or nothing, so this is far above any real answer.
+const CLAIM_CALL_MAX_BYTES: usize = 256 * 1024;
+
+/// How much of a claim call's stderr is kept for its diagnostic; the rest is
+/// read and discarded (see [`OutputCaps::stderr`]). The diagnostic built from it
+/// is cut much shorter still ([`crate::issue_dispatch::sanitize_claim_error`]),
+/// so this only bounds what the daemon holds while the call runs.
+const CLAIM_STDERR_MAX_BYTES: usize = 64 * 1024;
+
+/// The default total time all the claim calls of one run may take together
+/// (PRD #421 amendment item 12). [`CLAIM_CALL_TIMEOUT`] alone bounds each call,
+/// not their number, so a run of many issues against a GitHub that hangs every
+/// call would hold the scheduler for that bound times the calls; this caps it.
+const CLAIM_RUN_BUDGET: Duration = Duration::from_secs(120);
+
+/// Overrides [`CLAIM_RUN_BUDGET`], in milliseconds, for the same reason as
+/// [`CLAIM_CALL_TIMEOUT_ENV`]. A value that is not a positive integer is
+/// ignored.
+const CLAIM_RUN_BUDGET_ENV: &str = "DOT_AGENT_DECK_ISSUE_CLAIM_BUDGET_MS";
+
+/// What a claim step that ran out of [`ClaimBudget`] reports.
+const CLAIM_BUDGET_SPENT: &str = "the run's claim time budget was used up";
+
+/// A positive number of milliseconds, or `None` for anything else.
+fn positive_millis(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+}
+
+/// [`CLAIM_CALL_TIMEOUT`], or the [`CLAIM_CALL_TIMEOUT_ENV`] override when it
+/// holds a positive number of milliseconds.
+fn claim_call_timeout_from(value: Option<&str>) -> Duration {
+    positive_millis(value).unwrap_or(CLAIM_CALL_TIMEOUT)
+}
+
+/// [`CLAIM_RUN_BUDGET`], or the [`CLAIM_RUN_BUDGET_ENV`] override when it holds
+/// a positive number of milliseconds.
+fn claim_run_budget_from(value: Option<&str>) -> Duration {
+    positive_millis(value).unwrap_or(CLAIM_RUN_BUDGET)
+}
+
+/// The time the claim calls of one run share (PRD #421 amendment item 12):
+/// each call is bounded by the per-call bound or by what is left, whichever is
+/// shorter, and spends the time it actually took. Time between calls — the
+/// dispatching itself — spends none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaimBudget {
+    per_call: Duration,
+    remaining: Duration,
+}
+
+impl ClaimBudget {
+    /// The bound for the next call, or `None` once the budget is spent and no
+    /// further claim call may be made.
+    fn next_bound(&self) -> Option<Duration> {
+        (!self.remaining.is_zero()).then(|| self.per_call.min(self.remaining))
+    }
+
+    fn spend(&mut self, elapsed: Duration) {
+        self.remaining = self.remaining.saturating_sub(elapsed);
+    }
+
+    fn is_spent(&self) -> bool {
+        self.remaining.is_zero()
+    }
+}
+
+/// This machine's clock `local_now` moved onto GitHub's by `offset` (GitHub's
+/// clock minus this machine's, measured once per run), or left as it is when
+/// no offset was measured.
+fn clock_now(
+    local_now: chrono::DateTime<chrono::Utc>,
+    offset: Option<chrono::Duration>,
+) -> chrono::DateTime<chrono::Utc> {
+    offset.map_or(local_now, |offset| local_now + offset)
+}
+
+/// What the claims of one run share: the machine id the records name, the
+/// time budget every claim call draws from, and two lookups — the label
+/// provisioning (PRD #421 M2.6(a)) and the signed-in account (amendment item
+/// 6), which also yields the offset between GitHub's clock and this machine's
+/// (PRD #421 M3.1). Each is made lazily, on the first claim call that needs
+/// it, so a run that neither dispatches nor reads or refreshes a claim makes
+/// no claim call. Provisioning is attempted
+/// once per run, plus at most one re-attempt when a later label add fails while
+/// provisioning has not succeeded ([`ClaimRun::should_reprovision`], amendment
+/// item 14); its outcome otherwise stands for the rest of the run. Only a
+/// successful account lookup is cached, so a failed one is retried by the next
+/// claim that needs a record (amendment item 13).
+struct ClaimRun {
+    host_id: String,
+    budget: ClaimBudget,
+    provisioned: Option<Result<(), String>>,
+    reprovisioned: bool,
+    account: Option<u64>,
+    /// GitHub's clock minus this machine's, from the account lookup's `Date`;
+    /// `None` until a lookup carried a readable one, and then the local clock
+    /// stands in.
+    clock_offset: Option<chrono::Duration>,
+}
+
+impl ClaimRun {
+    fn new(hostname: &str) -> Self {
+        Self::with_budget(
+            hostname,
+            ClaimBudget {
+                per_call: claim_call_timeout_from(
+                    std::env::var(CLAIM_CALL_TIMEOUT_ENV).ok().as_deref(),
+                ),
+                remaining: claim_run_budget_from(
+                    std::env::var(CLAIM_RUN_BUDGET_ENV).ok().as_deref(),
+                ),
+            },
+        )
+    }
+
+    fn with_budget(hostname: &str, budget: ClaimBudget) -> Self {
+        Self {
+            host_id: crate::issue_dispatch::claim_host_id(hostname),
+            budget,
+            provisioned: None,
+            reprovisioned: false,
+            account: None,
+            clock_offset: None,
+        }
+    }
+
+    /// Whether a failed label add is worth provisioning the label once more and
+    /// retrying the add (amendment item 14): only while provisioning has not
+    /// succeeded in this run, so the label may be missing, only once per run,
+    /// and only with budget left to make the calls.
+    fn should_reprovision(&self) -> bool {
+        !self.reprovisioned && !matches!(self.provisioned, Some(Ok(()))) && !self.budget.is_spent()
+    }
+
+    /// Keep the account a lookup resolved; a failed lookup leaves nothing
+    /// behind, so the next claim that needs a record looks it up again.
+    fn remember_account(&mut self, lookup: &Result<u64, String>) {
+        if let Ok(id) = lookup {
+            self.account = Some(*id);
+        }
+    }
+
+    /// The id of the account `gh` is signed in with, looked up on first need
+    /// and kept for the rest of the run once a lookup succeeds. The lookup that
+    /// succeeds also sets the run's clock ([`ClaimRun::now`]) from GitHub's
+    /// `Date`, logging once when it has none.
+    async fn account(&mut self) -> Result<u64, String> {
+        use crate::issue_dispatch::{
+            authenticated_user_argv, parse_authenticated_user, sanitize_claim_error,
+        };
+        if let Some(id) = self.account {
+            return Ok(id);
+        }
+        let lookup = self
+            .call(
+                &authenticated_user_argv(),
+                "looking up the signed-in GitHub account",
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await
+            .and_then(|output| {
+                parse_authenticated_user(&output).map_err(|e| sanitize_claim_error(&e))
+            });
+        let local_now = chrono::Utc::now();
+        if let Ok(user) = &lookup {
+            self.clock_offset = user
+                .server_date
+                .map(|server| server.signed_duration_since(local_now));
+            if self.clock_offset.is_none() {
+                tracing::warn!(
+                    "issue-dispatch: GitHub's answer to the account lookup carried no readable \
+                     Date header; claim ages in this run use this machine's clock"
+                );
+            }
+        }
+        let lookup = lookup.map(|user| user.id);
+        self.remember_account(&lookup);
+        lookup
+    }
+
+    /// Now on GitHub's clock — this machine's clock moved by the offset the
+    /// account lookup measured — which is what every claim record's times are
+    /// on. This machine's clock when no offset was measured.
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        clock_now(chrono::Utc::now(), self.clock_offset)
+    }
+
+    /// Every claim record on `issue`, whoever wrote it (PRD #421 M3.2).
+    async fn claim_records(
+        &mut self,
+        repo: &str,
+        issue: u64,
+    ) -> Result<Vec<crate::issue_dispatch::IssueClaimRecord>, String> {
+        let comments = self
+            .call(
+                &crate::issue_dispatch::issue_comments_argv(repo, issue),
+                "reading the issue's comments",
+                CLAIM_COMMENTS_MAX_BYTES,
+            )
+            .await?;
+        crate::issue_dispatch::parse_issue_claim_records(&comments)
+            .map_err(|e| crate::issue_dispatch::sanitize_claim_error(&e))
+    }
+
+    /// Whether `issue` carries the claim label and when it was first added,
+    /// from its events (PRD #421 M3.1).
+    async fn claim_label(
+        &mut self,
+        repo: &str,
+        issue: u64,
+    ) -> Result<crate::issue_dispatch::ClaimLabelState, String> {
+        let events = self
+            .call(
+                &crate::issue_dispatch::issue_events_argv(repo, issue),
+                "reading the issue's events",
+                CLAIM_COMMENTS_MAX_BYTES,
+            )
+            .await?;
+        crate::issue_dispatch::parse_claim_label_state(&events)
+            .map_err(|e| crate::issue_dispatch::sanitize_claim_error(&e))
+    }
+
+    /// One claim call within the run's budget ([`gh_claim_call`]), or the
+    /// step reported as skipped when the budget is already spent. A call that
+    /// fails as it spends the last of the budget says so as well, since a
+    /// timeout shortened by the budget is not the per-call bound's.
+    async fn call(
+        &mut self,
+        argv: &[String],
+        what: &str,
+        max_stdout: usize,
+    ) -> Result<String, String> {
+        let Some(bound) = self.budget.next_bound() else {
+            return Err(format!("{what} was skipped: {CLAIM_BUDGET_SPENT}"));
+        };
+        let started = std::time::Instant::now();
+        let result = gh_claim_call(argv, what, bound, max_stdout).await;
+        self.budget.spend(started.elapsed());
+        match result {
+            Err(error) if self.budget.is_spent() => Err(format!("{error}; {CLAIM_BUDGET_SPENT}")),
+            result => result,
+        }
+    }
+
+    /// Provision the claim label, logging a failure.
+    async fn provision(&mut self, task_name: &str, repo: &str) {
+        let outcome = self
+            .call(
+                &crate::issue_dispatch::claim_label_provision_argv(repo),
+                "creating the label",
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await
+            .map(drop);
+        if let Err(error) = &outcome {
+            tracing::warn!(
+                task = task_name,
+                repo,
+                error = %error,
+                "issue-dispatch: could not provision the claim label"
+            );
+        }
+        self.provisioned = Some(outcome);
+    }
+
+    /// Add the claim label to `issue`.
+    async fn add_label(&mut self, repo: &str, issue: u64) -> Result<(), String> {
+        self.call(
+            &crate::issue_dispatch::claim_issue_argv(repo, issue),
+            "adding the label",
+            CLAIM_CALL_MAX_BYTES,
+        )
+        .await
+        .map(drop)
+    }
+}
+
+/// PRD #421 M2.2 — claim a just-dispatched issue on GitHub: provision the
+/// label (before the first claim write of the run, and at most once more if a
+/// label add fails while provisioning has not succeeded), add it to the issue,
+/// then write this deck's claimant record — editing its existing one if the
+/// issue already carries it, posting a new one otherwise.
+///
+/// Called only after `spawn` returned `Ok`, so a failed dispatch never leaves
+/// a claim. Every step is best-effort in the way [`ensure_worktrees_excluded`]
+/// is: a failure never fails the dispatch, which genuinely succeeded. Unlike
+/// that helper, a failure is not left to a WARN alone: a claim that did not
+/// fully succeed raises exactly one [`NotifyEvent::IssueClaimFailed`] naming
+/// both outcomes (M2.6(b)), so a read-only token does not pass as a run of
+/// clean claims. Every call draws on `run.budget`, so a call that hangs is
+/// reported as its step's failure and the run moves on to the next issue, and
+/// once the run's budget is spent a claim makes no call and is reported as
+/// skipped.
+///
+/// A failed provisioning does not stop the label write: a token that may apply
+/// labels without managing them (GitHub's triage role) still succeeds at the
+/// add when the label already exists. When the add fails as well, the label
+/// may be missing because provisioning failed transiently, so the label is
+/// provisioned once more and the add retried ([`ClaimRun::should_reprovision`]).
+async fn claim_issue_record(
+    task_name: &str,
+    cfg: &IssueDispatchConfig,
+    issue: u64,
+    run: &mut ClaimRun,
+    notifier: &dyn Notifier,
+) {
+    let repo = cfg.repo.as_str();
+    if run.budget.is_spent() {
+        let skipped = format!("the claim was skipped: {CLAIM_BUDGET_SPENT}");
+        tracing::warn!(
+            task = task_name,
+            repo,
+            issue,
+            "issue-dispatch: the issue was dispatched but {skipped}"
+        );
+        notifier.notify(NotifyEvent::IssueClaimFailed {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            label_error: Some(skipped.clone()),
+            record_error: Some(skipped),
+        });
+        return;
+    }
+
+    if run.provisioned.is_none() {
+        run.provision(task_name, repo).await;
+    }
+
+    let mut label = run.add_label(repo, issue).await;
+    if label.is_err() && run.should_reprovision() {
+        run.reprovisioned = true;
+        run.provision(task_name, repo).await;
+        label = run.add_label(repo, issue).await;
+    }
+    let label_error = label.err().map(|error| match &run.provisioned {
+        Some(Err(provision)) => format!("{error}; earlier, {provision}"),
+        _ => error,
+    });
+    if label_error.is_none() {
+        tracing::info!(
+            task = task_name,
+            repo,
+            issue,
+            "issue-dispatch: claim label added"
+        );
+    }
+
+    let record_error = write_claim_record(task_name, repo, issue, cfg.claim.ttl_hours, run)
+        .await
+        .err();
+
+    if label_error.is_some() || record_error.is_some() {
+        tracing::warn!(
+            task = task_name,
+            repo,
+            issue,
+            label_error = ?label_error,
+            record_error = ?record_error,
+            "issue-dispatch: the issue was dispatched but its claim did not fully succeed"
+        );
+        notifier.notify(NotifyEvent::IssueClaimFailed {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            label_error,
+            record_error,
+        });
+    }
+}
+
+/// Write this deck's claimant record on `issue`: read the comments to find a
+/// record this deck wrote — same task, same machine id, authored by the account
+/// `gh` is signed in with — and edit it if there is one, so a re-claim never
+/// appends a second record. If the account or the comments cannot be read,
+/// nothing is posted: a blind post is how a duplicate record would appear.
+/// The record states `ttl_hours`, the task's `claim_ttl_hours`, as its
+/// lifetime.
+async fn write_claim_record(
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    ttl_hours: u32,
+    run: &mut ClaimRun,
+) -> Result<(), String> {
+    use crate::issue_dispatch::{
+        create_claim_record_argv, edit_claim_record_argv, find_own_claim_record,
+        issue_comments_argv, next_claim_time, render_claim_record_with_ttl, sanitize_claim_error,
+    };
+    let user_id = run.account().await?;
+    let comments = run
+        .call(
+            &issue_comments_argv(repo, issue),
+            "reading the issue's comments",
+            CLAIM_COMMENTS_MAX_BYTES,
+        )
+        .await?;
+    let own = find_own_claim_record(&comments, task_name, &run.host_id, user_id)
+        .map_err(|e| sanitize_claim_error(&e))?;
+    let claimed_at = next_claim_time(run.now(), own.as_ref().and_then(|record| record.claimed_at));
+    let body = render_claim_record_with_ttl(task_name, &run.host_id, claimed_at, ttl_hours);
+    match own {
+        Some(record) => {
+            let id = record.id;
+            // Guaranteed by `next_claim_time`: an edit that repeated the body
+            // would leave `updated_at`, the claim's clock, where it was.
+            debug_assert_ne!(body, record.body, "a re-claim must change the record");
+            run.call(
+                &edit_claim_record_argv(repo, id, &body),
+                "editing the claim comment",
+                CLAIM_CALL_MAX_BYTES,
+            )
+            .await?;
+            tracing::info!(
+                task = task_name,
+                repo,
+                issue,
+                comment_id = id,
+                "issue-dispatch: claim record edited"
+            );
+        }
+        None => {
+            let created = run
+                .call(
+                    &create_claim_record_argv(repo, issue, &body),
+                    "posting the claim comment",
+                    CLAIM_CALL_MAX_BYTES,
+                )
+                .await?;
+            // The id is for the log line only: a response it cannot be read
+            // from does not make the posted record a failure.
+            let comment_id = serde_json::from_str::<serde_json::Value>(&created)
+                .ok()
+                .and_then(|comment| comment["id"].as_u64());
+            tracing::info!(
+                task = task_name,
+                repo,
+                issue,
+                comment_id = ?comment_id,
+                "issue-dispatch: claim record created"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Run one `gh` call of the claim within `bound` and return its stdout, killing
+/// the call if it prints more than `max_stdout` bytes; at most
+/// [`CLAIM_STDERR_MAX_BYTES`] of its stderr are kept. Its error names the
+/// step (`what`) instead of echoing the argv, which for a comment write carries
+/// the whole multi-line body, is folded onto one line so the notification
+/// built from it stays a single line, and is sanitised
+/// ([`crate::issue_dispatch::sanitize_claim_error`]) because it quotes `gh`'s
+/// stderr.
+async fn gh_claim_call(
+    argv: &[String],
+    what: &str,
+    bound: Duration,
+    max_stdout: usize,
+) -> Result<String, String> {
+    use crate::issue_dispatch::sanitize_claim_error;
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match output_within_capped(
+        tokio::process::Command::new("gh"),
+        "gh",
+        &args,
+        bound,
+        OutputCaps {
+            stdout: Some(max_stdout),
+            stderr: Some(CLAIM_STDERR_MAX_BYTES),
+        },
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(output) => Err(sanitize_claim_error(&format!(
+            "{what} failed ({}): {}",
+            output.status,
+            one_line(&String::from_utf8_lossy(&output.stderr))
+        ))),
+        Err(error) if is_subprocess_timeout(&error) => Err(format!(
+            "{what} timed out after {}s and was killed",
+            bound.as_secs_f64()
+        )),
+        Err(error) if is_subprocess_overflow(&error) => Err(format!(
+            "{what} failed: its output passed {max_stdout} bytes and the call was killed"
+        )),
+        Err(error) => Err(sanitize_claim_error(&format!(
+            "{what} failed: {}",
+            one_line(&error)
+        ))),
+    }
 }
 
 /// Outcome of [`create_worktree`] / [`create_worktree_sync`]: either we
@@ -2929,6 +4266,11 @@ fn worktree_add_backoff(attempt: u32) -> Duration {
     Duration::from_millis(100u64 << attempt.saturating_sub(1).min(10))
 }
 
+/// How long to wait for the per-repository worktree lock before giving up on
+/// serialization and creating the worktree unserialized. A stuck holder must
+/// slow a dispatch down, never wedge it forever.
+const WORKTREE_LOCK_WAIT: Duration = Duration::from_secs(60);
+
 /// Issue #541: does this `git worktree add` failure look like the reader
 /// side of a concurrent add rather than a real problem? `git worktree add`
 /// scans the repo's worktree list before creating its own entry, reading
@@ -2941,6 +4283,88 @@ fn worktree_add_backoff(attempt: u32) -> Duration {
 /// while `commondir` — a path component — does not.
 fn is_worktree_scan_short_read(err: &str) -> bool {
     err.contains("commondir")
+}
+
+/// Path of the lock that serializes worktree creation for one repository.
+///
+/// Derived from `git rev-parse --git-common-dir` and placed inside it, because
+/// that directory is exactly the contended resource — `worktrees/<name>` lives
+/// there — and because `clone_dir` may itself be a linked worktree, whose `.git`
+/// is a FILE and whose per-worktree admin dir is private. Asking git means every
+/// spelling of one repository (the main checkout, any of its worktrees, a
+/// relative path) maps onto a single lock file, which is what makes the
+/// exclusion hold between separate deck PROCESSES and not merely between tasks
+/// in one.
+///
+/// Returns `None` when the directory cannot be resolved (not a git repo) — the
+/// add itself then fails with git's own message, which is the better error.
+async fn worktree_lock_path(clone_dir: &Path) -> Option<PathBuf> {
+    let common = run_git_capture(&[
+        "-C",
+        &clone_dir.to_string_lossy(),
+        "rev-parse",
+        "--git-common-dir",
+    ])
+    .await
+    .ok()?;
+    let common = common.trim();
+    if common.is_empty() {
+        return None;
+    }
+    // `--git-common-dir` answers relative to the repository (plain `.git` for an
+    // ordinary checkout), and our cwd is the daemon's, not `clone_dir`'s — so a
+    // relative answer has to be joined here. Resolved this way rather than with
+    // `--path-format=absolute` so the derivation does not depend on git 2.31+.
+    let common = Path::new(common);
+    let path = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        clone_dir.join(common)
+    };
+    Some(path.join("dot-agent-deck-worktree.lock"))
+}
+
+/// Serialize `git worktree add` for one repository across processes (issue
+/// #541), so this deck's own concurrent dispatches cannot observe each other's
+/// half-created administrative directories.
+///
+/// Every failure mode degrades to "create the worktree anyway": an unresolvable
+/// repo, an unwritable `.git`, or a holder that never lets go all return `None`,
+/// which is precisely the pre-#541 behaviour that the bounded retry in
+/// [`create_worktree`] already covers. A lock is worth having only while it
+/// cannot itself become the reason a dispatch fails or hangs.
+///
+/// Serialization also does not make the retry redundant, and vice versa: this
+/// only binds processes that take the lock, so an add started by the user or by
+/// another tool still races us, and only the retry survives that.
+async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock::SpawnLock> {
+    let path = worktree_lock_path(clone_dir).await?;
+    match tokio::time::timeout(
+        WORKTREE_LOCK_WAIT,
+        crate::platform::lock::acquire_spawn_lock(&path),
+    )
+    .await
+    {
+        Ok(Ok(guard)) => Some(guard),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                lock = %path.display(),
+                error = %e,
+                "could not take the per-repository worktree lock; creating the worktree \
+                 unserialized (the bounded retry still covers a concurrent add)"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                lock = %path.display(),
+                waited_secs = WORKTREE_LOCK_WAIT.as_secs(),
+                "timed out waiting for the per-repository worktree lock; creating the \
+                 worktree unserialized rather than wedging the dispatch"
+            );
+            None
+        }
+    }
 }
 
 /// M2.2: create the per-issue worktree on `agent/issue-<n>`. The `.worktrees`
@@ -3017,7 +4441,56 @@ pub async fn create_worktree(
     reuse_existing_branch: bool,
     creator: Creator,
 ) -> Result<WorktreeCreation, String> {
+    create_worktree_from(
+        clone_dir,
+        worktree_dir,
+        branch,
+        reuse_existing_branch,
+        creator,
+        None,
+    )
+    .await
+}
+
+/// [`create_worktree`] with an explicit start-point for a branch it creates.
+///
+/// Issue #1643: with no start-point, `git worktree add -b` resolves the
+/// checkout's `HEAD` itself, at the moment it runs. A caller that has already
+/// read `HEAD` and reported it — `dispatch`'s `cut from <branch> at <sha>` —
+/// then names one commit while git may cut the branch from another, if `HEAD`
+/// moved in between. Passing the sha it read makes the reported base the
+/// branch's base by construction.
+///
+/// `start_point` applies only when this call CREATES the branch (`-b`). A
+/// branch that already exists is attached as it stands, and its own history is
+/// its base; that covers `reuse_existing_branch` and a retry after a scan
+/// short-read, whose branch our own earlier attempt created from the same
+/// start-point. `None` is exactly [`create_worktree`]. This stays the only
+/// `git worktree add` in `src/`.
+///
+/// **Locks, always in this order.** First the per-repository worktree lock
+/// ([`acquire_worktree_lock`], issue #541): the removal paths
+/// (`settle_failed_issue_spawn`, `reclaim_abandoned_spawn_paced`) take it to
+/// exclude a concurrent creation, so creation has to take the same one. Then the
+/// per-worktree attach lock shared with the TUI's [`create_worktree_sync`]
+/// (fork #282). Nothing takes them the other way round, so they cannot
+/// deadlock; both waits are bounded, and both are released on the `Created`
+/// arm before the warm-up.
+pub async fn create_worktree_from(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+    reuse_existing_branch: bool,
+    creator: Creator,
+    start_point: Option<&str>,
+) -> Result<WorktreeCreation, String> {
     ensure_worktree_parent_dir(worktree_dir)?;
+    // Issue #541: keep this deck's own concurrent creations off each other's
+    // half-created entries. Held across the probe AND the add so the two are
+    // atomic with respect to another dispatch of the same name, and DROPPED
+    // EXPLICITLY on the `Created` arm below — see the comment there for why the
+    // warm-up must not run under it.
+    let repo_lock = acquire_worktree_lock(clone_dir).await;
 
     // Fork #282 audit S3/S2, final-pass F3: `worktree_attach_lock_path`'s
     // git-common-dir resolution and `ensure_owner_only_dir` (blocking
@@ -3096,8 +4569,8 @@ pub async fn create_worktree(
 
     // Fork #282 audit S4/S1: this call, and the `git worktree add` below,
     // run while `_attach_lock` is held — a lock now shared with the TUI's
-    // `create_worktree_sync` (see the comment on `run_status` for the
-    // premise this changes). Bounded with the same `WORKTREE_GIT_TIMEOUT`
+    // `create_worktree_sync` (the premise behind `run_status`'s old
+    // detach-on-drop behaviour that this changes). Bounded with the same `WORKTREE_GIT_TIMEOUT`
     // the sync twin's equivalent calls already use, so a wedged `git` here
     // cannot hold the shared lock indefinitely and starve every other
     // caller of this same `worktree_dir` — including the TUI.
@@ -3107,30 +4580,38 @@ pub async fn create_worktree(
     // again on retry would fail with "a branch named … already exists" and
     // turn a transient race into a hard one.
     let mut attempt: u32 = 1;
+    let clone = clone_dir.to_string_lossy();
+    let branch_ref = format!("refs/heads/{branch}");
+    // Issue #692 / PR #1304: what a timed-out add may be cleaned up against.
+    // What the FIRST attempt's branch probe found — later attempts can only see
+    // a branch our own failed attempt made — and whether the worktree directory
+    // was there before the attempt that ended the loop.
+    let mut branch_existed_initially = None;
+    let mut dir_existed_before_add;
     let add: Result<(), AddError> = loop {
-        let branch_exists = match tokio::time::timeout(
-            WORKTREE_GIT_TIMEOUT,
-            run_status_args(
-                "git",
-                &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
-            ),
-        )
-        .await
-        {
-            Ok(result) => result.is_ok(),
-            Err(_) => {
-                return Err(format!(
-                    "timed out after {WORKTREE_GIT_TIMEOUT:?} probing for branch {branch} in {}",
-                    clone_dir.display()
-                ));
-            }
-        };
+        // Tri-state probe (upstream #692, Qodo on PR #1304): "absent" and "could
+        // not tell" differ, and only a DEFINITE absence licenses deleting the
+        // branch after a timed-out add. Bounded by the fork's
+        // `WORKTREE_GIT_TIMEOUT` because the attach lock is held (fork #282); a
+        // probe that hits it is still reported as an error naming the branch,
+        // exactly as before the sync, rather than guessed at.
+        let probe = probe_branch(&clone, &branch_ref, WORKTREE_GIT_TIMEOUT).await;
+        if probe == BranchProbe::TimedOut {
+            return Err(format!(
+                "timed out after {WORKTREE_GIT_TIMEOUT:?} probing for branch {branch} in {}",
+                clone_dir.display()
+            ));
+        }
+        let branch_exists = probe == BranchProbe::Present;
+        branch_existed_initially.get_or_insert(probe);
         // Only attempt 1 can report BranchExists/AlreadyClaimed off the bare
-        // branch probe. Reaching attempt 2 means the branch was PROVEN
-        // absent moments ago, so anything there now was created either by
-        // our own failed attempt or by a dispatch racing us — never the
-        // "may hold committed work from an earlier dispatch" case this
-        // guard exists for, and not re-checked on retry.
+        // branch probe. Reaching attempt 2 means the branch was PROVEN absent
+        // moments ago, so anything there now was created either by our own
+        // failed attempt or by a dispatch racing us — never the "may hold
+        // committed work from an earlier dispatch" case this guard exists for,
+        // and not re-checked on retry. (A branch a racing dispatch is really
+        // using fails the attach with "already used by worktree at …", and its
+        // worktree dir is then present, so the outcome is `AlreadyClaimed`.)
         if branch_exists && !reuse_existing_branch && attempt == 1 {
             // A worktree DIRECTORY that is still present is a live claim,
             // not a leftover branch: the caller can see it, and telling
@@ -3143,26 +4624,33 @@ pub async fn create_worktree(
             }
             return Ok(WorktreeCreation::BranchExists);
         }
-        let result: Result<(), AddError> = match tokio::time::timeout(
-            WORKTREE_GIT_TIMEOUT,
-            run_status_killable_args(
-                "git",
-                &crate::issue_dispatch::worktree_add_argv(
-                    clone_dir,
-                    worktree_dir,
-                    branch,
-                    branch_exists,
-                ),
-            ),
-        )
-        .await
-        {
-            Ok(result) => result.map_err(AddError::Failed),
-            Err(_) => Err(AddError::TimedOut(format!(
-                "`git worktree add` for {} timed out after {WORKTREE_GIT_TIMEOUT:?}",
-                worktree_dir.display()
-            ))),
-        };
+        dir_existed_before_add = worktree_dir.exists();
+        let mut add_argv = crate::issue_dispatch::worktree_add_argv(
+            clone_dir,
+            worktree_dir,
+            branch,
+            branch_exists,
+        );
+        if !branch_exists {
+            // Issue #1643 (upstream): the start-point applies only when this call
+            // CREATES the branch (`-b <branch>`); an existing branch is attached
+            // as it stands. Appended here rather than inside
+            // `worktree_add_argv` so the sync twin and its tests keep calling the
+            // 4-argument builder.
+            add_argv.extend(start_point.map(str::to_string));
+        }
+        // Bounded by the FORK's `WORKTREE_GIT_TIMEOUT`, not upstream's ten-minute
+        // `SUBPROCESS_TIMEOUT`: this add runs under the attach lock shared with
+        // the TUI's `create_worktree_sync` (fork #282), so a wedged `git` must
+        // not hold it for ten minutes. The runner kills the add's whole PROCESS
+        // GROUP at the bound (upstream #692), which also closes the residual
+        // fork #133 documented for the old direct-child-only `kill_on_drop` kill.
+        let result: Result<(), AddError> =
+            match run_git_status_within(&add_argv, WORKTREE_GIT_TIMEOUT).await {
+                Ok(()) => Ok(()),
+                Err(e) if is_subprocess_timeout(&e) => Err(AddError::TimedOut(e)),
+                Err(e) => Err(AddError::Failed(e)),
+            };
         match result {
             Err(AddError::Failed(e))
                 if attempt < WORKTREE_ADD_ATTEMPTS && is_worktree_scan_short_read(&e) =>
@@ -3188,14 +4676,37 @@ pub async fn create_worktree(
         }
     };
     // `AddOutcome::TimedOut` is reachable here (unlike before this bound was
-    // added). Fork #282 final-pass F1/A1: `run_status_killable`'s
-    // `kill_on_drop(true)` means the direct child was already sent a kill
-    // signal by the time we get here (see that function's doc comment), so
-    // — mirroring `create_worktree_sync`'s `attempt_worktree_cleanup` —
-    // attempt best-effort cleanup of whatever the add half-registered
-    // before it was killed, rather than hardcoding `cleaned_up_by: None` and
-    // leaving the slug wedged.
-    Ok(match classify_worktree_add_result(worktree_dir, add)? {
+    // added). Fork #282 final-pass F1/A1: the add's runner has already killed
+    // the add's whole process group at `WORKTREE_GIT_TIMEOUT` by the time we
+    // get here, so — mirroring `create_worktree_sync`'s
+    // `attempt_worktree_cleanup` — attempt best-effort cleanup of whatever the
+    // add half-registered before it was killed, rather than hardcoding
+    // `cleaned_up_by: None` and leaving the slug wedged.
+    //
+    // Issue #692 (upstream): the destructive extras (force-removing a LOCKED
+    // entry, and deleting the branch the add's `-b` made) are licensed only when
+    // the directory is provably ours — it was absent when the attempt that timed
+    // out started, and the per-repository lock is held, which is what keeps
+    // another dispatch of this deck from having created it in between. Without
+    // the lock the directory is left to the fork's own single-force cleanup and
+    // the timeout is reported as it stands.
+    let discard_licensed =
+        matches!(add, Err(AddError::TimedOut(_))) && repo_lock.is_some() && !dir_existed_before_add;
+    // Only a DEFINITE absence licenses deleting the branch: a probe that could
+    // not answer proves nothing, and the branch may hold committed work.
+    let created_branch = (branch_existed_initially == Some(BranchProbe::Absent)).then_some(branch);
+    let outcome = match classify_worktree_add_result(worktree_dir, add) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // A timed-out add that never got as far as creating the directory
+            // can still have registered an entry or made its branch.
+            if discard_licensed {
+                discard_timed_out_worktree(clone_dir, worktree_dir, created_branch).await;
+            }
+            return Err(e);
+        }
+    };
+    Ok(match outcome {
         AddOutcome::Created => {
             // Issue #425: claim the worktree we just created, HERE, so no
             // window exists in which a deck-created worktree is
@@ -3217,6 +4728,12 @@ pub async fn create_worktree(
             // materializations that do not touch each other's `.devbox` in
             // the first place.
             drop(_attach_lock);
+            // Likewise the per-repository ADD lock (upstream #541): it exists to
+            // serialize `git worktree add` against itself, and holding a
+            // 60s-wait lock across the warm-up would push a concurrent dispatch
+            // of ANOTHER worktree past `WORKTREE_LOCK_WAIT` into the
+            // unserialized path.
+            drop(repo_lock);
             // Issue #791: materialize this worktree's project environment
             // ONCE, HERE, before returning — so that by the time any caller
             // spawns a role into it, there is no cold `.devbox` left to race
@@ -3234,11 +4751,150 @@ pub async fn create_worktree(
                 "{}:{}",
                 creator.kind, creator.subject
             ));
-            let cleaned_up_by =
+            let mut cleaned_up_by =
                 attempt_worktree_cleanup_async(clone_dir, worktree_dir, &creator_str).await;
+            // Issue #692 (upstream, PR #1304): the fork's cleanup above is a single
+            // `git worktree remove --force`, which git REFUSES for an entry a
+            // killed add left `locked` ("initializing"), and it never touches the
+            // branch the add's `-b` had already made — so the next fire would
+            // find the slug wedged or its branch left behind. The escalation runs
+            // only when the directory is provably ours to remove (see
+            // `discard_licensed`), after the fork's cleanup rather than instead of
+            // it: when that one succeeded, the escalation's removal finds nothing
+            // and costs three cheap, individually bounded `git` calls, and it is
+            // the part that deletes the branch. If the escalation is what finally
+            // got the directory out, the cleanup is confirmed by it — same
+            // contract, "the directory is gone and git agrees".
+            if discard_licensed {
+                let discarded =
+                    discard_timed_out_worktree(clone_dir, worktree_dir, created_branch).await;
+                if cleaned_up_by.is_none() && discarded {
+                    cleaned_up_by = Some(creator_str);
+                }
+            }
             WorktreeCreation::TimedOut { cleaned_up_by }
         }
     })
+}
+
+/// What `git rev-parse --verify --quiet <ref>` said about a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchProbe {
+    /// Exit 0: the ref resolves.
+    Present,
+    /// Exit 1, which is how `--verify --quiet` reports a ref that does not
+    /// exist.
+    Absent,
+    /// `git` was killed at the probe's bound. Its own variant (fork) because
+    /// [`create_worktree_from`] holds the attach lock shared with the TUI while
+    /// it probes, so a probe that hit [`WORKTREE_GIT_TIMEOUT`] is reported as an
+    /// error rather than guessed at.
+    TimedOut,
+    /// Anything else — a `git` that would not start, another exit status.
+    /// Treated as absent for choosing `-b`, exactly as the old `is_ok()` probe
+    /// did, but never as proof that a branch may be deleted.
+    Unknown,
+}
+
+/// Probe `branch_ref` in `clone`, telling "absent" apart from "could not tell"
+/// (Qodo, PR #1304) — the difference decides whether a timed-out add's cleanup
+/// may delete the branch. `bound` is the caller's: the fork bounds it by
+/// [`WORKTREE_GIT_TIMEOUT`] because the attach lock is held (fork #282).
+///
+/// The argv is the one [`crate::issue_dispatch::worktree_branch_probe_argv`]
+/// builds for the sync twin (`-C <clone> rev-parse --verify --quiet <ref>`).
+async fn probe_branch(clone: &str, branch_ref: &str, bound: Duration) -> BranchProbe {
+    let args = ["-C", clone, "rev-parse", "--verify", "--quiet", branch_ref];
+    match output_within(
+        crate::git_env::git_async(),
+        crate::git_env::GIT,
+        &args,
+        bound,
+    )
+    .await
+    {
+        Ok(out) if out.status.success() => BranchProbe::Present,
+        Ok(out) if out.status.code() == Some(1) => BranchProbe::Absent,
+        Err(e) if is_subprocess_timeout(&e) => BranchProbe::TimedOut,
+        _ => BranchProbe::Unknown,
+    }
+}
+
+/// Undo what a `git worktree add` killed at its bound left behind (issue #692):
+/// its half-checked-out directory, its administrative entry, and — when
+/// `created_branch` names one — the branch its `-b` created. Returns whether the
+/// directory is gone and git agrees nothing is registered there (the removal or
+/// the prune succeeded), which is what lets the caller report the cleanup as
+/// confirmed.
+///
+/// Only [`create_worktree_from`] calls this, and only once it has established
+/// the worktree is its own (see `discard_licensed` there). Every step is
+/// best-effort and logged: the caller is already returning the timeout as the
+/// dispatch's result, and a cleanup that fails leaves exactly the state that
+/// would have existed without it. `--force` twice, because a killed add leaves
+/// its entry `locked` ("initializing") and a single `--force` refuses a locked
+/// worktree. The branch is deleted only when it did not exist before the first
+/// attempt, so a reused branch that may hold committed work is never touched —
+/// and `git branch -D` itself refuses a branch another worktree has checked out.
+///
+/// Each `git` call is bounded by the fork's [`WORKTREE_CLEANUP_TIMEOUT`], not
+/// upstream's ten minutes: this runs while the attach lock shared with the TUI
+/// is still held (fork #282), and a cleanup that itself wedges must not freeze
+/// the TUI's own attach.
+async fn discard_timed_out_worktree(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    created_branch: Option<&str>,
+) -> bool {
+    let clone = clone_dir.to_string_lossy();
+    let wt = worktree_dir.to_string_lossy();
+    let removed = git_within(
+        &[
+            "-C", &clone, "worktree", "remove", "--force", "--force", &wt,
+        ],
+        WORKTREE_CLEANUP_TIMEOUT,
+    )
+    .await;
+    if let Err(e) = &removed {
+        tracing::debug!(
+            worktree = %worktree_dir.display(),
+            error = %e,
+            "issue-dispatch: git could not remove the timed-out worktree; removing its directory"
+        );
+    }
+    // `tokio::fs` so walking a large partial checkout does not hold an async
+    // worker (Qodo, PR #1304).
+    match tokio::fs::remove_dir_all(worktree_dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            worktree = %worktree_dir.display(),
+            error = %e,
+            "issue-dispatch: could not remove the timed-out worktree's directory"
+        ),
+    }
+    let pruned = git_within(
+        &["-C", &clone, "worktree", "prune"],
+        WORKTREE_CLEANUP_TIMEOUT,
+    )
+    .await;
+    if let Err(e) = &pruned {
+        tracing::warn!(error = %e, "issue-dispatch: git worktree prune after a timed-out add failed");
+    }
+    if let Some(branch) = created_branch
+        && let Err(e) = git_within(
+            &["-C", &clone, "branch", "-D", branch],
+            WORKTREE_CLEANUP_TIMEOUT,
+        )
+        .await
+    {
+        tracing::warn!(
+            branch,
+            error = %e,
+            "issue-dispatch: could not delete the branch a timed-out add created"
+        );
+    }
+    !worktree_dir.exists() && (removed.is_ok() || pruned.is_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -3995,7 +5651,6 @@ pub(crate) fn forget_isolated_workspace(
 /// operation).
 fn fetch_origin(clone_dir: &Path) -> Result<(), String> {
     run_status_sync(
-        "git",
         &[
             "-C".to_string(),
             clone_dir.to_string_lossy().into_owned(),
@@ -4116,7 +5771,6 @@ pub(crate) fn sync_merged_workspace_to_main(
     // literal `@{-1}` component the same way it refuses `--detach`), but a
     // determinism gap worth closing on a gate this security-relevant.
     if run_status_sync(
-        "git",
         &[
             "-C".to_string(),
             clone_dir_str.clone(),
@@ -4135,7 +5789,6 @@ pub(crate) fn sync_merged_workspace_to_main(
     }
 
     let status_stdout = run_capture_sync(
-        "git",
         &[
             "-C".to_string(),
             clone_dir_str.clone(),
@@ -4165,7 +5818,6 @@ pub(crate) fn sync_merged_workspace_to_main(
 
     let remote_ref = format!("origin/{default_branch}");
     let ancestor_status = run_status_sync(
-        "git",
         &[
             "-C".to_string(),
             clone_dir_str.clone(),
@@ -4205,7 +5857,6 @@ pub(crate) fn sync_merged_workspace_to_main(
     // than merely untested for that case): restore via the exact SHA
     // instead of treating "HEAD" as a branch name.
     let starting_ref_name = run_capture_sync(
-        "git",
         &[
             "-C".to_string(),
             clone_dir_str.clone(),
@@ -4227,7 +5878,6 @@ pub(crate) fn sync_merged_workspace_to_main(
     })?;
     let starting_head_sha = if starting_ref_name == "HEAD" {
         run_capture_sync(
-            "git",
             &[
                 "-C".to_string(),
                 clone_dir_str.clone(),
@@ -4284,7 +5934,6 @@ pub(crate) fn sync_merged_workspace_to_main(
     // depends on being able to see.
     let local_branch_ref = format!("refs/heads/{default_branch}");
     let local_branch_exists = spawn_and_wait_sync(
-        "git",
         &[
             "-C",
             &clone_dir_str,
@@ -4298,7 +5947,6 @@ pub(crate) fn sync_merged_workspace_to_main(
     .is_ok_and(|out| out.status.success());
     if !local_branch_exists {
         let create_local_branch_status = run_status_sync(
-            "git",
             &[
                 "-C".to_string(),
                 clone_dir_str.clone(),
@@ -4335,7 +5983,6 @@ pub(crate) fn sync_merged_workspace_to_main(
         // above, so it is already known to resolve, and silently swallowing
         // a failure here would silently reproduce the exact bug this fixes.
         let set_upstream_status = run_status_sync(
-            "git",
             &[
                 "-C".to_string(),
                 clone_dir_str.clone(),
@@ -4359,7 +6006,6 @@ pub(crate) fn sync_merged_workspace_to_main(
     }
 
     let switch_status = run_status_sync(
-        "git",
         &[
             "-C".to_string(),
             clone_dir_str.clone(),
@@ -4381,7 +6027,6 @@ pub(crate) fn sync_merged_workspace_to_main(
     }
 
     let merge_status = run_status_sync(
-        "git",
         &[
             "-C".to_string(),
             clone_dir_str.clone(),
@@ -4419,7 +6064,7 @@ pub(crate) fn sync_merged_workspace_to_main(
         };
         restore_args.push("--".to_string());
         restore_args.push(restore_target.clone());
-        if let Err(restore_err) = run_status_sync("git", &restore_args, WORKTREE_GIT_TIMEOUT) {
+        if let Err(restore_err) = run_status_sync(&restore_args, WORKTREE_GIT_TIMEOUT) {
             tracing::warn!(
                 clone = %clone_dir.display(),
                 restore_target = %restore_target,
@@ -4925,7 +6570,6 @@ fn resume_existing_isolated_clone(
     // `.git/config` would otherwise open, at zero cost against the real
     // `origin` this fetches from.
     let fetch_warning = match run_status_sync(
-        "git",
         &[
             "-C".to_string(),
             clone_dir.to_string_lossy().into_owned(),
@@ -5061,7 +6705,6 @@ fn isolated_clone_ancestry_matches_source(source_dir: &Path, clone_dir: &Path) -
         // against whatever clone_dir's database already has, same as if
         // the fetch had never existed.
         let _ = run_status_sync(
-            "git",
             &[
                 "-C".to_string(),
                 clone_dir_str.clone(),
@@ -5119,7 +6762,6 @@ enum MergeBaseAttempt {
 
 fn merge_base_attempt(clone_dir_str: &str, source_head: &str) -> MergeBaseAttempt {
     match spawn_and_wait_sync(
-        "git",
         &["-C", clone_dir_str, "merge-base", source_head, "HEAD"],
         WORKTREE_GIT_TIMEOUT,
     ) {
@@ -5135,7 +6777,6 @@ fn merge_base_attempt(clone_dir_str: &str, source_head: &str) -> MergeBaseAttemp
 /// [`isolated_clone_git_state_readable`].
 fn isolated_clone_head_sha(dir: &Path) -> Option<String> {
     run_capture_sync(
-        "git",
         &[
             "-C".to_string(),
             dir.to_string_lossy().into_owned(),
@@ -5328,8 +6969,7 @@ pub(crate) fn worktree_attach_lock_path_from_common_dir(
 /// with a live orchestration's working directory — the same "ask git, don't
 /// assume `.git` is a directory" reasoning applies identically there.
 pub(crate) fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
-    let out = std::process::Command::new("git")
-        .current_dir(clone_dir)
+    let out = crate::git_env::git_at(clone_dir)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
         .map_err(|e| {
@@ -5355,8 +6995,7 @@ pub(crate) fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
     // submodule — `Path::join` handles both (an absolute `dir` replaces
     // `clone_dir` outright; a relative one joins onto it), so one fallback
     // covers every shape the flagged call did.
-    let fallback = std::process::Command::new("git")
-        .current_dir(clone_dir)
+    let fallback = crate::git_env::git_at(clone_dir)
         .args(["rev-parse", "--git-common-dir"])
         .output()
         .map_err(|e| {
@@ -5398,14 +7037,15 @@ pub(crate) fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
 ///
 /// Mirrors [`git_common_dir`]'s primary/fallback flag-support probe
 /// exactly (the same `--path-format=absolute` retry-without-it shape for
-/// pre-2.31 git); keep the two in sync if either changes. Unlike
-/// [`run_status_killable`], this sets no `kill_on_drop`: a probe read like
-/// `git rev-parse --git-common-dir` is safe to leave running detached if it
-/// is ever actually killed by the timeout, the same reasoning
-/// [`run_status`] (not the killable variant) applies to every other
-/// non-add/cleanup caller.
+/// pre-2.31 git); keep the two in sync if either changes. Unlike the add and
+/// its cleanup (which go through [`run_git_status_within`] and so kill their
+/// whole process group at the bound), this reads through a plain
+/// `.output()` with no `kill_on_drop`: a probe read like `git rev-parse
+/// --git-common-dir` is safe to leave running detached if it is ever actually
+/// cut off by the caller's timeout, and it writes nothing that a surviving copy
+/// could race.
 async fn git_common_dir_async(clone_dir: &Path) -> Result<PathBuf, String> {
-    let out = tokio::process::Command::new("git")
+    let out = crate::git_env::git_async()
         .current_dir(clone_dir)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
@@ -5425,7 +7065,7 @@ async fn git_common_dir_async(clone_dir: &Path) -> Result<PathBuf, String> {
 
     // See `git_common_dir`'s matching comment: `--path-format` requires git
     // >= 2.31, and an older git rejects the flag outright.
-    let fallback = tokio::process::Command::new("git")
+    let fallback = crate::git_env::git_async()
         .current_dir(clone_dir)
         .args(["rev-parse", "--git-common-dir"])
         .output()
@@ -5611,13 +7251,11 @@ pub(crate) fn create_worktree_sync(
             })?;
 
     let branch_exists = run_status_sync(
-        "git",
         &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
         WORKTREE_GIT_TIMEOUT,
     )
     .is_ok();
     let add = run_status_sync(
-        "git",
         &crate::issue_dispatch::worktree_add_argv(clone_dir, worktree_dir, branch, branch_exists),
         WORKTREE_GIT_TIMEOUT,
     );
@@ -5667,7 +7305,6 @@ fn attempt_worktree_cleanup(
     remover: &str,
 ) -> Option<String> {
     let removed = run_status_sync(
-        "git",
         &crate::issue_dispatch::worktree_remove_argv(clone_dir, worktree_dir),
         WORKTREE_CLEANUP_TIMEOUT,
     )
@@ -5680,21 +7317,21 @@ fn attempt_worktree_cleanup(
 }
 
 /// Fork #282 final-pass F1 (reviewer) / A1 (auditor): async twin of
-/// [`attempt_worktree_cleanup`] for [`create_worktree`]'s `TimedOut` arm.
-/// Runs after [`run_status_killable`]'s `kill_on_drop(true)` has already
-/// sent the direct child a kill signal (see that function's doc comment for
-/// the trace and its residual), through the same bounded, non-interactive
-/// subprocess path the add itself used (stdin closed,
-/// `GIT_TERMINAL_PROMPT=0`, …), reusing the identical
-/// [`crate::issue_dispatch::worktree_remove_argv`] the sync twin uses so the
-/// two argv shapes cannot drift. Bounded by its OWN, shorter
-/// [`WORKTREE_CLEANUP_TIMEOUT`] via an external `tokio::time::timeout` —
-/// there is no bound built into `run_status_killable_args` itself, unlike
-/// `run_status_sync`'s internal poll loop — so a stuck cleanup cannot itself
-/// hang the scheduler tick it exists to unwedge. Uses the killable variant
-/// for the same reason the add does: a cleanup `git worktree remove` that
-/// itself wedges must not be left to finish detached, or it can race the
-/// next attempt at the same slug.
+/// [`attempt_worktree_cleanup`] for [`create_worktree_from`]'s `TimedOut` arm.
+/// Runs after the add's own runner ([`status_within`], via
+/// [`run_git_status_within`]) has already killed the add's whole process group
+/// at [`WORKTREE_GIT_TIMEOUT`] — since the upstream sync that is the group, not
+/// just the direct child the earlier `kill_on_drop` runner reached, so a hook
+/// grandchild of the add no longer outlives it — through the same bounded,
+/// non-interactive subprocess path the add itself used (stdin closed,
+/// `GIT_TERMINAL_PROMPT=0`, ambient git location env cleared), reusing the
+/// identical [`crate::issue_dispatch::worktree_remove_argv`] the sync twin uses
+/// so the two argv shapes cannot drift. Bounded by its OWN, shorter
+/// [`WORKTREE_CLEANUP_TIMEOUT`], so a stuck cleanup cannot itself hang the
+/// scheduler tick it exists to unwedge, and killed at that bound for the same
+/// reason the add is: a cleanup `git worktree remove` that itself wedges must
+/// not be left to finish detached, or it can race the next attempt at the
+/// same slug.
 ///
 /// "Confirmed" means the same thing it means for the sync twin: both the
 /// command exited successfully AND the directory is actually gone
@@ -5702,8 +7339,8 @@ fn attempt_worktree_cleanup(
 /// fails loudly with the manual `git worktree remove --force` recovery
 /// command rather than assuming success it cannot back up. Issue #325: this
 /// is always a self-cleanup of `remover`'s own half-created directory (see
-/// [`create_worktree`]'s only call site, its `AddOutcome::TimedOut` arm) —
-/// `remover` is that same `creator`, forwarded straight through rather than
+/// [`create_worktree_from`]'s only call site, its `AddOutcome::TimedOut` arm)
+/// — `remover` is that same `creator`, forwarded straight through rather than
 /// re-resolved, and the return carries it (`Some(remover.to_string())`)
 /// only when the removal is actually confirmed, never fabricating an
 /// identity for a no-op.
@@ -5712,16 +7349,12 @@ async fn attempt_worktree_cleanup_async(
     worktree_dir: &Path,
     remover: &str,
 ) -> Option<String> {
-    let removed = tokio::time::timeout(
+    let removed = run_git_status_within(
+        &crate::issue_dispatch::worktree_remove_argv(clone_dir, worktree_dir),
         WORKTREE_CLEANUP_TIMEOUT,
-        run_status_killable_args(
-            "git",
-            &crate::issue_dispatch::worktree_remove_argv(clone_dir, worktree_dir),
-        ),
     )
     .await
-    .map(|result| result.is_ok())
-    .unwrap_or(false);
+    .is_ok();
     if removed && !worktree_dir.exists() {
         // Issue #325 reviewer P2-B / auditor A2: logged HERE rather than at
         // each of the two production consumers of `WorktreeCreation::TimedOut`
@@ -5771,38 +7404,61 @@ fn parse_open_issues(json: &str) -> Result<Vec<OpenIssue>, String> {
         .collect())
 }
 
-/// Shared implementation behind [`run_status`] and [`run_status_killable`]:
-/// run a subprocess that must exit zero; on failure return a message
-/// carrying the program, args, exit status, and any stderr.
+/// Run a subprocess that must exit zero; on failure return a message carrying
+/// the program, args, exit status, and any stderr.
 ///
-/// Fork #122/#123 audit (P2): stdin closed and a non-interactive git
-/// environment applied — `GIT_TERMINAL_PROMPT=0` suppresses git's own
-/// terminal credential prompt, and neutralising `GIT_ASKPASS`/`SSH_ASKPASS`
-/// stops git/ssh from shelling out to an inherited askpass helper that
-/// could itself block waiting on input — so a credential prompt can no
-/// longer read anything and fails fast instead of waiting. No bounded wait
-/// IN THIS FUNCTION, unlike [`run_status_sync`] below: this async path
-/// already runs off the render/event loop (inside the issue-dispatch
-/// scheduler's own tokio task), so a slow call here does not freeze the TUI
-/// the way a synchronous one on the `SpawnPane` dispatch path would.
+/// NOT for `git` — use [`run_git_status`], which neutralizes the ambient git
+/// location environment. `xtask/linkage-check`'s rule 13 fails the build on a
+/// `git` program literal in this module's production half, so that is enforced
+/// rather than asked for.
+pub async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
+    status_of(tokio::process::Command::new(program), program, args).await
+}
+
+/// [`run_status`] for `git`, built by [`crate::git_env::git_async`] so an
+/// ambient `GIT_DIR` cannot redirect it away from the `-C <dir>` in its argv
+/// (issue #1181).
+pub(crate) async fn run_git_status(args: &[&str]) -> Result<(), String> {
+    status_of(crate::git_env::git_async(), crate::git_env::GIT, args).await
+}
+
+/// How long one `gh` / `git` subprocess in the dispatch path may run before it
+/// is killed and reported as failed (issue #692).
 ///
-/// `kill_on_drop` is caller-selected rather than hardcoded (fork #282
-/// final-pass F1 correction): see [`run_status_killable`]'s doc comment for
-/// why a killable child is only safe for the two `create_worktree` call
-/// sites that need it, and [`run_status`]'s for why every other caller
-/// wants the opposite — detach-and-finish, not kill, when the caller stops
-/// awaiting.
-async fn run_status_impl(program: &str, args: &[&str], kill_on_drop: bool) -> Result<(), String> {
-    let output = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "")
-        .kill_on_drop(kill_on_drop)
-        .output()
-        .await
-        .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+/// **A deadlock guard, not a latency budget** — the same reasoning, and the same
+/// value, as [`DEVBOX_WARMUP_TIMEOUT`]. Before this bound the calls awaited
+/// `.output()` with nothing around it, so one hung `gh` wedged the fire for the
+/// rest of the daemon's life while it held the scheduler's `running` flag, and
+/// every later fire of that task was reported as skipped. Expiring early is not
+/// free either: it fails a dispatch that would have worked. The longest
+/// legitimate call here is `gh repo clone` of a large repository, and nothing
+/// has measured how long that takes over a slow link, so the value is set far
+/// enough out that expiry means *stuck* rather than *slow*. The small API calls
+/// (`gh issue list`, `gh pr list`) and the local `git` probes normally return
+/// in well under a second, so for them reaching the bound means something was
+/// already wrong.
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The shared body of [`run_status`] and [`run_git_status`] — one
+/// implementation, two ways of constructing the command, so the neutralized
+/// variant cannot drift from the error text or the exit handling.
+async fn status_of(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    status_within(cmd, program, args, SUBPROCESS_TIMEOUT).await
+}
+
+/// [`status_of`] with the bound passed in, so the timeout path can be driven
+/// by a unit test without a ten-minute wait.
+async fn status_within(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<(), String> {
+    let output = output_within(cmd, program, args, bound).await?;
     if output.status.success() {
         return Ok(());
     }
@@ -5815,97 +7471,47 @@ async fn run_status_impl(program: &str, args: &[&str], kill_on_drop: bool) -> Re
     ))
 }
 
-/// Run a subprocess that must exit zero, detaching it (rather than killing
-/// it) if the caller stops awaiting — e.g. an external `tokio::time::timeout`
-/// elapsing, or the whole scheduler task being `.abort()`ed on daemon
-/// shutdown (`daemon.rs`'s `scheduler_handle.abort()`).
+/// Like [`run_status`] but for `String` args — the `gh` argv helpers produce
+/// `Vec<String>` (fork: [`run_gh_write`] passes one straight through).
 ///
-/// Fork #282 final-pass F1 (reviewer) / A1 (auditor) correction: an earlier
-/// version of this fix set `kill_on_drop(true)` HERE, on the theory that
-/// [`create_worktree`]'s `git worktree add` needed it. That widened the
-/// blast radius to every OTHER caller of this shared function reached
-/// through the same scheduler task — a `gh repo clone`
-/// (`ensure_clone`/`run_status("gh", ["repo", "clone", …])`), `git
-/// fetch`/`git pull --ff-only`, the `gh issue` comment/label/assignee
-/// writes, and tab-close's `git worktree remove` — all of which relied on
-/// detaching cleanly on shutdown, not being SIGKILLed mid-flight. A killed
-/// `gh repo clone` in particular leaves a partial `clone_dir` that
-/// `ensure_clone` then treats as an existing-but-broken clone on every
-/// subsequent fire, hard-erroring `create_worktree`'s `git_common_dir` call
-/// until someone removes the directory by hand. `git worktree add` is the
-/// one caller that genuinely needs a kill rather than a detach (see
-/// [`run_status_killable`]) — it now goes through that dedicated variant
-/// instead of widening this one.
-pub(crate) async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
-    run_status_impl(program, args, false).await
-}
-
-/// Like [`run_status`] but with `kill_on_drop(true)` set — for the narrow set
-/// of callers where a timed-out child must not be left to finish detached.
-///
-/// Fork #282 audit S1 / final-pass F1 (reviewer) / A1 (auditor): the premise
-/// behind [`run_status`] ("a slow call here only affects this path") stopped
-/// being the whole story once [`create_worktree`] started calling it while
-/// holding the attach lock it now shares with the TUI's
-/// `create_worktree_sync`. That caller wraps its own calls in an external
-/// `tokio::time::timeout` against `WORKTREE_GIT_TIMEOUT` so a wedged `git`
-/// cannot hold the shared lock (and therefore starve the TUI) indefinitely.
-/// Without `kill_on_drop(true)`, that external timeout only stops the
-/// CALLER from awaiting the child — it does not kill it, so a timed-out
-/// `git worktree add` keeps running in the background and can finish
-/// (creating the worktree, without an ownership marker) after
-/// `create_worktree` has already reported a timeout/failure and released
-/// the lock, reproducing the fork #122/#123 "wedge this slug forever"
-/// failure on the async path. `kill_on_drop(true)` closes that: dropping a
-/// timed-out future here drops the `tokio::process::Command`'s underlying
-/// `Child`, and with `kill_on_drop` set that drop issues an immediate
-/// `SIGKILL`/`TerminateProcess` to the direct child instead of leaving it to
-/// finish unattended. `create_worktree` then runs its own best-effort
-/// cleanup (`attempt_worktree_cleanup_async`) on that same timeout arm, so a
-/// worktree the child half-registered before the kill does not wedge the
-/// slug either way.
-///
-/// Used ONLY at the two `create_worktree` call sites that need it — the
-/// `git worktree add` invocation and `attempt_worktree_cleanup_async`'s own
-/// cleanup call — never more broadly; see [`run_status`]'s doc comment for
-/// what widening this to every caller cost.
-///
-/// Fork issue #133's whole-process-group escalation
-/// (`terminate_child_with_grace_and_detached_reap_forcing_group_backstop`)
-/// targets [`run_status_sync`] only, not this function. This path kills only
-/// the DIRECT child, not its whole process group, so a hook grandchild
-/// `git` forks (e.g. `post-checkout`) is not reached and can keep running
-/// past the bound. Building an async equivalent of
-/// `spawn_in_new_process_group` plus a group-wide kill would close that
-/// residual gap but is substantial new machinery this path does not
-/// currently need — closing the common case (the `git` process itself
-/// hanging, not every hook it might have spawned) is what matters here.
-async fn run_status_killable(program: &str, args: &[&str]) -> Result<(), String> {
-    run_status_impl(program, args, true).await
-}
-
-/// Like [`run_status`] but for `String` args — the `git` worktree argv
-/// helpers ([`crate::issue_dispatch::worktree_branch_probe_argv`] /
-/// [`crate::issue_dispatch::worktree_add_argv`]) produce `Vec<String>`.
-///
-/// No caller today: [`create_worktree`] still builds its own `&[&str]`
-/// literals inline rather than sharing the argv builders
-/// [`create_worktree_sync`] uses. Kept rather than deleted — this genuinely
-/// predates the sync twin sharing those builders, per the original commit's
-/// own diff, not something a merge dropped — since removing it would be a
-/// design decision (converging the async path onto the shared argv
-/// builders) this rebase is not the place to make.
-#[allow(dead_code)]
+/// Since the upstream sync this is a thin wrapper over upstream's
+/// [`run_status`], which kills the command's whole process group at its bound
+/// or when the caller stops awaiting. The fork's earlier split between a
+/// detaching `run_status` and a `kill_on_drop` `run_status_killable` (fork
+/// #282 final-pass F1) is gone with it: the hazard F1 guarded against — a
+/// `gh repo clone` killed mid-flight leaving a partial `clone_dir` that wedges
+/// every later fire — is closed at its source by `clone_via_staging`, which
+/// clones into a staging directory and moves it into place only on success.
 async fn run_status_args(program: &str, args: &[String]) -> Result<(), String> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run_status(program, &refs).await
 }
 
-/// Like [`run_status_killable`] but for `String` args — see
-/// [`run_status_args`], its non-killable twin.
-async fn run_status_killable_args(program: &str, args: &[String]) -> Result<(), String> {
+/// [`run_git_status`] for `String` args and an explicit bound: the `git`
+/// worktree argv helpers ([`crate::issue_dispatch::worktree_add_argv`] /
+/// [`crate::issue_dispatch::worktree_remove_argv`]) produce `Vec<String>`, and
+/// the callers that hold the attach lock shared with the TUI's
+/// [`create_worktree_sync`] must bound each `git` by [`WORKTREE_GIT_TIMEOUT`] /
+/// [`WORKTREE_CLEANUP_TIMEOUT`] rather than [`SUBPROCESS_TIMEOUT`] (fork #282):
+/// ten minutes under a lock the TUI waits on would freeze it. The command is
+/// built by [`crate::git_env::git_async`] and, on expiry, its whole process
+/// group is killed — which also closes the residual fork #133 documented for
+/// the earlier `kill_on_drop` runner (a hook grandchild such as
+/// `post-checkout` surviving the direct child's kill).
+async fn run_git_status_within(args: &[String], bound: Duration) -> Result<(), String> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_status_killable(program, &refs).await
+    git_within(&refs, bound).await
+}
+
+/// [`run_git_status_within`] for a `&[&str]` argv.
+async fn git_within(args: &[&str], bound: Duration) -> Result<(), String> {
+    status_within(
+        crate::git_env::git_async(),
+        crate::git_env::GIT,
+        args,
+        bound,
+    )
+    .await
 }
 
 /// Fork #122/#123 audit (P2): the maximum time a single blocking `git`
@@ -6015,41 +7621,37 @@ const WORKTREE_GIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// [`clone_destination_predates_attempt`]'s doc comment for why matching
 /// hardcoded English substrings is safe given this override.
 fn spawn_git_status_child(
-    program: &str,
     args: &[&str],
 ) -> std::io::Result<(
     std::process::Child,
     crate::platform::proc::AgentProcessGroup,
 )> {
     // PRD fork#544 review-findings fix round 3 (auditor F1/F2): every call
-    // through this shared core now also carries `-c core.fsmonitor=`, the
-    // same override `crate::worktree_reclaim::git_in_untrusted_dir` applies
-    // for exactly the same reason -- several of this module's callers (the
-    // resume arm's ancestry/fetch probes chief among them) run `git` inside
-    // a `clone_dir` this process did not just create and cannot vouch for,
-    // and a forged `core.fsmonitor` in that directory's own `.git/config` is
-    // a same-uid code-execution vector through a plain `git
-    // status`/`git fetch`. Applied here, in the one shared spawn core,
-    // rather than at each of this module's own call sites individually -- a
-    // caller genuinely operating in a directory it just created (e.g. the
-    // initial `git clone` itself) pays a harmless no-op, the same tradeoff
-    // `check_cleanliness`'s doc comment in `worktree_reclaim.rs` already
-    // accepts for its own always-hardened calls. This blocks the fsmonitor
-    // vector specifically; it does NOT close every same-uid config-driven
-    // vector reachable through an untrusted `.git/config`
-    // (`filter.<driver>.clean`, `core.hooksPath`, `diff.external` chief
-    // among the residuals). `remote.<name>.uploadpack` on `fetch` was in
-    // this list too until PRD fork#544's final cleanup round closed it —
-    // see `isolated_clone_ancestry_matches_source`'s own doc comment for how
-    // and why.
-    let mut hardened_args: Vec<&str> = Vec::with_capacity(args.len() + 2);
-    hardened_args.push("-c");
-    hardened_args.push("core.fsmonitor=");
-    hardened_args.extend_from_slice(args);
-
-    let mut command = std::process::Command::new(program);
+    // through this shared core runs with hooks and fsmonitor switched off and
+    // the ambient git location environment cleared. Several of this module's
+    // callers (the resume arm's ancestry/fetch probes chief among them) run
+    // `git` inside a `clone_dir` this process did not just create and cannot
+    // vouch for, and a forged `core.fsmonitor` in that directory's own
+    // `.git/config` is a same-uid code-execution vector through a plain `git
+    // status`/`git fetch`. The fork closed that vector with its own
+    // `-c core.fsmonitor=` here; since the upstream sync the command is built by
+    // [`crate::git_env::git_sync`] (issue #1181 / #1888), whose `-c` list is a
+    // strict superset (`core.hooksPath=/dev/null` as well) and which also
+    // clears `GIT_DIR` and its siblings, so the one constructor now decides
+    // what a deck-run `git` may inherit and linkage-check rule 13 keeps the
+    // `"git"` literal out of this file. Applied in the one shared spawn core,
+    // rather than at each call site, for the reason the fork gave: a caller
+    // genuinely operating in a directory it just created (e.g. the initial `git
+    // clone` itself) pays a harmless no-op. This blocks the fsmonitor and hook
+    // vectors; it does NOT close every same-uid config-driven vector reachable
+    // through an untrusted `.git/config` (`filter.<driver>.clean` and
+    // `diff.external` chief among the residuals). `remote.<name>.uploadpack` on
+    // `fetch` was in this list too until PRD fork#544's final cleanup round
+    // closed it — see `isolated_clone_ancestry_matches_source`'s own doc
+    // comment for how and why.
+    let mut command = crate::git_env::git_sync();
     command
-        .args(&hardened_args)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -6091,12 +7693,9 @@ struct SyncGitOutput {
 /// — stdin closed, non-interactive git env, `LC_ALL=C`, a bounded
 /// process-group timeout — without a second, unhardened
 /// `std::process::Command` of its own.
-fn spawn_and_wait_sync(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<SyncGitOutput, AddError> {
-    let (mut child, group) = spawn_git_status_child(program, args)
+fn spawn_and_wait_sync(args: &[&str], timeout: Duration) -> Result<SyncGitOutput, AddError> {
+    let program = crate::git_env::GIT;
+    let (mut child, group) = spawn_git_status_child(args)
         .map_err(|e| AddError::Failed(format!("failed to run `{program}`: {e}")))?;
 
     // PRD fork#544 review-findings fix round 3 (auditor F4): drain stdout
@@ -6205,9 +7804,10 @@ fn spawn_and_wait_sync(
 /// accept input. `timeout` is a parameter (fork #122/#123 re-audit, P2)
 /// rather than the fixed [`WORKTREE_GIT_TIMEOUT`] so [`attempt_worktree_cleanup`]
 /// can give its own cleanup call a shorter, independent bound.
-fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<(), AddError> {
+fn run_status_sync(args: &[String], timeout: Duration) -> Result<(), AddError> {
+    let program = crate::git_env::GIT;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = spawn_and_wait_sync(program, &refs, timeout)?;
+    let out = spawn_and_wait_sync(&refs, timeout)?;
     if out.status.success() {
         return Ok(());
     }
@@ -6229,9 +7829,10 @@ fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<
 /// rather than [`spawn_git_status_child`]'s stdin-closed/non-interactive/
 /// bounded-timeout environment. Shares [`spawn_and_wait_sync`] with
 /// [`run_status_sync`] rather than duplicating the spawn/poll/timeout loop.
-fn run_capture_sync(program: &str, args: &[String], timeout: Duration) -> Result<String, AddError> {
+fn run_capture_sync(args: &[String], timeout: Duration) -> Result<String, AddError> {
+    let program = crate::git_env::GIT;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = spawn_and_wait_sync(program, &refs, timeout)?;
+    let out = spawn_and_wait_sync(&refs, timeout)?;
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
@@ -6244,6 +7845,310 @@ fn run_capture_sync(program: &str, args: &[String], timeout: Duration) -> Result
     )))
 }
 
+/// The prefix every [`output_within`] timeout error starts with, so a caller
+/// that has to undo what a killed command left half-done can recognise one —
+/// see [`is_subprocess_timeout`].
+const SUBPROCESS_TIMEOUT_MARKER: &str = "timed out: ";
+
+/// Whether `err` is the error [`output_within`] returns when it killed a
+/// command at its bound, as opposed to the command failing on its own.
+fn is_subprocess_timeout(err: &str) -> bool {
+    err.starts_with(SUBPROCESS_TIMEOUT_MARKER)
+}
+
+/// Run `cmd` with `args` to completion, or kill it once `bound` has elapsed
+/// (issue #692).
+///
+/// **Killed rather than left running**, which is the opposite of the choice
+/// [`warm_project_environment_with`] makes, for a reason specific to these
+/// calls. A timed-out fire releases the per-repository worktree lock and the
+/// scheduler's `running` flag, and the next fire then starts the same `gh repo
+/// clone` / `git fetch` / `git worktree add` again — so a survivor would be
+/// racing its own replacement over the same directory.
+///
+/// **On Unix the whole process group is killed, and the direct child is reaped
+/// before this returns.** Killing only the direct child is not enough: `gh repo
+/// clone` runs `git clone` as a child of its own, and with its stderr not a
+/// terminal that `git` prints no progress, so it would not even die of the
+/// closed pipe — it would go on writing the clone directory the next fire is
+/// about to use. So the command gets a process group of its own
+/// (`process_group(0)`), and the timeout `SIGKILL`s that group. The group
+/// outlives its leader while any member remains, so the signal reaches the
+/// grandchildren even though the leader is gone first. A descendant that moved
+/// itself to another group or session escapes it; nothing `gh` or `git` runs in
+/// this path is known to. A group of its own also means a terminal's `^C` would
+/// not reach the command — which costs nothing here, because every production
+/// caller runs inside the daemon, which is detached from any terminal. Windows
+/// has no process-group kill in this code, so there the direct child alone is
+/// killed.
+///
+/// **The direct child is not reaped until both pipes have been drained.** The
+/// run reads stdout and stderr to end-of-file first, and only then waits for
+/// the child. So whenever the group is signalled — on a timeout, on an
+/// overflow, or because the caller dropped the run part-way — the child is
+/// still unreaped, a zombie at worst, and its pid, which is the group's id,
+/// cannot have been reissued: the signal reaches this command's group and no
+/// other, including when the child exited early and a backgrounded descendant
+/// still holds a pipe open. Waiting alongside the drains instead would let the
+/// child be reaped first, leaving either a stale id to signal or no id at all
+/// and the descendant running.
+///
+/// The `.output()`-equivalent defaults are set explicitly because `spawn` does
+/// not imply them: stdin is `/dev/null`, so nothing can block reading it, and
+/// both output streams are captured. The whole run — the two pipes draining
+/// and then the exit — sits under the bound, so a descendant that keeps a pipe
+/// open after the child exits cannot stretch the wait past it either.
+async fn output_within(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<std::process::Output, String> {
+    output_within_capped(cmd, program, args, bound, OutputCaps::UNBOUNDED).await
+}
+
+/// The prefix of the error [`output_within_capped`] returns when it killed a
+/// command for printing more than its stdout cap — see
+/// [`is_subprocess_overflow`].
+const SUBPROCESS_OVERFLOW_MARKER: &str = "output too large: ";
+
+/// Whether `err` is the error [`output_within_capped`] returns when it killed
+/// a command for printing more than its stdout cap.
+fn is_subprocess_overflow(err: &str) -> bool {
+    err.starts_with(SUBPROCESS_OVERFLOW_MARKER)
+}
+
+/// How much of each output stream [`output_within_capped`] keeps. `None` keeps
+/// all of it.
+#[derive(Clone, Copy)]
+struct OutputCaps {
+    /// Past this many bytes of stdout the command is killed and reported with
+    /// [`SUBPROCESS_OVERFLOW_MARKER`]: stdout is the result, so a truncated
+    /// capture must never pass for the whole of it.
+    stdout: Option<usize>,
+    /// Past this many bytes of stderr the rest is read and discarded, and the
+    /// capture ends with a note of how many bytes were dropped. Stderr is only
+    /// ever a diagnostic, and a command that is merely chatty there (`gh` with
+    /// `GH_DEBUG` set) still succeeds.
+    stderr: Option<usize>,
+}
+
+impl OutputCaps {
+    /// Keep everything — what [`output_within`]'s callers get.
+    const UNBOUNDED: Self = Self {
+        stdout: None,
+        stderr: None,
+    };
+}
+
+/// The process group of a spawned command, `SIGKILL`ed when this is dropped
+/// unless [`GroupKill::disarm`] ran first — see [`output_within`] for why the
+/// id stays the command's own while this is armed. A no-op off Unix.
+struct GroupKill(Option<u32>);
+
+impl GroupKill {
+    fn kill(&self) {
+        let Some(pid) = self.0 else {
+            return;
+        };
+        #[cfg(all(test, unix))]
+        group_kill_probe::record(pid);
+        #[cfg(unix)]
+        // SAFETY: kill(2) with a negative pid signals the process group
+        // `process_group(0)` created, whose id is the child's pid. SIGKILL has
+        // no failure mode beyond ESRCH/EPERM, both ignored: ESRCH means
+        // everything in it has already exited. Every holder of an armed guard
+        // keeps the child unreaped, so the id cannot name anybody else's group.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
+
+    /// The child has been reaped, so its id is no longer this command's.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Test-only record, per thread, of whether each [`GroupKill::kill`] found the
+/// leader still unreaped. A killed descendant cannot show that: a group
+/// outlives its reaped leader while any member is left, so a signal sent after
+/// the reap still reaches the descendant.
+#[cfg(all(test, unix))]
+mod group_kill_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SIGNALS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(pid: u32) {
+        let unreaped = loop {
+            // SAFETY: an all-zero `siginfo_t` is a valid out-parameter, and
+            // `WNOWAIT` leaves the child waitable, so this reaps nothing. It
+            // returns 0 for a child that is running or a zombie, and fails
+            // with ECHILD once the child has been reaped.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    libc::id_t::from(pid),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                break true;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break false;
+            }
+        };
+        SIGNALS.with(|signals| signals.borrow_mut().push(unreaped));
+    }
+
+    /// The signals recorded on this thread since the last call.
+    pub(super) fn take() -> Vec<bool> {
+        SIGNALS.with(|signals| std::mem::take(&mut *signals.borrow_mut()))
+    }
+}
+
+/// [`output_within`] with caps on the bytes captured from each stream (see
+/// [`OutputCaps`]). A command that prints more stdout than its cap is killed
+/// and reaped the way a timed-out one is.
+async fn output_within_capped(
+    mut cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+    caps: OutputCaps,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Declared after `child`, so it is dropped first: a run dropped part-way
+    // signals the group before dropping `child` can reap the leader.
+    let mut group = GroupKill(child.id());
+
+    async fn drain(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    }
+
+    /// The stdout cap was exceeded.
+    struct Overflow;
+
+    /// [`drain`], reading at most one byte past `cap` so an overflow is
+    /// detected without buffering the rest of the stream.
+    async fn drain_capped(
+        pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+        cap: Option<usize>,
+    ) -> Result<Vec<u8>, Overflow> {
+        let Some(cap) = cap else {
+            return Ok(drain(pipe).await);
+        };
+        let mut buf = Vec::new();
+        if let Some(pipe) = pipe {
+            let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+            let _ = pipe.take(limit).read_to_end(&mut buf).await;
+        }
+        if buf.len() > cap {
+            return Err(Overflow);
+        }
+        Ok(buf)
+    }
+
+    /// [`drain`], keeping the first `cap` bytes and reading the rest to
+    /// end-of-file into nothing, so the command never blocks on a full pipe.
+    async fn drain_prefix(
+        pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+        cap: Option<usize>,
+    ) -> Vec<u8> {
+        let Some(cap) = cap else {
+            return drain(pipe).await;
+        };
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let limit = u64::try_from(cap).unwrap_or(u64::MAX);
+            let _ = (&mut pipe).take(limit).read_to_end(&mut buf).await;
+            let discarded = tokio::io::copy(&mut pipe, &mut tokio::io::sink())
+                .await
+                .unwrap_or(0);
+            if discarded > 0 {
+                buf.extend_from_slice(format!(" [{discarded} more bytes discarded]").as_bytes());
+            }
+        }
+        buf
+    }
+
+    let outcome = tokio::time::timeout(bound, async {
+        let stderr = async { Ok(drain_prefix(stderr, caps.stderr).await) };
+        let (stdout, stderr) = tokio::try_join!(drain_capped(stdout, caps.stdout), stderr)?;
+        // Only now that both pipes are at end-of-file — see `output_within`.
+        Ok::<_, Overflow>((child.wait().await, stdout, stderr))
+    })
+    .await;
+    let reason = match outcome {
+        Ok(Ok((status, stdout, stderr))) => {
+            // `id()` turns `None` once `wait` has reaped the child. A `wait`
+            // that failed may not have, and then the guard still kills the
+            // group as this returns.
+            if child.id().is_none() {
+                group.disarm();
+            }
+            return Ok(std::process::Output {
+                status: status.map_err(|e| format!("failed to run `{program}`: {e}"))?,
+                stdout,
+                stderr,
+            });
+        }
+        Ok(Err(Overflow)) => format!(
+            "{SUBPROCESS_OVERFLOW_MARKER}`{program} {}` printed more than {} bytes and was killed",
+            args.join(" "),
+            caps.stdout.unwrap_or_default()
+        ),
+        Err(_) => format!(
+            "{SUBPROCESS_TIMEOUT_MARKER}`{program} {}` did not finish within {}s and was \
+             killed; it is treated as failed so the task's later fires are not blocked \
+             behind it",
+            args.join(" "),
+            bound.as_secs_f64()
+        ),
+    };
+    // Unreaped on both arms: an overflow is found before `wait` starts, and a
+    // timeout cancels a `wait` that had not returned.
+    group.kill();
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    if child.id().is_none() {
+        group.disarm();
+    }
+    Err(reason)
+}
+
 /// Run a subprocess that must exit zero and return its captured stdout. Accepts
 /// `String` args (the `gh` argv helpers produce `Vec<String>`).
 async fn run_capture(program: &str, args: &[String]) -> Result<String, String> {
@@ -6251,78 +8156,45 @@ async fn run_capture(program: &str, args: &[String]) -> Result<String, String> {
     run_capture_args(program, &refs).await
 }
 
-/// Like [`run_capture`] but for `&str` args — the fixed-shape `git` probes
-/// (e.g. `remote get-url origin`) build their argv inline.
+/// Like [`run_capture`] but for `&str` args.
+///
+/// NOT for `git` — use [`run_git_capture`], for the reason [`run_status`]
+/// gives.
 pub(crate) async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new(program)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+    capture_of(tokio::process::Command::new(program), program, args).await
+}
+
+/// [`run_capture_args`] for `git` — the fixed-shape probes (`remote get-url
+/// origin`, `rev-parse --short HEAD`) build their argv inline, and the command
+/// comes from [`crate::git_env::git_async`] so the `-C <dir>` in that argv is
+/// what decides the repository (issue #1181).
+pub(crate) async fn run_git_capture(args: &[&str]) -> Result<String, String> {
+    capture_of(crate::git_env::git_async(), crate::git_env::GIT, args).await
+}
+
+/// The shared body of [`run_capture_args`] and [`run_git_capture`] — see
+/// [`status_of`] for why it is shared.
+async fn capture_of(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    capture_within(cmd, program, args, SUBPROCESS_TIMEOUT).await
+}
+
+/// [`capture_of`] with the bound passed in — see [`status_within`].
+async fn capture_within(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<String, String> {
+    let output = output_within(cmd, program, args, bound).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "`{program} {}` failed ({}): {}",
             args.join(" "),
-            output.status,
-            stderr.trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// [`remove_worktree`]'s `KeepIfDirty` dirty-probe (`git status --porcelain`
-/// against the worktree). Deliberately its OWN function rather than a call
-/// into the shared [`run_capture_args`]: that function is also used by `gh`
-/// network calls (via [`run_capture`]) that legitimately need more room than
-/// a local, no-network `git status`, so bounding it there would risk cutting
-/// off a slow-but-working `gh` call. This probe, by contrast, runs against a
-/// worktree an agent may have left in a stuck state — a held `index.lock`, a
-/// stalled filesystem — and the close-time cleanup that calls it is
-/// detached, so an unbounded wait here pins that task for the daemon's
-/// lifetime with the tree kept and, before PRD 236's blocking-1 fix, no
-/// notice ever reaching the user (PRD 236 review, item 5). Bounded with the
-/// same [`WORKTREE_CLEANUP_TIMEOUT`] `attempt_worktree_cleanup` uses for its
-/// own `git worktree remove --force`, and hardened the same way
-/// [`run_status`] is (stdin closed, no credential-prompt env) since — unlike
-/// `run_capture_args`'s other direct `git` use (`remote get-url origin`
-/// against a clone we just provisioned) — this runs against a worktree
-/// outside our control. Final cleanup round: also carries `-c
-/// core.fsmonitor=`, the same override [`spawn_git_status_child`] applies for
-/// exactly the same reason — a forged `core.fsmonitor` in this worktree's own
-/// (untrusted) `.git/config` is the same same-uid code-execution vector on a
-/// plain `git status`. A timeout is treated exactly like any other probe
-/// failure: the caller's `Err` arm already keeps the tree fail-safe and
-/// reports [`crate::event::KeptReason::ProbeError`].
-async fn probe_worktree_dirty(worktree: &str) -> Result<String, String> {
-    let output = tokio::time::timeout(
-        WORKTREE_CLEANUP_TIMEOUT,
-        tokio::process::Command::new("git")
-            .args([
-                "-c",
-                "core.fsmonitor=",
-                "-C",
-                worktree,
-                "status",
-                "--porcelain",
-            ])
-            .stdin(Stdio::null())
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ASKPASS", "")
-            .env("SSH_ASKPASS", "")
-            .output(),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "`git -C {worktree} status --porcelain` timed out after {WORKTREE_CLEANUP_TIMEOUT:?}"
-        )
-    })?
-    .map_err(|e| format!("failed to run `git`: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "`git -C {worktree} status --porcelain` failed ({}): {}",
             output.status,
             stderr.trim()
         ));
@@ -6340,6 +8212,806 @@ mod tests {
     // unused-import warning on the non-test build.
     use crate::issue_dispatch::parse_claim_fields;
     use spec::spec;
+
+    /// Scenario: PRD #1589 (auditor S5) — the worktree cleanup a close awaits
+    /// is pointed at a directory whose name carries a newline, a CR, an ESC and
+    /// a bidi override and runs far past any real path. The status check fails
+    /// (nothing is there), and its warning names the path escaped, on one line,
+    /// bounded — never with the raw controls that would forge a log line.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_worktree_cleanup_log_escapes_and_bounds_the_path() {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hostile = dir
+            .path()
+            .join(String::from("wt\nWARN forged line\r\u{1b}[2J\u{202e}") + &"x".repeat(2000));
+        let captured = CapturedLog::default();
+        let guard = crate::test_isolation::capture_tracing_on_this_thread(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with_ansi(false)
+                .finish(),
+        );
+        let outcome =
+            remove_worktree_outcome(&hostile, dir.path(), RemovalPolicy::KeepIfDirty).await;
+        drop(guard);
+        assert_eq!(outcome, WorktreeRemoval::KeptCouldNotCheck);
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("could not check worktree status"),
+            "the warning must be logged: {logged:?}"
+        );
+        assert_eq!(logged.trim_end().lines().count(), 1, "{logged:?}");
+        for raw in ['\r', '\u{1b}', '\u{202e}'] {
+            assert!(!logged.contains(raw), "{raw:?} reached the log: {logged:?}");
+        }
+        assert!(logged.contains("wt\\nWARN"), "{logged:?}");
+        assert!(
+            logged.chars().count() < 1800,
+            "each value is bounded: {} chars",
+            logged.chars().count()
+        );
+    }
+
+    /// Issue #692: a subprocess that outlives its bound is reported as a
+    /// failure naming the command and the bound, and the call returns promptly
+    /// instead of waiting for the child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_that_outlives_its_bound_fails_with_a_clear_error() {
+        let bound = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let err = status_within(
+            tokio::process::Command::new("sleep"),
+            "sleep",
+            &["30"],
+            bound,
+        )
+        .await
+        .expect_err("a 30s sleep must not pass a 200ms bound");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the bound must end the wait, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains("`sleep 30` did not finish within 0.2s and was killed"),
+            "the error must name the command and the bound: {err}"
+        );
+
+        let err = capture_within(
+            tokio::process::Command::new("sleep"),
+            "sleep",
+            &["30"],
+            bound,
+        )
+        .await
+        .expect_err("the capturing variant must be bounded too");
+        assert!(err.contains("did not finish within"), "{err}");
+    }
+
+    /// Scenario: PRD #421 amendment item 10 — a command capped at 1000 bytes of
+    /// stdout prints far more and keeps running; it is killed promptly and
+    /// reported as an overflow, never returned as a truncated capture. Output
+    /// at the cap itself is returned whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_past_its_stdout_cap_is_killed_and_reported() {
+        let started = std::time::Instant::now();
+        let err = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "head -c 5000 /dev/zero; sleep 30"],
+            Duration::from_secs(20),
+            stdout_cap(1000),
+        )
+        .await
+        .expect_err("5000 bytes must not pass a 1000-byte cap");
+        assert!(is_subprocess_overflow(&err), "{err}");
+        assert!(!is_subprocess_timeout(&err), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "an overflow must end the call, took {:?}",
+            started.elapsed()
+        );
+
+        let out = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "head -c 1000 /dev/zero"],
+            Duration::from_secs(20),
+            stdout_cap(1000),
+        )
+        .await
+        .expect("output at the cap is accepted");
+        assert_eq!(out.stdout.len(), 1000);
+    }
+
+    fn stdout_cap(bytes: usize) -> OutputCaps {
+        OutputCaps {
+            stdout: Some(bytes),
+            stderr: None,
+        }
+    }
+
+    /// Scenario: PRD #421 review round 2 — the command's leader exits at once,
+    /// leaving a backgrounded descendant that holds the pipes open and would
+    /// touch a marker a second later; the bound expires first. The descendant
+    /// is killed, and the group is signalled while the leader is still
+    /// unreaped — the id was this command's, not a stale one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_subprocess_whose_leader_exited_first_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!("(sleep 1; touch '{}') & exit 0", marker.display());
+        let started = std::time::Instant::now();
+        let err = output_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("the descendant holds the pipes past the bound");
+        assert!(is_subprocess_timeout(&err), "{err}");
+        assert_eq!(group_kill_probe::take(), [true]);
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "the bound must end the wait, took {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the descendant of a leader that had already exited survived the timeout"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 2 — the leader exits at once; its
+    /// backgrounded descendant then prints past a 1000-byte stdout cap and
+    /// would touch a marker a second later. The call is reported as an
+    /// overflow, and the descendant is killed with it rather than left running
+    /// behind an error that says the call was killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_overflowing_after_its_leader_exited_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!(
+            "(sleep 0.3; head -c 5000 /dev/zero; sleep 1; touch '{}') & exit 0",
+            marker.display()
+        );
+        let err = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_secs(20),
+            stdout_cap(1000),
+        )
+        .await
+        .expect_err("5000 bytes must not pass a 1000-byte cap");
+        assert!(is_subprocess_overflow(&err), "{err}");
+        assert_eq!(group_kill_probe::take(), [true]);
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            !marker.exists(),
+            "the overflowing descendant of an exited leader was left running"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 3 — the leader exits at once, leaving a
+    /// backgrounded descendant that holds the pipes open, touches a readiness
+    /// file and would touch a marker a second later. The caller drops the
+    /// unbounded call long before its bound, and the descendant is killed with
+    /// it rather than left running behind a run nobody is waiting on. The group
+    /// is signalled while the leader is still unreaped, so its id cannot have
+    /// been reissued to anybody else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_call_whose_leader_exited_first_takes_its_descendant_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("descendant-ready");
+        let marker = dir.path().join("descendant-survived");
+        let script = format!(
+            "(sleep 0.2; touch '{}'; sleep 1; touch '{}') & exit 0",
+            ready.display(),
+            marker.display()
+        );
+        let args = ["-c", script.as_str()];
+        let mut call = Box::pin(output_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &args,
+            Duration::from_secs(60),
+        ));
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the descendant never signalled readiness"
+            );
+            if let Ok(result) = tokio::time::timeout(Duration::from_millis(20), &mut call).await {
+                panic!("the call ended while the descendant held its pipes: {result:?}");
+            }
+        }
+        group_kill_probe::take();
+        drop(call);
+        assert_eq!(
+            group_kill_probe::take(),
+            [true],
+            "dropping the call must signal the group once, before the leader is reaped"
+        );
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            !marker.exists(),
+            "the descendant of an exited leader outlived the dropped call"
+        );
+    }
+
+    /// Scenario: PRD #421 review round 2 — a command floods stderr with 10 MB
+    /// and then succeeds. With a 4 KiB stderr cap it is still a success: its
+    /// stdout comes back whole, and its stderr is the first 4 KiB plus a note
+    /// of how many bytes were discarded, not the whole flood.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stderr_flood_keeps_a_bounded_prefix_and_the_call_succeeds() {
+        let out = output_within_capped(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &[
+                "-c",
+                "head -c 10000000 /dev/zero | tr '\\0' e >&2; echo done",
+            ],
+            Duration::from_secs(20),
+            OutputCaps {
+                stdout: Some(1000),
+                stderr: Some(4096),
+            },
+        )
+        .await
+        .expect("a stderr flood is not a failure");
+        assert!(out.status.success(), "{:?}", out.status);
+        assert_eq!(out.stdout, b"done\n");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&"e".repeat(4096)),
+            "the prefix is kept: {:?}",
+            &stderr[..64.min(stderr.len())]
+        );
+        assert!(
+            stderr.ends_with(" [9995904 more bytes discarded]"),
+            "{:?}",
+            &stderr[4096..]
+        );
+        assert!(
+            out.stderr.len() < 4096 + 64,
+            "{} bytes kept",
+            out.stderr.len()
+        );
+    }
+
+    /// Scenario: PRD #421 amendment item 9 — the claim-call bound is 30 s
+    /// unless the override holds a positive millisecond count.
+    #[test]
+    fn the_claim_call_timeout_defaults_to_30s_and_takes_an_override() {
+        assert_eq!(claim_call_timeout_from(None), Duration::from_secs(30));
+        assert_eq!(
+            claim_call_timeout_from(Some("1500")),
+            Duration::from_millis(1500)
+        );
+        for ignored in ["", "0", "-5", "abc", "1.5"] {
+            assert_eq!(
+                claim_call_timeout_from(Some(ignored)),
+                Duration::from_secs(30),
+                "{ignored:?}"
+            );
+        }
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — the run's claim budget is 120 s
+    /// unless the override holds a positive millisecond count.
+    #[test]
+    fn the_claim_run_budget_defaults_to_120s_and_takes_an_override() {
+        assert_eq!(claim_run_budget_from(None), Duration::from_secs(120));
+        assert_eq!(
+            claim_run_budget_from(Some("3000")),
+            Duration::from_millis(3000)
+        );
+        for ignored in ["", "0", "-5", "abc", "1.5"] {
+            assert_eq!(
+                claim_run_budget_from(Some(ignored)),
+                Duration::from_secs(120),
+                "{ignored:?}"
+            );
+        }
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — each call is bounded by the
+    /// shorter of the per-call bound and what is left of the run's budget, and
+    /// once the calls have spent it, no further call gets a bound.
+    #[test]
+    fn a_claim_call_is_bounded_by_what_is_left_of_the_run_budget() {
+        let mut budget = ClaimBudget {
+            per_call: Duration::from_secs(5),
+            remaining: Duration::from_secs(12),
+        };
+        assert_eq!(budget.next_bound(), Some(Duration::from_secs(5)));
+        budget.spend(Duration::from_secs(5));
+        budget.spend(Duration::from_secs(5));
+        assert_eq!(budget.next_bound(), Some(Duration::from_secs(2)));
+        assert!(!budget.is_spent());
+        // A call overruns its bound slightly before it is reaped.
+        budget.spend(Duration::from_millis(2_050));
+        assert!(budget.is_spent());
+        assert_eq!(budget.next_bound(), None);
+    }
+
+    fn claim_run_with(remaining: Duration) -> ClaimRun {
+        ClaimRun::with_budget(
+            "host",
+            ClaimBudget {
+                per_call: Duration::from_secs(30),
+                remaining,
+            },
+        )
+    }
+
+    /// Scenario: PRD #421 amendment item 14 — a failed label add provisions
+    /// the label once more only while provisioning has not succeeded in the
+    /// run, only once per run, and only with budget left.
+    #[test]
+    fn a_failed_label_add_reprovisions_once_while_the_label_may_be_missing() {
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.provisioned = Some(Err("HTTP 502".into()));
+        assert!(run.should_reprovision(), "transient provisioning failure");
+        run.reprovisioned = true;
+        assert!(!run.should_reprovision(), "at most once per run");
+
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.provisioned = Some(Ok(()));
+        assert!(!run.should_reprovision(), "the label exists");
+
+        let mut run = claim_run_with(Duration::ZERO);
+        run.provisioned = Some(Err("HTTP 502".into()));
+        assert!(!run.should_reprovision(), "no budget left for the calls");
+    }
+
+    /// Scenario: PRD #421 amendment item 13 — only a successful account
+    /// lookup is kept for the rest of the run; a failed one is not, so the
+    /// next claim looks the account up again.
+    #[test]
+    fn only_a_successful_account_lookup_is_kept() {
+        let mut run = claim_run_with(Duration::from_secs(120));
+        run.remember_account(&Err("HTTP 502".into()));
+        assert_eq!(run.account, None);
+        run.remember_account(&Ok(54321));
+        assert_eq!(run.account, Some(54321));
+    }
+
+    /// Scenario: PRD #421 M3.1 — a run ages claim records on GitHub's clock,
+    /// read from the account lookup's `Date`, so a machine whose clock is an
+    /// hour fast or slow reaches the same decisions as one in step with
+    /// GitHub; without a `Date` the local clock stands in.
+    #[test]
+    fn claim_decisions_use_githubs_clock_whatever_the_local_clock_says() {
+        use crate::issue_dispatch::{
+            ClaimIdentity, IssueClaimRecord, claim_refresh_due, live_claimant,
+            parse_authenticated_user, parse_issue_claim_records, render_claim_record,
+        };
+        let github = |rfc3339: &str| {
+            chrono::DateTime::parse_from_rfc3339(rfc3339)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let server_now = github("2026-10-23T12:00:00Z");
+        let lookup = parse_authenticated_user(
+            "HTTP/2.0 200 OK\nDate: Fri, 23 Oct 2026 12:00:00 GMT\r\n\r\n{\"id\":1}",
+        )
+        .unwrap();
+        let ttl = chrono::Duration::hours(1);
+        let me = ClaimIdentity {
+            user_id: 1,
+            task: "mine",
+            host_id: "h1-aaaa",
+        };
+        let record = |user: u64, task: &str, updated_at: &str| -> IssueClaimRecord {
+            let json = serde_json::json!([{
+                "id": 9, "user": {"id": user, "login": "teammate"},
+                "author_association": "COLLABORATOR",
+                "body": render_claim_record(task, "h1-aaaa", server_now),
+                "updated_at": updated_at,
+            }]);
+            parse_issue_claim_records(&json.to_string())
+                .unwrap()
+                .remove(0)
+        };
+        // A foreign record edited 50 minutes ago on GitHub's clock is live
+        // under a one-hour TTL; the deck's own record, edited just now, is
+        // not due for a refresh.
+        let foreign = record(2, "theirs", "2026-10-23T11:10:00Z");
+        let own = record(1, "mine", "2026-10-23T12:00:00Z");
+        for skew in [
+            chrono::Duration::zero(),
+            chrono::Duration::hours(1),
+            -chrono::Duration::hours(1),
+        ] {
+            let local_now = server_now + skew;
+            let offset = lookup
+                .server_date
+                .map(|server| server.signed_duration_since(local_now));
+            let now = clock_now(local_now, offset);
+            assert_eq!(now, server_now, "skew {skew}");
+            assert!(
+                live_claimant(std::slice::from_ref(&foreign), &me, false, None, now, ttl).is_some(),
+                "skew {skew}"
+            );
+            assert!(!claim_refresh_due(now, own.updated_at, ttl), "skew {skew}");
+        }
+        // What the local clock alone would decide: an hour fast reads the
+        // live foreign record as expired and edits the fresh own record on
+        // every fire; an hour slow reads the foreign record as dated ahead.
+        let fast = clock_now(server_now + chrono::Duration::hours(1), None);
+        assert!(
+            live_claimant(std::slice::from_ref(&foreign), &me, false, None, fast, ttl).is_none()
+        );
+        assert!(claim_refresh_due(fast, own.updated_at, ttl));
+        let slow = clock_now(server_now - chrono::Duration::hours(1), None);
+        assert!(
+            live_claimant(std::slice::from_ref(&foreign), &me, false, None, slow, ttl).is_none()
+        );
+    }
+
+    /// Scenario: PRD #421 M3.1 — a run starts on this machine's clock and
+    /// moves onto GitHub's only once the account lookup measured an offset.
+    #[test]
+    fn a_claim_run_uses_the_local_clock_until_an_offset_is_measured() {
+        let mut run = claim_run_with(Duration::from_secs(120));
+        let before = chrono::Utc::now();
+        let now = run.now();
+        assert!(now >= before && now <= chrono::Utc::now());
+        run.clock_offset = Some(chrono::Duration::hours(-3));
+        let now = run.now();
+        assert!(now < chrono::Utc::now() - chrono::Duration::minutes(170));
+    }
+
+    /// Scenario: PRD #421 amendment item 12 — once the budget is spent, a
+    /// claim call is reported as skipped for the budget without running `gh`.
+    #[tokio::test]
+    async fn a_claim_call_after_the_budget_is_spent_is_skipped() {
+        let mut run = claim_run_with(Duration::ZERO);
+        let error = run
+            .call(&["--version".to_string()], "adding the label", 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "adding the label was skipped: the run's claim time budget was used up"
+        );
+    }
+
+    /// Issue #692: the timed-out child is killed, not left running to race the
+    /// next fire's attempt at the same clone or worktree. The child would write
+    /// a marker one second in; the bound expires long before that, so a marker
+    /// that appears means the child survived.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_subprocess_is_killed_rather_than_left_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("survived");
+        let script = format!("sleep 1; touch '{}'", marker.display());
+        let err = status_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("the bound must expire before the script finishes");
+        assert!(err.contains("was killed"), "{err}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the timed-out child ran to completion, so it was left running"
+        );
+    }
+
+    /// PR #1304 (Qodo): the kill reaches the command's DESCENDANTS, not only
+    /// the direct child — the shape of `gh repo clone`, whose `git clone` would
+    /// otherwise go on writing the clone directory the next fire uses. The
+    /// marker is written by a backgrounded grandchild one second in; the bound
+    /// expires long before that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_subprocess_takes_its_descendants_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("grandchild-survived");
+        let script = format!("(sleep 1; touch '{}') & wait", marker.display());
+        let err = status_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("the bound must expire before the grandchild finishes");
+        assert!(is_subprocess_timeout(&err), "{err}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the timed-out command's grandchild ran to completion, so only the \
+             direct child was killed"
+        );
+    }
+
+    /// Only the timeout is recognised as one: a command that fails on its own
+    /// must not trigger the cleanup a killed command needs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_timeout_is_classified_as_one() {
+        let err = status_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "echo 'did not finish within' >&2; exit 1"],
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a non-zero exit must fail");
+        assert!(!is_subprocess_timeout(&err), "{err}");
+    }
+
+    /// PR #1304 (Greptile, Qodo): a clone that fails partway leaves no
+    /// `clone_dir` and no staging directory, so the next fire clones again
+    /// instead of taking a half-written directory for a finished clone; each
+    /// call stages under its own name, so a concurrent attempt's work in
+    /// progress is untouched; a clone that succeeds lands at `clone_dir`; and
+    /// one that loses the race to an attempt that already finished leaves the
+    /// winner's clone in place and says so, so the caller vets its origin.
+    #[tokio::test]
+    async fn a_failed_clone_leaves_nothing_a_later_fire_would_mistake_for_a_clone() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let clone_dir = ws.path().join("repo");
+        let entries = || -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(ws.path())
+                .expect("read workspace")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let err = clone_via_staging(&clone_dir, |staging| async move {
+            tokio::fs::create_dir_all(staging.join(".git"))
+                .await
+                .expect("start a partial clone");
+            Err("timed out: `gh repo clone` did not finish".to_string())
+        })
+        .await
+        .expect_err("a failed clone must fail");
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(
+            entries().is_empty(),
+            "a failed clone must leave neither clone_dir nor its staging dir: {:?}",
+            entries()
+        );
+
+        let concurrent = ws.path().join("repo.cloning-concurrent");
+        tokio::fs::create_dir_all(concurrent.join(".git"))
+            .await
+            .expect("another attempt, mid-clone");
+        let placed = clone_via_staging(&clone_dir, |staging| async move {
+            tokio::fs::create_dir_all(staging.join(".git"))
+                .await
+                .expect("clone");
+            Ok(())
+        })
+        .await;
+        assert_eq!(placed, Ok(StagedClone::Placed));
+        assert!(
+            clone_dir.join(".git").is_dir(),
+            "the clone lands at clone_dir"
+        );
+        assert!(
+            concurrent.join(".git").is_dir(),
+            "another attempt's staging directory must be left alone"
+        );
+
+        tokio::fs::write(clone_dir.join("winner"), "")
+            .await
+            .expect("mark the finished clone");
+        let lost = clone_via_staging(&clone_dir, |staging| async move {
+            tokio::fs::create_dir_all(staging.join(".git"))
+                .await
+                .expect("clone");
+            tokio::fs::write(staging.join("loser"), "")
+                .await
+                .expect("mark this copy");
+            Ok(())
+        })
+        .await;
+        assert_eq!(
+            lost,
+            Ok(StagedClone::LostRace),
+            "a clone somebody else placed first is reported as theirs, for the caller to vet"
+        );
+        assert!(
+            clone_dir.join("winner").exists(),
+            "the winner's clone is kept"
+        );
+        assert!(!clone_dir.join("loser").exists());
+        assert_eq!(
+            entries(),
+            vec!["repo".to_string(), "repo.cloning-concurrent".to_string()],
+            "the losing copy's staging directory is discarded"
+        );
+
+        // A destination the clone can never be moved onto — a file — fails the
+        // placement, and the copy it could not place is discarded rather than
+        // left to accumulate one per fire. Unix only: Windows' `rename` replaces
+        // an existing FILE with the directory (measured on `build-windows`,
+        // PR #1304), so there a file is not a destination that refuses.
+        #[cfg(unix)]
+        {
+            let blocked = ws.path().join("blocked");
+            tokio::fs::write(&blocked, "not a directory")
+                .await
+                .expect("occupy the destination");
+            let err = clone_via_staging(&blocked, |staging| async move {
+                tokio::fs::create_dir_all(staging.join(".git"))
+                    .await
+                    .expect("clone");
+                Ok(())
+            })
+            .await
+            .expect_err("a clone that cannot be placed must fail");
+            assert!(err.contains("could not move it"), "{err}");
+            assert_eq!(
+                entries(),
+                vec![
+                    "blocked".to_string(),
+                    "repo".to_string(),
+                    "repo.cloning-concurrent".to_string()
+                ],
+                "the unplaceable copy's staging directory is discarded"
+            );
+        }
+    }
+
+    /// PR #1304 (Qodo): the branch probe tells "absent" from "could not
+    /// tell", because only a definite absence lets a timed-out add's cleanup
+    /// delete the branch. A directory that is not a repository makes `git`
+    /// exit 128, which must not read as absent.
+    #[tokio::test]
+    async fn the_branch_probe_does_not_mistake_a_failed_probe_for_an_absent_branch() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(scratch.path(), &repo);
+        let clone = repo.to_string_lossy();
+        assert_eq!(
+            probe_branch(&clone, "refs/heads/main", WORKTREE_GIT_TIMEOUT).await,
+            BranchProbe::Present
+        );
+        assert_eq!(
+            probe_branch(
+                &clone,
+                "refs/heads/agent/no-such-branch",
+                WORKTREE_GIT_TIMEOUT
+            )
+            .await,
+            BranchProbe::Absent
+        );
+        let not_a_repo = scratch.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).expect("create a plain directory");
+        assert_eq!(
+            probe_branch(
+                &not_a_repo.to_string_lossy(),
+                "refs/heads/main",
+                WORKTREE_GIT_TIMEOUT
+            )
+            .await,
+            BranchProbe::Unknown
+        );
+    }
+
+    /// PR #1304 (Greptile): what a killed `git worktree add` leaves — a
+    /// directory, an administrative entry still `locked` as initializing, and
+    /// the branch its `-b` made — is removed, so a later fire sees the issue as
+    /// unclaimed rather than skipping it forever.
+    #[tokio::test]
+    async fn a_timed_out_worktree_add_is_discarded_with_its_branch() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(scratch.path(), &repo);
+        let worktree_dir = scratch.path().join("repo-issue-5");
+        let branch = "agent/issue-5";
+        let outcome = create_worktree(
+            &repo,
+            &worktree_dir,
+            branch,
+            false,
+            Creator::issue_dispatch("unit", 5),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(WorktreeCreation::Created { .. })),
+            "the setup creation must succeed, got {outcome:?}"
+        );
+        // The state an add is in before it finishes: its entry locked.
+        std::fs::write(
+            repo.join(".git")
+                .join("worktrees")
+                .join("repo-issue-5")
+                .join("locked"),
+            "initializing",
+        )
+        .expect("lock the entry the way an unfinished add leaves it");
+
+        discard_timed_out_worktree(&repo, &worktree_dir, Some(branch)).await;
+
+        assert!(
+            !worktree_dir.exists(),
+            "the worktree directory must be gone"
+        );
+        let git = |args: &[&str]| {
+            let out = crate::git_env::fixture_git(&repo, scratch.path())
+                .args(args)
+                .output()
+                .expect("run git");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let listed = git(&["worktree", "list", "--porcelain"]);
+        assert!(
+            !listed.contains("repo-issue-5"),
+            "the administrative entry must be gone: {listed}"
+        );
+        assert!(
+            git(&["branch", "--list", branch]).trim().is_empty(),
+            "the branch the add created must be gone"
+        );
+    }
+
+    /// The bound changes nothing for a call that finishes inside it: success
+    /// and a non-zero exit read exactly as they did before issue #692.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_inside_its_bound_reports_as_before() {
+        let out = capture_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "printf ok"],
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a quick success must pass");
+        assert_eq!(out, "ok");
+        let err = status_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "echo nope >&2; exit 3"],
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a non-zero exit must fail");
+        assert!(err.contains("failed (exit status: 3): nope"), "{err}");
+    }
 
     /// Test mutex covering temporary process-global env var mutation
     /// (`std::env::set_var` is process-global) — matches `agent_pty.rs`'s
@@ -6963,19 +9635,42 @@ exit 0
     /// A real repo with one commit plus a linked worktree at `worktree`, so the
     /// preview's `git status --porcelain` runs against a genuine tree rather
     /// than a stub. Mirrors `dispatch::tests::init_repo`.
-    fn init_repo_with_worktree(repo: &Path, worktree: &Path) {
+    ///
+    /// **Every `git` here goes through [`crate::git_env::fixture_git`]**,
+    /// which switches off the ambient git environment in both of the groups
+    /// issue #834 names: *configuration* (`GIT_CONFIG_GLOBAL`/`SYSTEM` at a
+    /// nonexistent path, `HOME` and `XDG_CONFIG_HOME` inside the sandbox) and
+    /// *location* (the eight discovery variables cleared, plus
+    /// `GIT_CEILING_DIRECTORIES` bounding the upward walk at `sandbox_root`).
+    /// Without it these commands ran with only `.current_dir(dir)`, and git's
+    /// location discovery **outranks** a process's cwd: with an ambient
+    /// `GIT_DIR` — routine under `rebase --exec`, a pre-commit hook or
+    /// `bisect run` — `init`, `commit` and `worktree add` are writes against
+    /// whatever repository that names, which under `cargo test` can be the
+    /// checkout the suite is running in. It also supplies the commit identity
+    /// by environment, so the fixture no longer writes `user.name`/`user.email`
+    /// into a repository to configure one.
+    ///
+    /// Reached here from issue #1121 round two: a sibling test in this module
+    /// went red once in eight plain `cargo test` runs and could not be
+    /// reproduced, and this was the one concrete candidate cause — under
+    /// `cargo test` (threads, one process) it shares its environment with
+    /// `worktree_owner`'s `with_ambient_git_dir_at`, which sets those very
+    /// variables process-globally under a lock this fixture did not take.
+    fn init_repo_with_worktree(sandbox_root: &Path, repo: &Path, worktree: &Path) {
         let run = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::git_env::fixture_git(dir, sandbox_root)
                 .args(args)
-                .current_dir(dir)
                 .output()
                 .expect("git available");
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
         };
         std::fs::create_dir_all(repo).unwrap();
         run(repo, &["init", "-q", "."]);
-        run(repo, &["config", "user.email", "t@t.t"]);
-        run(repo, &["config", "user.name", "T"]);
+        // Immune today only because `a.txt` holds no newline; pinned anyway so
+        // that adding one stays a content change rather than a Windows-only
+        // failure three modules away (`pin_fixture_eol`).
+        crate::worktree_owner::pin_fixture_eol(repo, sandbox_root);
         std::fs::write(repo.join("a.txt"), "hi").unwrap();
         run(repo, &["add", "."]);
         run(repo, &["commit", "-qm", "init"]);
@@ -7001,12 +9696,497 @@ exit 0
 
     const PROBE: Duration = Duration::from_secs(5);
 
+    /// Scenario: an issue's worktree has just been created when its agent is
+    /// refused because the daemon is restarting. The worktree is removed again
+    /// and the issue deferred — not failed — so the next fire, here or on the
+    /// successor, does not find the issue claimed by an empty worktree. Any
+    /// other spawn failure keeps the old behaviour: reported, tree left on disk
+    /// (PRD #1487 re-check, reviewer R3).
+    #[tokio::test]
+    async fn a_restart_refusal_releases_the_issue_worktree_instead_of_claiming_it() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
+
+        let outcome = settle_failed_issue_spawn(
+            crate::spawn::SpawnError::DaemonRestarting,
+            &reg,
+            &wt,
+            Creator::issue_dispatch("nightly", 7),
+        )
+        .await;
+        assert_eq!(outcome, Ok(IssueOutcome::DeferredForRestart));
+        assert!(
+            !wt.exists(),
+            "the refused issue's worktree was removed again"
+        );
+        assert_eq!(take_worktree(&reg, &wt), None, "and its record dropped");
+        assert_eq!(
+            dispatch_decision(wt.exists(), false, false, None),
+            DispatchDecision::Dispatch,
+            "so the next fire dispatches the issue"
+        );
+
+        let wt2 = tmp.path().join("repo-issue-8");
+        crate::git_env::fixture_git(&repo, tmp.path())
+            .args(["worktree", "add", "-q", "-b", "wt2", &wt2.to_string_lossy()])
+            .output()
+            .expect("git available");
+        record_worktree(&reg, &wt2, &repo, RemovalPolicy::Force);
+        let failed = settle_failed_issue_spawn(
+            crate::spawn::SpawnError::Agent("no such command".into()),
+            &reg,
+            &wt2,
+            Creator::issue_dispatch("nightly", 8),
+        )
+        .await;
+        assert!(failed.is_err(), "a real failure is still reported");
+        assert!(wt2.exists(), "and leaves its tree as before");
+    }
+
+    /// Scenario: a restart refuses the issue's spawn, and the repository's
+    /// worktree lock that guards removing its new worktree cannot be taken.
+    /// Nothing is removed: the worktree is marked as abandoned and the issue
+    /// reports a recoverable failure; the next attempt, which can take the
+    /// lock, reclaims it and frees the issue (PRD #1487 review).
+    #[tokio::test]
+    async fn a_restart_refusal_without_the_worktree_lock_keeps_the_worktree_for_a_retry() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        let reg = new_worktree_registry();
+        // A clone whose lock path cannot be resolved: no lock can be taken.
+        record_worktree(
+            &reg,
+            &wt,
+            &tmp.path().join("no-such-clone"),
+            RemovalPolicy::Force,
+        );
+
+        let outcome = settle_failed_issue_spawn(
+            crate::spawn::SpawnError::DaemonRestarting,
+            &reg,
+            &wt,
+            creator(),
+        )
+        .await;
+        let message = outcome.expect_err("an unremoved worktree is not a clean deferral");
+        assert!(
+            message.contains("lock")
+                && message.contains(&wt.display().to_string())
+                && message.contains("retries"),
+            "the report names the lock, the leftover, and the retry: {message}"
+        );
+        assert!(wt.exists(), "nothing is removed without the lock");
+        assert!(
+            crate::worktree_owner::is_abandoned_spawn_of(&wt, &creator()),
+            "the leftover is marked for the retry"
+        );
+        assert_eq!(take_worktree(&reg, &wt), None, "and its record dropped");
+
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
+            Reclaim::Removed,
+            "the next attempt reclaims it under the lock"
+        );
+        assert!(!wt.exists());
+    }
+
+    /// Scenario: the same restart refusal, but `git worktree remove --force`
+    /// fails (the worktree is locked). The issue is reported as failed — not a
+    /// clean deferral — and the leftover stays recoverable: the next attempt
+    /// retries the removal before the worktree-exists check can read it as a
+    /// claim, refusing while an agent is rooted there, a live dispatch records
+    /// it, or the mark names another issue; and once the lock is gone the
+    /// retry removes it and frees the issue (PRD #1487 final audit F2).
+    #[tokio::test]
+    async fn a_failed_removal_after_a_restart_refusal_is_reported_and_retried_next_attempt() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        // What `create_worktree`'s success arm leaves: the deck's own claim.
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_env::fixture_git(&repo, tmp.path())
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        // A locked worktree refuses a single `--force`.
+        git(&["worktree", "lock", &wt.to_string_lossy()]);
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
+
+        let outcome = settle_failed_issue_spawn(
+            crate::spawn::SpawnError::DaemonRestarting,
+            &reg,
+            &wt,
+            creator(),
+        )
+        .await;
+        let message = outcome.expect_err("a failed removal is not a clean deferral");
+        assert!(
+            message.contains(&wt.display().to_string()) && message.contains("retries"),
+            "the report names the leftover and says it will be retried: {message}"
+        );
+        assert!(wt.exists(), "the removal really did fail");
+        assert!(
+            crate::worktree_owner::is_abandoned_spawn_of(&wt, &creator()),
+            "the leftover is marked as abandoned by this task for this issue"
+        );
+
+        // Still locked: the retry runs, fails again, and says so.
+        assert!(matches!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
+            Reclaim::Failed(_)
+        ));
+        git(&["worktree", "unlock", &wt.to_string_lossy()]);
+
+        // Never someone else's: an agent starting in it, a live dispatch's
+        // record, or a mark naming another issue each keep the claim.
+        let agents = AgentPtyRegistry::new();
+        let starting = agents.reserve_spawn_in_for_test(&wt).unwrap();
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &agents).await,
+            Reclaim::NotAbandoned
+        );
+        agents.release_spawn_for_test(&starting);
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
+            Reclaim::NotAbandoned
+        );
+        take_worktree(&reg, &wt);
+        assert_eq!(
+            reclaim_abandoned_spawn(
+                &wt,
+                &repo,
+                Creator::issue_dispatch("nightly", 8),
+                &reg,
+                &AgentPtyRegistry::new()
+            )
+            .await,
+            Reclaim::NotAbandoned
+        );
+        assert!(wt.exists(), "none of those removed anything");
+
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
+            Reclaim::Removed
+        );
+        assert!(!wt.exists(), "the retry removed the leftover");
+        assert_eq!(
+            dispatch_decision(wt.exists(), false, false, None),
+            DispatchDecision::Dispatch,
+            "so the issue is dispatched rather than skipped as claimed"
+        );
+    }
+
+    /// Scenario: a worktree the deck created and an agent is (or was) using
+    /// carries the ownership marker but no abandoned-spawn mark. The retry
+    /// path leaves it alone, so the worktree-exists check still reads it as
+    /// the issue being claimed (PRD #1487 final audit F2).
+    #[tokio::test]
+    async fn the_abandoned_spawn_retry_never_removes_a_worktree_no_failed_spawn_left() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator).unwrap();
+        let reg = new_worktree_registry();
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator, &reg, &AgentPtyRegistry::new()).await,
+            Reclaim::NotAbandoned
+        );
+        assert!(wt.exists());
+    }
+
+    /// Scenario: two reclaimers (an old daemon and its successor, say) both
+    /// validate the same abandoned worktree. One is held just before it takes
+    /// the repository's worktree lock while the other removes the leftover and
+    /// re-creates the issue's worktree — first left unmarked, as a fresh
+    /// dispatch leaves it, then abandoned again by the same task under a new
+    /// generation. Released, the delayed reclaimer re-validates under the lock
+    /// and leaves the re-created worktree on disk both times (PRD #1487, the
+    /// F2 reclaim race).
+    #[tokio::test]
+    async fn a_delayed_reclaimer_never_removes_a_worktree_recreated_while_it_waited() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        let reg = new_worktree_registry();
+
+        for abandoned_again in [false, true] {
+            let stale = crate::worktree_owner::mark_abandoned_spawn(&wt, &creator()).unwrap();
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+            let agents = AgentPtyRegistry::new();
+            let delayed = reclaim_abandoned_spawn_paced(
+                &wt,
+                &repo,
+                creator(),
+                &reg,
+                &agents,
+                async move {
+                    reached_tx.send(()).unwrap();
+                    resume_rx.await.unwrap();
+                },
+                std::future::ready(()),
+            );
+            let (wt_ref, repo_ref, reg_ref, agents) = (&wt, &repo, &reg, &agents);
+            let other = async move {
+                reached_rx.await.unwrap();
+                assert_eq!(
+                    reclaim_abandoned_spawn(wt_ref, repo_ref, creator(), reg_ref, agents).await,
+                    Reclaim::Removed,
+                    "the first reclaimer removes the leftover"
+                );
+                assert!(!wt_ref.exists());
+                let recreated = create_worktree(repo_ref, wt_ref, "wt", true, creator()).await;
+                assert!(
+                    matches!(recreated, Ok(WorktreeCreation::Created { .. })),
+                    "and a fresh dispatch re-creates the issue's worktree: {recreated:?}"
+                );
+                if abandoned_again {
+                    let fresh =
+                        crate::worktree_owner::mark_abandoned_spawn(wt_ref, &creator()).unwrap();
+                    assert_ne!(fresh, stale, "each abandonment has its own generation");
+                }
+                resume_tx.send(()).unwrap();
+            };
+            let (outcome, ()) = tokio::join!(delayed, other);
+            assert_eq!(
+                outcome,
+                Reclaim::NotAbandoned,
+                "the delayed reclaimer validated a generation that no longer exists \
+                 (abandoned again: {abandoned_again})"
+            );
+            assert!(
+                wt.exists() && crate::worktree_owner::is_marked(&wt),
+                "the re-created worktree survives the delayed reclaimer \
+                 (abandoned again: {abandoned_again})"
+            );
+        }
+    }
+
+    /// Scenario: an agent is started in an abandoned worktree while it is being
+    /// reclaimed. Started after the reclaim's first pass and still unpublished
+    /// when its last check runs, it keeps the worktree. Started after that check
+    /// and before the removal, it is refused, so the removal deletes no
+    /// directory an agent runs in. Once the reclaim has finished, starts are
+    /// accepted again (issue #1612).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_agent_started_in_an_abandoned_worktree_never_has_it_removed_under_it() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        crate::worktree_owner::mark_abandoned_spawn(&wt, &creator()).unwrap();
+        let reg = new_worktree_registry();
+        let agents = Arc::new(AgentPtyRegistry::new());
+
+        // A start reserved after the first pass and unpublished at the last
+        // check: a removal that asked only the published records deleted it.
+        let starting = std::sync::Mutex::new(None);
+        let outcome = reclaim_abandoned_spawn_paced(
+            &wt,
+            &repo,
+            creator(),
+            &reg,
+            &agents,
+            async {
+                *starting.lock().unwrap() = Some(agents.reserve_spawn_in_for_test(&wt).unwrap());
+            },
+            std::future::ready(()),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            Reclaim::NotAbandoned,
+            "the starting agent keeps it"
+        );
+        assert!(wt.exists(), "and nothing was removed under it");
+        agents.release_spawn_for_test(&starting.into_inner().unwrap().unwrap());
+
+        // A start that arrives after the last check, before the removal.
+        let late_start = std::sync::Mutex::new(None);
+        let outcome = reclaim_abandoned_spawn_paced(
+            &wt,
+            &repo,
+            creator(),
+            &reg,
+            &agents,
+            std::future::ready(()),
+            async {
+                assert!(wt.exists(), "the worktree is still there to start in");
+                let wt = wt.to_string_lossy();
+                *late_start.lock().unwrap() =
+                    Some(agents.spawn_agent(crate::agent_pty::SpawnOptions {
+                        command: Some("sleep 30"),
+                        cwd: Some(&wt),
+                        ..crate::agent_pty::SpawnOptions::default()
+                    }));
+            },
+        )
+        .await;
+        let late_start = late_start.into_inner().unwrap().unwrap();
+        if let Ok(id) = &late_start {
+            agents.close_agent(id).unwrap();
+        }
+        assert!(
+            matches!(
+                late_start,
+                Err(crate::agent_pty::AgentPtyError::DirBeingRemoved(_))
+            ),
+            "a start in a worktree being removed is refused: {late_start:?}"
+        );
+        assert_eq!(outcome, Reclaim::Removed);
+        assert!(!wt.exists());
+        assert!(agents.agent_records().is_empty(), "no agent was started");
+
+        // The removal is over: starts in that path are refused no longer.
+        let after = agents
+            .reserve_spawn_in_for_test(&wt)
+            .expect("the reclaim's hold ends with it");
+        agents.release_spawn_for_test(&after);
+        agents.shutdown_all();
+    }
+
+    /// Scenario: another deck process holds the repository's worktree lock —
+    /// the one worktree creation takes — while an abandoned leftover is
+    /// reclaimed. The reclaim waits and removes nothing until the lock is
+    /// released, then removes the leftover (PRD #1487, the F2 reclaim race).
+    #[tokio::test]
+    async fn the_abandoned_spawn_retry_removes_only_under_the_repository_worktree_lock() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator).unwrap();
+        crate::worktree_owner::mark_abandoned_spawn(&wt, &creator).unwrap();
+
+        let lock_path = worktree_lock_path(&repo).await.expect("a lock path");
+        let held = crate::platform::lock::acquire_spawn_lock(&lock_path)
+            .await
+            .expect("hold the repository's worktree lock, as another deck process would");
+        let (wt_task, repo_task) = (wt.clone(), repo.clone());
+        let reclaiming = tokio::spawn(async move {
+            reclaim_abandoned_spawn(
+                &wt_task,
+                &repo_task,
+                creator,
+                &new_worktree_registry(),
+                &AgentPtyRegistry::new(),
+            )
+            .await
+        });
+        // Not a race: while the lock is held the reclaim can never finish.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!reclaiming.is_finished(), "the reclaim waits for the lock");
+        assert!(wt.exists(), "and removes nothing while it waits");
+
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), reclaiming)
+            .await
+            .expect("releasing the lock lets the reclaim proceed")
+            .expect("the reclaim task must not panic");
+        assert_eq!(outcome, Reclaim::Removed);
+        assert!(!wt.exists());
+    }
+
+    /// Scenario: an abandoned leftover whose repository's worktree lock cannot
+    /// be taken at all (the clone cannot be resolved). The reclaim fails
+    /// closed: it reports the issue as failed and leaves the worktree on disk
+    /// (PRD #1487, the F2 reclaim race).
+    #[tokio::test]
+    async fn the_abandoned_spawn_retry_removes_nothing_without_the_lock() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator).unwrap();
+        crate::worktree_owner::mark_abandoned_spawn(&wt, &creator).unwrap();
+
+        let outcome = reclaim_abandoned_spawn(
+            &wt,
+            &tmp.path().join("no-such-clone"),
+            creator,
+            &new_worktree_registry(),
+            &AgentPtyRegistry::new(),
+        )
+        .await;
+        assert!(
+            matches!(&outcome, Reclaim::Failed(message) if message.contains("lock")),
+            "no lock, no removal, and the issue says why: {outcome:?}"
+        );
+        assert!(wt.exists());
+    }
+
+    /// Scenario: an abandoned leftover that was edited between the refused spawn
+    /// and the retry — somebody left uncommitted work in it. Upstream removes it
+    /// regardless (`RemovalPolicy::Force`); this fork keeps a tree with
+    /// uncommitted work (PRD #236, rulings 42/43 of the 2026-11-05 upstream
+    /// merge), so the reclaim reports the issue as failed with a message that
+    /// says the work was kept and what to do, leaves the file in place, and
+    /// never reports the worktree removed. A CLEAN leftover is still removed
+    /// (`the_abandoned_spawn_retry_removes_only_under_the_repository_worktree_lock`).
+    #[tokio::test]
+    async fn a_dirty_abandoned_leftover_is_kept_and_reported_never_discarded() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator).unwrap();
+        crate::worktree_owner::mark_abandoned_spawn(&wt, &creator).unwrap();
+        std::fs::write(wt.join("scratch.txt"), "the user's uncommitted work").unwrap();
+
+        let outcome = reclaim_abandoned_spawn(
+            &wt,
+            &repo,
+            creator,
+            &new_worktree_registry(),
+            &AgentPtyRegistry::new(),
+        )
+        .await;
+        let Reclaim::Failed(message) = &outcome else {
+            panic!("a dirty leftover must be reported, not removed: {outcome:?}");
+        };
+        assert!(
+            message.contains("uncommitted") && message.contains("kept"),
+            "the report must say the work was kept: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("scratch.txt")).unwrap(),
+            "the user's uncommitted work",
+            "the uncommitted work is untouched"
+        );
+    }
+
     #[tokio::test]
     async fn kept_worktree_preview_reports_a_dirty_keep_if_dirty_tree_with_its_path() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "the user's uncommitted work").unwrap();
 
         let reg = new_worktree_registry();
@@ -7034,7 +10214,7 @@ exit 0
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         let reg = new_worktree_registry();
         record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
@@ -7052,7 +10232,7 @@ exit 0
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "discarded by design").unwrap();
 
         let reg = new_worktree_registry();
@@ -7072,7 +10252,7 @@ exit 0
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "dirty, but nobody dispatched here").unwrap();
 
         // Nothing recorded: this is a pane the user opened themselves, and the
@@ -7095,7 +10275,7 @@ exit 0
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-team");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "work from role 2").unwrap();
 
         let reg = new_worktree_registry();
@@ -7197,7 +10377,7 @@ exit 0
 
         // Dirty + KeepIfDirty: kept, and it says so with the path.
         let dirty = tmp.path().join("repo-dispatch-dirty");
-        init_repo_with_worktree(&repo, &dirty);
+        init_repo_with_worktree(tmp.path(), &repo, &dirty);
         std::fs::write(dirty.join("scratch.txt"), "work").unwrap();
         let outcome =
             remove_worktree(&dirty, &repo, RemovalPolicy::KeepIfDirty, "test:remover").await;
@@ -7210,9 +10390,8 @@ exit 0
         // Clean + KeepIfDirty: removed, and nothing is reported.
         let clean = tmp.path().join("repo-dispatch-clean");
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::git_env::fixture_git(&repo, tmp.path())
                 .args(args)
-                .current_dir(&repo)
                 .output()
                 .expect("git available");
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
@@ -7262,7 +10441,7 @@ exit 0
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         // `git -C <clone> worktree remove` against a clone that is not a repo
         // fails, which is the shape of every real failure here (locked, busy,
@@ -7282,7 +10461,7 @@ exit 0
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         assert_eq!(worktree_is_dirty(&wt).await, Ok(false));
         std::fs::write(wt.join("scratch.txt"), "work").unwrap();
@@ -7292,6 +10471,116 @@ exit 0
         // tell "clean" from "could not ask", because only one of them is safe
         // to delete on.
         assert!(worktree_is_dirty(&tmp.path().join("gone")).await.is_err());
+    }
+
+    /// Issue #1888: a repository whose shared `.git` carries a `post-checkout`
+    /// hook and a `core.fsmonitor` command, as a dispatched agent can plant
+    /// them. Plain git runs both (the control proves the traps are armed); the
+    /// deck's own `worktree add` and `status --porcelain` run neither, and
+    /// still answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_hooks_and_fsmonitor_never_run_from_the_decks_git() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let sandbox = tmp.path().to_path_buf();
+        let repo = sandbox.join("repo");
+        let marker = sandbox.join("MARKER");
+        // The fixture is synchronous git and file work, so it runs off the
+        // runtime's thread.
+        tokio::task::spawn_blocking({
+            let (repo, marker) = (repo.clone(), marker.clone());
+            move || plant_hook_and_fsmonitor_traps(&sandbox, &repo, &marker)
+        })
+        .await
+        .unwrap();
+
+        let created = tmp.path().join("repo-dispatch-y");
+        let outcome = create_worktree_from(
+            &repo,
+            &created,
+            "agent/y",
+            false,
+            Creator::dispatch("unit"),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(WorktreeCreation::Created { .. })),
+            "the setup creation must succeed, got {outcome:?}"
+        );
+        assert_eq!(worktree_is_dirty(&created).await, Ok(false));
+        tokio::fs::write(created.join("scratch.txt"), "work")
+            .await
+            .unwrap();
+        assert_eq!(worktree_is_dirty(&created).await, Ok(true));
+        assert!(
+            !tokio::fs::try_exists(&marker).await.unwrap(),
+            "the deck's git ran a planted program: {}",
+            tokio::fs::read_to_string(&marker).await.unwrap_or_default()
+        );
+    }
+
+    /// The fixture for [`planted_hooks_and_fsmonitor_never_run_from_the_decks_git`]:
+    /// a repository with a linked worktree, a `post-checkout` hook and a
+    /// `core.fsmonitor` command that each append their name to `marker`, and a
+    /// control showing that plain git runs both. Leaves `marker` absent.
+    #[cfg(unix)]
+    fn plant_hook_and_fsmonitor_traps(sandbox: &Path, repo: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let wt = sandbox.join("repo-dispatch-x");
+        init_repo_with_worktree(sandbox, repo, &wt);
+        let trap = |path: &Path| {
+            crate::test_isolation::write_script(
+                path,
+                format!("#!/bin/sh\necho \"$0\" >> '{}'\nexit 1\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let hooks = repo.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        trap(&hooks.join("post-checkout"));
+        let fsmonitor = sandbox.join("fsmonitor.sh");
+        trap(&fsmonitor);
+        let git = |dir: &Path, args: &[&str]| {
+            crate::git_env::fixture_git_with_hooks(dir, sandbox)
+                .args(args)
+                .output()
+                .expect("git available")
+        };
+        let config = git(
+            repo,
+            &["config", "core.fsmonitor", &fsmonitor.to_string_lossy()],
+        );
+        assert!(config.status.success(), "{config:?}");
+
+        // The control: plain git with this repository runs both traps. The
+        // add's own status is the hook's, which fails on purpose.
+        let control = sandbox.join("repo-control");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "control",
+                &control.to_string_lossy(),
+            ],
+        );
+        let fired = std::fs::read_to_string(marker).unwrap_or_default();
+        assert!(
+            fired.contains("post-checkout"),
+            "hook trap armed: {fired:?}"
+        );
+        std::fs::remove_file(marker).unwrap();
+        git(&wt, &["status", "--porcelain"]);
+        let fired = std::fs::read_to_string(marker).unwrap_or_default();
+        assert!(
+            fired.contains("fsmonitor.sh"),
+            "fsmonitor trap armed: {fired:?}"
+        );
+        std::fs::remove_file(marker).unwrap();
     }
 
     #[test]
@@ -7318,13 +10607,14 @@ exit 0
             // PRD #745 M11: likewise no spawn instant — this fixture builds a
             // record by hand rather than by spawning anything.
             spawned_at_ms: None,
-            daemon_boot_id: None,
-            registration_generation: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             outstanding_delegation: None,
-            silence_watch: None,
             delegation_commission: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            inbox: None,
         }
     }
 
@@ -7475,8 +10765,7 @@ exit 0
     #[tokio::test]
     async fn create_worktree_already_claimed_when_dir_present() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -7560,8 +10849,7 @@ exit 0
     #[tokio::test]
     async fn create_worktree_records_creator_identity() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -7600,8 +10888,7 @@ exit 0
             }
         );
 
-        let git_dir_out = std::process::Command::new("git")
-            .current_dir(&worktree_dir)
+        let git_dir_out = crate::git_env::fixture_git(&worktree_dir, &worktree_dir)
             .args(["rev-parse", "--git-dir"])
             .output()
             .expect("git rev-parse --git-dir must spawn");
@@ -7629,12 +10916,18 @@ exit 0
     /// A real git repo with one commit — `git worktree add` needs a commit to
     /// branch from. Disk-backed (issue #322 / CLAUDE.md rule 14): this fixture
     /// is a git repository plus its worktrees, not a scratch file.
-    fn init_repo_with_commit(repo: &Path) {
+    ///
+    /// Through [`crate::git_env::fixture_git`], for exactly the reasons
+    /// [`init_repo_with_worktree`] spells out — this fixture was the other half
+    /// of the same module and was missed when that one was isolated (issue
+    /// #1121 round three). The three `git config` writes it used to make are
+    /// gone with it: the identity now arrives as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+    /// in the environment, and `commit.gpgsign` no longer needs neutralizing
+    /// per-repo because no global or system config reaches the fixture at all.
+    fn init_repo_with_commit(sandbox_root: &Path, repo: &Path) {
         std::fs::create_dir_all(repo).expect("create repo dir");
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
+            let out = crate::git_env::fixture_git(repo, sandbox_root)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
@@ -7645,11 +10938,11 @@ exit 0
             );
         };
         git(&["init", "--initial-branch=main", "--quiet"]);
-        git(&["config", "user.email", "test@example.com"]);
-        git(&["config", "user.name", "Test"]);
-        // The dev box may have `commit.gpgsign` on globally; the fixture must
-        // not depend on a signing key being present.
-        git(&["config", "commit.gpgsign", "false"]);
+        // The one config a fixture repository must carry itself, because
+        // production `create_worktree` checks this repository out with the
+        // ambient config while the assertions read it with the neutralized one
+        // — see `pin_fixture_eol`, and issue #1121's `build-windows` red.
+        crate::worktree_owner::pin_fixture_eol(repo, sandbox_root);
         std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
         git(&["add", "README.md"]);
         git(&["commit", "--quiet", "-m", "seed"]);
@@ -7716,7 +11009,7 @@ exit 0
     async fn create_worktree_survives_a_concurrent_adds_half_created_entry() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let entry = begin_half_created_entry(&repo, "concurrent-add");
 
         // Closes while the three dispatches are in flight. Not a timing race:
@@ -7763,15 +11056,12 @@ exit 0
                 "dispatch '{name}' reported Created but its worktree has no checkout at {}",
                 worktree_dir.display()
             );
-            let head = run_capture_args(
-                "git",
-                &[
-                    "-C",
-                    &worktree_dir.to_string_lossy(),
-                    "branch",
-                    "--show-current",
-                ],
-            )
+            let head = run_git_capture(&[
+                "-C",
+                &worktree_dir.to_string_lossy(),
+                "branch",
+                "--show-current",
+            ])
             .await
             .expect("read the new worktree's branch");
             assert_eq!(
@@ -7791,7 +11081,7 @@ exit 0
     async fn create_worktree_surfaces_a_half_created_entry_that_never_completes() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let _entry = begin_half_created_entry(&repo, "abandoned-add");
         let worktree_dir = scratch.path().join("repo-dispatch-stuck");
 
@@ -7815,6 +11105,70 @@ exit 0
         );
     }
 
+    /// Issue #541, the other half of the fix: worktree creation is serialized
+    /// PER REPOSITORY and, because the lock is an `flock(2)` on a file (a named
+    /// mutex on Windows), between separate deck processes rather than merely
+    /// between tasks in one — concurrent dispatches can come from different
+    /// decks, and an in-process mutex would silently not cover them.
+    ///
+    /// Written the way the platform lock's own contract test is: a held lock
+    /// makes the creation block, and releasing it lets the creation complete.
+    /// The lock is taken through the SAME derivation production uses, so a
+    /// change that moved worktree creation off this key would fail here rather
+    /// than quietly stop serializing.
+    #[tokio::test]
+    async fn create_worktree_serializes_per_repository_across_processes() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(scratch.path(), &repo);
+
+        let lock_path = worktree_lock_path(&repo)
+            .await
+            .expect("a git repo must resolve a worktree lock path");
+        assert!(
+            lock_path.starts_with(repo.join(".git")),
+            "the lock must live in the repository's git common dir (the contended \
+             directory), got {}",
+            lock_path.display()
+        );
+        let held = crate::platform::lock::acquire_spawn_lock(&lock_path)
+            .await
+            .expect("hold the repository's worktree lock, as another deck process would");
+
+        let clone_dir = repo.clone();
+        let worktree_dir = scratch.path().join("repo-dispatch-serialized");
+        let creating = tokio::spawn(async move {
+            create_worktree(
+                &clone_dir,
+                &worktree_dir,
+                "agent/dispatch-serialized",
+                false,
+                Creator::dispatch("serialized"),
+            )
+            .await
+        });
+        // Long enough to reach the blocking wait. Not a race: while the lock is
+        // held the creation can NEVER finish, so a slow machine also passes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !creating.is_finished(),
+            "worktree creation must wait while another process holds this \
+             repository's worktree lock; not waiting is how two `git worktree add`s \
+             end up reading each other's half-created entries (#541)"
+        );
+
+        drop(held);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), creating)
+            .await
+            .expect("releasing the lock must let the creation proceed")
+            .expect("the creating task must not panic");
+        assert!(
+            matches!(outcome, Ok(WorktreeCreation::Created { .. })),
+            "once the lock is released the worktree must be created normally, got {outcome:?}"
+        );
+    }
+
     /// A dispatch whose name is claimed by a LIVE worktree must be told that,
     /// not that its branch is left over from a dispatch "whose worktree is
     /// already gone" — the user can see the directory, and the leftover-branch
@@ -7831,7 +11185,7 @@ exit 0
     async fn create_worktree_reports_a_live_claim_not_a_leftover_branch() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let worktree_dir = scratch.path().join("repo-dispatch-claimed");
 
         assert_eq!(
@@ -7883,7 +11237,7 @@ exit 0
     async fn create_worktree_marks_the_worktree_as_deck_owned_without_dirtying_it() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let worktree_dir = scratch.path().join("repo-dispatch-marked");
 
         assert_eq!(
@@ -7914,8 +11268,7 @@ exit 0
             marker.display()
         );
 
-        let status = std::process::Command::new("git")
-            .current_dir(&worktree_dir)
+        let status = crate::git_env::fixture_git(&worktree_dir, scratch.path())
             .args(["status", "--porcelain"])
             .output()
             .expect("git status");
@@ -7958,15 +11311,13 @@ exit 0
     async fn create_worktree_never_marks_a_worktree_it_did_not_create() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let worktree_dir = scratch.path().join("repo-dispatch-foreign");
 
         // Somebody else's worktree, on this same repo, at the path our dispatch
         // is about to want: a real linked worktree, so it HAS a git metadata
         // dir a marker could be written into.
-        let add = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
+        let add = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["worktree", "add", "-b", "someone-elses"])
             .arg(&worktree_dir)
             .output()
@@ -8019,8 +11370,7 @@ exit 0
     #[tokio::test]
     async fn mark_worktree_owned_best_effort_surfaces_a_failed_write() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8060,8 +11410,7 @@ exit 0
             "a normal successful mark must carry no warning"
         );
 
-        let git_dir_out = std::process::Command::new("git")
-            .current_dir(&worktree_dir)
+        let git_dir_out = crate::git_env::fixture_git(&worktree_dir, &worktree_dir)
             .args(["rev-parse", "--git-dir"])
             .output()
             .expect("git rev-parse --git-dir must spawn");
@@ -8246,8 +11595,7 @@ exit 0
     #[test]
     fn attempt_worktree_cleanup_records_remover_identity() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8314,8 +11662,7 @@ exit 0
     #[tokio::test]
     async fn remove_worktree_records_remover_identity() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8422,8 +11769,7 @@ exit 0
     #[test]
     fn create_001_concurrent_attach_never_double_creates() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8476,8 +11822,7 @@ exit 0
         /// — the second, independent symptom the issue measured (the path
         /// shown twice by `git worktree list`).
         fn count_worktree_list_entries(clone_dir: &Path, worktree_dir: &Path) -> usize {
-            let out = std::process::Command::new("git")
-                .current_dir(clone_dir)
+            let out = crate::git_env::fixture_git(clone_dir, clone_dir)
                 .args(["worktree", "list", "--porcelain"])
                 .output()
                 .expect("git worktree list must spawn");
@@ -8627,8 +11972,7 @@ exit 0
     #[test]
     fn create_002_attach_succeeds_from_inside_a_linked_worktree() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8695,8 +12039,7 @@ exit 0
     #[test]
     fn provision_isolated_clone_sync_sets_origin_and_branch_when_source_has_origin() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8734,8 +12077,7 @@ exit 0
             "isolated clone must succeed, got {result:?}"
         );
 
-        let branch_out = std::process::Command::new("git")
-            .current_dir(&clone_dir)
+        let branch_out = crate::git_env::fixture_git(&clone_dir, &clone_dir)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .expect("git rev-parse must spawn");
@@ -8745,8 +12087,7 @@ exit 0
             "the isolated clone must be checked out on the typed branch, not the source's HEAD"
         );
 
-        let origin_out = std::process::Command::new("git")
-            .current_dir(&clone_dir)
+        let origin_out = crate::git_env::fixture_git(&clone_dir, &clone_dir)
             .args(["remote", "get-url", "origin"])
             .output()
             .expect("git remote get-url must spawn");
@@ -8771,8 +12112,7 @@ exit 0
     #[test]
     fn provision_isolated_clone_sync_removes_origin_when_source_has_none() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8803,8 +12143,7 @@ exit 0
             "isolated clone must succeed, got {result:?}"
         );
 
-        let origin_out = std::process::Command::new("git")
-            .current_dir(&clone_dir)
+        let origin_out = crate::git_env::fixture_git(&clone_dir, &clone_dir)
             .args(["remote", "get-url", "origin"])
             .output()
             .expect("git remote get-url must spawn");
@@ -8826,8 +12165,7 @@ exit 0
     #[test]
     fn resolve_git_toplevel_distinguishes_root_from_nested_subdirectory() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8910,8 +12248,7 @@ exit 0
     #[cfg(unix)]
     fn resolve_git_toplevel_survives_a_newline_in_an_ancestor_directory_name() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -8970,8 +12307,7 @@ exit 0
     #[test]
     fn provision_isolated_clone_sync_succeeds_when_source_dir_is_a_repo_subdirectory() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -9043,8 +12379,7 @@ exit 0
     #[test]
     fn provision_isolated_clone_sync_resumes_when_source_dir_is_a_repo_subdirectory() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -9111,8 +12446,7 @@ exit 0
     #[test]
     fn provision_isolated_clone_sync_attaches_branch_that_exists_only_as_remote_tracking_ref() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -9143,8 +12477,7 @@ exit 0
         std::fs::write(source.join("WORK.md"), "real work\n").unwrap();
         git(&source, &["add", "WORK.md"]);
         git(&source, &["commit", "--quiet", "-m", "real work"]);
-        let clonegate1_sha = std::process::Command::new("git")
-            .current_dir(&source)
+        let clonegate1_sha = crate::git_env::fixture_git(&source, &source)
             .args(["rev-parse", "clonegate1"])
             .output()
             .expect("git rev-parse must spawn");
@@ -9160,8 +12493,7 @@ exit 0
             "isolated clone must succeed, got {result:?}"
         );
 
-        let head_sha = std::process::Command::new("git")
-            .current_dir(&clone_dir)
+        let head_sha = crate::git_env::fixture_git(&clone_dir, &clone_dir)
             .args(["rev-parse", "HEAD"])
             .output()
             .expect("git rev-parse must spawn");
@@ -9203,8 +12535,7 @@ exit 0
     #[test]
     fn provision_isolated_clone_sync_attaches_remote_only_branch_with_checkout_guess_disabled() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -9230,8 +12561,7 @@ exit 0
         std::fs::write(source.join("WORK.md"), "real work\n").unwrap();
         git(&source, &["add", "WORK.md"]);
         git(&source, &["commit", "--quiet", "-m", "real work"]);
-        let real_sha = std::process::Command::new("git")
-            .current_dir(&source)
+        let real_sha = crate::git_env::fixture_git(&source, &source)
             .args(["rev-parse", "clonegate-guess"])
             .output()
             .expect("git rev-parse must spawn");
@@ -9257,8 +12587,7 @@ exit 0
              failed here with `error: pathspec … did not match`, got {result:?}"
         );
 
-        let head_sha = std::process::Command::new("git")
-            .current_dir(&clone_dir)
+        let head_sha = crate::git_env::fixture_git(&clone_dir, &clone_dir)
             .args(["rev-parse", "HEAD"])
             .output()
             .expect("git rev-parse must spawn");
@@ -9309,8 +12638,7 @@ exit 0
     #[test]
     fn provision_isolated_clone_sync_concurrent_calls_never_both_create() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -9386,8 +12714,7 @@ exit 0
     /// PRD fork#544 M3 resume-eligibility tests below, mirroring the
     /// identically-named helper in `tests/e2e_orchestration_worktree.rs`.
     fn head_sha(dir: &Path) -> String {
-        let out = std::process::Command::new("git")
-            .current_dir(dir)
+        let out = crate::git_env::fixture_git(dir, dir)
             .args(["rev-parse", "HEAD"])
             .output()
             .expect("git rev-parse HEAD must spawn");
@@ -9406,8 +12733,7 @@ exit 0
     /// four more tests need the identical seed.
     fn seed_source_repo(dir: &Path, seed_content: &str) {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -9434,8 +12760,7 @@ exit 0
     /// (clone / fetch-a-branch-into-origin / merge --ff-only), not just seed
     /// one initial commit.
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .current_dir(dir)
+        let out = crate::git_env::fixture_git(dir, dir)
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -9448,8 +12773,7 @@ exit 0
 
     /// The capturing twin of [`git`] above — trimmed stdout.
     fn git_output(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .current_dir(dir)
+        let out = crate::git_env::fixture_git(dir, dir)
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -11402,8 +14726,7 @@ exit 0
         // S3: "this is NOT an edge case ... local_branch_exists is
         // normally false").
         git(&clone_dir, &["branch", "-D", "main"]);
-        let local_branch_check = std::process::Command::new("git")
-            .current_dir(&clone_dir)
+        let local_branch_check = crate::git_env::fixture_git(&clone_dir, &clone_dir)
             .args(["rev-parse", "--verify", "--quiet", "refs/heads/main"])
             .output()
             .expect("git rev-parse --verify --quiet refs/heads/main must spawn");
@@ -11440,8 +14763,7 @@ exit 0
              {result:?}"
         );
 
-        let upstream_check = std::process::Command::new("git")
-            .current_dir(&clone_dir)
+        let upstream_check = crate::git_env::fixture_git(&clone_dir, &clone_dir)
             .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
             .output()
             .expect("git rev-parse --abbrev-ref @{upstream} must spawn");
@@ -11645,8 +14967,7 @@ exit 0
     #[test]
     fn run_status_sync_clone_error_text_stays_english_under_non_english_locale() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -11674,7 +14995,6 @@ exit 0
 
         let _lang_guard = ScopedEnvVar::set("LANG", "de_DE.UTF-8");
         let result = run_status_sync(
-            "git",
             &[
                 "clone".to_string(),
                 "--".to_string(),
@@ -11711,8 +15031,7 @@ exit 0
     #[test]
     fn isolated_clone_no_origin_sentinel_rejects_push_unconditionally() {
         fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-            std::process::Command::new("git")
-                .current_dir(dir)
+            crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"))
@@ -11811,8 +15130,7 @@ exit 0
     #[test]
     fn create_003_concurrent_async_attach_never_double_creates() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -11845,8 +15163,7 @@ exit 0
         }
 
         fn count_worktree_list_entries(clone_dir: &Path, worktree_dir: &Path) -> usize {
-            let out = std::process::Command::new("git")
-                .current_dir(clone_dir)
+            let out = crate::git_env::fixture_git(clone_dir, clone_dir)
                 .args(["worktree", "list", "--porcelain"])
                 .output()
                 .expect("git worktree list must spawn");
@@ -11995,109 +15312,35 @@ exit 0
         );
     }
 
-    /// Scenario: fork #282 final-pass F1 (reviewer) / A1 (auditor), corrected
-    /// by a later F1 finding. Pins [`run_status_killable`]'s
-    /// `kill_on_drop(true)` directly, at the same seam [`create_worktree`]
-    /// itself uses (an external `tokio::time::timeout` wrapping the call) —
-    /// rather than driving the real [`WORKTREE_GIT_TIMEOUT`] (30s, not
-    /// injectable), which would make this a 30s-plus test for no added
-    /// coverage; `run_status_sync`'s own tests take the same shortcut by
-    /// calling it with a short explicit `timeout` instead of
-    /// `create_worktree_sync`'s hardcoded constant.
+    /// Scenario: fork #282 final-pass F1 (reviewer) / A1 (auditor), re-pointed
+    /// at the upstream runner by the upstream sync. Pins that a caller that
+    /// STOPS AWAITING a [`run_status`] call — the seam [`create_worktree_from`]
+    /// itself relies on (an external `tokio::time::timeout` wrapping the call)
+    /// — leaves no orphaned child behind, rather than driving the real
+    /// [`WORKTREE_GIT_TIMEOUT`] (30s, not injectable), which would make this a
+    /// 30s-plus test for no added coverage; `run_status_sync`'s own tests take
+    /// the same shortcut by calling it with a short explicit `timeout`.
     ///
-    /// Deliberately exercises [`run_status_killable`], not plain
-    /// [`run_status`]: an earlier version of this fix set `kill_on_drop`
-    /// unconditionally on the shared function, which widened it to every
-    /// other caller reached through the same scheduler task (a `gh repo
-    /// clone`, `git fetch`/`pull`, the `gh issue` writes, tab-close's `git
-    /// worktree remove`) and broke `gh repo clone` in particular — see
-    /// [`run_status`]'s doc comment. Only the two `create_worktree` call
-    /// sites that need a kill (the `git worktree add` invocation and
-    /// [`attempt_worktree_cleanup_async`]) go through the killable variant
-    /// now, so this test targets that variant directly rather than the
-    /// shared one.
+    /// This used to pin the fork's separate `run_status_killable`
+    /// (`kill_on_drop(true)`), because the plain `run_status` then DETACHED a
+    /// dropped child. Upstream's runner (issue #692, `output_within`) kills the
+    /// command's whole process group when it is dropped or its bound expires,
+    /// for every caller, so the killable variant and the test that pinned the
+    /// detaching one are gone; the dropped-call behaviour this test asserts is
+    /// now the shared one. Upstream's own
+    /// `a_dropped_call_whose_leader_exited_first_takes_its_descendant_with_it`
+    /// covers the descendant half; this keeps the fork's direct-child, plain
+    /// script seam.
     ///
     /// A fake `git` is a shell script that touches a `started` marker
     /// immediately, sleeps a full second, then touches a `finished` marker.
-    /// `run_status_killable` is called wrapped in a 100ms
-    /// `tokio::time::timeout`, so the sleep has not elapsed when the timeout
-    /// fires. Without `kill_on_drop(true)`, dropping that timed-out future
-    /// would leave the script running in the background — it would go on to
-    /// sleep out its full second and write `finished` regardless of the
-    /// caller having already moved on. With `kill_on_drop(true)`, the drop
-    /// sends a kill signal immediately, so `finished` must never appear even
-    /// after waiting well past the script's own sleep duration.
+    /// `run_status` is called wrapped in a 100ms `tokio::time::timeout`, so the
+    /// sleep has not elapsed when the timeout fires. Dropping that timed-out
+    /// future must kill the script, so `finished` must never appear even after
+    /// waiting well past the script's own sleep duration.
     #[cfg(unix)]
     #[test]
-    fn run_status_killable_kills_the_child_instead_of_orphaning_it() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let scratch = tempfile::tempdir().unwrap();
-        let started_marker = scratch.path().join("started");
-        let finished_marker = scratch.path().join("finished");
-        let script = scratch.path().join("slow-git.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\ntouch {}\nsleep 1\ntouch {}\n",
-                started_marker.display(),
-                finished_marker.display(),
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build current-thread runtime");
-
-        rt.block_on(async {
-            let program = script.to_str().unwrap();
-            let result = tokio::time::timeout(
-                Duration::from_millis(100),
-                run_status_killable(program, &[]),
-            )
-            .await;
-            assert!(
-                result.is_err(),
-                "the external 100ms timeout should have elapsed before the script's 1s sleep \
-                 finished, got {result:?}"
-            );
-
-            // Generous headroom well past the script's own 1s sleep: if
-            // `kill_on_drop` were not set, the script would finish and write
-            // `finished` somewhere in this window.
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-        });
-
-        assert!(
-            started_marker.exists(),
-            "the script must have actually started running for this test to mean anything"
-        );
-        assert!(
-            !finished_marker.exists(),
-            "run_status_killable's kill_on_drop should have killed the child before its 1s \
-             sleep completed, but the finished marker exists -- the child ran to completion in \
-             the background instead of being killed, reproducing fork #282 final-pass F1/A1"
-        );
-    }
-
-    /// Scenario: fork #282 final-pass F1 correction. Pins the OTHER half of
-    /// the F1 fix: plain [`run_status`] (used by every caller except the two
-    /// `create_worktree` sites that need a kill) must NOT set
-    /// `kill_on_drop` — a timed-out caller should leave the child to finish
-    /// detached, not kill it. Same fake-`git`-script shape as
-    /// [`run_status_killable_kills_the_child_instead_of_orphaning_it`], but
-    /// asserts the opposite outcome: after the same 100ms external timeout
-    /// elapses and the same 1500ms headroom passes, `finished` MUST exist —
-    /// if it does not, `run_status` has regressed back to killing its
-    /// child, reproducing the `gh repo clone` breakage F1's correction
-    /// exists to prevent (a killed clone leaves a partial `clone_dir` that
-    /// wedges every subsequent `ensure_clone` call).
-    #[cfg(unix)]
-    #[test]
-    fn run_status_leaves_the_child_to_finish_detached_instead_of_killing_it() {
+    fn run_status_kills_the_child_instead_of_orphaning_it() {
         use std::os::unix::fs::PermissionsExt;
 
         let scratch = tempfile::tempdir().unwrap();
@@ -12130,9 +15373,9 @@ exit 0
                  finished, got {result:?}"
             );
 
-            // Generous headroom well past the script's own 1s sleep: with no
-            // `kill_on_drop`, the detached child should finish and write
-            // `finished` somewhere in this window.
+            // Generous headroom well past the script's own 1s sleep: if the
+            // dropped call did not kill the child, the script would finish and
+            // write `finished` somewhere in this window.
             tokio::time::sleep(Duration::from_millis(1500)).await;
         });
 
@@ -12141,13 +15384,25 @@ exit 0
             "the script must have actually started running for this test to mean anything"
         );
         assert!(
-            finished_marker.exists(),
-            "run_status should leave a timed-out child to finish detached, but the finished \
-             marker is missing -- the child was killed instead, which would break every other \
-             caller of this shared function (gh repo clone, git fetch/pull, the gh issue \
-             writes, tab-close's git worktree remove)"
+            !finished_marker.exists(),
+            "run_status should have killed the child when its caller stopped awaiting, but the \
+             finished marker exists -- the child ran to completion in the background instead, \
+             reproducing fork #282 final-pass F1/A1"
         );
     }
+
+    // Retired at the upstream sync (#344, named): the fork's
+    // `run_status_leaves_the_child_to_finish_detached_instead_of_killing_it`
+    // pinned that plain `run_status` DETACHES a child its caller stopped
+    // awaiting (fork #282 final-pass F1's correction: a killed `gh repo clone`
+    // used to leave a partial `clone_dir` that wedged every later
+    // `ensure_clone`). Upstream's #692 runner deliberately kills the whole
+    // process group instead, and closes the same hazard at its source: a clone
+    // goes to a staging directory and is moved into place only on success
+    // (`clone_via_staging`, pinned by
+    // `a_failed_clone_leaves_nothing_a_later_fire_would_mistake_for_a_clone`),
+    // so a killed clone leaves nothing to mistake for a finished one. Same
+    // guarantee, stronger mechanism (rule 24 case 3).
 
     /// Scenario: fork #282 final-pass F3. Before this fix, [`create_worktree`]
     /// resolved its `git_common_dir` via the synchronous, unbounded
@@ -12246,8 +15501,7 @@ exit 0
     #[test]
     fn attempt_worktree_cleanup_async_removes_a_registered_worktree_and_confirms_it() {
         fn git(dir: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
+            let out = crate::git_env::fixture_git(dir, dir)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -12300,8 +15554,7 @@ exit 0
             !worktree_dir.exists(),
             "the worktree directory must actually be gone after a confirmed cleanup"
         );
-        let list = std::process::Command::new("git")
-            .current_dir(&clone_dir)
+        let list = crate::git_env::fixture_git(&clone_dir, &clone_dir)
             .args(["worktree", "list", "--porcelain"])
             .output()
             .expect("git worktree list must spawn");
@@ -12395,7 +15648,8 @@ exit 0
     fn stub_devbox(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("devbox-stub");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write devbox stand-in");
+        crate::test_isolation::write_script(&path, format!("#!/bin/sh\n{body}\n"))
+            .expect("write devbox stand-in");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod devbox stand-in");
         path
@@ -12538,9 +15792,16 @@ exit 0
              this proves nothing about what happens to a slow one"
         );
 
-        // Well past the stand-in's own runtime: it either finished on its own or
-        // it was killed when we stopped waiting.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for the stand-in to finish on its own. A killed one never writes
+        // the marker, so the deadline is the red path; it is a diagnostic bound,
+        // not a guess at how long ~2 s of stand-in takes on a loaded runner. A
+        // fixed 5 s sleep here read a merely slow stand-in as a killed one.
+        let _ = tokio::time::timeout(Duration::from_secs(30), async {
+            while !finished.is_file() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
         assert!(
             finished.is_file(),
             "a devbox that outlives the bound must be left running — killing it \
@@ -12568,20 +15829,16 @@ exit 0
     async fn create_worktree_warms_the_environment_before_it_reports_created() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         // Committed, so the fresh worktree checks one out and the warm-up's
         // manifest probe sees it — exactly as a real dispatched worktree does.
         std::fs::write(repo.join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
-        let git_add = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
+        let git_add = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["add", DEVBOX_MANIFEST])
             .output()
             .expect("git add devbox.json");
         assert!(git_add.status.success());
-        let git_commit = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
+        let git_commit = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["commit", "--quiet", "-m", "devbox"])
             .output()
             .expect("git commit devbox.json");

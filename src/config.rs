@@ -9,6 +9,10 @@ use crate::state::SessionStatus;
 pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ("default_command", "Default shell command for new panes"),
     (
+        "default_dir",
+        "Absolute directory the desktop's New agent browser opens in (default: home)",
+    ),
+    (
         "auto_config_prompt",
         "Enable/disable the config generation prompt (default: true)",
     ),
@@ -25,6 +29,30 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
         "Bell when session goes idle (default: false)",
     ),
     ("bell.on_error", "Bell on agent error (default: true)"),
+    (
+        "host_metrics.disk_free_warn_percent",
+        "Host disk shows a warning below this % free (default: 15)",
+    ),
+    (
+        "host_metrics.disk_free_critical_percent",
+        "Host disk shows critical below this % free (default: 5)",
+    ),
+    (
+        "host_metrics.memory_available_warn_percent",
+        "Host memory shows a warning below this % available (default: 20)",
+    ),
+    (
+        "host_metrics.memory_available_critical_percent",
+        "Host memory shows critical below this % available (default: 10)",
+    ),
+    (
+        "host_metrics.load_per_core_warn",
+        "Host load shows a warning above this load per core (default: 0.8)",
+    ),
+    (
+        "host_metrics.load_per_core_critical",
+        "Host load shows critical above this load per core (default: 1.5)",
+    ),
 ];
 
 pub fn config_keys_help() -> String {
@@ -36,8 +64,16 @@ pub fn config_keys_help() -> String {
 }
 
 /// Hook-ingestion endpoint path. Delegates to [`crate::platform::paths`] (PRD
-/// #42 M1): Unix resolves the `$XDG_RUNTIME_DIR`/per-uid-`/tmp` socket path,
-/// Windows resolves the named-pipe name. `DOT_AGENT_DECK_SOCKET` overrides.
+/// #42 M1): Unix resolves `$XDG_RUNTIME_DIR/dot-agent-deck.sock`, else
+/// `<temp dir>/dot-agent-deck-{uid}/hook.sock` — the sibling of the attach
+/// endpoint's `attach.sock` in that same per-uid directory. Windows resolves
+/// the named-pipe name. `DOT_AGENT_DECK_SOCKET` overrides.
+///
+/// "per-uid-`/tmp` socket path" is what this used to say, and it is now wrong
+/// twice over: the endpoints moved one level down into a directory the deck
+/// owns (issue #1121), and the root is `std::env::temp_dir()` rather than a
+/// literal `/tmp`, so it is not `/tmp` at all wherever `$TMPDIR` points
+/// elsewhere — which on macOS is everywhere.
 pub fn socket_path() -> PathBuf {
     crate::platform::paths::socket_path()
 }
@@ -88,7 +124,9 @@ impl BellConfig {
         match status {
             SessionStatus::WaitingForInput => self.on_waiting_for_input,
             SessionStatus::Idle => self.on_idle,
-            SessionStatus::Error => self.on_error,
+            // Issue #714: a quota-blocked agent needs a person just like an
+            // erroring one, so it rings under the same switch.
+            SessionStatus::Error | SessionStatus::Blocked => self.on_error,
             _ => false,
         }
     }
@@ -102,16 +140,70 @@ impl BellConfig {
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
+    /// PRD #1223: a deck-level setting — the directory that creating an agent
+    /// on this deck starts browsing in, typically the one folder most agents
+    /// here are started under.
+    ///
+    /// Stored verbatim; empty means unset. Every reader goes through
+    /// [`crate::new_agent_options::usable_default_dir`] — validated (absolute,
+    /// the orchestration-cwd predicate), canonicalised and opened, or `None`.
+    /// The desktop is TOLD it as
+    /// [`crate::new_agent_options::NewAgentOptions::default_dir`], absent when
+    /// it fails, so a bad setting never breaks the options query; the TUI,
+    /// which runs on this host, reads it from its own copy of this struct for
+    /// its directory picker and falls back to its cwd. Not serialised when empty, so a `config set` of an
+    /// unrelated key does not write `default_dir = ""` into the file.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_dir: String,
     pub bell: BellConfig,
     pub auto_config_prompt: bool,
+    /// PRD #1258: the `[host_metrics]` table — the thresholds this deck's
+    /// daemon judges its host's disk, memory and load by
+    /// ([`crate::host_metrics::HealthThresholds`], which documents the keys and
+    /// defaults). Kept as written, and validated per value where it is read, so
+    /// one bad value falls back to its own default with a warning instead of
+    /// failing the whole file, and a `config set` of another key writes the
+    /// table back unchanged. A `host_metrics` that is not a table reads as
+    /// empty, likewise without failing the file; the daemon's read
+    /// ([`DashboardConfig::load_bounded_reporting`]) reports it as a warning.
+    #[serde(
+        skip_serializing_if = "toml::Table::is_empty",
+        deserialize_with = "deserialize_host_metrics_table"
+    )]
+    pub host_metrics: toml::Table,
+}
+
+/// [`DashboardConfig::host_metrics`]'s lenient read: a table is kept as it is,
+/// anything else reads as empty, so it never fails the whole config. Silent:
+/// the warning is [`host_metrics_not_a_table`], raised by
+/// [`DashboardConfig::load_bounded_reporting`], which hands it to its caller
+/// rather than logging it on every read.
+fn deserialize_host_metrics_table<'de, D>(deserializer: D) -> Result<toml::Table, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match toml::Value::deserialize(deserializer)? {
+        toml::Value::Table(table) => table,
+        _ => toml::Table::new(),
+    })
+}
+
+/// The warning for a `host_metrics` in `config.toml` that is not a table.
+fn host_metrics_not_a_table(value: &toml::Value) -> String {
+    format!(
+        "host_metrics in config.toml is a {}, not a table; using the default thresholds",
+        value.type_str()
+    )
 }
 
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
             default_command: String::new(),
+            default_dir: String::new(),
             bell: BellConfig::default(),
             auto_config_prompt: true,
+            host_metrics: toml::Table::new(),
         }
     }
 }
@@ -135,6 +227,92 @@ impl DashboardConfig {
         }
     }
 
+    /// PRD #1223 audit A4: [`Self::load`] for the daemon, which reads this file
+    /// to answer a peer's `NewAgentOptions` query and so must not let the read
+    /// block, or allocate, without bound.
+    ///
+    /// The same file ([`config_path`], `DOT_AGENT_DECK_CONFIG` included) and the
+    /// same fallback — anything that is not a readable, parseable config yields
+    /// [`Self::default`] — with three differences, all confined to what a
+    /// pathological file does:
+    ///
+    /// * **The open cannot hang.** `O_NONBLOCK` on Unix, because a plain
+    ///   `open(2)` of a FIFO with no writer blocks inside the open — the reason
+    ///   [`crate::project_resolve::read_config_file`] sets it. A symlink IS
+    ///   followed, unlike that reader: a dotfiles manager linking `config.toml`
+    ///   into place is ordinary, and [`Self::load`] has always followed one.
+    /// * **Only a regular file is read**, checked on the open handle, so a FIFO,
+    ///   socket or device at the path (or behind a link) is refused unread.
+    /// * **At most [`MAX_DASHBOARD_CONFIG_BYTES`]**, checked against the recorded
+    ///   length and again by [`crate::bounded_read::read_capped`], which catches
+    ///   a file growing between the two.
+    ///
+    /// A refusal is logged without the TOML error's `Display`, which embeds a
+    /// snippet of the file (the `load_features_file` precedent).
+    pub fn load_bounded() -> Self {
+        Self::load_bounded_from(&config_path())
+    }
+
+    fn load_bounded_from(path: &Path) -> Self {
+        let (config, warnings) = Self::load_bounded_reporting_from(path);
+        for warning in warnings {
+            tracing::warn!("{warning}");
+        }
+        config
+    }
+
+    /// [`Self::load_bounded`], returning its warnings instead of logging them,
+    /// for a caller that reads the file repeatedly and logs each distinct
+    /// warning once (PRD #1258: the host sampler reads its thresholds on every
+    /// sample). The warnings are a file the reader could not read, a file that
+    /// is not valid TOML or does not fit the config's shape — each of which
+    /// yields [`Self::default`] — and a `host_metrics` that is not a table,
+    /// which reads as empty while the rest of the file is kept.
+    pub fn load_bounded_reporting() -> (Self, Vec<String>) {
+        Self::load_bounded_reporting_from(&config_path())
+    }
+
+    fn load_bounded_reporting_from(path: &Path) -> (Self, Vec<String>) {
+        let contents = match read_dashboard_config_bounded(path) {
+            Ok(None) => return (Self::default(), Vec::new()),
+            Ok(Some(contents)) => contents,
+            Err(reason) => {
+                return (
+                    Self::default(),
+                    vec![format!(
+                        "config at {} not read ({reason}); using the defaults",
+                        path.display()
+                    )],
+                );
+            }
+        };
+        let Ok(mut table) = contents.parse::<toml::Table>() else {
+            return (
+                Self::default(),
+                vec![format!(
+                    "invalid config at {}: malformed TOML; using the defaults",
+                    path.display()
+                )],
+            );
+        };
+        let mut warnings = Vec::new();
+        if let Some(value) = table.get("host_metrics").filter(|v| !v.is_table()) {
+            warnings.push(host_metrics_not_a_table(value));
+            table.remove("host_metrics");
+        }
+        match toml::Value::Table(table).try_into() {
+            Ok(config) => (config, warnings),
+            // The error's `Display` is not used: it can quote the file.
+            Err(_) => (
+                Self::default(),
+                vec![format!(
+                    "invalid config at {}: a setting has the wrong type; using the defaults",
+                    path.display()
+                )],
+            ),
+        }
+    }
+
     pub fn save(&self) -> Result<(), String> {
         let path = config_path();
         if let Some(parent) = path.parent() {
@@ -150,12 +328,23 @@ impl DashboardConfig {
     pub fn get_field(&self, key: &str) -> Result<String, String> {
         match key {
             "default_command" => Ok(self.default_command.clone()),
+            "default_dir" => Ok(self.default_dir.clone()),
             "bell.enabled" => Ok(self.bell.enabled.to_string()),
             "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
             "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
             "bell.on_error" => Ok(self.bell.on_error.to_string()),
             "auto_config_prompt" => Ok(self.auto_config_prompt.to_string()),
-            _ => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
+            _ => match host_metrics_key(key) {
+                // The value in effect, so a reader sees the default for an
+                // unset or invalid key rather than nothing.
+                Some(name) => Ok(crate::host_metrics::HealthThresholds::from_table(
+                    &self.host_metrics,
+                )
+                .0
+                .value(name)
+                .to_string()),
+                None => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
+            },
         }
     }
 
@@ -166,6 +355,19 @@ impl DashboardConfig {
         match key {
             "default_command" => {
                 self.default_command = value.to_string();
+                Ok(())
+            }
+            "default_dir" => {
+                // Refused here as well as at read time, so a typo is caught
+                // by the command that made it rather than by a browser that
+                // quietly opens in home. Empty unsets it.
+                if !value.is_empty() && !crate::agent_pty::is_valid_orchestration_cwd(value) {
+                    return Err(format!(
+                        "Invalid default_dir: {value:?} is not an absolute path \
+                         (empty unsets it)"
+                    ));
+                }
+                self.default_dir = value.to_string();
                 Ok(())
             }
             "bell.enabled" => {
@@ -190,9 +392,105 @@ impl DashboardConfig {
                     .map_err(|_| "Expected 'true' or 'false'".to_string())?;
                 Ok(())
             }
-            _ => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
+            _ => match host_metrics_key(key) {
+                Some(name) => {
+                    // Refused here as well as at read time, so a typo is caught
+                    // by the command that made it.
+                    let number = value
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|n| crate::host_metrics::HealthThresholds::in_range(name, *n))
+                        .ok_or_else(|| format!("Invalid {key}: {value:?}"))?;
+                    // A whole number stays an integer in the file, as a person
+                    // would write it.
+                    let stored = if number.fract() == 0.0 && number <= i64::MAX as f64 {
+                        toml::Value::Integer(number as i64)
+                    } else {
+                        toml::Value::Float(number)
+                    };
+                    // Refused, too, when it would invert its pair: the deck
+                    // would ignore it, and both of the pair, until fixed.
+                    let mut candidate = self.host_metrics.clone();
+                    candidate.insert(name.to_string(), stored.clone());
+                    let (effective, _) =
+                        crate::host_metrics::HealthThresholds::from_table(&candidate);
+                    if effective.value(name) != number {
+                        let other =
+                            crate::host_metrics::HealthThresholds::paired_key(name).unwrap_or(name);
+                        let other_value = threshold_as_read(&candidate, other);
+                        return Err(format!(
+                            "Invalid {key}: {value} with host_metrics.{other} = {other_value} \
+                             would make the critical limit less strict than the warning, and \
+                             the deck would use the defaults for both. Change \
+                             host_metrics.{other} first."
+                        ));
+                    }
+                    self.host_metrics.insert(name.to_string(), stored);
+                    Ok(())
+                }
+                None => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
+            },
         }
     }
+}
+
+/// The threshold `name` as [`crate::host_metrics::HealthThresholds::from_table`]
+/// reads it from `table` before checking its pair: the written number when it
+/// is one in range, else its default.
+fn threshold_as_read(table: &toml::Table, name: &str) -> f64 {
+    use crate::host_metrics::HealthThresholds;
+    table
+        .get(name)
+        .and_then(|value| match value {
+            toml::Value::Integer(n) => Some(*n as f64),
+            toml::Value::Float(f) => Some(*f),
+            _ => None,
+        })
+        .filter(|n| HealthThresholds::in_range(name, *n))
+        .unwrap_or_else(|| HealthThresholds::default().value(name))
+}
+
+/// The threshold name in a `host_metrics.<name>` config key, when it is one.
+fn host_metrics_key(key: &str) -> Option<&str> {
+    key.strip_prefix("host_metrics.")
+        .filter(|name| crate::host_metrics::HEALTH_THRESHOLD_KEYS.contains(name))
+}
+
+/// PRD #1223 audit A4: the most [`DashboardConfig::load_bounded`] reads.
+///
+/// **1 MiB**, the project-config reader's cap
+/// ([`crate::project_resolve::MAX_PROJECT_CONFIG_BYTES`]) — the other file the
+/// daemon reads on a peer's behalf — so the two bounds stay one number. A
+/// `config.toml` is a few hundred bytes; anything near this is not a config.
+pub const MAX_DASHBOARD_CONFIG_BYTES: u64 = crate::project_resolve::MAX_PROJECT_CONFIG_BYTES;
+
+/// [`DashboardConfig::load_bounded`]'s read: `Ok(None)` when there is no file,
+/// `Err` with a short reason (no file content) when there is one that is not a
+/// regular file within [`MAX_DASHBOARD_CONFIG_BYTES`] or cannot be read.
+fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("open failed: {e}")),
+    };
+    let metadata = file.metadata().map_err(|e| format!("stat failed: {e}"))?;
+    if !metadata.is_file() {
+        return Err("not a regular file".into());
+    }
+    if metadata.len() > MAX_DASHBOARD_CONFIG_BYTES {
+        return Err(format!(
+            "exceeds the {MAX_DASHBOARD_CONFIG_BYTES}-byte limit"
+        ));
+    }
+    crate::bounded_read::read_capped(file, MAX_DASHBOARD_CONFIG_BYTES, "config file").map(Some)
 }
 
 fn config_path() -> PathBuf {
@@ -214,9 +512,13 @@ pub struct SavedPane {
     pub dir: String,
     pub name: String,
     pub command: String,
-    /// When set, this pane was the agent pane of a mode tab.
-    /// The value is the mode name from the project config.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deprecated by issue #1199 (workspace modes were removed). A
+    /// `session.toml` written by an older build may still name the mode tab
+    /// this pane was the agent pane of, so the key keeps DEserializing — an
+    /// unknown key would otherwise be a silent drop, and the restore path needs
+    /// to know to warn — but it is never written again. A pane that carries one
+    /// restores as a plain dashboard pane with one session warning.
+    #[serde(default, skip_serializing)]
     pub mode: Option<String>,
     /// When set, this pane was the orchestrator pane of an orchestration
     /// tab; the snapshot carries enough metadata to rebuild the whole tab
@@ -379,8 +681,8 @@ pub struct SavedFocus {
     pub dashboard_active: bool,
     /// The pane focused in the tab that was ACTIVE, which doubles as the
     /// locator for which tab that was. Taken from the pane controller rather
-    /// than from the tab's own field, because a `Tab::Mode` stores `None` to
-    /// mean "the agent pane is focused" and a locator has to be a concrete id.
+    /// than from the tab's own field, because an orchestration tab stores `None`
+    /// to mean "the start role's pane" and a locator has to be a concrete id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_pane: Option<String>,
     /// The remembered focused pane of every tab that had one, the active tab's
@@ -402,23 +704,15 @@ impl SavedFocus {
     /// `EmbeddedPaneController::hydrate_from_daemon` reuses the very same value
     /// the previous TUI had. Every OTHER pane's id comes from `allocate_id`, a
     /// bare counter, and is reused across processes by coincidence rather than
-    /// by identity. Two such panes exist, and both were reported as one class:
-    ///
-    /// - on the daemon-EMPTY rebuild path, EVERY restored pane (pass an empty
-    ///   set there, and nothing id-shaped is honoured);
-    /// - on the warm-reattach path, a `Tab::Mode`'s SIDE panes, which are not
-    ///   daemon-tracked — `open_mode_tab_with_existing_agent_pane` adopts the
-    ///   hydrated agent pane and spawns the side panes fresh from the project
-    ///   config. The agent pane is daemon-supplied and survives this filter; its
-    ///   side panes do not.
+    /// by identity. That is EVERY restored pane on the daemon-EMPTY rebuild
+    /// path (pass an empty set there, and nothing id-shaped is honoured).
     ///
     /// Reusing a counter is worse than useless rather than merely unhelpful: a
     /// startup that recreates the same panes in the same order happens to
     /// reproduce the same numbers, but one that does not — a pane closed and
-    /// another created before the snapshot was written, or a mode's side-pane
-    /// list edited between runs — reassigns a remembered number to a DIFFERENT
-    /// pane, and restores focus, and every keystroke after it, to the wrong
-    /// terminal instead of failing to restore. A silent wrong answer is the one
+    /// another created before the snapshot was written — reassigns a
+    /// remembered number to a DIFFERENT pane, and restores focus, and every
+    /// keystroke after it, to the wrong terminal instead of failing to restore. A silent wrong answer is the one
     /// outcome worth engineering against here.
     ///
     /// [`crate::tab::TabManager::apply_focus_snapshot`] then still honours a
@@ -571,12 +865,11 @@ impl SavedSession {
 
     /// Build a `SavedSession` snapshot from the live UI state.
     ///
-    /// Must be called *before* tearing down mode/orchestration tabs — i.e., while
+    /// Must be called *before* tearing down orchestration tabs — i.e., while
     /// `live_panes` (the authoritative `state.managed_pane_ids`) still contains
-    /// every pane, including mode-tab agent panes that carry `mode = Some(...)`.
-    /// `retain` here only prunes panes the user externally closed before exit;
-    /// running it after teardown would also drop the mode-tab agent pane and lose
-    /// the mode field, breaking auto-restore of the mode tab (PRD #69).
+    /// every pane. `retain` here only prunes panes the user externally closed
+    /// before exit; running it after teardown would also drop the tabs' panes
+    /// and lose their metadata, breaking auto-restore of those tabs (PRD #69).
     pub fn snapshot(
         pane_metadata: &mut HashMap<String, SavedPane>,
         pane_display_names: &HashMap<String, String>,
@@ -769,6 +1062,73 @@ pub struct IssueDispatchConfig {
     /// schedule safely. Off by default.
     #[serde(default)]
     pub dry_run: bool,
+    /// PRD #421 Phase 3: the `claim_gating` / `claim_ttl_hours` keys, written
+    /// flat on the `[scheduled_tasks.issue_dispatch]` table.
+    #[serde(flatten)]
+    pub claim: ClaimGatingConfig,
+}
+
+/// PRD #421 M3.4: whether a live claim on GitHub stops an `issue_dispatch`
+/// task from dispatching an issue, and for how long a claim record stays live
+/// after its last edit. File-only keys of `[scheduled_tasks.issue_dispatch]`.
+/// The switch turns off the GATE only: the claim is written, and the owner's
+/// record refreshed, either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimGatingConfig {
+    /// `claim_gating`: honour other decks' live claims. Default `false`.
+    #[serde(rename = "claim_gating", default, skip_serializing_if = "is_false")]
+    pub gating: bool,
+    /// `claim_ttl_hours`: how long after its last edit a claim record stays
+    /// live. From 1 to [`crate::issue_dispatch::MAX_CLAIM_TTL_HOURS`] (checked
+    /// at load); default [`crate::issue_dispatch::DEFAULT_CLAIM_TTL_HOURS`].
+    /// The deck's claim records carry it, and other decks read them with it.
+    #[serde(
+        rename = "claim_ttl_hours",
+        default = "default_claim_ttl_hours",
+        skip_serializing_if = "is_default_claim_ttl_hours"
+    )]
+    pub ttl_hours: u32,
+    /// Why the load turned `gating` off although the file turns it on: the
+    /// TTL cannot be kept current by the task's cron (PRD #421 M3.1). Set at
+    /// load and never written back, so a CLI edit that rewrites the file keeps
+    /// the user's `claim_gating = true`.
+    #[serde(skip)]
+    pub gating_off: Option<String>,
+}
+
+impl Default for ClaimGatingConfig {
+    fn default() -> Self {
+        Self {
+            gating: false,
+            ttl_hours: default_claim_ttl_hours(),
+            gating_off: None,
+        }
+    }
+}
+
+impl ClaimGatingConfig {
+    /// Whether a fire should consult claims: switched on, and not turned off
+    /// at load.
+    pub fn gating_in_effect(&self) -> bool {
+        self.gating && self.gating_off.is_none()
+    }
+
+    /// The claim TTL as a duration.
+    pub fn ttl(&self) -> chrono::Duration {
+        chrono::Duration::hours(i64::from(self.ttl_hours))
+    }
+}
+
+fn default_claim_ttl_hours() -> u32 {
+    crate::issue_dispatch::DEFAULT_CLAIM_TTL_HOURS
+}
+
+fn is_default_claim_ttl_hours(hours: &u32) -> bool {
+    *hours == default_claim_ttl_hours()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One `[[scheduled_tasks]]` entry from the global
@@ -984,12 +1344,15 @@ impl LoadedSchedules {
 
 /// Validate a freshly-parsed task and apply load-time path expansion. A
 /// hand-edited entry with no (or blank) `command` is REJECTED here (PRD #127
-/// follow-up, USER DECISION): a scheduled task needs an agent command to act on
+/// follow-up, USER DECISION): a schedule needs an agent command to act on
 /// its prompt, and there is no silent `$SHELL` fallback. Rejection mirrors the
 /// malformed-entry path — the error is surfaced via the daemon's notification
 /// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
 /// crashing the daemon.
-fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, ScheduleLoadError> {
+fn validate_task(
+    mut task: ScheduledTask,
+    index: usize,
+) -> Result<ScheduledTask, ScheduleLoadError> {
     // Issue #835: validate the `shape` STRING here, next to the issue-dispatch
     // slug check and for the same reason — it arrives from hand-edited TOML and
     // is re-read unattended by the daemon on every fire, so a typo must be a load
@@ -1001,7 +1364,7 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
     {
         return Err(ScheduleLoadError {
             entry: Some(index),
-            message: format!("scheduled task {:?}: {message}", task.name),
+            message: format!("schedule {:?}: {message}", task.name),
         });
     }
     // fork #222: an unbounded `task.name` lets two scheduled tasks' marker-creator
@@ -1060,7 +1423,7 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
         ) {
             return Err(ScheduleLoadError {
                 entry: Some(index),
-                message: format!("scheduled task {:?}: {message}", task.name),
+                message: format!("schedule {:?}: {message}", task.name),
             });
         }
         // Issue #835: `shape` has nothing to apply to on an issue-dispatch task —
@@ -1072,12 +1435,33 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
             return Err(ScheduleLoadError {
                 entry: Some(index),
                 message: format!(
-                    "scheduled task {:?}: `shape` cannot be combined with \
+                    "schedule {:?}: `shape` cannot be combined with \
                      `issue_dispatch` (an issue-dispatch task resolves a shape per \
                      cloned repo, from that repo's own config); remove one of them",
                     task.name
                 ),
             });
+        }
+        if let Err(message) = crate::issue_dispatch::validate_claim_ttl_hours(disp.claim.ttl_hours)
+        {
+            return Err(ScheduleLoadError {
+                entry: Some(index),
+                message: format!("schedule {:?}: {message}", task.name),
+            });
+        }
+        // PRD #421 M3.1: a TTL the cron cannot keep current turns the GATE off
+        // rather than rejecting the task — dispatching, and writing the claim,
+        // carry on. The scheduler reports why on every (re)load.
+        if disp.claim.gating {
+            let gating_off = crate::issue_dispatch::check_claim_ttl_against_cron(
+                &task.cron,
+                disp.claim.ttl_hours,
+                &chrono::Local::now(),
+            )
+            .err();
+            if let Some(disp) = task.issue_dispatch.as_mut() {
+                disp.claim.gating_off = gating_off;
+            }
         }
         return Ok(expand_task(task));
     }
@@ -1086,8 +1470,8 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
         _ => Err(ScheduleLoadError {
             entry: Some(index),
             message: format!(
-                "scheduled task {:?} has no `command`; a command is required \
-                 (a scheduled task needs an agent command to act on its prompt — \
+                "schedule {:?} has no `command`; a command is required \
+                 (a schedule needs an agent command to act on its prompt — \
                  there is no $SHELL fallback)",
                 task.name
             ),
@@ -1104,14 +1488,36 @@ fn expand_task(mut task: ScheduledTask) -> ScheduledTask {
 /// Expand `~` and `$VAR` / `${VAR}` in a path, then resolve a relative result
 /// against `$HOME` (NOT any agent cwd — the authoring agent's cwd is
 /// irrelevant for a global daemon). PRD #127 Open Q7.
+///
+/// The `~` expansion uses the host's own separator (issue #1136). On Windows
+/// the home directory is native (`C:\Users\me`), so gluing the remainder onto
+/// it with a literal `/` produced the mixed-separator `C:\Users\me/proj`. That
+/// string resolves — Win32 accepts `/` — but it does not stay in memory: it is
+/// persisted to `schedules.toml` by `schedule add`/`update`, applied to every
+/// loaded task's `working_dir`, shown back to the user, and carried over the
+/// protocol as a fire's `working_dir` or an orchestration cwd. So what it cost
+/// was inconsistent stored and displayed text, not a failed spawn.
+///
+/// **Only the tilde expansion changes.** A path the user typed without a `~` is
+/// passed through exactly as typed on both platforms, and the relative-vs-
+/// absolute test stays the leading-`/` one rather than becoming
+/// `Path::is_absolute`. On Windows those differ — `/work/space` is rooted on
+/// whichever drive is current, so `is_absolute` is false and it would be
+/// re-anchored as `C:\work\space` — but that is a change to text the user
+/// wrote, not to text this function welded together, and several tests pin the
+/// current behaviour. Whether a driveless rooted path should be anchored at all
+/// belongs with native Windows support (#164), not here.
 pub fn expand_path(input: &str) -> String {
+    use crate::platform::paths::{join_home_and_rest, strip_tilde_prefix};
+
     let home = dirs_home();
 
-    // `~` / `~/...` → home.
+    // `~` / `~/...` → home. `~\...` counts too on Windows, where `\` is a path
+    // separator; on Unix it names a directory and is left alone.
     let after_tilde = if input == "~" {
         return home.to_string_lossy().into_owned();
-    } else if let Some(rest) = input.strip_prefix("~/") {
-        format!("{}/{}", home.to_string_lossy(), rest)
+    } else if let Some(rest) = strip_tilde_prefix(input) {
+        join_home_and_rest(&home.to_string_lossy(), rest)
     } else {
         input.to_string()
     };
@@ -1460,7 +1866,7 @@ pub(crate) fn config_dir() -> PathBuf {
 pub const EXPERIMENTAL_ENV: &str = "DOT_AGENT_DECK_EXPERIMENTAL";
 
 /// Internal mirror of the `.dot-agent-deck.toml` shape for the `[features]`
-/// table only. Every other key (`[[modes]]`, `[[orchestrations]]`, …) is
+/// table only. Every other key (`[[orchestrations]]`, …) is
 /// ignored, so this loader is decoupled from `ProjectConfig`'s schema and an
 /// absent `[features]` table deserializes to the default (experimental =
 /// false).
@@ -2097,6 +2503,144 @@ mod tests {
     use super::*;
     use spec::spec;
 
+    /// PRD #1258 (PR #1672 review): the reporting read hands back every warning
+    /// the plain bounded read would log — so the host sampler, which reads on
+    /// every sample, can log each one once — and still keeps the rest of a file
+    /// whose `host_metrics` is not a table.
+    #[test]
+    fn a_reporting_bounded_load_returns_its_warnings_instead_of_logging_them() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (config, warnings) = DashboardConfig::load_bounded_reporting_from(&path);
+        assert_eq!((config.default_command.as_str(), warnings.len()), ("", 0));
+
+        std::fs::write(
+            &path,
+            "default_command = \"claude\"\n[host_metrics]\nload_per_core_warn = 1\n",
+        )
+        .unwrap();
+        let (config, warnings) = DashboardConfig::load_bounded_reporting_from(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.default_command, "claude");
+        assert!(config.host_metrics.contains_key("load_per_core_warn"));
+
+        std::fs::write(&path, "default_command = \"claude\"\nhost_metrics = 5\n").unwrap();
+        let (config, warnings) = DashboardConfig::load_bounded_reporting_from(&path);
+        assert_eq!(
+            config.default_command, "claude",
+            "the rest of the file survives"
+        );
+        assert!(config.host_metrics.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("not a table"), "{warnings:?}");
+
+        for (contents, says) in [
+            ("default_command = [unclosed\n", "malformed TOML"),
+            ("bell = 5\n", "wrong type"),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            let (config, warnings) = DashboardConfig::load_bounded_reporting_from(&path);
+            assert_eq!(config.default_command, "", "{contents}: the defaults");
+            assert_eq!(warnings.len(), 1, "{contents}: {warnings:?}");
+            assert!(warnings[0].contains(says), "{contents}: {warnings:?}");
+            assert!(
+                !warnings[0].contains("unclosed"),
+                "no file content is quoted"
+            );
+        }
+
+        let (_, warnings) = DashboardConfig::load_bounded_reporting_from(dir.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("not read"), "{warnings:?}");
+    }
+
+    /// PRD #1223 audit A4: the daemon's bounded read of `config.toml` answers
+    /// what `load` answers for an ordinary file — including one reached through
+    /// a symlink — and falls back to the defaults for no file at all.
+    #[test]
+    fn a_bounded_load_reads_an_ordinary_config_and_follows_a_link_to_one() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(
+            DashboardConfig::load_bounded_from(&path).default_command,
+            "",
+            "no file is the defaults"
+        );
+
+        std::fs::write(&path, "default_command = \"opencode --model x\"\n").unwrap();
+        assert_eq!(
+            DashboardConfig::load_bounded_from(&path).default_command,
+            "opencode --model x"
+        );
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linked.toml");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(
+                DashboardConfig::load_bounded_from(&link).default_command,
+                "opencode --model x",
+                "a dotfiles-style link to a regular config is followed, as `load` follows it"
+            );
+        }
+
+        std::fs::write(&path, "default_command = [\n").unwrap();
+        assert_eq!(
+            DashboardConfig::load_bounded_from(&path).default_command,
+            "",
+            "a malformed config is the defaults"
+        );
+    }
+
+    /// Audit A4: a config over [`MAX_DASHBOARD_CONFIG_BYTES`] is not read into
+    /// memory; the daemon answers with the defaults instead.
+    #[test]
+    fn a_bounded_load_refuses_an_oversized_config() {
+        assert_eq!(
+            MAX_DASHBOARD_CONFIG_BYTES,
+            crate::project_resolve::MAX_PROJECT_CONFIG_BYTES
+        );
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut body = String::from("default_command = \"claude\"\n#");
+        body.push_str(&"x".repeat(MAX_DASHBOARD_CONFIG_BYTES as usize));
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(
+            DashboardConfig::load_bounded_from(&path).default_command,
+            ""
+        );
+    }
+
+    /// Audit A4: a FIFO at the config path — directly or behind a link — is
+    /// refused without blocking in the open, where `load`'s plain read would
+    /// wait for a writer forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_load_refuses_a_fifo_without_blocking() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let fifo = dir.path().join("config.toml");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `mkfifo` only reads through it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+        let link = dir.path().join("linked.toml");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+
+        for path in [fifo, link] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let probe = path.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(DashboardConfig::load_bounded_from(&probe).default_command);
+            });
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("{}: the bounded load blocked", path.display())),
+                ""
+            );
+        }
+    }
+
     /// The pure trust rule the ancestor walk stops on (issue #577). Split out
     /// of the filesystem check so the deletion-unsafe direction — adopting an
     /// ancestor config we do not own — is exercised without needing a
@@ -2721,7 +3265,11 @@ project_path = "/repo/app"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.toml");
         let prev = std::env::var("DOT_AGENT_DECK_SESSION").ok();
-        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        // SAFETY: a stated residual, not a proof (issue #1516). This test starts
+        // no runtime and no thread, so under nextest the threads that exist are
+        // its own and libtest's runner thread, which waits for it. Under plain
+        // `cargo test` it takes no lock and races any sibling test reading the
+        // environment (issue #245).
         unsafe {
             std::env::set_var("DOT_AGENT_DECK_SESSION", path.to_str().unwrap());
         }
@@ -2766,6 +3314,7 @@ project_path = "/repo/app"
         assert!(bc.should_bell(&SessionStatus::WaitingForInput));
         assert!(!bc.should_bell(&SessionStatus::Idle));
         assert!(bc.should_bell(&SessionStatus::Error));
+        assert!(bc.should_bell(&SessionStatus::Blocked));
         assert!(!bc.should_bell(&SessionStatus::Thinking));
         assert!(!bc.should_bell(&SessionStatus::Working));
         assert!(!bc.should_bell(&SessionStatus::Compacting));
@@ -2853,7 +3402,11 @@ project_path = "/repo/app"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("star.json");
         let prev = std::env::var("DOT_AGENT_DECK_STAR_PROMPT").ok();
-        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        // SAFETY: a stated residual, not a proof (issue #1516). This test starts
+        // no runtime and no thread, so under nextest the threads that exist are
+        // its own and libtest's runner thread, which waits for it. Under plain
+        // `cargo test` it takes no lock and races any sibling test reading the
+        // environment (issue #245).
         unsafe {
             std::env::set_var("DOT_AGENT_DECK_STAR_PROMPT", path.to_str().unwrap());
         }
@@ -2937,6 +3490,138 @@ timeout_secs = 600
         );
     }
 
+    /// PRD #1223: `config set default_dir` takes an absolute path, refuses a
+    /// relative one, unsets on empty, and an unset key is not written back.
+    #[test]
+    fn default_dir_is_settable_absolute_only_and_omitted_when_empty() {
+        let mut dc = DashboardConfig::default();
+        assert_eq!(dc.get_field("default_dir").unwrap(), "");
+        dc.set_field("default_dir", "/srv/reports").unwrap();
+        assert_eq!(dc.get_field("default_dir").unwrap(), "/srv/reports");
+        assert!(dc.set_field("default_dir", "reports").is_err());
+        assert_eq!(dc.default_dir, "/srv/reports");
+        assert!(
+            toml::to_string_pretty(&dc)
+                .unwrap()
+                .contains("default_dir = \"/srv/reports\"")
+        );
+        dc.set_field("default_dir", "").unwrap();
+        assert!(!toml::to_string_pretty(&dc).unwrap().contains("default_dir"));
+        let parsed: DashboardConfig = toml::from_str("default_dir = \"/srv/x\"").unwrap();
+        assert_eq!(parsed.default_dir, "/srv/x");
+        assert!(CONFIG_KEYS.iter().any(|(key, _)| *key == "default_dir"));
+    }
+
+    /// PRD #1258: the `[host_metrics]` thresholds are kept as written, so a
+    /// bad value never fails the rest of `config.toml` and a `config set` of
+    /// another key writes them back unchanged; `config set` refuses a value
+    /// out of range or one that would make its pair's critical limit less
+    /// strict than its warning, `config get` reports the threshold in effect,
+    /// and a `host_metrics` that is not a table is dropped without failing the
+    /// file.
+    #[test]
+    fn host_metrics_thresholds_round_trip_and_are_validated_by_config_set() {
+        let dc: DashboardConfig = toml::from_str(
+            "default_command = \"claude\"\n[host_metrics]\nload_per_core_warn = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dc.default_command, "claude",
+            "the rest of the file survives"
+        );
+        assert_eq!(
+            dc.get_field("host_metrics.load_per_core_warn").unwrap(),
+            "0.8"
+        );
+        assert!(
+            toml::to_string_pretty(&dc)
+                .unwrap()
+                .contains("load_per_core_warn = \"x\""),
+            "kept as written"
+        );
+
+        let mut dc = DashboardConfig::default();
+        assert!(
+            !toml::to_string_pretty(&dc)
+                .unwrap()
+                .contains("host_metrics"),
+            "an unset table is not written"
+        );
+        dc.set_field("host_metrics.disk_free_warn_percent", "20")
+            .unwrap();
+        dc.set_field("host_metrics.load_per_core_critical", "2.5")
+            .unwrap();
+        assert_eq!(
+            dc.get_field("host_metrics.disk_free_warn_percent").unwrap(),
+            "20"
+        );
+        assert_eq!(
+            dc.get_field("host_metrics.load_per_core_critical").unwrap(),
+            "2.5"
+        );
+        let written = toml::to_string_pretty(&dc).unwrap();
+        assert!(
+            written.contains("disk_free_warn_percent = 20\n"),
+            "{written}"
+        );
+        assert!(
+            written.contains("load_per_core_critical = 2.5\n"),
+            "{written}"
+        );
+        for (key, value) in [
+            ("host_metrics.disk_free_warn_percent", "101"),
+            ("host_metrics.load_per_core_warn", "-1"),
+            ("host_metrics.load_per_core_warn", "inf"),
+            ("host_metrics.load_per_core_warn", "busy"),
+        ] {
+            assert!(dc.set_field(key, value).is_err(), "{key} = {value}");
+        }
+        assert!(dc.set_field("host_metrics.typo", "1").is_err());
+        assert!(dc.get_field("host_metrics.typo").is_err());
+
+        // PR #1672 review: a value that would invert its pair is refused,
+        // naming the other limit, rather than written and then ignored.
+        let mut dc = DashboardConfig::default();
+        let err = dc
+            .set_field("host_metrics.disk_free_warn_percent", "3")
+            .unwrap_err();
+        assert!(
+            err.contains("host_metrics.disk_free_critical_percent = 5") && err.contains("first"),
+            "{err}"
+        );
+        assert!(dc.host_metrics.is_empty(), "nothing was written");
+        dc.set_field("host_metrics.disk_free_critical_percent", "2")
+            .unwrap();
+        dc.set_field("host_metrics.disk_free_warn_percent", "3")
+            .unwrap();
+        let err = dc
+            .set_field("host_metrics.load_per_core_critical", "0.5")
+            .unwrap_err();
+        assert!(
+            err.contains("host_metrics.load_per_core_warn = 0.8"),
+            "{err}"
+        );
+        dc.set_field("host_metrics.load_per_core_warn", "1.5")
+            .unwrap();
+        assert_eq!(
+            dc.get_field("host_metrics.load_per_core_warn").unwrap(),
+            "1.5",
+            "equal limits are allowed"
+        );
+        for key in crate::host_metrics::HEALTH_THRESHOLD_KEYS {
+            let full = format!("host_metrics.{key}");
+            assert!(
+                CONFIG_KEYS.iter().any(|(k, _)| *k == full),
+                "{full} is listed"
+            );
+        }
+
+        let dc: DashboardConfig =
+            toml::from_str("default_command = \"claude\"\nhost_metrics = 5\n").unwrap();
+        assert_eq!(dc.default_command, "claude");
+        assert!(dc.host_metrics.is_empty());
+    }
+
     #[test]
     fn auto_config_prompt_defaults_to_true() {
         let dc = DashboardConfig::default();
@@ -2955,16 +3640,21 @@ timeout_secs = 600
         assert!(!dc.auto_config_prompt);
     }
 
-    // PRD #42 M2: asserts the Unix `/tmp` + per-uid fallback specifically
+    // PRD #42 M2: asserts the Unix temp-dir + per-uid fallback specifically
     // (`current_uid()` is Unix-only and the path shape is POSIX), so it is
     // gated to Unix. The Windows endpoint is a per-user named pipe with no
-    // `/tmp`/uid analogue — covered separately under PRD #163/#164.
+    // temp-dir/uid analogue — covered separately under PRD #163/#164.
+    //
+    // Issue #1121 moved where the per-uid component sits — from a suffix on
+    // each socket's own name to the directory holding both — so this reads it
+    // off the directory now. The property being pinned is the one it always
+    // was and the reason is unchanged.
     #[cfg(unix)]
     #[test]
     fn attach_socket_fallback_is_per_user() {
         // PRD #93 round-2 reviewer REV-2: when XDG_RUNTIME_DIR is unset
-        // *and* DOT_AGENT_DECK_ATTACH_SOCKET is unset, the fallback under
-        // /tmp must include the uid so two users on the same host don't
+        // *and* DOT_AGENT_DECK_ATTACH_SOCKET is unset, the temp-dir fallback
+        // must include the uid so two users on the same host don't
         // collide. The old `/tmp/dot-agent-deck-attach.sock` would
         // sandwich two daemons onto one path and let the first binder
         // arbitrarily lock the rest of the host out.
@@ -2972,7 +3662,11 @@ timeout_secs = 600
         let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
         let prev_sock = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
         let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: state-dir lock held, restored on the way out.
+        // SAFETY: a stated residual, not a proof (issue #1516). The state-dir
+        // lock excludes the sibling tests that take it, not threads. This test
+        // starts no runtime and no thread, so under nextest the threads that
+        // exist are its own and libtest's runner thread, which waits for it.
+        // Restored on the way out.
         unsafe {
             std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET");
             std::env::remove_var("DOT_AGENT_DECK_SOCKET");
@@ -2980,21 +3674,36 @@ timeout_secs = 600
         }
 
         let uid = crate::platform::paths::current_uid();
+        let dir = crate::platform::paths::fallback_endpoint_dir();
         let attach = attach_socket_path();
         let hook = socket_path();
-        let attach_str = attach.to_string_lossy();
-        let hook_str = hook.to_string_lossy();
-        assert!(
-            attach_str.contains(&format!("-{uid}.sock")),
-            "attach fallback must embed uid: got {attach_str}"
+        assert_eq!(
+            dir.file_name().and_then(|name| name.to_str()),
+            Some(format!("dot-agent-deck-{uid}").as_str()),
+            "the fallback endpoint directory must embed the uid: got {}",
+            dir.display()
         );
-        assert!(
-            hook_str.contains(&format!("-{uid}.sock")),
-            "hook fallback must embed uid: got {hook_str}"
+        assert_eq!(
+            attach.parent(),
+            Some(dir.as_path()),
+            "attach fallback must live in the per-uid directory: got {}",
+            attach.display()
         );
-        assert!(
-            attach_str.starts_with("/tmp/"),
-            "attach fallback should live under /tmp when XDG is unset: got {attach_str}"
+        assert_eq!(
+            hook.parent(),
+            Some(dir.as_path()),
+            "hook fallback must live in the per-uid directory: got {}",
+            hook.display()
+        );
+        assert_ne!(
+            attach, hook,
+            "the two protocols must not share one endpoint"
+        );
+        assert_eq!(
+            dir.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the fallback directory sits directly under the temp dir: got {}",
+            dir.display()
         );
 
         // SAFETY: same lock; restoring previous values.
@@ -3466,7 +4175,10 @@ prompt = "hi"
         {
             let home = crate::platform::paths::home_dir();
             assert!(minimal.working_dir.starts_with(&*home.to_string_lossy()));
-            assert!(minimal.working_dir.ends_with("scheduled/morning"));
+            // Issue #1136: the remainder is now spelled with the host's own
+            // separator. The `scheduled/morning` this used to assert IS the
+            // mixed-separator text the issue is about — `C:\Users\me/scheduled/morning`.
+            assert!(minimal.working_dir.ends_with(r"scheduled\morning"));
             assert!(!minimal.working_dir.contains('~'));
         }
 
@@ -3633,6 +4345,164 @@ repo = "vfarcic/dot-ai"
         );
     }
 
+    /// One issue-dispatch task on `cron` with `claim_keys` appended to its
+    /// `[scheduled_tasks.issue_dispatch]` table.
+    fn issue_dispatch_toml(cron: &str, claim_keys: &str) -> String {
+        format!(
+            r#"
+[[scheduled_tasks]]
+name = "Issues vfarcic/dot-ai"
+cron = "{cron}"
+working_dir = "/work/space"
+prompt = "Work on issue {{{{issue_number}}}}"
+
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"
+{claim_keys}
+"#
+        )
+    }
+
+    fn loaded_claim(toml_str: &str) -> ClaimGatingConfig {
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(loaded.errors.is_empty(), "errors: {:?}", loaded.errors);
+        loaded.tasks[0]
+            .issue_dispatch
+            .as_ref()
+            .expect("issue-dispatch task")
+            .claim
+            .clone()
+    }
+
+    // PRD #421 M3.4 — the claim keys are optional: gating off, a week's TTL.
+    #[test]
+    fn issue_dispatch_claim_keys_default_to_gating_off_and_a_week() {
+        let claim = loaded_claim(&issue_dispatch_toml("0 9 * * MON-FRI", ""));
+        assert_eq!(claim, ClaimGatingConfig::default());
+        assert!(!claim.gating && claim.ttl_hours == 168 && claim.gating_off.is_none());
+        assert!(!claim.gating_in_effect());
+        assert_eq!(claim.ttl(), chrono::Duration::hours(168));
+    }
+
+    #[test]
+    fn issue_dispatch_claim_keys_are_read_from_the_issue_dispatch_table() {
+        let claim = loaded_claim(&issue_dispatch_toml(
+            "0 9 * * MON-FRI",
+            "claim_gating = true\nclaim_ttl_hours = 150",
+        ));
+        assert!(claim.gating && claim.ttl_hours == 150 && claim.gating_off.is_none());
+        assert!(claim.gating_in_effect());
+        let off = loaded_claim(&issue_dispatch_toml(
+            "0 9 * * *",
+            "claim_gating = false\nclaim_ttl_hours = 48",
+        ));
+        assert!(!off.gating_in_effect() && off.ttl_hours == 48);
+    }
+
+    // PRD #421 M3.4 — `claim_ttl_hours` is validated like the other keys: a
+    // value below 1 or above 2160 (90 days), or one that is not a non-negative
+    // integer, rejects the entry while its siblings still load.
+    #[test]
+    fn issue_dispatch_rejects_a_claim_ttl_outside_one_hour_to_ninety_days() {
+        assert!(
+            loaded_claim(&issue_dispatch_toml("0 9 * * *", "claim_ttl_hours = 2160")).ttl_hours
+                == 2160
+        );
+        for keys in [
+            "claim_ttl_hours = 0",
+            "claim_ttl_hours = 2161",
+            "claim_ttl_hours = -5",
+            "claim_ttl_hours = \"a week\"",
+            "claim_gating = \"yes\"",
+        ] {
+            let toml_str = format!(
+                "{}\n{}",
+                issue_dispatch_toml("0 9 * * *", keys),
+                r#"
+[[scheduled_tasks]]
+name = "sibling"
+cron = "0 9 * * *"
+working_dir = "/work/space"
+command = "claude"
+prompt = "go"
+"#
+            );
+            let loaded = LoadedSchedules::parse(&toml_str);
+            assert_eq!(loaded.errors.len(), 1, "{keys}: {:?}", loaded.errors);
+            assert_eq!(loaded.errors[0].entry, Some(0), "{keys}");
+            assert_eq!(
+                loaded
+                    .tasks
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["sibling"],
+                "{keys}"
+            );
+        }
+    }
+
+    // PRD #421 M3.1 — a TTL the task's cron cannot keep current (the weekday
+    // cron's 72h weekend gap needs 145h) loads the task with gating turned
+    // OFF rather than rejecting it, and says why.
+    #[test]
+    fn issue_dispatch_turns_gating_off_when_the_ttl_cannot_cover_the_cron() {
+        let claim = loaded_claim(&issue_dispatch_toml(
+            "0 9 * * MON-FRI",
+            "claim_gating = true\nclaim_ttl_hours = 100",
+        ));
+        assert!(claim.gating, "the file's setting is kept");
+        assert!(!claim.gating_in_effect(), "but the gate is off");
+        let reason = claim.gating_off.expect("the reason is recorded");
+        assert!(
+            reason.contains("claim_ttl_hours = 100") && reason.contains("0 9 * * MON-FRI"),
+            "{reason}"
+        );
+        // Gating switched off needs no check, so records no reason.
+        let off = loaded_claim(&issue_dispatch_toml(
+            "0 9 * * MON-FRI",
+            "claim_ttl_hours = 100",
+        ));
+        assert_eq!(off.gating_off, None);
+    }
+
+    // PRD #421 M3.1 — the load-time "gating off" is never written back: a CLI
+    // edit that rewrites the file keeps the user's `claim_gating = true`, and
+    // keys left at their defaults stay out of the file.
+    #[test]
+    fn issue_dispatch_claim_keys_round_trip_without_the_load_time_verdict() {
+        let tasks = LoadedSchedules::parse(&issue_dispatch_toml(
+            "0 9 * * MON-FRI",
+            "claim_gating = true\nclaim_ttl_hours = 100",
+        ))
+        .tasks;
+        assert!(
+            tasks[0]
+                .issue_dispatch
+                .as_ref()
+                .unwrap()
+                .claim
+                .gating_off
+                .is_some()
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("schedules.toml");
+        crate::schedule_cli::write_atomic(&path, &tasks).expect("write schedules");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("claim_gating = true") && written.contains("claim_ttl_hours = 100"),
+            "{written}"
+        );
+        let reloaded = LoadedSchedules::load_from(&path);
+        assert!(reloaded.errors.is_empty(), "errors: {:?}", reloaded.errors);
+        assert_eq!(reloaded.tasks, tasks);
+
+        let defaults = LoadedSchedules::parse(&issue_dispatch_toml("0 9 * * *", "")).tasks;
+        crate::schedule_cli::write_atomic(&path, &defaults).expect("write schedules");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("claim_"), "{written}");
+    }
+
     // Issue #835 — a `shape` scalar round-trips through the file and is carried
     // on the loaded task. The field sits BEFORE `issue_dispatch` in the struct
     // precisely so it serializes ahead of any sub-table; this asserts the value
@@ -3795,6 +4665,7 @@ repo = "vfarcic/dot-ai"
                     triage: false,
                     repo_allowlist: None,
                     dry_run: false,
+                    claim: Default::default(),
                 }),
             },
         ];
@@ -3906,6 +4777,84 @@ label = "-rf"
             match prev_var {
                 Some(v) => std::env::set_var("DAD_BRACE", v),
                 None => std::env::remove_var("DAD_BRACE"),
+            }
+        }
+    }
+
+    /// Issue #1136: `expand_path` must hand back a path spelled with the host's
+    /// own separator, and must recognise the host's own tilde forms.
+    ///
+    /// On Windows the home directory is native (`C:\Users\me`), so the old
+    /// `format!("{home}/{rest}")` glue produced `C:\Users\me/proj` — it
+    /// resolves, but it is persisted to `schedules.toml`, displayed, and sent
+    /// over the protocol as a fire's `working_dir`. And `~\proj`, the form a
+    /// Windows user actually types, missed the `~/` test entirely and came back
+    /// as `C:\Users\me\~\proj`.
+    ///
+    /// The Unix half is a preservation assertion: `\` is a legal character in a
+    /// Unix file name, so `~\proj` there is a directory name and nothing about
+    /// this platform's output moves.
+    #[test]
+    fn expand_path_uses_the_host_separator_and_tilde_forms() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: env-var lock held; restored below.
+        unsafe {
+            std::env::set_var("HOME", "/home/tester");
+        }
+
+        #[cfg(unix)]
+        {
+            assert_eq!(expand_path("~/proj"), "/home/tester/proj");
+            assert_eq!(expand_path("~/proj/sub"), "/home/tester/proj/sub");
+            // NOT a tilde path here, and deliberately unchanged by #1136.
+            assert_eq!(expand_path(r"~\proj"), r"/home/tester/~\proj");
+            // An absolute path is returned as it was typed, a relative one is
+            // anchored at $HOME, and a backslash inside a name survives both.
+            assert_eq!(expand_path("/abs/path"), "/abs/path");
+            assert_eq!(expand_path("rel/path"), "/home/tester/rel/path");
+            assert_eq!(expand_path(r"odd\name"), r"/home/tester/odd\name");
+        }
+
+        #[cfg(windows)]
+        {
+            let home = crate::platform::paths::home_dir();
+            let expected = home.join("proj");
+
+            // Exact text, derived from the resolver rather than hardcoded: the
+            // username varies per machine, and asserting the *text* is the
+            // whole point — the path equality below would hold for the
+            // mixed-separator spelling too, since both parse to the same
+            // components.
+            let expected_text = format!("{}\\proj", home.to_string_lossy());
+            for input in ["~/proj", r"~\proj"] {
+                let got = expand_path(input);
+                assert_eq!(
+                    got, expected_text,
+                    "{input} must expand to the `proj` directory under the home \
+                     directory, spelled with the host's own separator"
+                );
+                assert_eq!(Path::new(&got), expected.as_path());
+            }
+
+            // Untouched by #1136, and asserted so the narrowing stays pinned:
+            // a non-tilde path is passed through exactly as typed. A relative
+            // one still anchors at the home directory; a drive-absolute one and
+            // a Unix-style rooted one both come back verbatim, forward slashes
+            // and all.
+            assert_eq!(
+                Path::new(&expand_path("rel/path")),
+                home.join("rel").join("path").as_path()
+            );
+            assert_eq!(expand_path(r"D:\work"), r"D:\work");
+            assert_eq!(expand_path("/work/space"), "/work/space");
+        }
+
+        // SAFETY: same lock held; restore the previous value.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
             }
         }
     }

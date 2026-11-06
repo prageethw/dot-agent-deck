@@ -40,10 +40,11 @@ on:
   # trigger lands first and sits inert until the setting flips.
   #
   # Context names are what a ruleset matches, and they do not move with the event:
-  # no job in this file carries a job-level `name:` or a `strategy:` matrix, so
-  # `build`, `build-macos`, `build-windows`, `security` and `e2e-deterministic`
-  # each report under their own job id here exactly as they do on a
-  # `pull_request`. A job that ran but reported a DIFFERENT context would hang the
+  # none of the five required jobs carries a job-level `name:` or a `strategy:`
+  # matrix (the `e2e` shards do, which is one reason `e2e-deterministic`
+  # aggregates them), so `build`, `build-macos`, `build-windows`, `security` and
+  # `e2e-deterministic` each report under their own job id here exactly as they
+  # do on a `pull_request`. A job that ran but reported a DIFFERENT context would hang the
   # queue just as surely as one that never ran.
   #
   # The `changes` gate below is safe here for the reason its own comment gives
@@ -89,6 +90,21 @@ permissions:
   # anything to inspect.
   pull-requests: read
 
+# Rust caches are SAVED only from `main` (`save-if` on every
+# `Swatinem/rust-cache` step) and RESTORED everywhere. A cache saved by a PR or
+# a branch is scoped to that ref — no other PR can read it — yet it counts
+# against the repository's 10 GB limit like any other, and `main`'s own set
+# already fills ~9 GB of it (Rust caches for ten jobs plus the devbox Nix
+# store). Every PR saving its own copies pushed the total over the limit, so
+# GitHub evicted entries continuously — `main`'s included, which every PR
+# restores from — and about half of `main`'s runs restored no Rust cache at all
+# (measured 2026-10-18: 11.9 GB in 1,628 entries). With saves on `main` only,
+# a PR restores `main`'s warm cache and adds nothing. A PR that changes
+# Cargo.lock restores the nearest older `main` entry (rust-cache falls back by
+# key prefix) and builds the difference. The devbox job's
+# `devbox-install-action` cache has no equivalent switch and still saves per
+# ref.
+#
 # Issue #811 — every `actions/checkout` in this file carries
 # `persist-credentials: false`. The action defaults that input to TRUE, which
 # makes it run `git config --local http.https://github.com/.extraheader` in the
@@ -96,7 +112,7 @@ permissions:
 # `.git/config` for the life of the job, readable by anything the job runs.
 # `e2e-deterministic` is the sharp case and has its own note below — it executes
 # the PTY e2e tier, which is contributor-authored code — but the flag is on all
-# eleven checkouts rather than that one, because no job here needs the credential
+# seventeen checkouts rather than that one, because no job here needs the credential
 # after the fetch:
 #
 #   * none of them pushes, and the `permissions:` block above grants no write
@@ -112,10 +128,13 @@ permissions:
 #     subject. That survey is what picked the SET; the CI run on the PR that set
 #     the flag is what checked it. The COUNT in this note is maintained by hand
 #     and has drifted before — it read "nine" while there were already ten, and
-#     issue #1088's `notify-main-red` made it eleven — so recount with
+#     issue #1088's `notify-main-red` made it eleven, issue #953's
+#     `desktop-driver` twelve, issue #1507's `cross-version` thirteen and the
+#     split of `build` and `e2e-deterministic` into parallel jobs seventeen — so
+#     recount with
 #     `grep -cE '^ +- uses: actions/checkout@' .github/workflows/ci.yml` rather
 #     than trusting the number. The pattern is anchored to a step line on
-#     purpose: an unanchored one matches this comment too and reports twelve.
+#     purpose: an unanchored one matches this comment too and reports more.
 #
 # `security`'s `cargo audit` does clone the RustSec advisory DB over the
 # network, but into `~/.cargo/advisory-db` — a separate repository, which a
@@ -128,9 +147,9 @@ permissions:
 # a layer under them.
 #
 # It says nothing about the other workflows in this directory. `release.yml`
-# and `docs-publish.yml` push to `main` and MUST keep a usable credential in
-# the checkout — they check out under the RELEASE_TOKEN admin PAT for exactly
-# that reason (CLAUDE.md rule 8). Do not copy this flag onto them.
+# pushes to `main` and MUST keep a usable credential in the checkout: it
+# checks out under the RELEASE_TOKEN admin PAT for exactly that reason
+# (CLAUDE.md rule 8). Do not copy this flag onto it.
 
 jobs:
   # Renovate automerges devbox digest/pin/patch/minor bumps (renovate.json), and
@@ -161,14 +180,78 @@ jobs:
     outputs:
       devbox_only: ${{ steps.detect.outputs.devbox_only }}
       flake_only: ${{ steps.detect.outputs.flake_only }}
-      docs_only: ${{ steps.detect.outputs.docs_only }}
+      docs_only: ${{ steps.docs_only.outputs.docs_only }}
+      binary: ${{ steps.detect.outputs.binary }}
+      linux_backend: ${{ steps.backend.outputs.linux_backend }}
+      dad_version: ${{ steps.version.outputs.dad_version }}
     steps:
+      # Which system runs the Linux jobs for a PULL REQUEST:
+      # `.github/ci-backend` says `rwx` or `gha`, read at the commit under
+      # test. Only pull requests move to RWX; a push to `main` always runs here,
+      # so post-merge verification does not depend on RWX credits or uptime.
+      # Anything other than `rwx` — a missing file, an API error, another word —
+      # means `gha`, the side that needs nothing outside this repository.
+      - id: backend
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # The PR's HEAD, not `github.sha` (the merge commit): RWX reads the
+          # file at the head, and both sides must make the same choice. Read
+          # at the merge commit, a PR cut before `main` switched to `rwx`
+          # would make GHA skip its Linux jobs while RWX, reading `gha` at
+          # the head, skipped its own, and nothing would run.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          backend=gha
+          if [ "$EVENT" = pull_request ]; then
+            file=$(gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/$REPO/contents/.github/ci-backend?ref=$SHA" 2>/dev/null \
+              | tr -d '[:space:]' || true)
+            [ "$file" = rwx ] && backend=rwx
+          fi
+          echo "linux_backend=$backend" | tee -a "$GITHUB_OUTPUT"
+      # The path classification lives in scripts/ci-changes.sh, which
+      # `.rwx/ci.yml` runs too, so the two CI systems skip the same jobs for the
+      # same change. Its header has the reasoning for each output. The
+      # `version` step below runs scripts/latest-release-version.sh.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci-changes.sh
+            scripts/latest-release-version.sh
+          sparse-checkout-cone-mode: false
       - id: detect
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          files=""
+          if [ "$EVENT" = pull_request ]; then
+            # `|| true` so a transient API failure reaches the script as an
+            # empty list, which it reads as "unknown" and answers with the
+            # full matrix, rather than failing this job and with it every job
+            # that `needs` it.
+            # A renamed file counts by its old path too (`previous_filename`),
+            # as `.rwx/ci.yml`'s `git diff --no-renames` list does.
+            files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
+          fi
+          printf '%s' "$files" | scripts/ci-changes.sh "$EVENT" "${PR_AUTHOR:-}" | tee -a "$GITHUB_OUTPUT"
+      # FORK-ONLY step (not in upstream). `docs_only` and the changed-files report
+      # have no counterpart in `scripts/ci-changes.sh`, which `.rwx/ci.yml` also
+      # runs and which this fork has no reason to fork, so they are computed here,
+      # after `detect`, from the same PR file list. `devbox_only`, `flake_only`
+      # and `binary` come from the script.
+      - id: docs_only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
 
@@ -178,8 +261,6 @@ jobs:
           # comment above): that run must never apply any reduction below.
           if [ -z "${PR_NUMBER:-}" ]; then
             echo "no PR number (push/workflow_dispatch) -> full CI"
-            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
-            echo "flake_only=false" >> "$GITHUB_OUTPUT"
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -208,8 +289,6 @@ jobs:
           # everything rather than read that as "nothing to test".
           if [ -z "$files" ]; then
             echo "no files reported -> full CI"
-            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
-            echo "flake_only=false" >> "$GITHUB_OUTPUT"
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -217,7 +296,7 @@ jobs:
           # Tier 1 "unexpected-file report" (fork issue #259): group the file
           # list above by top-level directory and print it to the job summary,
           # purely for a human to glance at -- non-blocking, no output, no
-          # effect on docs_only/devbox_only/flake_only below. The issue's own
+          # effect on docs_only/devbox_only/flake_only. The issue's own
           # postmortem (PR #219's post-sync rebase silently resurrecting stale
           # content) found the failure mode was that nobody had the changed-
           # file list in front of them grouped in a way that made the odd one
@@ -264,7 +343,7 @@ jobs:
             # Fetch filenames only (drop `.previous_filename`) for this
             # report: $files above includes both the new and old path for
             # every renamed file, which docs_only/devbox_only/flake_only
-            # below correctly need (a file moving OUT of a scoped directory
+            # correctly need (a file moving OUT of a scoped directory
             # must still be caught), but a report of the diff's current shape
             # should show a renamed file once, under its current path --
             # otherwise a same-directory rename inflates the Files count and
@@ -320,7 +399,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY" || echo "::warning::unexpected-file report failed to render -- non-blocking, see step log"
 
           # docs_only applies to EVERY PR author, unlike devbox_only/flake_only
-          # below -- a doc-only diff can't move most of what the Rust/security/
+          # (Renovate-scoped, computed by scripts/ci-changes.sh) -- a doc-only diff can't move most of what the Rust/security/
           # e2e jobs check, whoever wrote it, so there's no equivalent of "the
           # author might grow this past devbox on the next push" risk to scope
           # it to Renovate. `build` and `semgrep` stay unskipped even on a
@@ -348,43 +427,36 @@ jobs:
           if [ "$docs_only" = true ]; then
             echo "docs-only diff -> skipping build-macos/build-windows/windows-cross-check/security/nix/sonarqube/e2e (build and semgrep still run)"
           fi
-
-          # devbox_only / flake_only stay Renovate-scoped, unchanged from
-          # before: anything that is not a Renovate PR gets the full matrix
-          # for these two, regardless of what docs_only above decided.
-          if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
-            echo "author='${PR_AUTHOR:-}' is not Renovate -> devbox_only/flake_only stay false"
-            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
-            echo "flake_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
+      # Issue #326 — the version the binaries built in this run report. Every
+      # checkout here is shallow and fetches no tags, so `build.rs`'s
+      # `git describe` finds none and a build falls through to the `0.1.0`
+      # placeholder, which the binary reads as "version unknown" (`0.1.0+unknown`).
+      # Release builds and a developer's checkout know their version, and the
+      # tests were written there: `remote upgrade` with no `--version`, for
+      # one, refuses on an unknown one. So the jobs that run what they build
+      # take `DAD_VERSION` from here: the newest `vX.Y.Z` tag, which is what
+      # `git describe --tags --abbrev=0` reports in a developer's checkout of
+      # `main`. scripts/latest-release-version.sh does the lookup, with
+      # `git ls-remote`, which reads the tags without the history a deep fetch
+      # would download. A failure fails this job, and with it the
+      # run, rather than sending every build down the placeholder path. It
+      # runs only when a job here will build (the same conditions those jobs
+      # carry; `linux_backend` reads `rwx` only on a pull request, where
+      # `build-macos` does not run), so an RWX-owned or lock-only PR cannot
+      # go red over a tag it would not use. `.rwx/ci.yml`'s `backend` task
+      # runs the same script for RWX, and `.rwx/sandbox.yml`'s `version` task
+      # for the sandbox (issue #2052).
+      - id: version
+        if: steps.detect.outputs.devbox_only != 'true' && steps.detect.outputs.flake_only != 'true' && steps.backend.outputs.linux_backend != 'rwx'
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! version=$(scripts/latest-release-version.sh "https://github.com/$REPO.git"); then
+            echo "::error::no vX.Y.Z release tag could be read from $REPO"
+            exit 1
           fi
-
-          # Both flags start true and any file outside their family clears them,
-          # so a PR touching devbox.lock AND flake.lock clears both and gets the
-          # full matrix. Deliberate: the two reductions rest on different jobs
-          # surviving, and nothing here has looked at whether they interact.
-          devbox_only=true
-          flake_only=true
-          while IFS= read -r f; do
-            case "$f" in
-              devbox.json | devbox.lock) flake_only=false ;;
-              flake.nix | flake.lock) devbox_only=false ;;
-              *)
-                echo "'$f' is outside devbox and outside the flake -> full CI"
-                devbox_only=false
-                flake_only=false
-                break
-                ;;
-            esac
-          done <<< "$files"
-
-          if [ "$devbox_only" = true ]; then
-            echo "devbox files only -> skipping the Rust jobs and the nix job"
-          elif [ "$flake_only" = true ]; then
-            echo "flake files only -> skipping the Rust jobs, keeping nix"
-          fi
-          echo "devbox_only=$devbox_only" >> "$GITHUB_OUTPUT"
-          echo "flake_only=$flake_only" >> "$GITHUB_OUTPUT"
+          echo "dad_version=$version" | tee -a "$GITHUB_OUTPUT"
 
   # PR #416 review M2: the desktop web app's TypeScript tests and type-check
   # were previously run by no CI job anywhere (~800 lines of vitest invisible
@@ -393,7 +465,7 @@ jobs:
   # needs only Node + pnpm, so it starts (and fails) fast.
   desktop-web:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -402,22 +474,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # Issue #807: the pnpm version is pinned EXACTLY, never a floating major.
-      # The floating `12` resolved to 12.6.0 on 2026-09-29 and every
-      # `desktop-browser` run on it hung after the tests passed; later runs
-      # resolved to 12.8.x and did not (causation unproven). It is not read from
-      # `packageManager` in `desktop/package.json` because that makes
-      # `pnpm install --frozen-lockfile` fail until the lockfile records pnpm
-      # itself. Renovate's github-actions manager does track this `version:`
-      # input, but `renovate.json`'s `uses-with` rule holds such bumps for manual
-      # review and it looks inactive on this fork, so bump it by hand and keep
-      # this pin in step with the one in the other desktop job.
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      # An EXACT pnpm, never a major (issue #1262): `version: 12` took every
+      # 12.x the day it shipped, and 12.6.0 hung `desktop-browser` with no
+      # commit here to review or revert. It is the same version devbox.json
+      # pins, and `scripts/check-pin-lockstep.sh` fails if any pnpm/action-setup
+      # site in .github/workflows/ is not an exact version or disagrees with it.
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
         with:
-          version: 12.8.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+          version: 12.9.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -425,6 +492,20 @@ jobs:
       # `pnpm build` is tsc --noEmit + vite build: the type gate and the
       # bundle gate in one step, no Rust or Tauri required.
       - run: pnpm build
+      # Issue #953 — the driver tier's `window.__dadDriver` seam is compiled in
+      # only when `VITE_DAD_DRIVER_SEAM=1` is set at build time. This build does
+      # not set it, so its output must not contain it; a seam that leaked into
+      # every bundle would ship to users with nothing saying so.
+      - run: "! grep -rl __dadDriver dist/"
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's vitest results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: vitest-attempt-${{ github.run_attempt }}
+          path: desktop/junit/vitest.xml
+          if-no-files-found: warn
 
   # Issues #823 and #836 — the browser-level tier. `desktop-web` above runs ~296
   # vitest tests under `environment: "jsdom"`, and jsdom is a DOM implementation
@@ -464,19 +545,26 @@ jobs:
   # touch the bundle this job builds.
   desktop-browser:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
-    # Issue #807: this job cap is only a BACKSTOP behind the per-step caps (the
-    # Playwright install step has 13 minutes, `pnpm test:browser` has 9), and it
-    # must stay above their sum plus setup (checkout, pnpm, `pnpm install`, a
-    # couple of minutes), so a slow install cannot get the job cancelled before
-    # Playwright's own 8-minute `globalTimeout` fires and writes its report. A
-    # hang is now reported by the step that hung, not by this cap. Measured
-    # healthy: 4.5-7 minutes in total (install ~1 minute, the 112-test suite
-    # ~3.5 minutes at `--workers=1`, which is the shape CI runs in); the
-    # slowest passing run seen, on a slow package mirror, took ~14 minutes.
-    # It still caps a wedged browser at a fraction of the 6-hour runner default.
-    timeout-minutes: 25
+    # NOT a measured runner wall clock — this job's own first run is the first
+    # measurement, so this is derived rather than observed. Measured on a warm
+    # 16-core dev box after #836's second phase took the suite from 20 tests to
+    # 54 across two engines, including the `vite build` the Playwright
+    # `webServer` runs first: 24.6s at 8 workers, 1m06s at `--workers=1`, which
+    # is the shape CI runs in. On top of that CI pays for `pnpm install`, the
+    # ~400 MiB browser download and the apt install for WebKit's runtime deps,
+    # and those three dominate. The original 20-minute budget aimed to leave
+    # room for all of it while capping a wedged browser at a fraction of the
+    # 6-hour runner default. Re-tune downward once honest runs exist; do not
+    # raise it to paper over a hang.
+    # On 2026-10-22 the apt downloads of `--with-deps` took 14–20 minutes (the
+    # browser download stayed at seconds; see the install step), exhausting that
+    # budget. Since issue #1934 the .debs are fetched in their own step, bounded
+    # at 15 minutes (three 3-minute attempts and the index fetches), and the
+    # install that follows at 8; with 15 for the suite (observed 8–12) and the
+    # rest for setup/reporting, separate step limits bound each part.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: desktop
@@ -484,22 +572,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # Issue #807: the pnpm version is pinned EXACTLY, never a floating major.
-      # The floating `12` resolved to 12.6.0 on 2026-09-29 and every
-      # `desktop-browser` run on it hung after the tests passed; later runs
-      # resolved to 12.8.x and did not (causation unproven). It is not read from
-      # `packageManager` in `desktop/package.json` because that makes
-      # `pnpm install --frozen-lockfile` fail until the lockfile records pnpm
-      # itself. Renovate's github-actions manager does track this `version:`
-      # input, but `renovate.json`'s `uses-with` rule holds such bumps for manual
-      # review and it looks inactive on this fork, so bump it by hand and keep
-      # this pin in step with the one in the other desktop job.
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      # Exact, and in lockstep with devbox.json — see `desktop-web` above.
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
         with:
-          version: 12.8.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+          version: 12.9.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -510,57 +589,208 @@ jobs:
       # downloaded (Chromium 187, its headless shell 114, WebKit 95, ffmpeg 2),
       # unpacking to 927 MB, in ~50s.
       #
-      # Deliberately NOT wrapped in `actions/cache`, for two reasons, and the
-      # second is the one a future "let's just cache this to speed CI up" PR
-      # has to argue against. Cost is the weaker one: the repository's cache
-      # budget is shared, and `Swatinem/rust-cache` in four other jobs is what
-      # actually keeps CI fast; adding a several-hundred-megabyte entry here to
-      # save part of a one-minute download risks evicting those.
+      # Deliberately NOT wrapped in `actions/cache`, and since issue #1833 the
+      # reason is cost against benefit, measured. Every slow or timed-out
+      # attempt of this job on `main` on 2026-10-22 and 2026-10-23 (14 of them,
+      # run 39996955663 among them) spent its time in the APT half of
+      # `--with-deps` — 119 MB of .debs from the runner's Ubuntu mirror, at
+      # 85–203 kB/s where the fetch finished — and the ten that hit a time limit
+      # never reached the browser download. The CDN download of the browsers
+      # took 9–12 s in each of the four that did, as in the healthy rerun of
+      # 39996955663. So a browser cache saves at most those seconds, less the
+      # restore of its own several-hundred-megabyte entry, and would have
+      # prevented none of those timeouts. Against that, the repository's cache
+      # is capped at 10 GB and `main`'s set already fills ~9 GB of it (the note
+      # above `jobs:`, issue #1743), so a browser entry of several hundred MB
+      # makes evicting `main`'s Rust caches — what actually keeps CI fast —
+      # more likely. What the timeouts needed was a cache of the apt .debs,
+      # which the steps below add (issue #1864).
       #
-      # The security property is the stronger one. A GitHub Actions cache entry
-      # is writable by a workflow run on ANY branch, so a cached browser
-      # payload keyed by Playwright version would be a cross-branch poisoning
-      # target: a malicious or compromised branch could populate or overwrite
-      # that entry, and a later trusted run would restore those binaries and
-      # then EXECUTE them. Re-downloading from the pinned CDN on every run
-      # removes that write surface entirely. Note what it does NOT do: it does
-      # not make the download independently verified. The pin is a browser
-      # revision number resolved from the lockfile, not a hash of the archive
-      # bytes, so what arrives is trusted on TLS and CDN trust alone. Losing a
-      # cross-branch write path is the whole of what a cache would cost here,
-      # and a speed argument alone does not settle it.
+      # Security does NOT decide it. An earlier version of this note said it
+      # did, on the premise that a run on any branch can write an entry a
+      # trusted run restores; GitHub's cache scoping makes that false:
+      #
+      #   * A `pull_request` run saves under its PR's merge ref, restored by
+      #     that PR's later runs alone. A push to another branch, or a
+      #     `workflow_dispatch` of one, saves under that branch, restored by its
+      #     own later runs and by PRs that target it as their base. A run
+      #     restores from its own ref, its PR's base and the default branch, so
+      #     neither reaches `main` or a sibling branch.
+      #   * `main`'s scope, which every run can restore from, is writable by any
+      #     run on `main`'s ref in any workflow: this file's pushes, and also
+      #     event-triggered workflows such as the issue labeler (`issues`). So
+      #     "saved only from `main`" bounds the writers to code running on the
+      #     default branch, not to this job.
+      #   * A key cannot be overwritten within a scope, but that does not pin the
+      #     content: the first writer of a key owns it (a future Playwright
+      #     version's key included), and once size pressure evicts an entry its
+      #     key can be written again.
+      #   * The Rust caches already carry that exposure: they restore compiled
+      #     dependency artifacts from `main`'s scope, proc-macro libraries that
+      #     rustc loads and runs among them. A browser cache saved only from
+      #     `main` would be another instance of an accepted risk, not a new kind.
+      #
+      # Not caching does not make the download verified either. The pin is a
+      # browser revision resolved from the lockfile, not a hash of the archive
+      # bytes, and nothing in this job checks one, so each run trusts TLS and
+      # the CDN; a cache would swap that for trust in the `main` run that saved
+      # the entry. That is where it differs from the .deb cache below, whose
+      # files are checked against Ubuntu's signed index on every restore:
+      # Playwright publishes no hash a restored browser could be checked
+      # against (its `browsers.json` lists revisions only, at 1.64.1). What
+      # would reverse the decision is the timing: if the
+      # browser download becomes the slow part, a cache restored everywhere and
+      # saved only from `main` (gated like the Rust caches' `save-if`) is
+      # acceptable on the reasoning above.
       #
       # `--with-deps` is for WebKit, not for Chromium: WebKit needs a GTK4 and
       # GStreamer runtime that the runner image does not carry in full. It runs
       # apt, so it is the slowest step here.
       #
-      # Issue #807: the Ubuntu mirror once served WebKit's ~125 MB of apt
-      # packages at ~118 kB/s and this step ate the whole job budget. apt now
-      # retries and times out on a STALLED connection, and the install is one
-      # bounded attempt: slow-but-passing mirrors have taken ~9 minutes (230
-      # kB/s), so the limit is 12 minutes and there is deliberately no second
-      # attempt, which would need a mirror faster than that. `-k 30s` kills a
-      # child that ignores SIGTERM. No `|| true`: any failure fails the step.
-      - name: Install Playwright browsers and system dependencies
-        timeout-minutes: 13
+      # Issue #1864 — the .debs that apt installs are cached, and the index is
+      # not. In the 14 slow or timed-out attempts of this job on `main` on
+      # 2026-10-22 and 2026-10-23, the .deb fetch (119 MB, 189 packages) ran at
+      # 85–203 kB/s in the four that finished it and never finished in the
+      # other ten, while `apt-get update` fetched its 8–12.5 MB of indexes from
+      # the same mirror in about a second in 13 of them (6 s in the other). So
+      # the steps below keep the fast half and skip the slow one: a warm cache
+      # leaves apt only the packages Ubuntu has updated since the entry was
+      # saved.
+      #
+      # apt does NOT verify a .deb that is already in its archive directory: it
+      # checks the size and hands the file to dpkg. In an `ubuntu:24.04`
+      # container a same-size tampered .deb went straight to "Preparing to
+      # unpack", with no "Hash Sum mismatch", and failed only because zstd's
+      # own checksum caught random corruption. A crafted .deb would pass that
+      # check. So the restore step hands apt only the cached files whose SHA-256
+      # matches the one in the index this job has just fetched and apt has
+      # checked against Ubuntu's signature, and drops every other file. apt
+      # fetches the dropped packages from the mirror again, so a bad cache entry
+      # costs time and nothing else. The trust root is the same as an uncached
+      # install, Ubuntu's archive key.
+      #
+      # Saved only from `main`, the rule the Rust caches follow (the note above
+      # `jobs:`, issue #1743): ~119 MB of a budget that `main` already nearly
+      # fills. Each key covers one runner image version and one Playwright
+      # version. A new image restores the previous image's entry by prefix and
+      # fetches only what changed. Rejected alternatives: a retry from the same
+      # mirror, because the slow attempts did not recover (one averaged 85 kB/s
+      # over 23 minutes, and in the three traced file by file the rate fell
+      # rather than rose), so it would most likely repeat it — issue #1934's
+      # prefetch step below retries from the next mirror instead; Playwright's
+      # container image, which would move the trust to that image and need
+      # another pin kept in lockstep with `@playwright/test`. `.rwx/ci.yml`'s
+      # copy of this job has no cache because it has not needed one: in the 57
+      # RWX runs of that task on those two days it took 407–441 s, and the two
+      # whose logs were read fetched its .debs (195 MB on that image) in 1–2 s.
+      - name: Compute the .deb cache key
+        id: debs-key
         run: |
-          printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' 'DPkg::Lock::Timeout "120";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          rc=0
-          timeout -k 30s 12m pnpm exec playwright install --with-deps chromium webkit || rc=$?
-          if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-            echo "playwright install TIMED OUT or was KILLED (exit ${rc})"
-          elif [ "$rc" -ne 0 ]; then
-            echo "playwright install FAILED (exit ${rc})"
+          playwright=$(node -p 'require("./node_modules/@playwright/test/package.json").version')
+          echo "prefix=playwright-debs-${ImageOS:-unknown}-" >> "$GITHUB_OUTPUT"
+          echo "key=playwright-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}-${playwright}" >> "$GITHUB_OUTPUT"
+      - id: debs
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: ${{ steps.debs-key.outputs.key }}
+          restore-keys: ${{ steps.debs-key.outputs.prefix }}
+      # The file name is `<package>_<version>_<arch>.deb` with an epoch's `:`
+      # written as `%3a`, which `apt-cache show <package>=<version>` takes back.
+      # A file the index does not list, or lists with another hash, is dropped.
+      - name: Hand apt the cached .debs whose hash the signed index carries
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/playwright-debs"
+          shopt -s nullglob
+          debs=("$dir"/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "No cached .debs: apt fetches every one from the mirror."
+            exit 0
           fi
-          exit "$rc"
+          sudo apt-get update -qq
+          kept=0
+          dropped=0
+          for deb in "${debs[@]}"; do
+            IFS=_ read -r pkg ver _ <<< "$(basename "$deb" .deb)"
+            signed=$(apt-cache show "$pkg=${ver//%3a/:}" 2>/dev/null | sed -n 's/^SHA256: //p' || true)
+            if grep -qxF "$(sha256sum "$deb" | cut -d' ' -f1)" <<< "$signed"; then
+              sudo cp "$deb" /var/cache/apt/archives/
+              kept=$((kept + 1))
+            else
+              echo "Dropped $(basename "$deb"): no entry in the signed index carries its SHA-256."
+              dropped=$((dropped + 1))
+            fi
+          done
+          echo "Handed apt $kept cached .debs; dropped $dropped."
+      # Issue #1934 — the cache above does not always hold: it is saved only
+      # from `main`, and the repository's cache budget evicts it (on 2026-10-26
+      # it was gone from about 03:40 to 13:30 UTC, and again overnight), so a
+      # run in that window fetches all 142 MB from the mirror. Four attempts on
+      # 2026-10-26 did, from an Azure mirror serving a few kB/s, and timed out
+      # in the install step below at 25 minutes. This step fetches the same
+      # .debs with a limit per attempt and moves off that mirror after the
+      # first stalled one; `.github/scripts/apt-prefetch.sh` has the evidence.
+      # The package list is Playwright's own: `install-deps --dry-run` prints
+      # what `--with-deps` would install (exiting 1 when that is anything),
+      # and the arguments match the `apt-get install` it runs.
+      - name: Fetch the .debs, bounding each attempt
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          rc=0
+          out=$(pnpm exec playwright install-deps --dry-run chromium webkit 2>&1) || rc=$?
+          pkgs=()
+          while read -r pkg; do
+            pkgs+=("$pkg")
+          done < <(sed -n 's/^  \([^ ]\+\)$/\1/p' <<< "$out")
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "$out"
+            if [ "$rc" -eq 0 ]; then
+              exit 0
+            fi
+            echo "::error::Read no package list from Playwright's install-deps --dry-run (exit $rc)."
+            exit 1
+          fi
+          echo "Playwright's dependencies to install: ${#pkgs[@]} packages."
+          ../.github/scripts/apt-prefetch.sh --no-install-recommends "${pkgs[@]}"
+      # The fetch above leaves apt nothing to download, so this installs from
+      # the archive cache and downloads only the browsers (9-12 s from the CDN
+      # in every measured run).
+      - run: pnpm exec playwright install --with-deps chromium webkit
+        timeout-minutes: 8
+      # Rebuilt from what this run installed, so a package nothing installs any
+      # more, a version Ubuntu has replaced or a dropped file is not saved
+      # again. It runs on every ref, so a branch's run shows what `main` would
+      # save; only the save itself is limited to `main`.
+      - name: Collect the .debs this run installed
+        if: steps.debs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/playwright-debs"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          shopt -s nullglob
+          for deb in /var/cache/apt/archives/*.deb; do
+            IFS=_ read -r pkg ver _ <<< "$(basename "$deb" .deb)"
+            if [ "$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)" = "${ver//%3a/:}" ]; then
+              cp "$deb" "$dir/"
+            fi
+          done
+          echo "Collected $(find "$dir" -name '*.deb' | wc -l) .debs, $(du -sh "$dir" | cut -f1)."
+      - if: steps.debs.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/playwright-debs
+          key: ${{ steps.debs-key.outputs.key }}
       # Playwright transpiles specs without type-checking them, so a type error
       # under `desktop/e2e` would run happily and could pass. This is the gate
       # that makes it an error, and it is fast enough to run before the browsers
       # are launched.
       - run: pnpm test:browser:types
-      - name: Run browser tests
-        timeout-minutes: 9
-        run: pnpm test:browser
+      - run: pnpm test:browser
+        timeout-minutes: 15
       # `retries` is 0 in `playwright.config.ts` — a retry turns a flake into a
       # green tick and deletes the evidence — so the trace and the HTML report
       # are the whole record of a failure. Both are written only on failure
@@ -569,8 +799,10 @@ jobs:
       # the conclusion in place, and upload-artifact v4+ refuses to overwrite an
       # existing name.
       - name: Preserve this attempt's browser report
+        # Fork (issue #807): also on `cancelled()`. A job-level timeout cancels the
+        # job instead of failing a step, and the report is what is needed then.
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: playwright-attempt-${{ github.run_attempt }}
           path: |
@@ -582,47 +814,237 @@ jobs:
           # `?fixture=1` scenarios — so this is tidiness rather than a leak, but
           # nobody opens a failure trace from a PR that closed two months ago.
           retention-days: 7
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's browser test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: playwright-junit-attempt-${{ github.run_attempt }}
+          path: desktop/junit/playwright.xml
+          if-no-files-found: warn
 
-  build:
+  # Issue #953 — the driver rung, the one above `desktop-browser` on the ladder.
+  # That job drives the built web bundle with fixture data; this one drives the
+  # REAL Tauri window: `tauri-driver` launches the app binary through
+  # `WebKitWebDriver`, the distribution's WebKitGTK renders it under xvfb, and
+  # every scenario runs against a real `daemon serve` in its own sandbox — so it
+  # exercises IPC, the `desktop://` event stream, the daemon handshake and xterm
+  # over a real PTY, none of which any other job reaches. Narrow on purpose: two
+  # smoke scenarios, `desktop/driver/smoke.test.ts`, and `docs/develop/
+  # desktop-gui.md` ("The driver tier") has what they cover and what they do not.
+  #
+  # ADVISORY, and the reason is the one `desktop-browser` records, one rung
+  # higher: a native window under xvfb is the flake-prone end of the ladder
+  # (issue #807's load-sensitive race lived in a tier with LESS exposure than
+  # this one), and nothing about its behaviour on a GitHub runner has been
+  # measured beyond the runs on the PR that added it. Every wait in the suite is
+  # on state rather than on time, which is the design answer to that; a run
+  # history is the evidence one. Making it required is then a deliberate
+  # `REQUIRED_CHECKS` change applied with `scripts/apply-branch-protection.sh` —
+  # a repository-administration act, not something a PR does.
+  #
+  # Same `changes` gate as the other desktop jobs. Unlike them it also builds
+  # the root package, so a daemon-only change reaches it too — which is the
+  # point: the handshake it checks has two ends.
+  desktop-driver:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
+    # Measured once, on run 36231844544 (a workflow_dispatch of this job's own
+    # branch, cold rust-cache): 6m55s end to end — the app's `tauri build`
+    # 2m52s, the daemon's build 1m17s, `cargo install tauri-driver` 17s, the
+    # suite 86s. The original 30-minute budget was four times that, capping a
+    # wedged window at a fraction of the 6-hour default. Re-tune from more
+    # runs; do not raise it to paper over a hang.
+    # Slow downloads on 2026-10-22 warranted 25 minutes for apt; since issue
+    # #1934 the apt step's attempts are bounded and it gets 15, with 10 for the
+    # suite and 15 for builds/setup/reporting (run 39821435797 used about 6
+    # minutes outside the suite), the suite's own limit bounding a wedged window.
+    timeout-minutes: 45
+    env:
+      # The ONE place tauri-driver's version is written. renovate.json's
+      # tauri-driver customManager bumps this line, and
+      # `desktop/scripts/driver-test.sh` reads it from here for a local run
+      # instead of restating it.
+      TAURI_DRIVER_VERSION: 2.0.6
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
-      # PRD fork#340 (E1): `fetch-depth: 0`, not the default depth-1 checkout
-      # every other job here uses. `work-type-check` below resolves `git
-      # merge-base HEAD origin/main`, and on a `pull_request` event a depth-1
-      # checkout has no `origin/main` ref at all — `list-tests` never ran in
-      # CI, so this has never mattered before. A full clone is what makes
-      # that ref resolvable. Issue #259: `cargo xtask linkage-check`'s check
-      # 11 (resurrected-changelog-fragment detection) is a second consumer
-      # of the same property — it also resolves `origin/main` via
-      # `work_type::resolve_base`, and fails closed with a printed skip
-      # rather than a hard failure when it cannot (B1), so removing this
-      # flag would make check 11 quietly stop running rather than break the
-      # build outright. `cargo xtask linkage-check`'s check 12 (fork #281)
-      # is a third consumer of this same full-history requirement — it
-      # resolves both `refs/remotes/origin/main` and a merge-base against
-      # it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.97.1
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          tool: cargo-nextest@0.9.143
-      # Tauri's Linux build deps, needed because clippy/nextest below run with
-      # --workspace, which includes desktop/src-tauri (dot-agent-deck-desktop).
-      # Without them the desktop crate fails to build on this runner at all.
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      # Exact, and in lockstep with devbox.json — see `desktop-web` above.
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
+        with:
+          version: 12.9.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      # The desktop crate's build set — the same six packages as `build`, whose
+      # comment names the other places that declare it — plus the six this job
+      # alone needs at run time: the driver package is WebKitWebDriver for the
+      # SAME WebKitGTK the app links against, `xvfb` is the display, `xclip`
+      # reads that display's clipboard from outside the app for `terminal_002`
+      # (issue #1403), and `xdotool` moves the display's focus to and from the
+      # app's window for `terminal_003` (issue #1457). `fleet_001` (issue
+      # #1356) needs two more: `openssh-server` for the loopback `sshd` its
+      # second deck is reached through, and `libnss-wrapper`, which points the
+      # app's `ssh` at the sandbox's `known_hosts` (`FarDeck` in
+      # `desktop/driver/harness.ts` says why).
+      #
+      # The driver package has two names. Ubuntu 26.04 renamed
+      # `webkit2gtk-driver` to `webkitgtk-webdriver` and dropped the old name,
+      # 24.04 has only the old one, and `ubuntu-latest` lands on either while
+      # GitHub migrates it (run 40227995009 failed on 26.04). So this installs
+      # whichever has a candidate rather than pinning `runs-on`, which would
+      # only move the break to 24.04's retirement. Both put the binary at
+      # `/usr/bin/WebKitWebDriver`, where the suite step below points; checked
+      # in `ubuntu:24.04` and `ubuntu:26.04` containers on 2026-10-25. The
+      # other packages here have the same names on both.
+      #
+      # Issue #1934 — the .debs (80 MB) are fetched by
+      # `.github/scripts/apt-prefetch.sh` before the install, for the reason
+      # that script records: on 2026-10-26 this step sat on an Azure mirror
+      # serving a few kB/s until its 25-minute limit (run 40395729937). The
+      # prefetch bounds each attempt and moves off that mirror after the first
+      # stalled one, so the install finds every .deb already downloaded. Its
+      # first run on a runner did exactly that (run 40450743777: 78 of 80 MB
+      # from Azure in a 5-minute first attempt, the rest from
+      # archive.ubuntu.com in 1 s). They
+      # are not cached the way `desktop-browser`'s are: that cache is evicted
+      # by the repository's cache budget for hours at a time, so it cannot be
+      # what keeps this step inside its limit, and another entry would add to
+      # the pressure that evicts `main`'s Rust caches.
+      - name: Install driver system dependencies
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # Read whole rather than with `grep -q`, whose early exit can fail
+          # the pipeline under pipefail and pick the wrong name.
+          driver=webkitgtk-webdriver
+          candidate=$(apt-cache policy "$driver" | sed -n 's/^ *Candidate: //p')
+          if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+            driver=webkit2gtk-driver
+          fi
+          echo "WebKitWebDriver package: $driver"
+          pkgs=(libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
+            "$driver" xvfb xclip xdotool openssh-server libnss-wrapper)
+          .github/scripts/apt-prefetch.sh "${pkgs[@]}"
+          sudo apt-get install -y "${pkgs[@]}"
+      # From crates.io source with its own lockfile, not a prebuilt binary:
+      # tauri-driver publishes none, and a third-party build cache would be a
+      # binary this job then executes on trust alone. rust-cache keeps
+      # ~/.cargo/bin, so a warm run finds it installed and this is a no-op.
+      - run: cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
+      - run: cargo build --locked --bin dot-agent-deck
+      - working-directory: desktop
+        run: pnpm install --frozen-lockfile
+      # Node runs the suite by stripping types, not checking them.
+      - working-directory: desktop
+        run: pnpm test:driver:types
+      # `VITE_DAD_DRIVER_SEAM=1` compiles the one read the suite needs into
+      # this bundle — xterm's buffer text, since the WebGL renderer leaves none
+      # in the DOM — and into no other: `desktop-web` checks that an ordinary
+      # build carries none of it. `--no-bundle` because tauri-driver launches
+      # the binary, not a package.
+      - working-directory: desktop
+        env:
+          VITE_DAD_DRIVER_SEAM: "1"
+        run: pnpm tauri build --debug --no-bundle
+      # 96 DPI rather than xvfb's default 100: WebKitWebDriver places clicks
+      # without the scale WebKitGTK derives from DPI, so on a scaled display
+      # every click lands short. `driver/harness.ts` refuses such a window by
+      # name rather than letting it fail as a missing dialog.
+      - working-directory: desktop
+        env:
+          DAD_DRIVER_NATIVE_DRIVER: /usr/bin/WebKitWebDriver
+        timeout-minutes: 10
+        run: xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
+      # The harness writes a failing scenario's screenshot, page text,
+      # terminal text and every sandbox log under `desktop/driver-results/`.
+      # Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's driver results
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: desktop-driver-attempt-${{ github.run_attempt }}
+          path: desktop/driver-results/
+          if-no-files-found: warn
+          # Synthetic content — a sandbox daemon and a bash shell — so this is
+          # tidiness rather than a leak.
+          retention-days: 7
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's driver test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: desktop-driver-junit-attempt-${{ github.run_attempt }}
+          path: desktop/junit/driver.xml
+          if-no-files-found: warn
+
+  # The Linux build, split for wall clock. Until the split, one `build` job ran
+  # fmt, clippy, the release build, the fast tier and linkage-check one after
+  # another on one 4-vCPU runner (~14-20 minutes); here they run side by side
+  # and the slowest, `test`, sets the pace. `build` survives below as an
+  # aggregator, so the required context keeps its name and its meaning.
+  fmt:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.0
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      # The desktop crate's Linux build deps, needed because clippy/nextest below
+      # run with --workspace, which includes desktop/src-tauri
+      # (dot-agent-deck-desktop). Without them that crate fails to build on this
+      # runner at all.
+      #
+      # The first five are Tauri's. `libasound2-dev` is PRD #802 M7's: the crate
+      # declares `cpal` for microphone capture, and on Linux its `alsa-sys`
+      # build script resolves `alsa` through pkg-config. macOS needs nothing for
+      # CoreAudio and Windows nothing for WASAPI, so this line is Linux-shaped.
+      # The same set is declared in `tauri-deps/flake.nix` for a devbox shell,
+      # in `build-release`, `test`, `e2e-build` and the `e2e` shards below, in the
+      # `desktop-driver` job, and in release.yml's bundle job — keep the five in
+      # step.
       - run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - run: cargo fmt --check
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
       # Issue #407 — `--all-targets --features e2e`, not the bare `cargo clippy`
       # this used to be. Both flags are load-bearing: without `--all-targets`
       # cargo builds only lib and bin targets, and every `tests/e2e_*.rs` opens
@@ -637,7 +1059,7 @@ jobs:
       # `e2e-deterministic` below — but this step is still only a type-check and
       # lint: it runs no test and needs no agent or API key, so naming the e2e
       # features here neither duplicates that job nor gives this one a
-      # credential. It just makes the local rule 2 gate something a contributor
+      # credential. It just makes the local CLAUDE.md rule 2 gate something a contributor
       # cannot forget to run.
       #
       # Linux only. build-windows/build-macos below stay on bare `cargo clippy`
@@ -666,14 +1088,145 @@ jobs:
       #
       # THAT FLAG NOW CARRIES THE WHOLE WEIGHT. Lane 2 does not run in CI at
       # all — no e2e test reaches a real agent there, so no TEST credential is
-      # registered on this repository (the separately credentialed Codex
-      # issue-labeler is out of scope; see the e2e-deterministic job's comment
-      # and docs/develop/issue-labeling.md) — which makes this step the ONLY
+      # registered on this repository (the separately credentialed agent PR
+      # reviewer is out of scope; see the e2e-deterministic job's comment) —
+      # which makes this step the ONLY
       # thing in CI that compiles the lane-2 files. Drop `e2e-live` from this
       # line and they go back to being checked by nothing until a developer
       # runs them.
       - run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
+
+  build-release:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
+    runs-on: ubuntu-latest
+    steps:
+      # PRD fork#340 (E1): `fetch-depth: 0`, not the default depth-1 checkout
+      # every other job here uses. `work-type-check` below resolves `git
+      # merge-base HEAD origin/main`, and on a `pull_request` event a depth-1
+      # checkout has no `origin/main` ref at all — `list-tests` never ran in
+      # CI, so this has never mattered before. A full clone is what makes
+      # that ref resolvable. Issue #259: `cargo xtask linkage-check`'s rule
+      # 20 (resurrected-changelog-fragment detection) is a second consumer
+      # of the same property — it also resolves `origin/main` via
+      # `work_type::resolve_base`, and fails closed with a printed skip
+      # rather than a hard failure when it cannot (B1), so removing this
+      # flag would make rule 20 quietly stop running rather than break the
+      # build outright. `cargo xtask linkage-check`'s rule 21 (fork #281)
+      # is a third consumer of this same full-history requirement — it
+      # resolves both `refs/remotes/origin/main` and a merge-base against
+      # it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      # The desktop crate's Linux build deps — the comment on `clippy`'s copy of
+      # this step has why, and where else the same set is declared.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
       - run: cargo build --release
+      # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
+      # rule 7 fails the build if the Scenario comment is missing or the
+      # generator fails"), and the build-macos/build-windows comment says these
+      # steps "stay on the Linux job" — but no such step existed, so nothing
+      # enforced either claim. Added 2026-07-30 after a revert removed two
+      # `#[spec]`-annotated tests and left their tests/CATALOG.md entries
+      # orphaned: linkage-check was failing on main and no gate noticed, because
+      # it only ever ran when somebody invoked it by hand.
+      - run: cargo xtask linkage-check
+      # PRD fork#340 M3 -- R0 only (E2: kept in this job, which has no path filter
+      # and is skipped only for Renovate's devbox/flake-only PRs, which are exempt
+      # anyway). `--self-test` runs immediately before the real invocation,
+      # mirroring `scripts/check-symlinks.sh --self-test` (`build-windows` below):
+      # the same binary is shown rejecting a genuinely violating case seconds
+      # before it passes on the real diff, so a green result here is never the
+      # vacuous kind (E3).
+      #
+      # This job also runs on `push: [main]` (the post-merge trigger above), where
+      # the resolved base and HEAD are the same commit. `run_in` treats that as a
+      # printed skip and exits 0 (the B1 review fix) -- see `work_type.rs`'s
+      # "merged-base skip" module doc for why this is not folded into the
+      # branch-prefix exemption list.
+      - run: cargo xtask work-type-check --self-test
+      - run: cargo xtask work-type-check
+      # PR #573 fix round / issue #286 -- `.claude/hooks/check-issue-claim.sh
+      # --self-test` was invoked NOWHERE: no CI, no shellcheck, no Rust/e2e test
+      # touches it. Same pattern as the two self-tests above: exercised on every
+      # push before anything trusts the script. Needs no toolchain and no network
+      # (~0.3s); the script's own header names both of those as its model. There
+      # is no "real invocation" pairing to add alongside it -- this script is a
+      # live PreToolUse hook, not a checker with a real target to run against in
+      # CI.
+      - run: .claude/hooks/check-issue-claim.sh --self-test
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
+    runs-on: ubuntu-latest
+    env:
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      # The Pi extension's Node suites run from the fast tier
+      # (`question_detect_008` in src/hook.rs, `the_pi_extensions_node_suites_pass`
+      # in src/orchestrator_ext.rs) and need a Node that strips TypeScript types
+      # (23.6+); with an older one they print `SKIP:` and pass. Same major as
+      # the desktop jobs and devbox.json.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 26
+      # Issue #1708 — the Pi extension's type gate, which until then ran
+      # nowhere. In this job, rather than `desktop-web` beside the desktop's own
+      # tsc, because `build` aggregates this one, so a type error blocks the
+      # merge. `--ignore-scripts`: tsc needs no install script, so none of the
+      # type packages' dependencies runs code on the runner.
+      - run: npm ci --ignore-scripts
+        working-directory: pi-extension
+      - run: npm run typecheck
+        working-directory: pi-extension
+      # The desktop crate's Linux build deps — the comment on `clippy`'s copy of
+      # this step has why, and where else the same set is declared.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
+      # Issue #324: `release_channel_vars_005` runs the Homebrew/Scoop tasks
+      # through go-task itself, since go-task's built-in shell — not bash — is
+      # what executes them in release.yml's `finalize`. It skips where `task` is
+      # absent, so this installs it with the same pinned action and the same
+      # `3.x` spec as `finalize`, and DAD_REQUIRE_GO_TASK on the nextest step
+      # turns a skip into a failure — without it a missing install would read
+      # as green.
+      #
+      # `repo-token` because the action resolves `3.x` through GitHub's API and
+      # has no default token: unauthenticated, it shares the runner IP's
+      # 60-requests-an-hour limit and fails the job on `API rate limit
+      # exceeded` (PR #1465's `build`, run 36814458923). The token is this
+      # workflow's read-only one (`permissions:` above).
+      - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
       # already use it. `cargo test` runs the whole tier in ONE process with
@@ -710,52 +1263,44 @@ jobs:
           # RUST_BACKTRACE comment. Capture only happens on panic, so this
           # tier's passing runs pay nothing.
           RUST_BACKTRACE: "1"
+          # Issue #324: see the go-task step above.
+          DAD_REQUIRE_GO_TASK: "1"
+          # Line tables keep file:line in panics and backtraces and drop the rest of
+          # the debug info, which is most of a test build's `target/`: it links
+          # faster and leaves a smaller cache entry for the 10 GB repository limit.
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The patched crossterm's own test (vendor/crossterm/VENDORED.md), which
+      # the step above does not run: the crate is outside the workspace.
+      # `--locked` to the crate's own Cargo.lock, which pins the dev-dependencies
+      # the deck's lock does not carry.
+      - run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib event::source::unix::mio::tests
       # Issue #564: keep this attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos` below — the masking is a property of re-running any job,
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nextest-linux-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
           if-no-files-found: warn
-      # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
-      # rule 7 fails the build if the Scenario comment is missing or the
-      # generator fails"), and the build-macos/build-windows comment says these
-      # steps "stay on the Linux job" — but no such step existed, so nothing
-      # enforced either claim. Added 2026-07-30 after a revert removed two
-      # `#[spec]`-annotated tests and left their tests/CATALOG.md entries
-      # orphaned: linkage-check was failing on main and no gate noticed, because
-      # it only ever ran when somebody invoked it by hand.
-      - run: cargo xtask linkage-check
-      # PRD fork#340 M3 — R0 only (E2: kept in `build`, which has no path
-      # filter and is skipped only for Renovate's devbox/flake-only PRs,
-      # which are exempt anyway). `--self-test` runs immediately before the
-      # real invocation, mirroring `scripts/check-symlinks.sh --self-test`
-      # (`build-windows` below) — the same binary is shown rejecting a
-      # genuinely violating case seconds before it passes on the real diff,
-      # so a green result here is never the vacuous kind (E3).
-      #
-      # This job also runs on `push: [main]` (the post-merge trigger above),
-      # where the resolved base and HEAD are the same commit. `run_in`
-      # treats that as a printed skip and exits 0 (the B1 review fix) — see
-      # `work_type.rs`'s "merged-base skip" module doc for why this is not
-      # folded into the branch-prefix exemption list.
-      - run: cargo xtask work-type-check --self-test
-      - run: cargo xtask work-type-check
-      # PR #573 fix round / issue #286 — `.claude/hooks/check-issue-claim.sh
-      # --self-test` was invoked NOWHERE: no CI, no shellcheck, no Rust/e2e
-      # test touches it (reviewer M4, auditor A4 — both independently flagged
-      # this as its own blocker). Same pattern as the two self-tests above:
-      # exercised on every push before anything trusts the script. Needs no
-      # toolchain and no network (~0.3s here); the script's own header names
-      # both of those as its model. There is no "real invocation" pairing to
-      # add alongside it (unlike check-symlinks.sh/work-type-check above) —
-      # this script is a live PreToolUse hook, not a checker with a real
-      # target to run against in CI.
-      - run: .claude/hooks/check-issue-claim.sh --self-test
+
+  # The required `build` context: green only when every part above is. A part
+  # skipped by the `changes` gate leaves this skipped too, which the ruleset
+  # counts as passing, exactly as it counted the single job before the split.
+  build:
+    needs: [changes, fmt, clippy, build-release, test]
+    # Skipped, which the ruleset counts as passing, when `.rwx/ci.yml` runs
+    # these jobs instead; RWX's own check is then the one that must pass.
+    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failed="$(printf '%s' "$NEEDS_JSON" | jq -r '[to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"] | join(", ")')"
+          if [ -n "$failed" ]; then echo "not green: $failed"; exit 1; fi
 
   # Issue #502 lane 1 — the DETERMINISTIC two thirds of the L2 e2e tier, run on
   # every PR. This is the first job in this repository that has ever executed
@@ -801,7 +1346,7 @@ jobs:
   # sitting in the tree for the life of the job while this lane drives the PTY
   # e2e tier — dozens of contributor-authored test binaries spawning the real
   # deck. The note above `jobs:` has the survey behind that flag and why it went
-  # on all eleven checkouts rather than only this one.
+  # on all seventeen checkouts rather than only this one.
   #
   # SCOPE is still the outer bound and still does the heavier lifting: this
   # workflow's top-level `permissions:` block grants `contents: read` and
@@ -810,13 +1355,9 @@ jobs:
   # `.claude/skills/verify-pr/SKILL.md`). The flag is a layer under that, not a
   # replacement for it.
   #
-  # That is deliberately NOT the wider claim "no agent credential reaches this
-  # repository's CI", which is false: the Codex issue-labeler
-  # (`issue-labeler.md`, `issue-labeler.lock.yml`, `issue-labeler-batch.yml`)
-  # passes the repository secret OPENAI_API_KEY into a `codex exec` step and
-  # genuinely reaches a real agent. That is a separate feature with its own
-  # threat model — `docs/develop/issue-labeling.md` — and out of scope for the
-  # e2e lanes. Do not cite it as precedent for putting a test key here.
+  # This fork runs no agent PR reviewer either (CLAUDE.md rule 8), so no agent
+  # credential reaches this repository's CI at all; do not read anything here as
+  # precedent for putting a test key in it.
   #
   # NO AGENT CLI is installed either, and that is deliberate rather than merely
   # unnecessary. `scheduler/cli/002` in tests/e2e_scheduler_cli.rs writes a
@@ -827,13 +1368,93 @@ jobs:
   # spawn just fails into a pane nothing looks at, which is the behaviour this
   # lane was classified against.
   #
-  # NOT one of the four required checks. The required set is a repository
-  # ruleset (CLAUDE.md rule 8) and widening it is a separate, deliberate act —
-  # worth revisiting only once this job has enough honest runs to show whether
-  # the tier is stable on a runner at all.
-  e2e-deterministic:
+  # `e2e-deterministic` IS a required check, since 2026-09-07 — the ruleset was
+  # widened directly and `scripts/apply-branch-protection.sh` caught up the same
+  # day (docs/develop/governance.md). This comment said the opposite until the
+  # job was split into the archive build and the shards below.
+  #
+  # HOW THE TIER RUNS. One job, `e2e-build`, compiles it into a nextest archive
+  # (`cargo nextest archive`, the same `--workspace --features e2e` selection the
+  # `cargo test-e2e` alias makes) and uploads it; five `e2e` shards download and
+  # run it, and `e2e-deterministic` aggregates them under the required name.
+  # The shards never build the tier: a cargo build there would recompile the
+  # workspace crates, whose sources get fresh mtimes on every
+  # checkout. One test, `lifecycle/version/001`, runs a nested cold
+  # `cargo build` (72-370s in CI) and had set the floor of whichever partition
+  # drew it, so it runs alone in its own shard and the other four split the
+  # rest with `--partition count:N/4`. Measured on 2026-10-18 against the
+  # single-job layout on the same commits: ~12.6 minutes to a Linux verdict
+  # instead of ~20.
+  e2e-build:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    # FORK: enabled as upstream wrote it; see the note on `e2e-deterministic` below.
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
+    runs-on: ubuntu-latest
+    env:
+      # NO debug info in the e2e build, unlike the `test` job's line tables.
+      # Every shard downloads this archive, and its transfer from GitHub's
+      # artifact storage was the slowest step of the tier: 2.9 GB, measured at
+      # 31 s to 14.5 min per shard on 2026-10-19, against 2-4 min of tests.
+      # Even line tables were 37% of a test binary. Nothing here needs them: CI
+      # sets no RUST_BACKTRACE, and a panic's file:line is compiled in
+      # regardless of debug info. What is lost is file:line in a backtrace if
+      # someone reruns a shard with RUST_BACKTRACE=1.
+      # Job-level, not on the archive step: rust-cache folds the CARGO*
+      # variables it can see into its key, so the cache keeps a separate entry
+      # for this profile instead of restoring artifacts built with debug info
+      # and, on an exact key hit, never saving the rebuild.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      # Issue #326: see the `changes` job's `version` step. The shards run this
+      # archive, so they need no copy; `lifecycle/version/001`'s nested build
+      # sets its own.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      # The same Linux deps `clippy` installs, for the same reason: the archive
+      # is built with `--workspace`, which includes desktop/src-tauri
+      # (dot-agent-deck-desktop), and without them that crate does not build on
+      # this runner at all. Locally the devbox shell lacks them too, which is
+      # issue #771 and why a local run needs `--exclude dot-agent-deck-desktop`;
+      # installing them here is the fix rather than narrowing the CI gate.
+      # `libasound2-dev` is PRD #802 M7's `cpal` — see `clippy`'s copy.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
+      - run: cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
+      - name: Record the archive's size
+        run: |
+          echo "e2e archive: $(du -h e2e.tar.zst | cut -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
+      # One name for every attempt, NOT the `-attempt-<n>` suffix the JUnit
+      # uploads carry. "Re-run failed jobs" reruns a failed shard under a new
+      # `github.run_attempt` without rerunning this job when it passed, so a
+      # per-attempt name would leave the rerun shard asking for an archive that
+      # was never uploaded. A full rerun rebuilds and replaces it (`overwrite`);
+      # three days of retention let a shard be rerun after the first day.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: e2e-archive
+          path: e2e.tar.zst
+          overwrite: true
+          # Already zstd-compressed.
+          compression-level: 0
+          retention-days: 3
+
+  e2e:
+    needs: [changes, e2e-build]
+    # FORK: enabled as upstream wrote it; see the note on `e2e-deterministic` below.
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     # HOW THIS NUMBER WAS PICKED, and what it is not. It is NOT a measured
     # runner wall clock: nobody has ever run this tier on a GitHub runner, so
@@ -854,28 +1475,47 @@ jobs:
     # while still capping a wedged PTY test at a sixth of the 6-hour runner
     # default. Re-tune it downward once a few honest runs exist; do not raise it
     # to paper over a hang.
+    #
+    # It is now per SHARD, each of which runs a fifth of the tier (or the one
+    # nested build), so the bound has more margin than when it was derived.
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1", "2", "3", "4", version]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      # Some e2e tests run a nested `cargo build`, so the toolchain is still
+      # needed although the tier itself is not compiled here.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
         with:
-          tool: cargo-nextest@0.9.143
-      # The same Tauri Linux deps the `build` job installs, for the same reason:
-      # the alias carries `--workspace`, which includes desktop/src-tauri
-      # (dot-agent-deck-desktop), and without them that crate does not build on
-      # this runner at all. Locally the devbox shell lacks them too, which is
-      # issue #771 and why a local run needs `--exclude dot-agent-deck-desktop`;
-      # installing them here is the fix rather than narrowing the CI gate.
+          tool: cargo-nextest@0.9.146
+      # The desktop crate's test binaries link these libraries at run time.
       - run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
+      # The archive download's time varies far more than its size explains
+      # (31 s to 14.5 min for the same 2.9 GB on 2026-10-19, typically 1-3 min),
+      # and a slow transfer usually goes faster on a fresh connection. So the
+      # first attempt gets a short limit and a second attempt a long one; a
+      # failure that survives both still fails the shard.
+      - id: download-archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          name: e2e-archive
+      - if: steps.download-archive.outcome != 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        timeout-minutes: 20
+        with:
+          name: e2e-archive
       # Issues #351/#818: a single ~16-21s stall lands on ONE arbitrary test per
       # run on a `ubuntu-latest` runner, and reddens the tier wherever it hits.
       # Measured across four reports of the same tree: `pane_input_007` 1.54s /
@@ -897,7 +1537,19 @@ jobs:
       # and the same value already sit on `dispatch_015` in
       # `.config/nextest.toml`. Local runs keep `retries = 0` so a developer
       # still sees the raw signal.
-      - run: cargo test-e2e --retries 1
+      #
+      # The archive is extracted into the checkout, so `target/` lands where the
+      # tests' compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
+      - env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          if [ "$SHARD" = version ]; then
+            set -- -E 'test(=version_001_injected_build_env_reaches_the_binary)'
+          else
+            set -- --partition "count:$SHARD/4" -E 'not test(=version_001_injected_build_env_reaches_the_binary)'
+          fi
+          cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
+            --extract-to . --extract-overwrite --retries 1 "$@"
       # Issue #564: keep THIS attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos`. It matters more here than anywhere else in this file:
@@ -907,11 +1559,203 @@ jobs:
       # real regression.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: nextest-e2e-attempt-${{ github.run_attempt }}
+          name: nextest-e2e-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
           if-no-files-found: warn
+
+  # The required `e2e-deterministic` context: green only when the archive
+  # build and every shard are.
+  e2e-deterministic:
+    needs: [changes, e2e-build, e2e]
+    # Skipped, which the ruleset counts as passing, when `.rwx/ci.yml` runs
+    # these jobs instead; RWX's own check is then the one that must pass.
+    # FORK: the fork tip's own `ci.yml` ran a blocking `e2e-deterministic` lane (one
+    # job at about line 834, no `continue-on-error`). This `e2e-build` -> `e2e` ->
+    # `e2e-deterministic` pipeline is upstream's improved version of that lane, so
+    # all three jobs run as upstream wrote them (net-merge ruling 104, which revised
+    # ruling 75). The fork's `e2e.yml` `e2e:` job stays as an informational
+    # duplicate; the maintainer decides which of the two to keep. `.github/ci-backend`
+    # is `gha`, so `linux_backend` never reads `rwx` here and these jobs run on
+    # GitHub-hosted runners.
+    if: always() && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failed="$(printf '%s' "$NEEDS_JSON" | jq -r '[to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"] | join(", ")')"
+          if [ -n "$failed" ]; then echo "not green: $failed"; exit 1; fi
+
+  # CLAUDE.md rule 12's cross-version check, `cargo xver`
+  # (docs/develop/cross-version-harness.md), run on a runner instead of a
+  # contributor's machine. It pairs the PREVIOUS RELEASE with this PR's branch
+  # in both directions — the old daemon under the branch's TUI and CLI
+  # (forward, the pairing CLAUDE.md rule 12 names) and the branch daemon under the old
+  # TUI and CLI (reverse) — and asserts that a delegate still routes and hooks
+  # still arrive. Its evidence files are uploaded as the run's artifact, which is
+  # the record CLAUDE.md rule 12 asks a PR to carry.
+  #
+  # Why here: the harness wants a disk-backed floor of free space and a host it
+  # can start unprivileged bubblewrap namespaces on, and a shared dev box
+  # running several units at once has neither to spare. A hosted runner is also
+  # the disposable VM the harness doc says unreviewed code belongs in. It holds
+  # no agent credential — every role is a stand-in — so it does not reopen rule
+  # 5's decision; the job token it uses is read-only and serves `gh release`.
+  #
+  # ADVISORY, as `desktop-browser` and `desktop-driver` are, until a run history
+  # shows its runner behaviour; requiring it is a `REQUIRED_CHECKS` change made
+  # with `scripts/apply-branch-protection.sh`, not something a PR can do.
+  cross-version:
+    needs: changes
+    # Stays on GitHub Actions whatever `.github/ci-backend` says: its harness
+    # contains the builds in unprivileged bubblewrap namespaces, and inside an
+    # RWX task bwrap cannot set up the network namespace (measured 2026-10-22:
+    # `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`).
+    if: needs.changes.outputs.binary == 'true'
+    runs-on: ubuntu-latest
+    # A cold build of one binary plus both directions' scenarios, each bounded
+    # by the harness's own `--run-timeout-secs` (1200 by default).
+    timeout-minutes: 75
+    steps:
+      # Full history and tags: the previous release is the nearest stable tag
+      # the PR's own head can reach, which needs both.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, and
+      # both of the harness's namespaces are unprivileged ones. The runner is a
+      # throwaway VM, so lifting that confinement for the job is the setting it
+      # is meant to change.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # A short, disk-backed runs root. Each sandbox's sockets live under
+          # `<runs root>/<branch slug>-<epoch>/`, and a Unix socket address is
+          # capped at 108 bytes: under the default root beside the checkout
+          # (`/home/runner/work/<repo>/dot-agent-deck-xver-runs`), a branch
+          # named like `agent/dispatch-issue-1507-tui-agent-order` overran it
+          # by 16 bytes and the run aborted before its first tell. `/` is the
+          # runner's ext4 disk, not a tmpfs, which the preflight requires.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 /xr
+          df -h / "$GITHUB_WORKSPACE/.."
+      # The commit under test, and the release to pair it with. The harness is
+      # handed the head's SHA rather than a ref: `pull/<n>/head` and a branch
+      # both move, and a push landing between this step and the harness's own
+      # fetch would build a commit the protocol check below never looked at.
+      # GitHub serves a fetch by SHA for any commit its refs reach, a fork PR's
+      # head included (through `refs/pull/<n>/head`).
+      #
+      # The previous release is the nearest stable tag reachable from that head,
+      # not the Latest release: a branch cut before the newest release would
+      # otherwise face a daemon carrying changes it has never seen (the harness
+      # doc's "Which release is previous").
+      #
+      # And a commit that moves `PROTOCOL_VERSION` is not run at all. The two
+      # builds refuse each other by design across a bump — that refusal IS the
+      # outcome CLAUDE.md rule 12 asks to record, and the harness would report it as a
+      # failing `aborted` tell. The step writes that outcome as an evidence file
+      # of its own, so the artifact exists either way.
+      - id: plan
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          previous=$(git describe --tags --abbrev=0 --exclude '*-*' "$HEAD_SHA")
+          protocol() {
+            git show "$1:src/daemon_protocol.rs" \
+              | sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);$/\1/p'
+          }
+          old=$(protocol "$previous")
+          new=$(protocol "$HEAD_SHA")
+          echo "commit=$HEAD_SHA previous=$previous protocol $old -> $new"
+          if [ -z "$old" ] || [ -z "$new" ]; then
+            echo "::error::could not read PROTOCOL_VERSION at $previous or $HEAD_SHA"
+            exit 1
+          fi
+          if [ "$old" != "$new" ]; then
+            message="PROTOCOL_VERSION moves from $old ($previous) to $new at $HEAD_SHA, so the two builds refuse each other by design; no cross-version run. Record that refusal as the CLAUDE.md rule 12 outcome."
+            echo "::notice::$message"
+            mkdir -p .dot-agent-deck/xver-evidence
+            printf '# Cross-version check: not run\n\n%s\n' "$message" \
+              > ".dot-agent-deck/xver-evidence/$HEAD_SHA-protocol-refusal.md"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "commit=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+      # `--min-free-gib 15`: the default floor of 100 GiB is sized for a dev box
+      # shared with other builds (CLAUDE.md rule 14). What a run writes is one
+      # debug build of the binary, its crates and one release asset — a few GiB —
+      # on a runner that builds nothing else.
+      #
+      # `--probe generic`: a reverse run otherwise derives its stimulus from a
+      # `dispatch-issue-<n>` branch name, which a commit SHA is not.
+      #
+      # `--allow-build-changes`: a branch that touches build-time code is built
+      # into a target dir of its own in the build namespace; on a laptop the flag
+      # asks for a human to review those files first, and on this throwaway VM
+      # there is nothing for them to reach.
+      #
+      # Exit 3 is a DECLARED BREAK (issue #1596): every tell was measured, and
+      # each one that failed failed the way a contract break that the daemon's
+      # build declares in `CONTRACT_BREAKS` and the client's does not says it
+      # will, with the daemon's refusal in the run's log. CLAUDE.md rule 12 records that
+      # as the outcome rather than as a regression, so the job reports it with
+      # a warning and passes. Any other non-zero exit, a failure no declared
+      # break accounts for included, fails the job.
+      - if: steps.plan.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.plan.outputs.commit }}
+          PREVIOUS: ${{ steps.plan.outputs.previous }}
+          REPO: ${{ github.repository }}
+        run: |
+          rc=0
+          cargo xver --repo "$REPO" --branch "$COMMIT" --previous "$PREVIOUS" \
+            --direction both --probe generic --allow-build-changes --min-free-gib 15 \
+            --runs-root /xr || rc=$?
+          if [ "$rc" -eq 3 ]; then
+            echo "::warning title=cross-version declared contract break::$COMMIT against $PREVIOUS: a tell failed exactly as a contract break declared between the two builds says it will. That is the CLAUDE.md rule 12 outcome to record, not a regression; the job summary and the evidence artifact name the break."
+            exit 0
+          fi
+          exit "$rc"
+      # Each evidence file's verdict line, in the job summary, so a declared
+      # break (or a failure) is readable without downloading the artifact.
+      - name: Summarise the verdicts
+        if: always() && steps.plan.outcome == 'success'
+        run: |
+          {
+            echo "### cross-version"
+            echo
+            shopt -s nullglob
+            files=(.dot-agent-deck/xver-evidence/*.md)
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "No evidence file was written."
+            fi
+            for f in "${files[@]}"; do
+              verdict=$(grep -m1 '^\*\*Verdict:' "$f" || head -n 3 "$f" | tail -n 1)
+              echo "- \`$(basename "$f")\`: $verdict"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve the evidence
+        if: always() && steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: xver-evidence-attempt-${{ github.run_attempt }}
+          path: .dot-agent-deck/xver-evidence/
+          if-no-files-found: warn
+          include-hidden-files: true
 
   # Issue #368 — run the LOCAL Windows pre-PR gate in CI, for one reason only:
   # so that it cannot rot again. `scripts/windows-cross-check.sh` had been
@@ -938,17 +1782,19 @@ jobs:
   # runner with CC and AR unset is enough (verified).
   windows-cross-check:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.0
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - name: Type-check the workspace for Windows from Linux
         run: |
           set -euo pipefail
@@ -988,10 +1834,20 @@ jobs:
   # red locally and is not a gate (issue #368). Porting the harness to Windows
   # named pipes + ConPTY and running full integration/e2e on a Windows VM is
   # tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9), not M8.
+  # FORK NOTE (upstream sync 2026-11-05): upstream switched this job off with
+  # `if: false` because no release so far carries a Windows build, leaving only
+  # `windows-cross-check` (a type-check) on pull requests. This fork keeps the
+  # native Windows leg running (CLAUDE.md rules 2 and 5 name all three build
+  # jobs), so the condition below is the fork's own, with the `docs_only` gate.
+  # Adopting upstream's saving is a maintainer decision, not a merge one: replace
+  # the condition with `false` and keep this note.
   build-windows:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: windows-latest
+    env:
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1032,15 +1888,17 @@ jobs:
         run: |
           scripts/check-symlinks.sh --self-test
           scripts/check-symlinks.sh
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.0
           targets: x86_64-pc-windows-msvc
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-nextest@0.9.146
       - run: cargo build
       # Deliberately NARROWER than the Linux `build` job: no --all-targets, no
       # --features e2e, so this job lints lib + bins only. PRD #42 review S1's
@@ -1082,7 +1940,7 @@ jobs:
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nextest-windows-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -1104,18 +1962,33 @@ jobs:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: macos-latest
+    # Line tables keep file:line in panics and backtraces and drop the rest of
+    # the debug info, which is most of a test build's link time — the same
+    # setting the Linux `test` and `e2e-build` jobs use. JOB-wide rather than on
+    # the nextest step: `cargo build`, clippy and nextest below share one
+    # profile, and setting it on the nextest step alone would make nextest
+    # rebuild what `cargo build` had just compiled. Measured on 2026-10-18 over
+    # three warm runs against the eleven before: the job's median went from
+    # ~17.0 to ~14.1 minutes (nextest step ~850s -> ~718s). macOS runners vary
+    # by several minutes run to run, so read that as ~2-3 minutes, not exact.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.0
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          tool: cargo-nextest@0.9.143
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-nextest@0.9.146
       - run: cargo build
       # Deliberately NARROWER than the Linux `build` job, for the same reason
       # as build-windows above: lib + bins only, so a macOS-only test lint
@@ -1181,7 +2054,7 @@ jobs:
       # the test step has no results and must not fail on that.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nextest-macos-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -1190,18 +2063,24 @@ jobs:
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+      # `cargo audit` skips the crates under vendor/, which have no registry
+      # source in Cargo.lock; this audits their upstream releases. The script
+      # has why, and what it does not check.
+      - run: scripts/audit-vendored-upstream.sh
 
   # PRD #231 M2: the only check that exercises the root flake.nix. Nothing else
   # in CI evaluates or builds it: the Rust jobs install their toolchain via
@@ -1236,7 +2115,7 @@ jobs:
   # from-source release build of the whole crate.
   nix:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1437,12 +2316,12 @@ jobs:
         if: env.SONAR_TOKEN == ''
         run: echo "SONAR_TOKEN not set - skipping SonarQube analysis"
       # The three third-party actions below are SHA-pinned, unlike the rest of the repo's tag-pinned actions, specifically to satisfy Sonar's `new_security_rating` quality gate (rule githubactions:S7637), which grades new code only; `actions/checkout` above is GitHub-owned and exempt.
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         if: env.SONAR_TOKEN != ''
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.0
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: env.SONAR_TOKEN != ''
       - name: Generate clippy report for Sonar import
         if: env.SONAR_TOKEN != ''
@@ -1487,8 +2366,9 @@ jobs:
   #
   # Duplication is kept honest by Renovate rather than by discipline: the
   # `customManagers` entries in renovate.json track both pinned values (Rust from
-  # rust-lang/rust releases, nextest from the crates.io datasource) and open the
-  # same upgrade PRs the devbox pins get. The upstream-breakage signal that the
+  # the devbox datasource, grouped into one PR with devbox.json's Rust packages
+  # and Cargo.toml's `rust-version` since issue #1478; nextest from the crates.io
+  # datasource) and open the same upgrade PRs the devbox pins get. The upstream-breakage signal that the
   # old floating refs provided now arrives as those PRs — visible and gated on
   # CI, rather than landing unannounced in the middle of an unrelated change.
   #
@@ -1509,7 +2389,7 @@ jobs:
   # unvalidated; add a macos-latest leg if that gap starts to bite.
   devbox:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1603,7 +2483,13 @@ jobs:
       - changes
       - desktop-web
       - desktop-browser
+      - fmt
+      - clippy
+      - build-release
+      - test
       - build
+      - e2e-build
+      - e2e
       - e2e-deterministic
       - windows-cross-check
       - build-windows

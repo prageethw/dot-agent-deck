@@ -1,3 +1,5 @@
+import type { AgentBackground, ConnectionView } from "../types";
+
 /**
  * Display-only sanitising and bounding for daemon-supplied text.
  *
@@ -15,8 +17,10 @@
  * here rather than in the Rust DTO — sanitising upstream would corrupt the keys.
  *
  * The policy mirrors `src/untrusted_text.rs::strip_control_and_bidi`
- * character for character. Keep it that way: that module's own header records
- * that the bug class came from two copies of the policy drifting apart.
+ * character for character, with ONE recorded widening: `U+2028` and `U+2029`
+ * (see `UNSAFE_DISPLAY_CHARS`). Keep it that way otherwise: that module's own
+ * header records that the bug class came from two copies of the policy
+ * drifting apart.
  *
  * `displayActivity` and `displayUptime` at the bottom of the file are the same
  * seam for a daemon-supplied INSTANT rather than a string (PRD #745 M9, M11):
@@ -40,6 +44,18 @@
  *   swallow the inline siblings printed after it, the COORDINATOR badge
  *   included, on a screen whose entire purpose is telling one agent from
  *   another.
+ * - `U+2028` LINE SEPARATOR and `U+2029` PARAGRAPH SEPARATOR (PRD #1223 audit
+ *   D1). Neither is a control character (`Zl` / `Zp`), but both are MANDATORY
+ *   line breaks under Unicode's line-breaking algorithm (UAX #14 class `BK`),
+ *   which browser line breakers implement — so in the webview either one can
+ *   break a one-line cell the way a newline would, which is what the C0 clause
+ *   above exists to stop. This is the one place the list is wider than the
+ *   Rust policy, and deliberately: a terminal does not break a line on them,
+ *   so the TUI does not need it for the same string. A current deck keeps
+ *   them out of the paths it lists and refuses them in an authoring start's
+ *   directory, but an older deck can still list a directory named with one,
+ *   and other daemon strings — a display name, for one — can carry one
+ *   regardless.
  *
  * Zero-width joiners and the other default-ignorable format characters
  * (`U+200B` ZWSP, `U+200C` ZWNJ, `U+200D` ZWJ, `U+FEFF`) are deliberately NOT
@@ -58,7 +74,7 @@
  * columns below 680px, so a narrow window leaves two same-status rows with
  * nothing to tell them apart.
  */
-const UNSAFE_DISPLAY_CHARS = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const UNSAFE_DISPLAY_CHARS = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069]/g;
 
 /**
  * Character budgets. `DesktopAgentDto` is a TypeScript *assertion* about a shape
@@ -108,6 +124,15 @@ export const DISPLAY_LIMITS = {
   /** The daemon's own connection message. */
   message: 240,
   /**
+   * A failure's full sentence, where `message` shows its first 240 characters
+   * and a disclosure offers the rest (PRD #1223 audit F6: a launch error names
+   * the role that failed, then every role that had started, then what the
+   * rollback did — so the part a reader most needs is the part the `message`
+   * clamp cuts). 2048 is the crate's own `ERROR_MESSAGE_MAX_CHARS`, the cap
+   * `safe_message` applies to each part of such a sentence.
+   */
+  detail: 2048,
+  /**
    * Identity values that reach a DOM attribute, an IDREF or a React key —
    * `domIdentity` is the seam. Generous next to the others because these are
    * percent-encoded composites (`<kind>:<encoded id>`, `<encoded daemonId>:<encoded
@@ -119,7 +144,7 @@ export const DISPLAY_LIMITS = {
   domIdentity: 160,
 } as const;
 
-/** Drop every control and bidi character. Nothing else is touched. */
+/** Drop every control, bidi and line/paragraph-separator character. Nothing else is touched. */
 export function sanitizeText(value: string): string {
   return value.replace(UNSAFE_DISPLAY_CHARS, "");
 }
@@ -423,4 +448,82 @@ function uptimeLabel(elapsed: number): string {
   if (elapsed < HOUR_MS) return `${Math.floor(elapsed / MINUTE_MS)}m`;
   if (elapsed < DAY_MS) return `${Math.floor(elapsed / HOUR_MS)}h`;
   return `${Math.floor(elapsed / DAY_MS)}d`;
+}
+
+/**
+ * Issue #1678: the line a tile shows under its status while the agent's turn is
+ * over but work it started is still running — `Background: 2 commands, 1
+ * subagent · 3h 12m` — or `undefined` when there is nothing to show.
+ *
+ * **The words are the TUI card's, character for character** (CLAUDE.md rule
+ * 22): `background_work_label` in `src/ui.rs` builds the same sentence, so a
+ * zero kind is omitted, each kind is singular at one, and the duration is
+ * {@link elapsedSpanLabel}, a port of the TUI's `format_elapsed`. It is NOT
+ * `uptimeLabel`: that one floors to a single unit (`3h`), and the two clients
+ * would then disagree about the same agent.
+ *
+ * The duration follows {@link relativeTo}'s policy — the one every
+ * daemon-supplied instant on this screen goes through — so a start up to
+ * {@link CLOCK_SKEW_TOLERANCE_MS} ahead of this clock reads `0s`, and one
+ * further ahead, absent, or not a usable instant drops the duration while the
+ * counts stay: the counts are true without it, and a made-up span is not.
+ */
+export function displayBackgroundWork(background: AgentBackground | undefined, now: number = Date.now()): string | undefined {
+  if (!background) return undefined;
+  const count = (n: number, unit: string) => (n > 0 ? `${n} ${unit}${n === 1 ? "" : "s"}` : undefined);
+  const kinds = [count(background.commands, "command"), count(background.subagents, "subagent")].filter((kind) => kind !== undefined);
+  if (kinds.length === 0) return undefined;
+  const usable = relativeTo(background.sinceMs, now);
+  const span = usable ? ` · ${elapsedSpanLabel(Math.max(0, usable.elapsed))}` : "";
+  return `Background: ${kinds.join(", ")}${span}`;
+}
+
+/**
+ * The TUI's `format_elapsed` (`src/ui.rs`), ported: whole seconds under a
+ * minute (`0s`, `42s`), minutes and seconds under an hour (`4m`, `4m 30s`),
+ * hours and minutes beyond (`3h`, `3h 12m`). Floored, so it never claims more
+ * time than has passed.
+ */
+function elapsedSpanLabel(elapsedMs: number): string {
+  const total = Math.floor(elapsedMs / 1000);
+  if (total < 60) return `${total}s`;
+  if (total < 3600) {
+    const minutes = Math.floor(total / 60);
+    const seconds = total % 60;
+    return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
+  }
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}m`;
+}
+
+/**
+ * What a deck is CALLED on screen.
+ *
+ * A local deck is "Local daemon", exactly as it was when there was only one. A
+ * remote one is called by its name in the shared deck list when it has one
+ * (issue #1426) — the name `dot-agent-deck connect` takes, and the one the user
+ * chose when adding it — and otherwise by its address, `Endpoint::describe()`'s
+ * `user@host[:port]`. Both go through this module, because bounding a
+ * daemon-supplied string at the render seam is the rule and not a judgement
+ * about any one field.
+ *
+ * # Why it lives here rather than in `AgentOverview`
+ *
+ * It was that screen's private helper until PRD #1105 gave the agent pane a
+ * second caller: the pane for an agent on a deck the app is not attached to
+ * says *which* deck, inside a sentence. Two spellings of a deck's name is
+ * exactly the drift this module exists to prevent, so there is one function and
+ * both call sites read it.
+ *
+ * `displayIdentity` rather than `displayText`, for the reason that function
+ * exists: a remote label made entirely of invisible characters would otherwise
+ * render as an empty header cell, and — since #1105 — as a gap in the middle of
+ * the pane's sentence. It falls back to the same words the addressless case
+ * already uses.
+ */
+export function deckName(connection: Pick<ConnectionView, "deckKind" | "socketPath" | "name">): string {
+  if (connection.deckKind !== "remote") return "Local daemon";
+  const address = connection.socketPath ? displayIdentity(connection.socketPath, DISPLAY_LIMITS.path, "Remote daemon") : "Remote daemon";
+  return connection.name ? displayIdentity(connection.name, DISPLAY_LIMITS.name, address) : address;
 }

@@ -67,7 +67,7 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // which an unborn HEAD (the harness's own bare `git init`) does not
     // provide.
     commit_fixture(deck.workdir());
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab A is up
@@ -310,7 +310,7 @@ fn orchestration_024_ctrl_l_forwards_to_pty_on_focused_orchestration_role_pane()
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-bash-role");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     // Isolated-clone provisioning needs a ref to branch from — an unborn
     // HEAD (the harness's own bare `git init`) does not provide one.
     commit_fixture(deck.workdir());
@@ -360,7 +360,7 @@ fn orchestration_015_active_tab_bold_status_color_no_underline() {
         .into_owned();
     let active_label = format!("{launch_dir_basename}-orchestrator-1");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     // Isolated-clone provisioning needs a ref to branch from — an unborn
     // HEAD (the harness's own bare `git init`) does not provide one.
     commit_fixture(deck.workdir());
@@ -468,7 +468,9 @@ fn contains_role_word(line: &str, role: &str) -> bool {
 /// resolving correctly on PATH — a dev machine may have a separately
 /// installed `dot-agent-deck` shadowing the build under test.
 fn write_beta_agent(deck: &TuiDeck) {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin = common::contained_deck_binary()
+        .to_str()
+        .expect("the contained deck path is UTF-8");
     let body = format!(
         "#!/bin/sh\n\
          printf 'BETA_ROLE_SENTINEL\\n'\n\
@@ -476,7 +478,14 @@ fn write_beta_agent(deck: &TuiDeck) {
          sleep 1\n\
          {pre_tool_use}\
          sleep 600\n",
-        session_start = common::claude_session_start_line(bin, "beta-sess"),
+        // The bare hook, not `claude_session_start_line`: that one also draws
+        // Claude Code's prompt box and repaints it on every resize by clearing
+        // the screen, which wipes BETA_ROLE_SENTINEL when focus resizes the
+        // pane. This stand-in needs the status events, not the box.
+        session_start = common::claude_hook_line(
+            bin,
+            r#"{"hook_event_name":"SessionStart","session_id":"beta-sess"}"#,
+        ),
         pre_tool_use = common::claude_hook_line(
             bin,
             r#"{"hook_event_name":"PreToolUse","session_id":"beta-sess","tool_name":"Bash"}"#,
@@ -493,7 +502,7 @@ fn write_beta_agent(deck: &TuiDeck) {
 }
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
-/// `orch-focus-lifecycle` fixture. With no `[[modes]]` defined the Mode chip
+/// `orch-focus-lifecycle` fixture. The Mode chip
 /// row is `[No mode] [Orch: focus-lifecycle] [schedule]`, so ONE Right
 /// selects the orchestration; selecting an orchestration hides the Command
 /// field, so a second Enter submits the form.
@@ -551,7 +560,7 @@ fn orchestration_008_stacked_pane_column_hides_collapsed_frames_while_agents_sta
         .with_pty_size(160, 45)
         .launch_with_fixture("orch-focus-lifecycle");
     write_beta_agent(&deck);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_focus_lifecycle_orchestration(&deck);
     deck.wait_for_string("orchestrator");
     deck.wait_for_string("alpha");
@@ -679,7 +688,7 @@ fn orchestration_018_z_zooms_the_focused_role_pane_in_command_mode() {
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-focus-lifecycle");
     write_beta_agent(&deck);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_string("alpha");
@@ -887,7 +896,7 @@ fn orchestration_019_real_agent_reflows_across_a_zoom_round_trip() {
         // directives below are not swallowed answering them.
         .with_claude_trust_workdir()
         .launch_with_fixture("orch-lock-live");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Uniquely-named fixture sentinels the agent has to DISCOVER. Written into
     // the agents' cwd before the orchestration opens.
