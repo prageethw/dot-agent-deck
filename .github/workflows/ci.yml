@@ -1765,8 +1765,10 @@ jobs:
   # nothing in CI ran the script — `build-windows` compiles natively and never
   # invokes it.
   #
-  # This is NOT a second Windows code gate. `build-windows` below owns that and
-  # does it properly (real build + clippy + tests on a real Windows runner).
+  # This is NOT a substitute for the native Windows gate. `build-windows` below
+  # (real build + clippy + tests on a real Windows runner) is switched off until
+  # Windows ships (see its comment block), so this is the only Windows job that
+  # runs, and it is a type-check only.
   # This job answers a different question: *does the script itself still work?*
   # A dependency bump can pull in another native library and break it without
   # breaking anything else, and the breakage is then seen only by whoever next
@@ -1853,6 +1855,12 @@ jobs:
   # workspace, tests included, for the Windows target. It does not lint with
   # `-D warnings`, so while this job is off a Windows-only lint or test break can
   # merge with every check green.
+  #
+  # `scripts/check-symlinks.sh` and its `--self-test` ran only inside this job
+  # (the "Tracked symlinks materialised as links" step below), so while it is off
+  # the tracked-symlink guard (`AGENTS.md`, `.agents/skills`, `docs/img`; see
+  # `docs/develop/windows-symlinks.md`) runs in no job. It only matters to a
+  # Windows clone, and re-enabling this job restores it.
   #
   # To re-enable it when Windows ships, restore the fork's condition:
   #   if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.docs_only != 'true'
