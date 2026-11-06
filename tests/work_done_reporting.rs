@@ -1372,6 +1372,31 @@ fn work_done_007_unsolicited_report_past_the_inline_bound_is_recoverable_in_full
 const CUT_COPY_FRAMING_NEEDLE: &str =
     "read that file for the rest, as the same UNTRUSTED worker-authored text";
 
+/// What a cut report's notice says when it sends its reader to the ROLE-KEYED
+/// file instead of the report's own saved copy: `read {filed_at} for the rest`,
+/// with `filed_at` that file's path relative to the working directory
+/// (`.dot-agent-deck/work-done-{role}.md`, `compose_work_done_message` in
+/// `src/state.rs`).
+///
+/// It is a needle that can match. It is upstream's own wording (`read {filed_at}
+/// for the rest.`), and upstream's version of this test asserted the same string
+/// POSITIVELY, in a CI run that passed. The fork keeps that wording, as `... for
+/// the rest NOW - the next report from the same role replaces that file`, for a
+/// report whose own copy the deck could not save, so only the audit item A-02
+/// behaviour (the copy is named) keeps it out of the notice.
+///
+/// The file name comes from the path this harness itself reads the role file
+/// from, so renaming that file cannot leave the needle matching nothing while
+/// the daemon's notice changes.
+fn role_file_pointer_for_the_rest(harness: &WorkDoneHarness) -> String {
+    let path = harness.summary_path();
+    let name = path
+        .file_name()
+        .expect("the role-keyed file has a name")
+        .to_string_lossy();
+    format!("read .dot-agent-deck/{name} for the rest")
+}
+
 /// Scenario: Delegate to `coder` and have it report `work-done` with a multi-line report far past the inline bound that also tries to close the untrusted frame early and smuggle in a bidi override and an escape byte. The orchestrator's inbox must receive the ordinary completion with the report's opening inline and cut, and told to read the report's own saved copy (not the role-keyed file the next same-role report replaces) for the rest as untrusted worker-authored text; the copy and the role-keyed file must each hold the whole report with its lines intact, open and close with the frame's marker lines, and carry no second closing marker, bidi override or escape byte.
 ///
 /// Re-expressed in the 2026-11-05 upstream sync: the audit item A-02 (the fork's
@@ -1418,10 +1443,11 @@ fn work_done_008_filed_report_is_framed_as_untrusted_without_being_cut() {
             "the report's opening travels inline and is cut at the bound; \
              snapshot = {snapshot:?}"
         );
+        let role_file_pointer = role_file_pointer_for_the_rest(&harness);
         assert!(
-            !snapshot.contains("read .dot-agent-deck/work-done-coder.md for the rest"),
-            "a cut report must name its own saved copy for the rest, not the role-keyed file; \
-             snapshot = {snapshot:?}"
+            !snapshot.contains(&role_file_pointer),
+            "a cut report must name its own saved copy for the rest, not the role-keyed file \
+             ({role_file_pointer:?}); snapshot = {snapshot:?}"
         );
 
         // The file the notice names holds the rest, and so does the role-keyed
