@@ -9249,7 +9249,7 @@ exit 0
         let bindir = scratch.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let gh = bindir.join("gh");
-        std::fs::write(&gh, CLAIM_019_GH_STUB).unwrap();
+        crate::test_isolation::write_script(&gh, CLAIM_019_GH_STUB).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -9413,7 +9413,7 @@ exit 0
         let bindir = scratch.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let gh = bindir.join("gh");
-        std::fs::write(&gh, CLAIM_024_GH_STUB).unwrap();
+        crate::test_isolation::write_script(&gh, CLAIM_024_GH_STUB).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -9549,7 +9549,7 @@ exit 0
         let bindir = scratch.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let gh = bindir.join("gh");
-        std::fs::write(&gh, CLAIM_024_GH_STUB).unwrap();
+        crate::test_isolation::write_script(&gh, CLAIM_024_GH_STUB).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -15347,7 +15347,7 @@ exit 0
         let started_marker = scratch.path().join("started");
         let finished_marker = scratch.path().join("finished");
         let script = scratch.path().join("slow-git.sh");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &script,
             format!(
                 "#!/bin/sh\ntouch {}\nsleep 1\ntouch {}\n",
@@ -15432,7 +15432,7 @@ exit 0
         std::fs::create_dir_all(&bindir).unwrap();
         let started_marker = scratch.path().join("started");
         let git_stub = bindir.join("git");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &git_stub,
             format!("#!/bin/sh\ntouch {}\nsleep 5\n", started_marker.display()),
         )

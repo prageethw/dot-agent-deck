@@ -4929,7 +4929,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = app-server ]; then\n  IFS= read -r _initialize\n  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\",\"codexHome\":\"test\"}}}}'\n  IFS= read -r _list\n  printf '%s\\n' '{{\"id\":2,\"result\":{{\"data\":[{{\"cwd\":\"/workspace\",\"hooks\":{hooks_json},\"warnings\":[],\"errors\":[]}}]}}}}'\nfi\n"
         );
         let codex_path = bindir.join("codex");
-        std::fs::write(&codex_path, script).expect("write fake codex script");
+        crate::test_isolation::write_script(&codex_path, script).expect("write fake codex script");
         std::fs::set_permissions(&codex_path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake codex script");
     }

@@ -4519,9 +4519,10 @@ mod tests {
     }
 
     /// Runs `f` against a thread-local subscriber that captures every emitted
-    /// line (`with_default`, like `tests/logging_filter.rs`, so this stays
-    /// independent of `cargo test`'s threads / `nextest`'s processes) and
-    /// returns everything written.
+    /// line (installed through `capture_tracing_on_this_thread`, so this stays
+    /// independent of `cargo test`'s threads / `nextest`'s processes and
+    /// loses no event to another test's callsite interest) and returns
+    /// everything written.
     fn capture_tracing(f: impl FnOnce()) -> String {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
@@ -4529,7 +4530,10 @@ mod tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
             .with_ansi(false)
             .finish();
-        tracing::subscriber::with_default(subscriber, f);
+        {
+            let _capture = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+            f();
+        }
         String::from_utf8(buf.lock().expect("capture buffer poisoned").clone())
             .expect("log output is not UTF-8")
     }
