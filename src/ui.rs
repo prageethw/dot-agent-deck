@@ -29841,14 +29841,21 @@ mod tests {
     }
 
     /// Test setup that follows the live-open and restore-from-saved-config
-    /// sites in `run_tui` step for step: register each role pane, draw its
-    /// placeholder through the REAL seam (`insert_placeholder_session_learned`,
-    /// stamped with the stream the deck is attached to, as the sites do when
-    /// the controller reports no attach incarnation), then apply fork issue
-    /// #542's cue to the card it drew. That cue is inline in `run_tui` (it
-    /// cannot be called), so it is mirrored here; everything else is
-    /// production code. There is deliberately no production helper to call:
-    /// both sites went to `insert_placeholder_session_learned` directly.
+    /// sites in `run_tui` step for step: register each role pane, then draw its
+    /// placeholder through the REAL seam — the spawn-time constructor
+    /// `insert_placeholder_session_awaiting_report_learned`, stamped with the
+    /// stream the deck is attached to (as the sites do when the controller
+    /// reports no attach incarnation) and carrying fork issue #542's
+    /// `expects_agent_report`, derived from the role's command exactly as the
+    /// sites derive it.
+    ///
+    /// Upstream-sync round 30: the sites call that constructor directly, so the
+    /// only thing mirrored here is the one-line derivation of the flag; the
+    /// early-pane reconciliation (issue #806) these tests pin is production code
+    /// the sites reach, not something the helper imitates. An earlier round had
+    /// pointed this at the plain learned constructor plus an inline cue, which
+    /// pinned a seam the fork's sites no longer reach and let the lost
+    /// reconciliation go unnoticed.
     fn place_role_placeholders(
         st: &mut AppState,
         role_pane_ids: &[String],
@@ -29859,19 +29866,15 @@ mod tests {
         for (i, (id, agent_id)) in role_pane_ids.iter().zip(role_agent_ids.iter()).enumerate() {
             st.register_pane(id.clone());
             let learned_from = st.stream_incarnation.clone();
-            let placeholder_id = st.insert_placeholder_session_learned(
+            st.insert_placeholder_session_awaiting_report_learned(
                 id.clone(),
                 Some(dir.to_string()),
                 None,
                 agent_id.clone(),
                 learned_from,
+                crate::event::AgentType::from_command_including_devbox(Some(&roles[i].command))
+                    .is_some(),
             );
-            if crate::event::AgentType::from_command_including_devbox(Some(&roles[i].command))
-                .is_some()
-                && let Some(session) = st.sessions.get_mut(&placeholder_id)
-            {
-                session.expects_agent_report = true;
-            }
         }
     }
 
@@ -36447,11 +36450,12 @@ mod tests {
 
     /// Scenario: Draw the placeholders for one role whose command is a
     /// devbox-wrapped agent launch and one role whose command is a plain
-    /// non-agent binary through the real `insert_placeholder_session_learned`
-    /// seam and fork issue #542's inline `expects_agent_report` cue (mirrored
-    /// by `place_role_placeholders`, since the cue lives inside `run_tui`),
-    /// and assert the two resulting sessions' `expects_agent_report` come out
-    /// `true` and `false` respectively.
+    /// non-agent binary through the real spawn-time constructor
+    /// `insert_placeholder_session_awaiting_report_learned`, with fork issue
+    /// #542's `expects_agent_report` derived from each role's command as the
+    /// `run_tui` sites derive it (`place_role_placeholders`), and assert the
+    /// two resulting sessions' `expects_agent_report` come out `true` and
+    /// `false` respectively.
     #[spec("dashboard/placeholder/003")]
     #[test]
     fn dashboard_placeholder_003_role_wiring_seeds_expects_agent_report_for_devbox_and_non_agent() {
@@ -36528,7 +36532,7 @@ mod tests {
     #[test]
     fn dashboard_placeholder_004_real_activity_clears_starting_and_never_reverts() {
         // Issue #549: `expects_agent_report` is only ever set true at spawn
-        // time (`insert_placeholder_session_inner`) and nothing clears it, so
+        // time (`mint_placeholder`) and nothing clears it, so
         // `is_pending` in `render_session_card` stays true forever once set —
         // even once the session has done real, visible work and
         // `session.status` genuinely reflects it. This pins the maintainer's
@@ -36930,7 +36934,7 @@ mod tests {
     #[spec("dashboard/placeholder/007")]
     #[test]
     fn dashboard_placeholder_007_placeholder_insert_after_real_event_does_not_reclobber() {
-        // Issue #724: `insert_placeholder_session_inner` does an
+        // Issue #724: `mint_placeholder` does an
         // unconditional `self.sessions.insert(session_id_for_pane(&pane_id),
         // ...)`, so when the placeholder-insert loop reaches a pane AFTER
         // that pane's real wrapper fork-time `SessionStart` has already
