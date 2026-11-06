@@ -209,10 +209,32 @@ fn card_event(
 /// site is a one-line call naming only the event and what it represents.
 #[cfg(unix)]
 fn write_event(daemon: &common::InProcDaemon, event: &AgentEvent, description: &str) {
-    let line =
-        serde_json::to_string(event).unwrap_or_else(|e| panic!("serialize {description}: {e}"));
+    // Hook provenance (merged from upstream): the daemon refuses a status event
+    // that names a pane it issued a capability for unless the line presents that
+    // capability, so a raw line carries the token of the agent it speaks for.
+    let token = event.agent_id.as_deref().and_then(capability_of);
+    let line = dot_agent_deck::event::agent_event_line(event, token.as_deref())
+        .unwrap_or_else(|e| panic!("serialize {description}: {e}"));
     common::write_hook_line(&daemon.hook_path, &line)
         .unwrap_or_else(|e| panic!("write {description} to the daemon hook socket: {e}"));
+}
+
+/// The pane capability each stub pane this test process spawned exported, keyed
+/// by both its agent id (for injected events) and its pane id (for the `wait`
+/// CLI, which names only its pane). One test per process under nextest, and the
+/// keys are unique per pane under `cargo test`, so a plain map is enough.
+#[cfg(unix)]
+static CAPABILITIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(unix)]
+fn capability_of(key: &str) -> Option<String> {
+    CAPABILITIES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(key)
+        .cloned()
 }
 
 /// Register a `cat`-stub pane directly on the daemon's own live
@@ -223,15 +245,26 @@ fn write_event(daemon: &common::InProcDaemon, event: &AgentEvent, description: &
 /// seed event.
 #[cfg(unix)]
 async fn setup_idle_pane(daemon: &common::InProcDaemon, cwd: &str, pane_id: &str) -> TestPane {
+    // The stub keeps its own injected capability in its cwd (`exec` so `cat`
+    // replaces the shell and the pane still has no descendant process).
+    let command = common::capability_export_command("exec cat");
     let agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some("cat"),
+            command: Some(&command),
             cwd: Some(cwd),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
             ..SpawnOptions::default()
         })
         .expect("spawn cat-stub pane for wait/monitored setup");
+    let token = common::recorded_hook_capability(std::path::Path::new(cwd), &agent_id)
+        .await
+        .expect("the cat-stub pane exports its capability");
+    {
+        let mut capabilities = CAPABILITIES.lock().unwrap_or_else(|p| p.into_inner());
+        capabilities.insert(agent_id.clone(), token.clone());
+        capabilities.insert(pane_id.to_string(), token);
+    }
 
     let session_id = format!("{pane_id}-session");
     write_event(
@@ -279,6 +312,12 @@ async fn run_wait_cli(
         cmd.args(&args);
         cmd.env("DOT_AGENT_DECK_SOCKET", &hook_path);
         cmd.env(DOT_AGENT_DECK_PANE_ID, &pane_id);
+        // `wait start` / `wait done` are hook verbs: the daemon refuses one that
+        // does not present the pane's capability, as a role's shell would from
+        // the environment the deck injected.
+        if let Some(token) = capability_of(&pane_id) {
+            cmd.env("DOT_AGENT_DECK_PANE_CAPABILITY", token);
+        }
         for (k, v) in &extra_env {
             cmd.env(k, v);
         }
