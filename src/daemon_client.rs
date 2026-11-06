@@ -9538,8 +9538,13 @@ mod protocol_gate_tests {
 /// by the same build — every compatibility check passes, and only the process
 /// its `Hello` names changes. Each connection is served by the process current
 /// when it was accepted, and every request that is not a `Hello` is recorded as
-/// `"<process>:<op>"`. Both processes answer for the agent `"1"` in pane
-/// `"pane-1"` with viewer `"v1"`, as two daemons counting from 1 would.
+/// `"<process>:<op>"`. Both processes answer for the agent `"1"` with viewer
+/// `"v1"`, as two daemons counting from 1 would, and the Nth `start-agent` the
+/// fixture serves, whichever process serves it, is answered with pane
+/// `"pane-N"`: the daemon mints the pane id (PRD #365 M2), and a test that
+/// starts several panes needs a distinct one for each, as the client's own
+/// counter gave it before the daemon minted them. The first is `"pane-1"`,
+/// which the listings below also carry.
 #[cfg(all(test, unix))]
 pub(crate) mod restart_fixture {
     use std::collections::HashMap;
@@ -9560,6 +9565,9 @@ pub(crate) mod restart_fixture {
         hellos: HashMap<&'static str, usize>,
         /// Capabilities every process leaves out of its `Hello`.
         withheld: Vec<&'static str>,
+        /// How many `start-agent` requests the fixture has served, across its
+        /// processes: the number in the next pane id it mints.
+        started: usize,
     }
 
     pub(crate) struct RestartingDaemon {
@@ -9588,7 +9596,7 @@ pub(crate) mod restart_fixture {
         }
     }
 
-    fn serve(op: &str) -> AttachResponse {
+    fn serve(op: &str, script: &Mutex<Script>) -> AttachResponse {
         match op {
             // A subscription's snapshot lists what a listing does (G-fix6).
             "list-agents" | "subscribe-events-with-snapshot" => {
@@ -9605,10 +9613,17 @@ pub(crate) mod restart_fixture {
             "start-agent" => {
                 // PRD #365 M2: the daemon mints the pane id and the client
                 // takes it from this reply, refusing a start that carries none
-                // ("start-agent ok but no pane_id in response"). Both processes
-                // answer for pane `pane-1`, as the fixture's doc says.
+                // ("start-agent ok but no pane_id in response"). A fresh one for
+                // every start: answering `pane-1` each time put a test's second
+                // pane on the first one's id, so its controller held one pane
+                // where the test had made several.
+                let started = {
+                    let mut script = script.lock().unwrap();
+                    script.started += 1;
+                    script.started
+                };
                 let mut reply = AttachResponse::with_id("1".into());
-                reply.pane_id = Some("pane-1".into());
+                reply.pane_id = Some(format!("pane-{started}"));
                 reply
             }
             "post-message" => AttachResponse::with_id("m-1".into()),
@@ -9703,7 +9718,7 @@ pub(crate) mod restart_fixture {
                                 recorded.lock().unwrap().push(format!("{process}:{op}"));
                                 requests.lock().unwrap().push((process, request.clone()));
                                 restart_after_serving(&script, process, &op);
-                                let _ = write_resp(&mut stream, &serve(&op)).await;
+                                let _ = write_resp(&mut stream, &serve(&op, &script)).await;
                                 // Hold an attach or subscription open, as a
                                 // daemon would, until the client leaves.
                                 while let Ok(Some(_)) = read_frame(&mut stream).await {}
