@@ -3,7 +3,10 @@
 //! (issue #326). It replaced three inline copies, in `.github/workflows/ci.yml`,
 //! `.rwx/ci.yml` and `.rwx/sandbox.yml`, which nothing kept in step: a fix to
 //! one (the version pattern, the pre-release rule) would have left the others
-//! choosing a different version for the same commit.
+//! choosing a different version for the same commit. The fork-only
+//! `.github/workflows/e2e.yml` is a fourth caller: it cannot read `ci.yml`'s job
+//! output (a job output does not cross a workflow file), so its `e2e` job runs
+//! the script itself, and its `version` step is held to the same two rules.
 //!
 //! These tests hold both halves: the script's choice, driven under `bash`
 //! against an offline `git` stand-in, so no test reads the network or runs
@@ -209,12 +212,17 @@ fn release_version_lookup_004_a_comment_naming_the_script_is_not_a_call() {
 #[test]
 fn release_version_lookup_005_every_caller_runs_the_script_and_keeps_no_copy() {
     let ci = load_yaml(".github/workflows/ci.yml");
+    let e2e = load_yaml(".github/workflows/e2e.yml");
     let rwx_ci = load_yaml(".rwx/ci.yml");
     let sandbox = load_yaml(".rwx/sandbox.yml");
     let callers = [
         (
             ".github/workflows/ci.yml",
             run_of(&ci["jobs"]["changes"]["steps"], "id", "version", "ci.yml"),
+        ),
+        (
+            ".github/workflows/e2e.yml",
+            run_of(&e2e["jobs"]["e2e"]["steps"], "id", "version", "e2e.yml"),
         ),
         (
             ".rwx/ci.yml",
@@ -234,6 +242,7 @@ fn release_version_lookup_005_every_caller_runs_the_script_and_keeps_no_copy() {
     }
     for file in [
         ".github/workflows/ci.yml",
+        ".github/workflows/e2e.yml",
         ".rwx/ci.yml",
         ".rwx/sandbox.yml",
     ] {

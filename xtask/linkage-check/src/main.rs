@@ -216,7 +216,7 @@ mod reap_orphans;
 #[cfg(all(test, unix))]
 mod release_channel_vars;
 /// Issue #2052 follow-up: the one lookup that gives a tagless CI or sandbox
-/// build its `DAD_VERSION`, `scripts/latest-release-version.sh`, and its three
+/// build its `DAD_VERSION`, `scripts/latest-release-version.sh`, and its four
 /// callers. Tests only, and Unix only — the script is driven under `bash`
 /// against an offline `git` stand-in.
 #[cfg(all(test, unix))]

@@ -19,6 +19,8 @@
 #
 # The callers, which must not grow their own copy of the lookup:
 #   .github/workflows/ci.yml  the `changes` job's `version` step
+#   .github/workflows/e2e.yml the `e2e` job's `version` step (fork-only: it
+#                             cannot read ci.yml's job output, so it runs this)
 #   .rwx/ci.yml               the `backend` task
 #   .rwx/sandbox.yml          the `version` task
 # xtask/linkage-check/src/release_version_lookup.rs tests this script and that
