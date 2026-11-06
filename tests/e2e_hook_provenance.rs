@@ -77,7 +77,8 @@ fn provenance_003_outside_status_events_cannot_drive_a_spawned_panes_card() {
         },
         Duration::from_secs(20),
     );
-    std::fs::write(deck.workdir().join("status-running"), b"go").expect("release own running");
+    std::fs::write(pane_dir(&deck, &pane).join("status-running"), b"go")
+        .expect("release own running");
     let own_running = sub.wait_for(
         |event| event.pane_id.as_deref() == Some(&pane) && event.event_type == EventType::Thinking,
         Duration::from_secs(20),
@@ -85,7 +86,8 @@ fn provenance_003_outside_status_events_cannot_drive_a_spawned_panes_card() {
     deck.wait_until_grid("own status renders Thinking", |grid| {
         grid.contains("orchestrator") && grid.contains("Thinking")
     });
-    std::fs::write(deck.workdir().join("status-waiting"), b"go").expect("release own waiting");
+    std::fs::write(pane_dir(&deck, &pane).join("status-waiting"), b"go")
+        .expect("release own waiting");
     let own_waiting = sub.wait_for(
         |event| {
             event.pane_id.as_deref() == Some(&pane)
@@ -168,7 +170,8 @@ fn provenance_003_outside_status_events_cannot_drive_a_spawned_panes_card() {
             .any(|event| event.session_id == "forged-318"),
         "forged SessionStart must never reach attach clients"
     );
-    std::fs::write(deck.workdir().join("status-finished"), b"go").expect("release own finished");
+    std::fs::write(pane_dir(&deck, &pane).join("status-finished"), b"go")
+        .expect("release own finished");
     deck.wait_until_grid("own later status still drives the card", |grid| {
         grid.contains("orchestrator") && grid.contains("Idle") && !grid.contains("Needs Input")
     });
@@ -251,10 +254,30 @@ fn orchestration_ids_with_pane(deck: &TuiDeck) -> (String, String, String) {
     ids.into_inner().expect("the ready poll stores both ids")
 }
 
+/// The directory the process in `pane_id` runs in, read from the daemon's own
+/// agent record. A role's relative trigger file (`./provenance-go-1`) is polled
+/// in THAT directory, which on this fork is the orchestration's isolated clone of
+/// the launch directory (PRD fork#544 M2b), not the launch directory the deck
+/// was started in, so a trigger written to `deck.workdir()` is never seen.
+fn pane_dir(deck: &TuiDeck, pane_id: &str) -> std::path::PathBuf {
+    common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.pane_id_env.as_deref() == Some(pane_id))
+        .and_then(|record| record.cwd)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| panic!("no agent record with a working directory for pane {pane_id}"))
+}
+
 /// Release one of the worker's two trigger files and wait for the report it
 /// gates to reach the orchestrator's inbox.
-fn release_and_await(deck: &TuiDeck, trigger: &str, sentinel: &str, orchestrator_pane: &str) {
-    std::fs::write(deck.workdir().join(trigger), b"go\n")
+fn release_and_await(
+    deck: &TuiDeck,
+    worker_pane: &str,
+    trigger: &str,
+    sentinel: &str,
+    orchestrator_pane: &str,
+) {
+    std::fs::write(pane_dir(deck, worker_pane).join(trigger), b"go\n")
         .unwrap_or_else(|e| panic!("create the worker's trigger file {trigger}: {e}"));
     let landed = inbox_view::wait_for(
         deck.attach_socket_path(),
@@ -295,7 +318,13 @@ fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands
     let (worker_pane, _, orchestrator_pane) = orchestration_ids_with_pane(&deck);
 
     // ---- 1. THE LEGITIMATE PATH, PROVEN LIVE ----------------------------
-    release_and_await(&deck, "provenance-go-1", ATTESTED_FIRST, &orchestrator_pane);
+    release_and_await(
+        &deck,
+        &worker_pane,
+        "provenance-go-1",
+        ATTESTED_FIRST,
+        &orchestrator_pane,
+    );
 
     // ---- 2. THE FORGERY -------------------------------------------------
     // Everything a same-uid process on this box can obtain: the socket path
@@ -342,6 +371,7 @@ fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands
     // ---- 3. A LATER LEGITIMATE SIGNAL COMPLETES THE ROUND TRIP ----------
     release_and_await(
         &deck,
+        &worker_pane,
         "provenance-go-2",
         ATTESTED_SECOND,
         &orchestrator_pane,
@@ -479,7 +509,7 @@ fn provenance_002_a_stale_pane_identity_cannot_route_into_another_live_orchestra
 
     // ---- 1. THE STALE IDENTITY, from inside B's own pane ------------------
     std::fs::write(
-        deck.workdir().join(format!("stale-go-{}", orch_b.pane_id)),
+        pane_dir(&deck, &orch_b.pane_id).join(format!("stale-go-{}", orch_b.pane_id)),
         format!(
             "STALE_PANE='{}'\nSTALE_AGENT='{}'\n",
             orch_a.pane_id,
@@ -507,7 +537,7 @@ fn provenance_002_a_stale_pane_identity_cannot_route_into_another_live_orchestra
 
     // ---- 2. B'S OWN IDENTITY: the control and the later round trip --------
     std::fs::write(
-        deck.workdir().join(format!("own-go-{}", orch_b.pane_id)),
+        pane_dir(&deck, &orch_b.pane_id).join(format!("own-go-{}", orch_b.pane_id)),
         b"go\n",
     )
     .expect("release B's own delegate");
