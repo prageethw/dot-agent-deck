@@ -547,10 +547,17 @@ fn newagent_options_001_reports_host_config_registry_features_and_capabilities()
     .expect("write daemon DashboardConfig");
     let config_path = wire_path(&config_path);
 
+    // The "absent" daemon pins the flag OFF explicitly: this fork's committed
+    // `.dot-agent-deck.toml` turns `[features] experimental` ON (CLAUDE.md rule 9)
+    // and a daemon started from the repository reads it, so leaving the env var
+    // unset would report ON. The env var wins over the file.
     let ordinary = common::spawn_daemon_serve_with_env(
         None,
         "0",
-        &[("DOT_AGENT_DECK_CONFIG", config_path.as_str())],
+        &[
+            ("DOT_AGENT_DECK_CONFIG", config_path.as_str()),
+            ("DOT_AGENT_DECK_EXPERIMENTAL", "0"),
+        ],
     );
     let ordinary_response = send_json_request(&ordinary, &json!({"op": "new-agent-options"}));
     assert_options(&ordinary_response, false, CONFIGURED_COMMAND);
@@ -615,10 +622,14 @@ fn newagent_options_002_serves_a_usable_default_dir_and_omits_a_bad_one() {
             format!("default_command = {CONFIGURED_COMMAND:?}\ndefault_dir = {default_dir:?}\n"),
         )
         .expect("write daemon DashboardConfig");
+        // Flag pinned OFF explicitly: the fork's committed config turns it ON.
         common::spawn_daemon_serve_with_env(
             None,
             "0",
-            &[("DOT_AGENT_DECK_CONFIG", wire_path(&path).as_str())],
+            &[
+                ("DOT_AGENT_DECK_CONFIG", wire_path(&path).as_str()),
+                ("DOT_AGENT_DECK_EXPERIMENTAL", "0"),
+            ],
         )
     };
 
