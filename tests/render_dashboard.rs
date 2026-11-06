@@ -459,10 +459,14 @@ fn background_016_minimal_card_keeps_background_beside_its_reason() {
     let minimal = render(&blocked, CardDensityKind::Minimal, 80);
     insta::assert_snapshot!("background_016_minimal_blocked_card", minimal);
 
-    // Narrow: the reason is kept whole and the background part is cut.
+    // Narrow: the reason is kept whole and the background part is cut. The
+    // fork's Minimal card folds the card's identity (here the name `background`,
+    // plus two spaces) in front of its one content row (decision D1: identity on
+    // the first body row), so the 38 columns inside the border hold
+    // `background  `, then the reason whole, then the cut background part.
     let narrow = render(&blocked, CardDensityKind::Minimal, 40);
     let row = narrow.lines().nth(1).unwrap().trim_matches(['│', ' ']);
-    assert_eq!(row, "⚠ Usage limit reached · Background: 1…");
+    assert_eq!(row, "background  ⚠ Usage limit reached · B…");
 
     // Orphaned (and not Blocked): the orphaned line shares its row the same way.
     let mut orphaned = blocked.clone();
@@ -473,7 +477,7 @@ fn background_016_minimal_card_keeps_background_beside_its_reason() {
     let row = row.lines().nth(1).unwrap().trim_matches(['│', ' ']);
     assert_eq!(
         row,
-        "Orphaned — delegation unavailable · Background: 1 command, 1 subagent · 4m"
+        "background  Orphaned — delegation unavailable · Background: 1 command, 1 subagent · 4m"
     );
 
     // Normal has room for both rows, so each keeps its own.
