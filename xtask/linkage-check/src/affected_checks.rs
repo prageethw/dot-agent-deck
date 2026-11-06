@@ -144,9 +144,13 @@ pub(crate) const TEXT_CLASSES: &[TextClass] = &[
     TextClass {
         name: "skills",
         read_by: "read by xtask/linkage-check (skill_frontmatter, verify_pr_stream, \
-                  tag_release_cleanup)",
+                  tag_release_cleanup) and tests/release_cleanup.rs, which runs the \
+                  tag-release skill's cleanup.sh",
         patterns: &[Pattern::Under(".claude/skills/")],
-        root_tests: &[],
+        root_tests: &[RootTest {
+            name: "release_cleanup",
+            features: &[],
+        }],
         root_lib_modules: &[],
     },
     TextClass {
@@ -1045,11 +1049,20 @@ mod tests {
     fn a_skill_change_runs_linkage_check_with_verify_pr_stream() {
         // `XTASK_TESTS` is `xtask/linkage-check`'s whole suite, which is where
         // `skill_frontmatter`, `verify_pr_stream` and `tag_release_cleanup` live.
+        // The fork's `tests/release_cleanup.rs` also runs the tag-release skill's
+        // `cleanup.sh` from the checkout, so the "skills" class names it too.
         for path in [
             ".claude/skills/prd-full/SKILL.md",
             ".claude/skills/verify-pr/scan.sh",
         ] {
-            assert_eq!(commands(&paths(&[path])), vec![xtask()]);
+            assert_eq!(
+                commands(&paths(&[path])),
+                vec![
+                    xtask(),
+                    "cargo nextest run -p dot-agent-deck --test release_cleanup".to_string(),
+                ],
+                "{path}"
+            );
         }
     }
 
@@ -1251,6 +1264,16 @@ mod tests {
             "tests/harness_isolation.rs",
             ".claude",
             "a test HOME's ~/.claude, not the checkout's",
+        ),
+        (
+            "tests/release_cleanup.rs",
+            "README.md",
+            "the seed file the test commits into its throwaway clones; the checkout's README.md is never read",
+        ),
+        (
+            "src/ui.rs",
+            "README.md",
+            "the seed file the worktree tests commit into their throwaway repos; the checkout's README.md is never read",
         ),
     ];
 
