@@ -2808,8 +2808,16 @@ mod tests {
         let unit_agent = deck.start("unit", "/usr/bin/true", None).await;
         let id = deck.single_unit("u1", ("disp", "nobody"), "unit", &unit_agent);
         wait_exited(&deck.registry, &unit_agent).await;
+        // `exited` is published well before the PTY-EOF thread reaches its own
+        // `note_unit_member_exited` (telemetry, the inbox's exit settlement and
+        // the caller-route sweep run in between), so this call is what makes the
+        // state deterministic; it is idempotent with the thread's. The unit's
+        // pane is the one the daemon MINTED for `unit` — a unit is matched by
+        // pane id and agent id, so the bare name matches nothing and the
+        // assertion below would race the thread's call.
+        let unit_pane = deck.pane("unit");
         deck.registry
-            .note_unit_member_exited(&unit_agent, Some("unit"));
+            .note_unit_member_exited(&unit_agent, Some(unit_pane.as_str()));
         assert_eq!(
             deck.registry.dispatched_units().get(&id).unwrap().state,
             crate::dispatched_units::UnitState::Exited
