@@ -18,6 +18,11 @@ pub struct Fixture {
     pub runtime: tokio::runtime::Runtime,
     pub client: DaemonClient,
     pub agent_id: String,
+    /// The pane id the daemon minted for the stand-in. The daemon is
+    /// authoritative for `pane_id` (fork PRD #365 M2: it discards the
+    /// `DOT_AGENT_DECK_PANE_ID` proposed as [`PANE`]), and the capability token
+    /// is issued for this id, so the hook CLI must name it.
+    pub pane: String,
     pub capability: String,
     pub events: EventSub,
 }
@@ -73,8 +78,8 @@ finally:
         } else {
             stand_in
         };
-        let agent_id = runtime
-            .block_on(client.start_agent(StartAgentOptions {
+        let (agent_id, pane) = runtime
+            .block_on(client.start_agent_with_pane_id(StartAgentOptions {
                 command: Some(command),
                 cwd: Some(deck.workdir().to_string_lossy().into_owned()),
                 display_name: Some("background-synthetic".into()),
@@ -83,6 +88,7 @@ finally:
                 ..Default::default()
             }))
             .unwrap();
+        let pane = pane.expect("the start-agent reply carries the daemon-minted pane_id");
         let capability = runtime
             .block_on(common::recorded_hook_capability(deck.workdir(), &agent_id))
             .unwrap();
@@ -91,6 +97,7 @@ finally:
             runtime,
             client,
             agent_id,
+            pane,
             capability,
             events,
         }
@@ -165,7 +172,7 @@ finally:
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.deck.home_dir())
             .env("DOT_AGENT_DECK_SOCKET", self.deck.hook_socket_path())
-            .env(DOT_AGENT_DECK_PANE_ID, PANE)
+            .env(DOT_AGENT_DECK_PANE_ID, &self.pane)
             .env(DOT_AGENT_DECK_AGENT_ID, &self.agent_id)
             .env(DOT_AGENT_DECK_PANE_CAPABILITY, &self.capability)
             .stdin(Stdio::piped())
