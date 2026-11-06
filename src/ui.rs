@@ -13032,7 +13032,19 @@ fn dispatch_action(
                     // token) before any of this provisioning ran — see
                     // `orchestration_claim_name`/`orchestration_claim_token`
                     // above.
-                    let start_idx = orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                    //
+                    // Issue #523: the ONE rule
+                    // ([`OrchestrationConfig::orchestrator_role_index`]: the
+                    // `start` flag, else the role NAMED `orchestrator`, else
+                    // role 0), the one `TabManager::open_orchestration_tab`
+                    // seats the tab with. A bare `position(|r| r.start)` here
+                    // disagreed with it for a config that names its
+                    // orchestrator but sets no `start`: the tab seated
+                    // `orchestrator` while this index focused, claimed and
+                    // snapshotted the FIRST role, and under the command-entry
+                    // lock every keystroke aimed at a pane that was not the
+                    // orchestrator was dropped.
+                    let start_idx = orch_config.orchestrator_role_index();
                     // `None`: the interactive path carries no caller task — the user
                     // types their instructions after the orchestrator acknowledges.
                     // `Attended` for the same reason (issue #703): this pane was
@@ -54903,6 +54915,308 @@ mod tests {
             "a freshly opened orchestration tab must observe the deck-global \
              command-entry lock LOCKED — only the orchestrator pane accepts \
              direct input until Ctrl+e unlocks it"
+        );
+    }
+
+    /// Issue #523 pin support: a [`PaneController`] that behaves as its
+    /// [`CapturingPaneController`] but remembers every `focus_pane` target and
+    /// reports the last one as the live focus — what `gate_pane_input_key`
+    /// reads through `focused_pane_id()`. `CapturingPaneController`'s own
+    /// `focus_pane` is a no-op, so it cannot tell which pane the launch focused.
+    struct FocusRecordingPaneController {
+        inner: CapturingPaneController,
+        focused: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FocusRecordingPaneController {
+        fn new() -> Self {
+            Self {
+                inner: CapturingPaneController::new(),
+                focused: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneController for FocusRecordingPaneController {
+        fn create_pane_with_options(
+            &self,
+            command: Option<&str>,
+            cwd: Option<&str>,
+            opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            self.inner.create_pane_with_options(command, cwd, opts)
+        }
+        fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.focused.lock().unwrap().push(pane_id.to_string());
+            Ok(())
+        }
+        fn focused_pane_id(&self) -> Option<String> {
+            self.focused.lock().unwrap().last().cloned()
+        }
+        fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+            self.inner.pane_agent_id(pane_id)
+        }
+        fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.inner.close_pane(pane_id)
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            self.inner.list_panes()
+        }
+        fn resize_pane(
+            &self,
+            pane_id: &str,
+            direction: crate::pane::PaneDirection,
+            amount: u16,
+        ) -> Result<(), PaneError> {
+            self.inner.resize_pane(pane_id, direction, amount)
+        }
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            self.inner.rename_pane(pane_id, name)
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            self.inner.toggle_layout()
+        }
+        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+            self.inner.write_to_pane(pane_id, text)
+        }
+        fn name(&self) -> &str {
+            "focus-recording"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Issue #523 pin support: a stub attach daemon that answers every request
+    /// `ok` (like [`with_recording_daemon`]) and hands each request's whole
+    /// JSON body to `on_request`, so a test can read a field the op-only log
+    /// of the other stubs drops — here the `pane_id` a
+    /// `confirm-orchestration-claim` rebinds the title claim to.
+    fn with_request_observing_daemon(
+        unique_dir: &std::path::Path,
+        on_request: impl Fn(&serde_json::Value) + Send + 'static,
+    ) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "build stub request-observing daemon runtime: {e}"
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx
+                                .send(Err(format!("bind stub request-observing listener: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let ok_payload = serde_json::to_vec(&crate::daemon_protocol::AttachResponse::ok())
+                    .expect("serialize AttachResponse::ok()");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let Some(payload) = read_request_after_hello(&mut stream).await else {
+                        continue;
+                    };
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                        on_request(&v);
+                    }
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &ok_payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub request-observing daemon must report readiness within 10s")
+            .expect("stub request-observing daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
+    /// Scenario: Issue #523 regression (the lost upstream fix; e2e twin
+    /// `tabs_orchestration_001`). Open an orchestration whose config lists the
+    /// WORKER first, names its orchestrator `orchestrator`, and sets NO
+    /// `start` flag — the one shape where "the `start` flag, else the role
+    /// named `orchestrator`, else role 0" and a bare `position(|r| r.start)`
+    /// disagree. The tab seats `orchestrator` (role index 1), and the SAME
+    /// pane must be the one the launch focuses, rebinds the title claim to,
+    /// and snapshots as the start role. Under the default LOCKED command-entry
+    /// lock a launch that focused the first role instead (`worker`) would
+    /// have `gate_pane_input_key` drop every keystroke, so the last assertion
+    /// reads the symptom itself.
+    #[test]
+    fn a_config_naming_its_orchestrator_without_a_start_flag_is_focused_claimed_and_snapshotted() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("project");
+        init_committed_git_repo(&dir);
+
+        let confirmed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let observed = confirmed.clone();
+        let _daemon = with_request_observing_daemon(tmp.path(), move |req| {
+            if req.get("op").and_then(|o| o.as_str()) == Some("confirm-orchestration-claim")
+                && let Some(pane_id) = req.get("pane_id").and_then(|p| p.as_str())
+            {
+                observed.lock().unwrap().push(pane_id.to_string());
+            }
+        });
+
+        let role = |name: &str| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start: false,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        };
+        let config = OrchestrationConfig {
+            default: false,
+            name: "seat-523".to_string(),
+            roles: vec![role("worker"), role("orchestrator")],
+        };
+        assert_eq!(
+            config.orchestrator_role_index(),
+            1,
+            "fixture: the role named `orchestrator` is the seat although it is not listed first"
+        );
+
+        let pc = Arc::new(FocusRecordingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let req = NewPaneRequest {
+            dir,
+            name: "seat-523".to_string(),
+            command: String::new(),
+            orchestration_config: Some(config),
+            seed_prompt: None,
+            authoring_kind: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected the orchestration tab to be active");
+        };
+        assert_eq!(role_pane_ids.len(), 2, "one pane per role");
+        let (worker_pane, orchestrator_pane) = (&role_pane_ids[0], &role_pane_ids[1]);
+        assert_eq!(
+            *start_role_index, 1,
+            "the tab seats the role named `orchestrator`"
+        );
+
+        // 1. The launch focuses the seated pane.
+        assert_eq!(
+            pc.focused_pane_id().as_ref(),
+            Some(orchestrator_pane),
+            "the launch must focus the orchestrator's pane, not the first role's \
+             (focus calls: {:?})",
+            pc.focused.lock().unwrap()
+        );
+        assert_eq!(ui.mode, UiMode::PaneInput, "the launch enters pane input");
+
+        // 2. The title claim is rebound to the seated pane, so it is released
+        // when the ORCHESTRATOR closes.
+        assert_eq!(
+            *confirmed.lock().unwrap(),
+            vec![orchestrator_pane.clone()],
+            "the title claim must be confirmed on the orchestrator's pane, not the worker's"
+        );
+
+        // 3. The restore snapshot lives on the seated pane and names its index.
+        assert!(
+            !ui.pane_metadata.contains_key(worker_pane),
+            "the worker pane must carry no orchestration snapshot"
+        );
+        let snap = ui
+            .pane_metadata
+            .get(orchestrator_pane)
+            .and_then(|saved| saved.orchestration.as_ref())
+            .expect("the orchestrator's pane carries the orchestration snapshot");
+        assert_eq!(snap.start_role_index, 1, "snapshot start_role_index");
+        assert_eq!(
+            snap.started_role_indices,
+            vec![1],
+            "snapshot started_role_indices"
+        );
+
+        // 4. The symptom: the first keystroke typed after the launch reaches
+        // the pane under the default LOCKED command-entry lock.
+        assert!(
+            ui.command_entry_locked,
+            "fixture: a fresh orchestration tab is LOCKED"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(b"x".to_vec()),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &HashMap::new(),
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "a keystroke typed right after the launch must reach the orchestrator, got {gated:?}"
         );
     }
 
