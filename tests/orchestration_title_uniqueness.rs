@@ -45,6 +45,19 @@ struct Role<'a> {
 /// for `pane_id`, so none is proposed; a caller that needs to name the pane
 /// afterwards (its liveness, its registry record) uses the reply's.
 async fn start_role(client: &DaemonClient, role: Role<'_>) -> Result<String, ClientError> {
+    start_role_from(client, role, None).await
+}
+
+/// [`start_role`] as the fork's TUI starts a role of an ISOLATED CLONE: the
+/// role's `orchestration_cwd` names the clone its panes run in, and
+/// `isolated_clone_origin` the project directory the clone was made from. With
+/// `None` it is exactly [`start_role`] — what a client that runs in the picked
+/// directory itself (the desktop app, an older or upstream TUI) sends.
+async fn start_role_from(
+    client: &DaemonClient,
+    role: Role<'_>,
+    isolated_clone_origin: Option<&str>,
+) -> Result<String, ClientError> {
     let (_agent_id, pane_id) = client
         .start_agent_with_pane_id(StartAgentOptions {
             command: Some(role.command.to_string()),
@@ -59,6 +72,7 @@ async fn start_role(client: &DaemonClient, role: Role<'_>) -> Result<String, Cli
                 display_title: role.display_title.map(str::to_string),
                 orchestration_id: Some(role.orchestration_id.to_string()),
             }),
+            isolated_clone_origin: isolated_clone_origin.map(str::to_string),
             ..StartAgentOptions::default()
         })
         .await?;
@@ -477,6 +491,118 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         "a daemon-spawned run's title must be free once its roles have exited — still refused \
          here means the spawn's own admission claim was never released",
     );
+}
+
+/// The one role start of a tab that the run-title check reads, as a client
+/// sends it: its per-tab token, the title it asks for and the directory it names
+/// as its `orchestration_cwd`.
+fn title_role<'a>(tab: &'a str, title: &'a str, orchestration_cwd: &'a str) -> Role<'a> {
+    Role {
+        command: "cat",
+        orchestration_id: tab,
+        role_index: 0,
+        role_name: "orchestrator",
+        is_start_role: true,
+        display_title: Some(title),
+        orchestration_cwd,
+    }
+}
+
+/// Scenario: the fork's TUI runs every orchestration in an isolated clone and names the clone as its `orchestration_cwd`, sending the project directory only as `isolated_clone_origin`, while the desktop app names the project directory itself. Two raw `StartAgent` requests for one run title, one of each kind, are therefore one project's two tabs: in either order the later is refused with the title-in-use error and spawns nothing, and so is a second cloned start of the same project. Controls: the same title from a cloned start of another project is admitted, and a start that names the clone's own directory but no origin keeps keying on that directory, as before.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/identity/043")]
+async fn identity_043_a_cloned_start_and_a_source_directory_start_share_one_run_title() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    let fresh_dir = || {
+        let dir = common::race_safe_tempdir();
+        let path = dir.path().to_string_lossy().into_owned();
+        (dir, path)
+    };
+    // The project, and the sibling clones the fork's TUI would make of it. The
+    // guards stay bound so no directory is removed while a pane runs in it.
+    let (_source_guard, source) = fresh_dir();
+    let (_clone_guards, clones): (Vec<_>, Vec<_>) = (0..5).map(|_| fresh_dir()).unzip();
+    // A second project, with its own clone.
+    let (_other_source_guard, other_source) = fresh_dir();
+    let (_other_clone_guard, other_clone) = fresh_dir();
+
+    // A source-directory client first (the desktop app), then the fork's TUI.
+    let title = "proj-orchestrator-1";
+    start_role(&client, title_role("desktop-1", title, &source))
+        .await
+        .expect("a free title is admitted");
+    let agents = daemon.registry.agent_records().len();
+    let refused = start_role_from(
+        &client,
+        title_role("deck-1", title, &clones[0]),
+        Some(&source),
+    )
+    .await;
+    assert_title_refusal(refused, title);
+    assert_eq!(
+        daemon.registry.agent_records().len(),
+        agents,
+        "a cloned start refused for the title a source-directory start holds must spawn nothing"
+    );
+
+    // The fork's TUI first, then a source-directory client.
+    let title = "proj-orchestrator-2";
+    start_role_from(
+        &client,
+        title_role("deck-2", title, &clones[1]),
+        Some(&source),
+    )
+    .await
+    .expect("a free title is admitted");
+    let agents = daemon.registry.agent_records().len();
+    let refused = start_role(&client, title_role("desktop-2", title, &source)).await;
+    assert_title_refusal(refused, title);
+    assert_eq!(
+        daemon.registry.agent_records().len(),
+        agents,
+        "a source-directory start refused for the title a cloned start holds must spawn nothing"
+    );
+
+    // Two cloned starts of one project: each has a clone of its own, and the
+    // project is what they share.
+    let title = "proj-orchestrator-3";
+    start_role_from(
+        &client,
+        title_role("deck-3a", title, &clones[2]),
+        Some(&source),
+    )
+    .await
+    .expect("a free title is admitted");
+    let refused = start_role_from(
+        &client,
+        title_role("deck-3b", title, &clones[3]),
+        Some(&source),
+    )
+    .await;
+    assert_title_refusal(refused, title);
+
+    // Controls. The same title from a cloned start of ANOTHER project is another
+    // key, and a start that names the first clone's own directory but no origin
+    // is keyed by that directory, as it was before the origin was read.
+    let title = "proj-orchestrator-4";
+    start_role_from(
+        &client,
+        title_role("deck-4", title, &clones[4]),
+        Some(&source),
+    )
+    .await
+    .expect("a free title is admitted");
+    start_role_from(
+        &client,
+        title_role("other-deck-4", title, &other_clone),
+        Some(&other_source),
+    )
+    .await
+    .expect("the same title from a cloned start of another project is another key");
+    start_role(&client, title_role("no-origin-4", title, &clones[4]))
+        .await
+        .expect("a start that names no origin keeps keying on its own orchestration cwd");
 }
 
 /// The spawn primitive reports failures through a notifier; nothing here is
