@@ -235,6 +235,27 @@ struct GridLayout {
     density: CardDensity,
 }
 
+/// The fewest rows a card can be dealt and still draw its role row and its
+/// `Dir:` row on separate rows: [`CardDensity::Minimal`]'s three rows (border,
+/// one body row, border) plus the `Dir:` row Minimal folds onto the role row.
+///
+/// This is the fork's own squeeze boundary, not a new one. A card painted into
+/// four rows keeps its role row and puts `Dir:` on the row beneath; at three it
+/// has one body row and `Dir:` shares the role's (issue #847, pinned at exactly
+/// this boundary by `card_height_847_three_row_card_shows_role_and_dir`). PRD
+/// fork#446 M2 says the clipping order is prompts, tool lines, then `Dir:`.
+const MIN_UNFOLDED_CARD_ROWS: u16 = 4;
+
+/// Whether the fork's fit-all division (PRD fork#446 M1: [`even_row_heights`]
+/// over the rows `total_cards` make at `cols` columns) deals EVERY card at least
+/// [`MIN_UNFOLDED_CARD_ROWS`] rows of `available_height`. `false` when there is
+/// nothing to divide, or when not even one row per card is available.
+fn fit_all_keeps_dir_rows(total_cards: usize, cols: usize, available_height: u16) -> bool {
+    let total_rows = total_cards.div_ceil(cols.max(1));
+    even_row_heights(total_rows, available_height)
+        .is_some_and(|heights| heights.iter().all(|&rows| rows >= MIN_UNFOLDED_CARD_ROWS))
+}
+
 /// Choose columns and density TOGETHER: the first pair that renders **all**
 /// `total_cards` cards in `available_height` rows.
 ///
@@ -268,6 +289,18 @@ struct GridLayout {
 /// that fit today: seven cards in 25 rows at 90 columns get two columns of
 /// Compact cards, and would instead have got one column of Minimal ones.
 ///
+/// Upstream-sync round 30 (CLAUDE.md rule 24, fork PRD #446 M1): that second
+/// pass must not pre-empt the fork's fit-all division either. When Compact fits
+/// nowhere, the fork has always spread the column's rows evenly over every card
+/// (the render site, [`even_row_heights`] at [`max_columns_for_width`] columns),
+/// and a card dealt [`MIN_UNFOLDED_CARD_ROWS`] or more keeps its role row and its
+/// `Dir:` row apart — the PRD's headline is seven roles in 32 rows painted as
+/// `[5, 5, 5, 5, 4, 4, 4]`. Minimal is the FOLDED card, so it is taken only when
+/// that division would deal some card fewer rows than that, which is where the
+/// fork's own card would have to fold `Dir:` onto the role row too (issue #847).
+/// Where the division keeps the rows apart this returns the Compact fallback
+/// below, and the render site divides.
+///
 /// When nothing fits, the layout the deck has always used is returned rather
 /// than the widest one, and the caller is left to signal the overflow. Narrowing
 /// every card is a real cost, paid here only for completeness; if completeness
@@ -279,11 +312,14 @@ fn choose_grid_layout(total_cards: usize, width: u16, available_height: u16) -> 
     // the ceiling can never sit below the historical count, so no deck loses a
     // column it has today.
     let max_cols = max_columns_for_width(width).max(preferred_cols);
+    // The fork's fit-all division runs at the widest column count, whichever
+    // column count Minimal would have fitted at (see the render site).
+    let division_keeps_dir_rows = fit_all_keeps_dir_rows(total_cards, max_cols, available_height);
 
     for accept_minimal in [false, true] {
         for cols in preferred_cols..=max_cols {
             match fitting_density(total_cards, cols, available_height) {
-                Some(CardDensity::Minimal) if !accept_minimal => {}
+                Some(CardDensity::Minimal) if !accept_minimal || division_keeps_dir_rows => {}
                 Some(density) => return GridLayout { cols, density },
                 None => {}
             }
@@ -18849,7 +18885,10 @@ fn render_card_grid(
     // `(preferred_cols, Compact)` fallback) when its own loop never finds a
     // `(cols, density)` combination that fits — a successful loop return
     // always satisfies `rows * card_height <= available_height` for the
-    // returned `cols`, so this condition can only trip on that fallback.
+    // returned `cols`, so this condition can only trip on that fallback. (The
+    // fallback is also what `choose_grid_layout` returns, on purpose, where
+    // Minimal would fit but this division deals every card at least
+    // `MIN_UNFOLDED_CARD_ROWS`: the fork's headline split beats the folded card.)
     // Rather than silently truncating to a scrolled window (the pre-fix
     // behaviour), maximise columns first — fewer, taller rows — then divide
     // the column height evenly so every row still paints.
@@ -43611,6 +43650,48 @@ mod tests {
                 cols: 1,
                 density: CardDensity::Compact
             }
+        );
+    }
+
+    /// Upstream-sync round 30 (CLAUDE.md rule 24, fork PRD #446 M1): Minimal is
+    /// the FOLDED card, so it never pre-empts the fork's fit-all division where
+    /// that division keeps every card's `Dir:` row apart. Where Minimal would fit
+    /// but the division deals every card at least `MIN_UNFOLDED_CARD_ROWS`, the
+    /// Compact fallback is returned and the render site divides.
+    #[test]
+    fn choose_grid_layout_leaves_the_fork_division_where_it_keeps_dir_rows() {
+        let fallback = GridLayout {
+            cols: 1,
+            density: CardDensity::Compact,
+        };
+        // The PRD's headline: 79 columns, 32 rows. Minimal (21 rows) fits, and
+        // seven cards divide as 5,5,5,5,4,4,4 — every one keeps `Dir:` apart.
+        assert_eq!(choose_grid_layout(7, 79, 32), fallback);
+        // 28 rows is the first height that deals all seven cards four rows...
+        assert_eq!(choose_grid_layout(7, 79, 28), fallback);
+        // ...and 27 deals the last card three, which is where the fork's own card
+        // would fold `Dir:` too, so Minimal stands.
+        assert_eq!(
+            choose_grid_layout(7, 79, 27),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Minimal
+            }
+        );
+        // The division runs at the WIDEST column count, not the one Minimal would
+        // have fitted at: 90 columns widens to two, four rows of four.
+        assert_eq!(choose_grid_layout(7, 90, 16), fallback);
+        assert_eq!(
+            choose_grid_layout(7, 90, 15),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Minimal
+            }
+        );
+        // The boundary is Minimal's own height plus the `Dir:` row it folds.
+        assert_eq!(
+            MIN_UNFOLDED_CARD_ROWS,
+            CardDensity::Minimal.card_height() + 1
         );
     }
 
