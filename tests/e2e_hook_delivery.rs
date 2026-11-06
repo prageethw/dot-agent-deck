@@ -87,7 +87,6 @@ fn reading_reply_001_subscription_delivers_only_future_selected_agent_replies() 
     use std::time::Duration;
 
     const SESSION: &str = "reading1497";
-    const PANE: &str = "pane-reading-reply";
     const EARLIER: &str = "BEFORE_SUBSCRIPTION_1497_a31c";
     const REPLY: &str = "AFTER_SUBSCRIPTION_1497_b62d: all tests pass.";
     const SECOND: &str = "NEXT_TURN_REPLY_1497_c93e: two files changed.";
@@ -99,18 +98,23 @@ fn reading_reply_001_subscription_delivers_only_future_selected_agent_replies() 
         .build()
         .expect("reply client runtime");
     let client = DaemonClient::new(deck.attach_socket_path().to_path_buf());
-    let agent_id = runtime
-        .block_on(client.start_agent(StartAgentOptions {
+    // The daemon is authoritative for `pane_id` (fork PRD #365 M2): it strips
+    // whatever pane id a client proposes and mints its own, returned in the
+    // start reply. The hooks below must name THAT pane, or the daemon sees a
+    // foreign agent posting to a pane it never spawned and the subscription
+    // never carries the reply.
+    let (agent_id, pane) = runtime
+        .block_on(client.start_agent_with_pane_id(StartAgentOptions {
             command: Some(common::capability_export_command(
                 "printf '%s\\n' 'TERMINAL_ONLY_1497_d24f'; cat",
             )),
             cwd: Some(deck.workdir().to_string_lossy().into_owned()),
             display_name: Some("reading-pane".into()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), PANE.into())],
             agent_type: Some(AgentType::ClaudeCode),
             ..Default::default()
         }))
         .expect("daemon-owned synthetic pane");
+    let pane = pane.expect("the start-agent reply carries the daemon's pane_id");
     let token = runtime
         .block_on(common::recorded_hook_capability(deck.workdir(), &agent_id))
         .expect("stand-in's own capability");
@@ -131,7 +135,7 @@ fn reading_reply_001_subscription_delivers_only_future_selected_agent_replies() 
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", deck.home_dir())
             .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-            .env(DOT_AGENT_DECK_PANE_ID, PANE)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane)
             .env(DOT_AGENT_DECK_AGENT_ID, &agent_id)
             .env(DOT_AGENT_DECK_PANE_CAPABILITY, &token)
             .stdin(Stdio::piped())
@@ -213,7 +217,7 @@ fn reading_reply_001_subscription_delivers_only_future_selected_agent_replies() 
             .expect("reply stream live")
     });
     assert_eq!(first.agent_id, agent_id);
-    assert_eq!(first.pane_id, PANE);
+    assert_eq!(first.pane_id, pane);
     assert_eq!(
         first.reply.text, REPLY,
         "deliver the hook's final reply, without terminal content or backlog"
@@ -237,7 +241,7 @@ fn reading_reply_001_subscription_delivers_only_future_selected_agent_replies() 
             .expect("reply stream live")
     });
     assert_eq!(second.agent_id, agent_id);
-    assert_eq!(second.pane_id, PANE);
+    assert_eq!(second.pane_id, pane);
     assert_eq!(second.reply.text, SECOND);
     assert!(!second.reply.failed);
     assert!(
@@ -304,7 +308,6 @@ fn reading_reply_003_a_codex_turn_reported_by_hook_and_rollout_is_delivered_once
     use std::time::Duration;
 
     const SESSION: &str = "codex-reading-1497";
-    const PANE: &str = "pane-codex-reading";
     const ROLLOUT_FIRST: &str = "CODEX_ROLLOUT_FIRST_1497_f40a: two files changed.";
     const STOP_FIRST: &str = "CODEX_STOP_FIRST_1497_9b2e: all tests pass.";
     // Verbatim task_complete captured from a real Codex rollout (see
@@ -332,12 +335,13 @@ fn reading_reply_003_a_codex_turn_reported_by_hook_and_rollout_is_delivered_once
         .build()
         .expect("reply client runtime");
     let client = DaemonClient::new(deck.attach_socket_path().to_path_buf());
-    let agent_id = runtime
-        .block_on(client.start_agent(StartAgentOptions {
+    // The daemon is authoritative for `pane_id` (fork PRD #365 M2): the pane
+    // the hooks name must be the one it minted for this start, not a proposal.
+    let (agent_id, pane) = runtime
+        .block_on(client.start_agent_with_pane_id(StartAgentOptions {
             command: Some(common::capability_export_command("cat")),
             cwd: Some(deck.workdir().to_string_lossy().into_owned()),
             display_name: Some("codex-reading".into()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), PANE.into())],
             // Untyped: a Codex-typed spawn is wrapped, which would not run the
             // stand-in's capability export. The daemon's Codex handling keys on
             // the hook events, which the Codex hook CLI types as Codex.
@@ -345,6 +349,7 @@ fn reading_reply_003_a_codex_turn_reported_by_hook_and_rollout_is_delivered_once
             ..Default::default()
         }))
         .expect("daemon-owned stand-in for a Codex pane");
+    let pane = pane.expect("the start-agent reply carries the daemon's pane_id");
     let token = runtime
         .block_on(common::recorded_hook_capability(deck.workdir(), &agent_id))
         .expect("stand-in's own capability");
@@ -368,7 +373,7 @@ fn reading_reply_003_a_codex_turn_reported_by_hook_and_rollout_is_delivered_once
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", deck.home_dir())
             .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
-            .env(DOT_AGENT_DECK_PANE_ID, PANE)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane)
             .env(DOT_AGENT_DECK_AGENT_ID, &agent_id)
             .env(DOT_AGENT_DECK_PANE_CAPABILITY, &token)
             .stdin(Stdio::piped())
