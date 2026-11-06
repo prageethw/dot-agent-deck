@@ -901,6 +901,13 @@ fn status_blocked_021_pane_restart_clears_a_blocked_card() {
     let deck = quota_deck(&bin, &fifo, &transcript);
     deck.wait_for_string("No active agents");
     write_orchestration(&deck, &[("worker", "claude", "claude")]);
+    // `pane restart` re-reads the role from `.dot-agent-deck.toml` in the
+    // restarted pane's OWN directory, which is the orchestration's isolated
+    // clone (PRD fork#544 M2b), and a clone carries only COMMITTED files. Left
+    // uncommitted, the clone holds the fixture's config without `worker`, and
+    // the restart is refused ("could not resolve role `worker`") before it can
+    // show whether the Blocked card is cleared.
+    common::commit_fixture(deck.workdir());
     open_orchestration(&deck);
     wait_for_role(&deck, "worker");
     release_standin(&fifo, &deck, "worker");
