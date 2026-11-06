@@ -65,7 +65,8 @@ use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    bind_attach_listener, read_frame, serve_attach, serve_attach_with_counter, write_frame,
+    PROTOCOL_VERSION, bind_attach_listener, read_frame, serve_attach, serve_attach_with_counter,
+    write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::event::{
@@ -4126,6 +4127,19 @@ const RACE_SESSION: &str = "sess-race-36";
 /// reproducible instead of left to scheduler luck.
 const RACE_SUBSCRIBE_DELAY: Duration = Duration::from_millis(500);
 
+/// The reply a mock daemon gives the `Hello` the production client sends
+/// BEFORE it subscribes (issue #405's protocol check, and the capability read
+/// that decides between `SubscribeEvents` and `SubscribeEventsWithSnapshot`;
+/// PRD #1666 §2.8 / upstream issue #1555). A mock that answers it with a bare
+/// `ok` carries no `server_version`, which the client refuses as another
+/// protocol, so nothing ever subscribes. This is what a real daemon answers:
+/// this binary's protocol and every capability it advertises, the ordered
+/// subscribe included, so a mock is subscribed through the same request a real
+/// daemon is.
+fn stub_hello_reply() -> AttachResponse {
+    AttachResponse::hello(PROTOCOL_VERSION).with_capabilities()
+}
+
 /// Mock daemon for fork issue #36: it is SLOW to service its `SubscribeEvents`
 /// connection, and it broadcasts an event the instant it has served the
 /// `ListAgents` snapshot.
@@ -4183,11 +4197,21 @@ async fn run_delayed_subscribe_server(
                     // are no receivers — which is precisely the lost edge.
                     let _ = event_tx.send(BroadcastMsg::Event(idle_event));
                 }
-                AttachRequest::SubscribeEvents => {
+                AttachRequest::Hello { .. } => {
+                    let _ = write_resp(&mut stream, &stub_hello_reply()).await;
+                }
+                request @ (AttachRequest::SubscribeEvents
+                | AttachRequest::SubscribeEventsWithSnapshot) => {
                     tokio::time::sleep(RACE_SUBSCRIBE_DELAY).await;
                     let mut rx = event_tx.subscribe();
-                    let payload = serde_json::to_vec(&AttachResponse::ok())
-                        .expect("AttachResponse must serialize");
+                    // The ordered request answers with the daemon's agents as of
+                    // the instant the receiver above was registered.
+                    let ack = if matches!(request, AttachRequest::SubscribeEventsWithSnapshot) {
+                        AttachResponse::agent_records(vec![record])
+                    } else {
+                        AttachResponse::ok()
+                    };
+                    let payload = serde_json::to_vec(&ack).expect("AttachResponse must serialize");
                     if write_frame(&mut stream, KIND_RESP, &payload).await.is_err() {
                         return;
                     }
@@ -4503,12 +4527,22 @@ async fn run_reconnect_teardown_server(
                     };
                     let _ = write_resp(&mut stream, &resp).await;
                 }
-                AttachRequest::SubscribeEvents => {
+                AttachRequest::Hello { .. } => {
+                    let _ = write_resp(&mut stream, &stub_hello_reply()).await;
+                }
+                request @ (AttachRequest::SubscribeEvents
+                | AttachRequest::SubscribeEventsWithSnapshot) => {
                     let rx = event_tx.subscribe();
-                    if write_resp(&mut stream, &AttachResponse::ok())
-                        .await
-                        .is_err()
-                    {
+                    // The ordered request (which a reconnect resynchronizes
+                    // from) answers with the agents as of the instant the
+                    // receiver above was registered: `record`'s CURRENT value.
+                    let ack = if matches!(request, AttachRequest::SubscribeEventsWithSnapshot) {
+                        let snapshot = record.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        AttachResponse::agent_records(vec![snapshot])
+                    } else {
+                        AttachResponse::ok()
+                    };
+                    if write_resp(&mut stream, &ack).await.is_err() {
                         return;
                     }
                     let is_first =
@@ -4844,12 +4878,22 @@ async fn run_reconcile_server(
                     };
                     let _ = write_resp(&mut stream, &resp).await;
                 }
-                AttachRequest::SubscribeEvents => {
+                AttachRequest::Hello { .. } => {
+                    let _ = write_resp(&mut stream, &stub_hello_reply()).await;
+                }
+                request @ (AttachRequest::SubscribeEvents
+                | AttachRequest::SubscribeEventsWithSnapshot) => {
                     let mut rx = daemon.event_tx.subscribe();
-                    if write_resp(&mut stream, &AttachResponse::ok())
-                        .await
-                        .is_err()
-                    {
+                    // The ordered request answers with the daemon's agents as of
+                    // the instant the receiver above was registered, so a
+                    // reconnect resynchronizes from this reply and asks for no
+                    // `ListAgents` of its own.
+                    let ack = if matches!(request, AttachRequest::SubscribeEventsWithSnapshot) {
+                        AttachResponse::agent_records(records)
+                    } else {
+                        AttachResponse::ok()
+                    };
+                    if write_resp(&mut stream, &ack).await.is_err() {
                         return;
                     }
                     let is_first = daemon.subscriptions.fetch_add(1, Ordering::SeqCst) == 0;
