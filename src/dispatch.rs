@@ -4337,14 +4337,14 @@ mod tests {
     /// against `provision_isolated_clone_sync`'s own single synchronous
     /// call, which this sidesteps entirely.
     ///
-    /// Final cleanup round (nit 7): this stub matches `$1`/`$2` positionally
-    /// -- the same fragility `e663edf2` had to fix elsewhere in this round.
-    /// Safe today only because `point_isolated_clone_origin`'s real call
-    /// site is a raw `std::process::Command`, not the shared hardened core
-    /// (`spawn_git_status_child` et al.), which prepends `-c core.fsmonitor=`
-    /// and would shift `remote`/`set-url` off positions `$1`/`$2`. If that
-    /// call site is ever routed through the shared core, this stub silently
-    /// stops matching and needs updating alongside it.
+    /// Final cleanup round (nit 7) warned that matching `$1`/`$2` positionally
+    /// would stop matching if `point_isolated_clone_origin`'s call site were
+    /// ever routed through the shared hardened core. It now is
+    /// (`crate::git_env::git_at`, rule 13), and that core prepends
+    /// `-c core.hooksPath=… -c core.fsmonitor=…` ahead of the subcommand, so
+    /// `remote`/`set-url` are no longer `$1`/`$2`. The stub therefore looks for
+    /// `remote` immediately followed by `set-url` wherever they sit in argv,
+    /// the way `with_git_clone_failing_with_hostile_stderr` finds `clone`.
     #[cfg(unix)]
     fn with_git_remote_set_url_failing(scratch: &Path) -> FakeGitOnPathGuard {
         use std::os::unix::fs::PermissionsExt;
@@ -4353,14 +4353,18 @@ mod tests {
         let bindir = scratch.join("git-remote-set-url-stub-bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let stub = bindir.join("git");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &stub,
             format!(
                 "#!/bin/sh\n\
-                 if [ \"$1\" = remote ] && [ \"$2\" = set-url ]; then\n\
-                 \x20\x20echo 'stub: simulated git remote set-url failure' >&2\n\
-                 \x20\x20exit 1\n\
-                 fi\n\
+                 prev=\"\"\n\
+                 for a in \"$@\"; do\n\
+                 \x20\x20if [ \"$prev\" = remote ] && [ \"$a\" = set-url ]; then\n\
+                 \x20\x20\x20\x20echo 'stub: simulated git remote set-url failure' >&2\n\
+                 \x20\x20\x20\x20exit 1\n\
+                 \x20\x20fi\n\
+                 \x20\x20prev=\"$a\"\n\
+                 done\n\
                  exec {real_git} \"$@\"\n"
             ),
         )
@@ -4406,7 +4410,7 @@ mod tests {
         let bindir = scratch.join("git-clone-fail-stub-bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let stub = bindir.join("git");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &stub,
             format!(
                 "#!/bin/sh\n\
@@ -4463,7 +4467,7 @@ mod tests {
         let bindir = scratch.join("git-clone-unremovable-stub-bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let stub = bindir.join("git");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &stub,
             format!(
                 "#!/bin/sh\n\
@@ -4522,7 +4526,7 @@ mod tests {
         let bindir = scratch.join("git-worktree-add-lock-stub-bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let stub = bindir.join("git");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &stub,
             format!(
                 "#!/bin/sh\n\
@@ -4586,7 +4590,7 @@ mod tests {
         let bindir = scratch.join("git-branch-delete-fail-stub-bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let stub = bindir.join("git");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &stub,
             format!(
                 "#!/bin/sh\n\

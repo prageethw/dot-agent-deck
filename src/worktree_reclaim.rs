@@ -4531,7 +4531,7 @@ mod tests {
         let bindir = scratch.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let _path_guard = PathEnvGuard::prepend(&bindir);
@@ -4605,7 +4605,7 @@ mod tests {
         let bindir = scratch.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let _path_guard = PathEnvGuard::prepend(&bindir);
@@ -5150,7 +5150,7 @@ mod tests {
         let bindir = scratch.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let _path_guard = PathEnvGuard::prepend(&bindir);
@@ -6185,15 +6185,20 @@ mod tests {
     /// output, since `examine_worktrees`/`run_reclaim` return via `?` on
     /// the very first `git` call and never reach a second one on this
     /// path.
+    ///
+    /// `worktree` and `list` are found as an adjacent pair anywhere in argv,
+    /// not as `$1`/`$2`: the production call goes through
+    /// `crate::git_env::git_at` (rule 13), which puts `-c
+    /// core.hooksPath=… -c core.fsmonitor=…` ahead of the subcommand.
     #[cfg(unix)]
     fn write_fake_git_failing_worktree_list(bindir: &Path, hostile_stderr: &str) {
         use std::os::unix::fs::PermissionsExt;
 
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = list ]; then\n  printf '%s' '{hostile_stderr}' >&2\n  exit 1\nfi\nexit 1\n"
+            "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = worktree ] && [ \"$a\" = list ]; then\n    printf '%s' '{hostile_stderr}' >&2\n    exit 1\n  fi\n  prev=\"$a\"\ndone\nexit 1\n"
         );
         let git_path = bindir.join("git");
-        std::fs::write(&git_path, script).expect("must write fake git script");
+        crate::test_isolation::write_script(&git_path, script).expect("must write fake git script");
         std::fs::set_permissions(&git_path, std::fs::Permissions::from_mode(0o755))
             .expect("must make fake git script executable");
     }
@@ -6510,7 +6515,7 @@ mod tests {
         );
         std::fs::create_dir_all(bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -6596,7 +6601,7 @@ mod tests {
         );
         std::fs::create_dir_all(bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -6868,7 +6873,7 @@ mod tests {
         );
         std::fs::create_dir_all(bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -6951,7 +6956,7 @@ mod tests {
         );
         std::fs::create_dir_all(bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -6976,7 +6981,7 @@ mod tests {
         );
         std::fs::create_dir_all(bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -7011,7 +7016,7 @@ mod tests {
         );
         std::fs::create_dir_all(bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -7856,7 +7861,7 @@ mod tests {
 
         let sentinel = scratch.path().join("pwned.txt");
         let payload_path = scratch.path().join("payload.sh");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &payload_path,
             format!("#!/bin/sh\nprintf 'PWNED\\n' >> '{}'\n", sentinel.display()),
         )
@@ -8604,7 +8609,7 @@ mod tests {
         let bindir = scratch.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let gh_path = bindir.join("gh");
-        std::fs::write(&gh_path, gh_script).unwrap();
+        crate::test_isolation::write_script(&gh_path, gh_script).unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
