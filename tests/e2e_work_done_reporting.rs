@@ -531,6 +531,23 @@ fn run_work_done_cli(
     task_id: &str,
     report: &str,
 ) -> std::process::Output {
+    // A task report is accepted only from the agent the daemon can attribute it
+    // to (hook provenance, upstream PRD #1077): the CLI presents the agent id and
+    // the capability the worker's own command exported into its directory.
+    let worker = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.pane_id_env.as_deref() == Some(worker_pane))
+        .unwrap_or_else(|| panic!("no agent record for the worker pane {worker_pane}"));
+    let worker_dir = PathBuf::from(
+        worker
+            .cwd
+            .as_deref()
+            .expect("the worker's working directory"),
+    );
+    let capability = tokio::runtime::Runtime::new()
+        .expect("capability reader runtime")
+        .block_on(common::recorded_hook_capability(&worker_dir, &worker.id))
+        .expect("the worker exported its own capability");
     std::process::Command::new(common::contained_deck_binary())
         .arg("work-done")
         .arg("--task-id")
@@ -539,6 +556,8 @@ fn run_work_done_cli(
         .arg(report)
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", worker_pane)
+        .env("DOT_AGENT_DECK_AGENT_ID", &worker.id)
+        .env("DOT_AGENT_DECK_PANE_CAPABILITY", &capability)
         .env("HOME", deck.home_dir())
         .current_dir(deck.workdir())
         .output()
@@ -720,6 +739,16 @@ fn launch_deck_with_orchestration() -> TuiDeck {
         .impersonating_pane_signals()
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active agents");
+    // `work-done --task-id` is a TASK report, and the daemon takes one only from
+    // an agent it can attribute it to: the capability it put in that agent's own
+    // environment. The `cat` worker therefore exports it (`run_work_done_cli`
+    // presents it), and the config is rewritten HERE, before `open_orchestration`
+    // commits it into the isolated clone every respawn re-reads it from.
+    std::fs::write(
+        deck.workdir().join(".dot-agent-deck.toml"),
+        orchestration_config_with_worker_command(&common::capability_export_command("cat")),
+    )
+    .expect("give the worker role a capability-exporting command");
     open_orchestration(&deck);
     deck.wait_for_string(WORKER_ROLE);
     deck
@@ -1084,7 +1113,7 @@ fn orchestration_config_with_worker_command(worker_command: &str) -> String {
     format!(
         "[[orchestrations]]\nname = \"demo-orch\"\n\n\
          [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
-         [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = \"{worker_command}\"\n"
+         [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = {worker_command:?}\n"
     )
 }
 
