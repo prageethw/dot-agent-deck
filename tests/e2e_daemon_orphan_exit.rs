@@ -313,7 +313,8 @@ async fn sigterm_003_signal_shutdown_names_the_agents_and_roles_it_destroys() {
     use dot_agent_deck::daemon_protocol::{AttachRequest, TabMembership};
     use dot_agent_deck::platform::ipc::IpcStream;
 
-    const PANE: &str = "sched-issue-work-1109-r0";
+    // The pane id proposed to the daemon; the daemon discards it and mints its own.
+    const PROPOSED_PANE: &str = "sched-issue-work-1109-r0";
     const ORCHESTRATION: &str = "issue-work";
     const ROLE: &str = "orchestrator";
 
@@ -373,7 +374,7 @@ async fn sigterm_003_signal_shutdown_names_the_agents_and_roles_it_destroys() {
             display_name: Some(ROLE.into()),
             rows: 24,
             cols: 80,
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE.into())],
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PROPOSED_PANE.into())],
             tab_membership: Some(TabMembership::Orchestration {
                 name: ORCHESTRATION.to_string(),
                 role_index: 0,
@@ -394,6 +395,12 @@ async fn sigterm_003_signal_shutdown_names_the_agents_and_roles_it_destroys() {
     .await
     .expect("start-agent round trip");
     assert!(resp.ok, "start-agent failed: {:?}", resp.error);
+    // Fork PRD #365 M2: the daemon is authoritative for `pane_id` — it strips the
+    // proposed `DOT_AGENT_DECK_PANE_ID` and mints its own — so the shutdown log
+    // names the minted id, which the reply carries.
+    let pane = resp.pane_id.clone().unwrap_or_else(|| {
+        panic!("the start-agent reply carries the daemon-minted pane_id: {resp:?}")
+    });
     drop(rd);
     drop(wr);
 
@@ -415,7 +422,7 @@ async fn sigterm_003_signal_shutdown_names_the_agents_and_roles_it_destroys() {
     for expected in [
         "terminating 1 managed agent(s)",
         "destroying 1 orchestration role registration(s)",
-        PANE,
+        pane.as_str(),
         ROLE,
         ORCHESTRATION,
         "can never delegate again",

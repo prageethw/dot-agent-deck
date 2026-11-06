@@ -76,10 +76,15 @@ fn send_json_request(daemon: &DaemonProc, request: &Value) -> Value {
     serde_json::from_slice(&body).expect("response payload is JSON")
 }
 
+/// Start the readiness-announcing stand-in and return the pane id the DAEMON
+/// minted for it. The daemon is authoritative for `pane_id` (fork PRD #365 M2):
+/// it strips the `DOT_AGENT_DECK_PANE_ID` proposed here, so `proposed_pane_id`
+/// is only the display name and everything keyed by pane (the inbox, the
+/// doorbell) is keyed by the returned id.
 fn start_stand_in(
     daemon: &DaemonProc,
     cwd: &Path,
-    pane_id: &str,
+    proposed_pane_id: &str,
     log_name: &str,
     announce_after_secs: u64,
     authoring_kind: Option<&str>,
@@ -93,8 +98,8 @@ fn start_stand_in(
         "cwd": wire_path(cwd),
         "rows": 24,
         "cols": 100,
-        "env": [["DOT_AGENT_DECK_PANE_ID", pane_id]],
-        "display_name": pane_id,
+        "env": [["DOT_AGENT_DECK_PANE_ID", proposed_pane_id]],
+        "display_name": proposed_pane_id,
     });
     if let Some(kind) = authoring_kind {
         request["authoring_kind"] = Value::String(kind.to_string());
@@ -104,12 +109,19 @@ fn start_stand_in(
     assert_eq!(
         response.get("ok").and_then(Value::as_bool),
         Some(true),
-        "StartAgent for pane {pane_id:?} must succeed; response: {response}"
+        "StartAgent for pane {proposed_pane_id:?} must succeed; response: {response}"
     );
+    minted_pane_id(&response)
+}
+
+/// The `pane_id` the daemon minted for a successful `start-agent` response.
+fn minted_pane_id(response: &Value) -> String {
     response
-        .get("id")
+        .get("pane_id")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("StartAgent success must carry an id; response: {response}"))
+        .unwrap_or_else(|| {
+            panic!("StartAgent success must carry the daemon-minted pane_id; response: {response}")
+        })
         .to_string()
 }
 
@@ -251,8 +263,8 @@ fn newagent_authoring_001_each_kind_delivers_its_tui_seed_and_is_advertised() {
         let cwd = fixture.path().join(kind_name);
         let log_name = format!("{kind_name}-authoring.log");
         let log_path = cwd.join(&log_name);
-        let pane_id = format!("newagent-authoring-001-{kind_name}");
-        start_stand_in(&daemon, &cwd, &pane_id, &log_name, 1, Some(kind_name));
+        let proposed = format!("newagent-authoring-001-{kind_name}");
+        let pane_id = start_stand_in(&daemon, &cwd, &proposed, &log_name, 1, Some(kind_name));
         assert_ready_then_received_once(
             &daemon,
             &pane_id,
@@ -320,7 +332,7 @@ fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_
     let fixture = common::harness_tempdir().expect("mint late-authoring fixture");
     let authoring_cwd = fixture.path().join("late-authoring");
     let authoring_log = authoring_cwd.join("late-authoring.log");
-    start_stand_in(
+    let late_pane = start_stand_in(
         &daemon,
         &authoring_cwd,
         "newagent-authoring-002-late",
@@ -331,7 +343,7 @@ fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_
 
     let plain_cwd = fixture.path().join("plain-control");
     let plain_log = plain_cwd.join("plain-control.log");
-    start_stand_in(
+    let plain_pane = start_stand_in(
         &daemon,
         &plain_cwd,
         "newagent-authoring-002-plain",
@@ -342,7 +354,7 @@ fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_
 
     assert_ready_then_received_once(
         &daemon,
-        "newagent-authoring-002-late",
+        &late_pane,
         &authoring_log,
         &daemon_composed_seed(KIND, &authoring_cwd),
         KIND,
@@ -368,7 +380,7 @@ fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_
         "a StartAgent with no authoring_kind must receive no daemon-owned seed\nstand-in log:\n{}",
         stand_in_log(&plain_log)
     );
-    let plain_inbox = inbox_view::messages(&daemon.attach_socket, "newagent-authoring-002-plain");
+    let plain_inbox = inbox_view::messages(&daemon.attach_socket, &plain_pane);
     assert!(
         plain_inbox.is_empty(),
         "a StartAgent with no authoring_kind must post no daemon-owned seed; inbox = \
@@ -382,6 +394,7 @@ fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_
 #[spec("newagent/authoring/003")]
 #[test]
 fn newagent_authoring_003_refuses_unsafe_cwd_without_changing_plain_starts() {
+    // Proposed names only: the daemon mints the real pane ids (fork PRD #365 M2).
     const ORDINARY_PANE: &str = "newagent-authoring-003-ordinary";
     const PLAIN_PANE: &str = "newagent-authoring-003-plain";
 
@@ -464,7 +477,7 @@ fn newagent_authoring_003_refuses_unsafe_cwd_without_changing_plain_starts() {
     assert!(
         after_ordinary
             .iter()
-            .any(|record| record.pane_id_env.as_deref() == Some(ORDINARY_PANE)),
+            .any(|record| record.pane_id_env.as_deref() == Some(minted_pane_id(&ordinary).as_str())),
         "the ordinary authoring control must appear in ListAgents: {after_ordinary:?}"
     );
 
@@ -488,7 +501,7 @@ fn newagent_authoring_003_refuses_unsafe_cwd_without_changing_plain_starts() {
     assert!(
         after_plain
             .iter()
-            .any(|record| record.pane_id_env.as_deref() == Some(PLAIN_PANE)),
+            .any(|record| record.pane_id_env.as_deref() == Some(minted_pane_id(&plain).as_str())),
         "the plain control-byte cwd control must appear in ListAgents: {after_plain:?}"
     );
 

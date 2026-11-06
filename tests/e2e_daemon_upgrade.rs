@@ -262,6 +262,13 @@ impl InstalledDaemon {
             isolated_clone_origin: None,
         });
         assert!(response.ok, "stand-in spawn failed: {:?}", response.error);
+        // Fork PRD #365 M2: the daemon is authoritative for `pane_id` — it strips
+        // the `DOT_AGENT_DECK_PANE_ID` proposed above and returns the id it
+        // minted, which is the id the registry lists the agent under. The
+        // proposed name stays the display name.
+        let pane = response.pane_id.clone().unwrap_or_else(|| {
+            panic!("the start-agent reply carries the daemon-minted pane_id: {response:?}")
+        });
         assert!(
             common::wait_until(WAIT, || read_pid(&pid_file).is_some()),
             "stand-in never started"
@@ -269,7 +276,7 @@ impl InstalledDaemon {
         self.agent_pids.push(read_pid(&pid_file).unwrap());
         self.agents()
             .into_iter()
-            .find(|agent| agent.pane_id_env.as_deref() == Some(&pane))
+            .find(|agent| agent.pane_id_env.as_deref() == Some(pane.as_str()))
             .expect("spawned stand-in must appear in ListAgents")
     }
 

@@ -46,6 +46,11 @@ pub(crate) struct Remote {
     pub(crate) installed: PathBuf,
     pub(crate) successor: PathBuf,
     pub(crate) agents: Vec<(String, i32)>,
+    /// The pane id the daemon minted for each stand-in [`Self::seed_live`]
+    /// started, in start order. The daemon is authoritative for `pane_id` (fork
+    /// PRD #365 M2: it strips the proposed `DOT_AGENT_DECK_PANE_ID`), so these,
+    /// not the proposed names, are what the restart prompt can name.
+    pub(crate) panes: Vec<String>,
     expected_roles: usize,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) version: String,
@@ -178,6 +183,7 @@ impl Remote {
             installed,
             successor,
             agents: Vec::new(),
+            panes: Vec::new(),
             expected_roles: 0,
             version,
             env: vec![
@@ -275,6 +281,9 @@ impl Remote {
             )
             .unwrap();
             assert!(response.ok, "spawn stand-in: {:?}", response.error);
+            self.panes.push(response.pane_id.clone().unwrap_or_else(|| {
+                panic!("the start-agent reply carries the daemon-minted pane_id: {response:?}")
+            }));
             assert!(
                 common::wait_until(WAIT, || pid_file(&pid).is_some()),
                 "stand-in must start"

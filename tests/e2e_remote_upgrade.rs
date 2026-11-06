@@ -56,7 +56,7 @@ fn assert_kept_summary(text: &str) {
     );
 }
 
-fn assert_live_prompt(terminal: &mut Terminal) {
+fn assert_live_prompt(terminal: &mut Terminal, panes: &[String]) {
     terminal.wait("Restart now?");
     let text = terminal.output();
     for label in LABELS {
@@ -65,9 +65,12 @@ fn assert_live_prompt(terminal: &mut Terminal) {
             "restart prompt must name {label}: {text}"
         );
     }
-    for pane in ["upgrade-pane-0", "upgrade-pane-1", "upgrade-pane-2"] {
+    // The panes are the ones the daemon minted for the stand-ins (fork PRD #365
+    // M2), not the names `seed_live` proposed.
+    assert_eq!(panes.len(), 3, "seed_live starts three stand-ins");
+    for pane in panes {
         assert!(
-            text.contains(pane),
+            text.contains(pane.as_str()),
             "restart prompt must name {pane}: {text}"
         );
     }
@@ -99,7 +102,7 @@ fn remote_upgrade_006_tty_live_keep_and_restart_choices() {
         let mut remote = Remote::new();
         remote.seed_live();
         let mut terminal = remote.tty(&["remote", "upgrade", DECK]);
-        assert_live_prompt(&mut terminal);
+        assert_live_prompt(&mut terminal, &remote.panes);
         remote.assert_installed();
         remote.assert_kept();
         terminal.send(answer);
@@ -391,7 +394,7 @@ fn remote_connect_001_upgrade_choices_connect_without_second_question() {
         let mut terminal = remote.tty(&["connect", DECK]);
         terminal.wait("Upgrade and connect? [y/N]");
         terminal.send("y\n");
-        assert_live_prompt(&mut terminal);
+        assert_live_prompt(&mut terminal, &remote.panes);
         remote.assert_installed();
         remote.assert_kept();
         terminal.send(if mode == "live-keep" { "\n" } else { "r\n" });
