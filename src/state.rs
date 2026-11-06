@@ -9430,11 +9430,50 @@ impl AppState {
         self.insert_placeholder_session_learned(pane_id, cwd, agent_type, agent_id, learned_from)
     }
 
+    /// Pending-status redesign: the spawn-time constructor
+    /// ([`Self::insert_placeholder_session_awaiting_report_learned`]) for a card
+    /// learned from the stream open now. It is the convenience for tests and for
+    /// a future caller that has no attach of its own to name.
+    ///
+    /// No production site calls it: every spawn and restore site names the daemon
+    /// process that produced its pane and calls the learned constructor, whose
+    /// docs carry the issue #806 reconciliation and the two preconditions every
+    /// caller of either must meet (a freshly minted pane id; register and insert
+    /// under one lock). This one only stamps the card with the stream's process
+    /// ([`Self::stream_incarnation`]) and defers to it.
+    ///
+    /// The plain constructor ([`Self::insert_placeholder_session`]) is the one
+    /// for every other caller; it seeds `expects_agent_report = false`.
+    pub fn insert_placeholder_session_awaiting_report(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        expects_agent_report: bool,
+    ) -> String {
+        let learned_from = self.stream_incarnation.clone();
+        self.insert_placeholder_session_awaiting_report_learned(
+            pane_id,
+            cwd,
+            agent_type,
+            agent_id,
+            learned_from,
+            expects_agent_report,
+        )
+    }
+
     /// Pending-status redesign: sibling of [`Self::insert_placeholder_session`]
-    /// for the three call sites that spawn a pane running a recognized agent
+    /// for the sites that spawn or restore a pane running a recognized agent
     /// CLI and therefore know, at mint time, that the placeholder is awaiting
     /// that agent's first report. Every other caller keeps using the plain
-    /// constructor above, which seeds `expects_agent_report = false`.
+    /// constructor, which seeds `expects_agent_report = false`.
+    ///
+    /// The card is learned from the daemon process `learned_from`: the attach or
+    /// start that produced a pane this client started or attached itself (PRD
+    /// #1666 part 2, G-fix7), which is what every production spawn and restore
+    /// site names. [`Self::insert_placeholder_session_awaiting_report`] learns it
+    /// from the stream open now.
     ///
     /// Issue #806: this is the SPAWN-TIME constructor, so it is also the one
     /// that can lose a race. The daemon has already started the pane's process
@@ -9486,35 +9525,6 @@ impl AppState {
     /// Returns the id of the session that now stands for the pane: the
     /// pane-derived key in every case but one — when the pane is left to an
     /// early session naming a different agent, it is that session's own id.
-    ///
-    /// The card is learned from the stream open now, as
-    /// [`Self::insert_placeholder_session`] does; a caller that spawned or
-    /// attached the pane itself names the process that produced it through
-    /// [`Self::insert_placeholder_session_awaiting_report_learned`].
-    pub fn insert_placeholder_session_awaiting_report(
-        &mut self,
-        pane_id: String,
-        cwd: Option<String>,
-        agent_type: Option<AgentType>,
-        agent_id: Option<String>,
-        expects_agent_report: bool,
-    ) -> String {
-        let learned_from = self.stream_incarnation.clone();
-        self.insert_placeholder_session_awaiting_report_learned(
-            pane_id,
-            cwd,
-            agent_type,
-            agent_id,
-            learned_from,
-            expects_agent_report,
-        )
-    }
-
-    /// The spawn-time constructor ([`Self::insert_placeholder_session_awaiting_report`])
-    /// for a card learned from the daemon process `learned_from` — the attach or
-    /// start that produced a pane this client started or attached itself (PRD
-    /// #1666 part 2, G-fix7), which is what every production spawn and restore
-    /// site names.
     ///
     /// Upstream-sync round 30 (CLAUDE.md rule 24): the two features this joins.
     /// The fork's issue #806 reconciliation (the lone early session is ADOPTED
