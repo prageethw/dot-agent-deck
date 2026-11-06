@@ -620,6 +620,10 @@ mod tests {
 
             let document = StatusDocument::new(build_status_agents(vec![populated, bare]));
             let json = serde_json::to_value(&document).unwrap();
+            // This fork's rows always carry the three presentation flags
+            // (`shell_synthetic_working`, `wait_observing`,
+            // `observing_delegations`): additive fields, so no SCHEMA_VERSION
+            // bump, and false on a row with no live snapshot.
             assert_eq!(
                 json,
                 serde_json::json!({
@@ -632,9 +636,17 @@ mod tests {
                             "cwd": "/tmp/x",
                             "role": "mode:review",
                             "status": expected_status,
+                            "shell_synthetic_working": false,
+                            "wait_observing": false,
+                            "observing_delegations": false,
                             "active_tool": { "name": "Bash" },
                         },
-                        { "agent_id": "agent-2" },
+                        {
+                            "agent_id": "agent-2",
+                            "shell_synthetic_working": false,
+                            "wait_observing": false,
+                            "observing_delegations": false,
+                        },
                     ],
                 }),
                 "the public `daemon status --json` shape moved for {status:?}; if that is \
