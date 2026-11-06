@@ -5,9 +5,7 @@
 mod background_work;
 mod common;
 
-use background_work::{Fixture, PANE};
-use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
-use dot_agent_deck::daemon_client::StartAgentOptions;
+use background_work::Fixture;
 use dot_agent_deck::event::{AgentType, EventType};
 use serde_json::json;
 use spec::spec;
@@ -333,24 +331,7 @@ fn background_006_monitor_count_edges_no_idle_spam_and_replacement() {
         .block_on(f.client.stop_agent(&f.agent_id))
         .unwrap();
     let before = f.events.snapshot().len();
-    f.agent_id = f
-        .runtime
-        .block_on(f.client.start_agent(StartAgentOptions {
-            command: Some(common::capability_export_command("cat")),
-            cwd: Some(f.deck.workdir().to_string_lossy().into_owned()),
-            display_name: Some("successor".into()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), PANE.into())],
-            agent_type: Some(AgentType::ClaudeCode),
-            ..Default::default()
-        }))
-        .unwrap();
-    f.capability = f
-        .runtime
-        .block_on(common::recorded_hook_capability(
-            f.deck.workdir(),
-            &f.agent_id,
-        ))
-        .unwrap();
+    f.start_successor_in_same_pane();
     f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
     f.hook("claude-code", "Stop", json!({}));
     f.assert_successor_clean(before);
@@ -411,24 +392,7 @@ fn background_014_natural_exit_clears_the_attached_card_only() {
         })
         .cloned();
 
-    f.agent_id = f
-        .runtime
-        .block_on(f.client.start_agent(StartAgentOptions {
-            command: Some(common::capability_export_command("cat")),
-            cwd: Some(f.deck.workdir().to_string_lossy().into_owned()),
-            display_name: Some("successor".into()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), PANE.into())],
-            agent_type: Some(AgentType::ClaudeCode),
-            ..Default::default()
-        }))
-        .unwrap();
-    f.capability = f
-        .runtime
-        .block_on(common::recorded_hook_capability(
-            f.deck.workdir(),
-            &f.agent_id,
-        ))
-        .unwrap();
+    f.start_successor_in_same_pane();
     f.hook(
         "claude-code",
         "SessionStart",
@@ -449,7 +413,7 @@ fn background_014_natural_exit_clears_the_attached_card_only() {
     // event, so do not invent a shell/status event with different semantics.
     if let Some(control_clear) = clear.as_ref() {
         let mut tui = dot_agent_deck::state::AppState::default();
-        tui.register_pane(PANE.into());
+        tui.register_pane(f.pane.clone());
         // An attached client has seen the predecessor and the successor's
         // announcement; preserve that generation evidence in this replay.
         for frame in f.events.snapshot() {

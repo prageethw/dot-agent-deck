@@ -10,7 +10,13 @@ use dot_agent_deck::event::{AgentType, EventType};
 use dot_agent_deck::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY;
 use serde_json::{Value, json};
 
-pub const PANE: &str = "background-synthetic-pane";
+/// The pane id the stand-in (and a successor) asks for. The daemon is
+/// authoritative for `pane_id` (fork PRD #365 M2) and strips whatever a client
+/// proposes, with ONE exception (E-365b): a lone, well-formed, unused
+/// `desktop-` id is honoured. This one is such an id on purpose, so a test can
+/// name a pane in advance and start a successor in the very pane its
+/// predecessor held; any other name would be replaced by a freshly minted id.
+pub const PANE: &str = "desktop-background-synthetic-pane";
 const SESSION: &str = "background-synthetic-session";
 
 pub struct Fixture {
@@ -18,10 +24,11 @@ pub struct Fixture {
     pub runtime: tokio::runtime::Runtime,
     pub client: DaemonClient,
     pub agent_id: String,
-    /// The pane id the daemon minted for the stand-in. The daemon is
-    /// authoritative for `pane_id` (fork PRD #365 M2: it discards the
-    /// `DOT_AGENT_DECK_PANE_ID` proposed as [`PANE`]), and the capability token
-    /// is issued for this id, so the hook CLI must name it.
+    /// The pane id the daemon reported for the stand-in, which is [`PANE`]
+    /// because the daemon honours an unused `desktop-` id. The capability token
+    /// is issued for this id, so the hook CLI must name it; it is read from the
+    /// start reply rather than assumed, and [`Fixture::new`] asserts the two
+    /// agree.
     pub pane: String,
     pub capability: String,
     pub events: EventSub,
@@ -88,7 +95,11 @@ finally:
                 ..Default::default()
             }))
             .unwrap();
-        let pane = pane.expect("the start-agent reply carries the daemon-minted pane_id");
+        let pane = pane.expect("the start-agent reply carries the daemon's pane_id");
+        assert_eq!(
+            pane, PANE,
+            "the daemon must honour the lone unused `desktop-` pane id the fixture named"
+        );
         let capability = runtime
             .block_on(common::recorded_hook_capability(deck.workdir(), &agent_id))
             .unwrap();
@@ -221,6 +232,51 @@ finally:
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Replace the stand-in with a Claude successor that holds the SAME pane
+    /// id, and re-read the capability the daemon issued it.
+    ///
+    /// The only StartAgent request that reaches the pane a predecessor held is
+    /// one naming [`PANE`] again, because the daemon honours a lone, unused
+    /// `desktop-` id and mints every other. The `pane restart` verb cannot
+    /// stand in for it: that replaces an orchestration ROLE's agent at the
+    /// orchestrator's request, and this stand-in is no role. A predecessor
+    /// that exited on its own stays registered until it is closed, and the
+    /// daemon refuses a `desktop-` id a registered agent still holds, so the
+    /// predecessor is closed first, as the TUI closes a dead pane; one already
+    /// stopped has nothing to close, so its `NotFound` is ignored (a record
+    /// that really stays held shows as the daemon's "already in use" refusal
+    /// on the start below).
+    pub fn start_successor_in_same_pane(&mut self) {
+        let _ = self
+            .runtime
+            .block_on(self.client.stop_agent(&self.agent_id));
+        let (agent_id, pane) = self
+            .runtime
+            .block_on(self.client.start_agent_with_pane_id(StartAgentOptions {
+                command: Some(common::capability_export_command("cat")),
+                cwd: Some(self.deck.workdir().to_string_lossy().into_owned()),
+                display_name: Some("successor".into()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.into(), PANE.into())],
+                agent_type: Some(AgentType::ClaudeCode),
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_eq!(
+            pane.as_deref(),
+            Some(self.pane.as_str()),
+            "the successor must hold the pane its predecessor held, or the scenario \
+             (a replaced agent in the SAME pane) is no longer what is being tested"
+        );
+        self.agent_id = agent_id;
+        self.capability = self
+            .runtime
+            .block_on(common::recorded_hook_capability(
+                self.deck.workdir(),
+                &self.agent_id,
+            ))
+            .unwrap();
     }
 
     pub fn live(&self) -> Value {
