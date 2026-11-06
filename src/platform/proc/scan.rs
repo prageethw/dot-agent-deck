@@ -947,6 +947,36 @@ mod tests {
     /// binary. A pane whose user-configured command happens to carry `wrap`
     /// as its second word for an unrelated reason must not get the #644
     /// exemption for its direct children.
+    ///
+    /// **Upstream-sync round 29: the detached child is `without_tty(..)` now.**
+    /// The #644 exemption this test was written against was an *argv* gate: a
+    /// session-leading child of a `wrap` root was exempt, so the test needed a
+    /// `git wrap` lookalike root to prove the gate read the first token. Upstream
+    /// replaced the gate with a *structural* rule (issue #1493): a session leader
+    /// that owns a controlling terminal is a terminal nested in the pane (`wrap`'s
+    /// inner pty, but equally `tmux`, `script`, `ssh -t`), and the walk re-roots
+    /// there ([`walk_with_reference_session`]) whatever its parent's argv says.
+    /// Under that rule the pty-bearing child this test used to model is a nested
+    /// terminal under ANY parent, `wrap` or lookalike alike, so it reads idle and
+    /// the original premise (the lookalike's argv decides) can no longer be
+    /// observed through it; a genuinely detached command (no controlling terminal:
+    /// a backgrounded tool, `setsid`) is what still reads busy beneath a lookalike
+    /// root. The contract is pinned by upstream's `status/background/005`
+    /// (`tests/shell_activity.rs`: a pty-bearing leader whose parent has
+    /// [`CommandLine::NotSampled`] re-roots the walk), which an argv gate would
+    /// break.
+    ///
+    /// Why the gate cannot be restored without a redesign: the sampler reads argv
+    /// only for [`command_line_targets`] (the session-boundary candidates plus
+    /// their `wrap` parents), and a nested terminal is never a candidate under the
+    /// structural rule, so the walk would meet its parent as `NotSampled` in
+    /// production every time and could only read that as "exempt". Making the
+    /// gate real means widening the sampler to every tty-bearing leader's parent
+    /// (a cost change against the issue #862 bound) and changing the walk the
+    /// #1678 count path ([`qualifying_command_sessions`]) shares. The accepted
+    /// cost is that a `script`/`tmux`/`ssh -t` the agent starts reads idle;
+    /// [`a_pty_bearing_child_under_a_lookalike_root_is_a_nested_terminal_not_a_detached_command`]
+    /// pins that half.
     #[test]
     fn an_argv_that_merely_contains_wrap_as_its_second_token_must_not_exempt_a_detached_child() {
         let root = 800300;
@@ -958,21 +988,60 @@ mod tests {
                 root,
                 "git wrap --agent codex -- codex --model gpt-5.6-terra",
             ),
-            row(
+            without_tty(row(
                 detached_child,
                 root,
                 detached_child,
                 "codex --model gpt-5.6-terra",
-            ),
+            )),
         ];
         assert_eq!(
             descendant_shell_activity(&lookalike_pane, root, &[]),
             Some(true),
             "root's argv is not actually a dot-agent-deck wrap invocation — it merely has the \
              literal token 'wrap' in the second position — so its direct child re-leading a new \
-             session is genuine evidence of a detached foreground command, not the #644 \
-             exemption's targeted shape (issue #644 round 2, reviewer F3 / auditor F2)"
+             session WITHOUT a controlling terminal is genuine evidence of a detached foreground \
+             command, not a nested terminal (issue #644 round 2, reviewer F3 / auditor F2; \
+             structural rule, issue #1493)"
         );
+    }
+
+    /// The other half of the lookalike test above, and the accepted cost of the
+    /// structural nested-terminal rule (issue #1493): a session leader that owns a
+    /// controlling terminal is a nested terminal under ANY parent, so a pty-bearing
+    /// child beneath a `git wrap` lookalike root reads idle exactly like the
+    /// pty-bearing child beneath a real `dot-agent-deck wrap` root. The root's argv
+    /// is never consulted. Upstream's `status/background/005`
+    /// (`tests/shell_activity.rs`) pins the re-rooting itself.
+    #[test]
+    fn a_pty_bearing_child_under_a_lookalike_root_is_a_nested_terminal_not_a_detached_command() {
+        let root = 800310;
+        let nested_terminal = 800311;
+        let real_wrap = vec![
+            row(
+                root,
+                1,
+                root,
+                "dot-agent-deck wrap --agent codex -- codex --model gpt-5.6-terra",
+            ),
+            row(
+                nested_terminal,
+                root,
+                nested_terminal,
+                "codex --model gpt-5.6-terra",
+            ),
+        ];
+        let mut lookalike = real_wrap.clone();
+        lookalike[0].command_line =
+            CommandLine::Read("git wrap --agent codex -- codex --model gpt-5.6-terra".to_string());
+        for (label, pane) in [("real wrap", real_wrap), ("lookalike", lookalike)] {
+            assert_eq!(
+                descendant_shell_activity(&pane, root, &[]),
+                Some(false),
+                "{label}: a session leader that owns a controlling terminal is a nested terminal \
+                 whatever its parent's argv says (issue #1493)"
+            );
+        }
     }
 
     /// Issue #1493: `dot-agent-deck wrap` runs the agent it hosts on a
