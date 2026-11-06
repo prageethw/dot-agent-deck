@@ -43585,8 +43585,8 @@ mod tests {
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
-    /// so it returns exactly Compact=6 / Normal=9 / Spacious=11. Locks the
-    /// three density-derived values against future drift.
+    /// so it returns exactly Minimal=3 / Compact=6 / Normal=9 / Spacious=11.
+    /// Locks the four density-derived values against future drift.
     #[test]
     fn card_height_001_content_derived_values() {
         assert_eq!(CardDensity::Minimal.card_height(), 3);
