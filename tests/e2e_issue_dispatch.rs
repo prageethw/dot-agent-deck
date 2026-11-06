@@ -3964,8 +3964,15 @@ fn dispatch_026_triage_enabled_ensures_labels_and_prompts_agent() {
 
     // The delivered prompt must carry the full vocabulary and the
     // uncertainty rule, captured once so multiple substrings can be checked
-    // against the same snapshot.
-    let delivered = daemon.attach_and_capture_output(&agent.id, Duration::from_millis(600), w());
+    // against the same snapshot. Since PRD #1666 the deck posts the prompt to
+    // the agent's inbox instead of typing it into the PTY, so it is read there
+    // (the PTY holds only the agent's own output).
+    let pane_id = agent.pane_id_env.as_deref().expect("the agent's pane id");
+    assert!(
+        view::wait_for(&daemon.attach_socket, pane_id, "ISSUEDISPATCH-7", w()),
+        "the substituted per-issue prompt must reach the dispatched agent's inbox"
+    );
+    let delivered = view::text(&daemon.attach_socket, pane_id);
     for label in TRIAGE_LABELS {
         assert!(
             delivered.contains(label),
@@ -4040,7 +4047,15 @@ fn dispatch_027_triage_off_by_default_no_label_no_prompt_text() {
             )
         });
 
-    let delivered = daemon.attach_and_capture_output(&agent.id, Duration::from_millis(600), w());
+    // The prompt is posted to the agent's inbox (PRD #1666), not typed into the
+    // PTY. Wait for it first: a negative check on text that has not arrived yet
+    // (or on the PTY, which never holds it) would pass whatever the prompt says.
+    let pane_id = agent.pane_id_env.as_deref().expect("the agent's pane id");
+    assert!(
+        view::wait_for(&daemon.attach_socket, pane_id, "ISSUEDISPATCH-7", w()),
+        "the substituted per-issue prompt must reach the dispatched agent's inbox"
+    );
+    let delivered = view::text(&daemon.attach_socket, pane_id);
     for label in TRIAGE_LABELS {
         assert!(
             !delivered.contains(label),
