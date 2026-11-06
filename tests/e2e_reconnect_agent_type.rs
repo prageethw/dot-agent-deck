@@ -375,7 +375,11 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
 #[spec("session/live/019")]
 #[test]
 fn live_019_a_reconnected_event_stream_catches_the_card_up() {
-    const PANE_ID: &str = "pane-stream-gap";
+    // PRD fork#365 M2: the daemon mints and owns `pane_id` and strips the
+    // proposed `DOT_AGENT_DECK_PANE_ID`, so this is only the value the start
+    // request proposes. The stream-break seam and the `agent-event` CLI below are
+    // keyed by the id the daemon actually minted (`response.pane_id`).
+    const PROPOSED_PANE_ID: &str = "pane-stream-gap";
     const LABEL: &str = "stream-gap-19";
 
     let daemon =
@@ -386,7 +390,7 @@ fn live_019_a_reconnected_event_stream_catches_the_card_up() {
             cwd: None,
             rows: 24,
             cols: 80,
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE_ID.into())],
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PROPOSED_PANE_ID.into())],
             display_name: Some(LABEL.into()),
             tab_membership: None,
             agent_type: Some(AgentType::Pi),
@@ -402,6 +406,10 @@ fn live_019_a_reconnected_event_stream_catches_the_card_up() {
         "StartAgent should succeed, got error: {:?}",
         response.error
     );
+    let pane_id = response
+        .pane_id
+        .clone()
+        .expect("PRD fork#365 daemon always mints and returns a pane_id");
     let records = daemon.wait_for_agent_count(1, Duration::from_secs(5));
     let agent_id = records
         .first()
@@ -422,12 +430,12 @@ fn live_019_a_reconnected_event_stream_catches_the_card_up() {
         )
         .with_env(
             "DOT_AGENT_DECK_E2E_BREAK_STREAM_ON",
-            format!("{PANE_ID}/Thinking"),
+            format!("{pane_id}/Thinking"),
         )
         .launch_with_fixture("minimal");
     tui.wait_for_string(LABEL);
 
-    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), "running");
+    let output = daemon.run_agent_event(&pane_id, Some(&agent_id), "running");
     assert!(
         output.status.success(),
         "the real `agent-event --type running` CLI failed: status={:?} stdout={:?} stderr={:?}",
@@ -435,13 +443,18 @@ fn live_019_a_reconnected_event_stream_catches_the_card_up() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // Fork-only removed the agent-type badge from card titles (b33cec2), so
+    // "Pi" is not drawn on the card by default (upstream's `Pi` + `Thinking`
+    // same-row check can never hold). The card is found by its identity row (the
+    // body row directly under the title, PRD fork#405 M1) and the status word is
+    // read from the title row above it, so a `Thinking` painted anywhere else on
+    // the grid cannot satisfy the wait.
     tui.wait_until_grid(
         "the card catches up to Thinking after the event stream reconnects",
         |grid| {
-            grid.contains(LABEL)
-                && grid
-                    .lines()
-                    .any(|line| line.contains("Pi") && line.contains("Thinking"))
+            common::card_identity_row(grid, LABEL)
+                .and_then(|row| grid.lines().nth(row - 1))
+                .is_some_and(|title| title.contains("Thinking"))
         },
     );
 }
