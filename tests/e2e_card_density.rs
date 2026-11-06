@@ -60,8 +60,10 @@ fn card_heights(grid: &str) -> Vec<usize> {
 /// Scenario: Start the deck in a 79x30 terminal and send eight agents' session
 /// starts over the hook socket — more than the screen holds at the 5-row
 /// Compact card. Every one of the eight cards appears on screen at the 3-row
-/// Minimal height, each with its `Dir:` row and `Last:` counter, and the deck
-/// title shows no hidden-card marker, so nothing needs scrolling.
+/// Minimal height, each with its directory folded onto its role row (issue #847;
+/// the fork's Minimal card has one content row, not a separate `Dir:` row) and
+/// its `Last:` counter, and the deck title shows no hidden-card marker, so
+/// nothing needs scrolling.
 #[spec("dashboard/density/009")]
 #[test]
 fn density_009_real_binary_draws_every_card_at_minimal() {
@@ -88,11 +90,22 @@ fn density_009_real_binary_draws_every_card_at_minimal() {
             "card {id} must be on screen without scrolling:\n{grid}"
         );
     }
+    // The fork's Minimal card has ONE content row (issue #847): the role name and
+    // `Dir: <basename>` are folded onto it, `Dir:` with a single space where
+    // upstream's separate row reads `Dir:  <basename>`. So every card keeps its
+    // directory, on its own row after its role name, never on a row of its own.
     assert_eq!(
-        grid.matches("Dir:  density-dir").count(),
+        grid.matches("Dir: density-dir").count(),
         CARDS,
-        "every Minimal card keeps its Dir row:\n{grid}"
+        "every Minimal card keeps its directory:\n{grid}"
     );
+    for id in &ids {
+        assert!(
+            grid.lines()
+                .any(|line| line.starts_with(&format!("│{id}  Dir: density-dir"))),
+            "card {id} must fold its directory onto its role row:\n{grid}"
+        );
+    }
     assert_eq!(
         grid.matches("Last:").count(),
         CARDS,
