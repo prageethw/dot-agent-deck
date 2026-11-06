@@ -851,7 +851,13 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// deliberately not on. The bump is what makes a skew *nameable* — the number
 /// the handshake reports and `daemon hello` prints — and, at the two sites
 /// above, what makes it *refused*.
-pub const PROTOCOL_VERSION: u32 = 13; // PROVISIONAL: awaiting maintainer approval
+///
+/// PROVISIONAL: awaiting maintainer approval (the "12 → 13" paragraph above). The
+/// note lives here and not as a trailing `//` comment on the constant's line:
+/// `.github/workflows/ci.yml`'s `cross-version` plan step reads this line with an
+/// end-anchored `sed` (`...= \([0-9]*\);$`), so anything after the `;` makes it
+/// report "could not read PROTOCOL_VERSION".
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The attach-protocol version the daemon's `Hello` handler advertises as
 /// [`AttachResponse::server_version`]. [`PROTOCOL_VERSION`] in every shipped
