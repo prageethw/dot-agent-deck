@@ -926,6 +926,10 @@ fn telemetry_otlp_011_respawn_mints_a_new_run_id() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = \"telemetry-respawn\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
+    // A clone carries committed files only, and a later delegate resolves the
+    // `coder` role from the orchestration's directory: commit the config the way
+    // the fork's own orchestration tests do.
+    common::commit_fixture(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
@@ -934,20 +938,27 @@ fn telemetry_otlp_011_respawn_mints_a_new_run_id() {
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
     deck.wait_for_string("coder");
-    common::wait_for_file_contains(
-        &deck.workdir().join("telemetry-respawn.env"),
-        "deck.run.id=",
-    );
     let record = |role: &str| {
         common::agent_records_on(deck.attach_socket_path()).into_iter().find(|record| {
         matches!(&record.tab_membership, Some(TabMembership::Orchestration { role_name, .. }) if role_name == role)
     })
     };
+    // The role writes its environment into its OWN working directory, which on
+    // this fork is the orchestration's isolated clone of the launch directory
+    // (PRD fork#544 M2b), not the launch directory itself: read it from the
+    // coder's own record.
+    assert!(
+        common::wait_until(Duration::from_secs(30), || record("coder")
+            .is_some_and(|record| record.cwd.is_some())),
+        "the coder role was never registered with a working directory"
+    );
     let first = record("coder").expect("first worker");
     let orchestrator = record("orchestrator").expect("orchestrator");
+    let env_file = Path::new(first.cwd.as_deref().expect("the coder's working directory"))
+        .join("telemetry-respawn.env");
+    common::wait_for_file_contains(&env_file, "deck.run.id=");
     let run_id_from_env = || {
-        let environment =
-            std::fs::read_to_string(deck.workdir().join("telemetry-respawn.env")).unwrap();
+        let environment = std::fs::read_to_string(&env_file).unwrap();
         env_value(&environment, "OTEL_RESOURCE_ATTRIBUTES")
             .unwrap()
             .split(',')
