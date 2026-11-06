@@ -1689,7 +1689,11 @@ fn codex_trust_005_untrusted_hooks_are_declared_on_every_wrapper_event() {
         );
 
         assert!(output.status.success(), "wrapper failed: {output:?}");
-        let trust_recorded = home.path().join("config.toml").exists();
+        // Hook trust specifically, not merely a `config.toml`: the wrapper also
+        // writes Codex's per-project `trust_level` into that file (fork issue
+        // #732, a separate mechanism that needs no `codex` on the PATH), so the
+        // file exists in every case, including the one with no `codex` at all.
+        let trust_recorded = hook_trust_recorded(home.path());
         assert_eq!(
             trust_recorded,
             case != Case::NoCodexOnPath,
@@ -1745,6 +1749,23 @@ fn hook_list_response_with_warnings(entries: Vec<Value>, warnings: Vec<&str>) ->
         }
     })
     .to_string()
+}
+
+/// Whether `home`'s `config.toml` holds any `[hooks.state]` record, i.e. whether
+/// a hook trust step has recorded something. `false` for no file, no table or an
+/// empty table; unlike [`trust_state_hashes`] it never panics, since "nothing
+/// recorded" is an answer here.
+fn hook_trust_recorded(home: &std::path::Path) -> bool {
+    std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|contents| toml::from_str::<toml::Value>(&contents).ok())
+        .and_then(|root| {
+            root.get("hooks")?
+                .get("state")?
+                .as_table()
+                .map(|table| !table.is_empty())
+        })
+        .unwrap_or(false)
 }
 
 /// Every `[hooks.state]` record in `home`'s `config.toml`, as `key -> trusted_hash`
