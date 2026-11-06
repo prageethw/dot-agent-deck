@@ -18,7 +18,7 @@
 
 #![cfg(unix)]
 
-use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, TabMembership};
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership};
 use dot_agent_deck::daemon_client::{ClientError, DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE;
 use spec::spec;
@@ -32,7 +32,6 @@ const ORCHESTRATION: &str = "review";
 /// the same directory differ only by it.
 struct Role<'a> {
     command: &'a str,
-    pane_id: &'a str,
     orchestration_id: &'a str,
     role_index: usize,
     role_name: &'a str,
@@ -41,13 +40,16 @@ struct Role<'a> {
     orchestration_cwd: &'a str,
 }
 
+/// Start one role through the daemon and answer the pane id the daemon minted
+/// for it. Fork #365 (PRD #365 M2): the daemon, not the caller, is authoritative
+/// for `pane_id`, so none is proposed; a caller that needs to name the pane
+/// afterwards (its liveness, its registry record) uses the reply's.
 async fn start_role(client: &DaemonClient, role: Role<'_>) -> Result<String, ClientError> {
-    client
-        .start_agent(StartAgentOptions {
+    let (_agent_id, pane_id) = client
+        .start_agent_with_pane_id(StartAgentOptions {
             command: Some(role.command.to_string()),
             cwd: Some(role.orchestration_cwd.to_string()),
             display_name: Some(role.role_name.to_string()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), role.pane_id.to_string())],
             tab_membership: Some(TabMembership::Orchestration {
                 name: ORCHESTRATION.to_string(),
                 role_index: role.role_index,
@@ -59,15 +61,8 @@ async fn start_role(client: &DaemonClient, role: Role<'_>) -> Result<String, Cli
             }),
             ..StartAgentOptions::default()
         })
-        .await
-}
-
-fn pane_is_registered(daemon: &common::InProcDaemon, pane_id: &str) -> bool {
-    daemon
-        .registry
-        .agent_records()
-        .iter()
-        .any(|r| r.pane_id_env.as_deref() == Some(pane_id))
+        .await?;
+    Ok(pane_id.expect("the daemon must mint the started agent's pane_id (PRD #365 M2)"))
 }
 
 fn assert_title_refusal(result: Result<String, ClientError>, title: &str) {
@@ -112,7 +107,6 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
         &client,
         Role {
             command: "cat",
-            pane_id: "tab-a-orchestrator",
             orchestration_id: "tab-a",
             role_index: 0,
             role_name: "orchestrator",
@@ -126,11 +120,11 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
 
     // Client B, whose form snapshot predates A: same title, same directory,
     // different tab. This is the start the daemon must refuse.
+    let agents_before_refusal = daemon.registry.agent_records().len();
     let refused = start_role(
         &client,
         Role {
             command: "cat",
-            pane_id: "tab-b-orchestrator",
             orchestration_id: "tab-b",
             role_index: 0,
             role_name: "orchestrator",
@@ -141,8 +135,11 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
     )
     .await;
     assert_title_refusal(refused, title);
-    assert!(
-        !pane_is_registered(&daemon, "tab-b-orchestrator"),
+    // Counted rather than looked up by name: the daemon mints the pane id, so a
+    // name the test chose could never match a pane that did start.
+    assert_eq!(
+        daemon.registry.agent_records().len(),
+        agents_before_refusal,
         "a refused start must spawn nothing — the refusal is before the registry insert; \
          records = {:?}",
         daemon.registry.agent_records()
@@ -156,7 +153,6 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
         &client,
         Role {
             command: "cat",
-            pane_id: "tab-a-coder",
             orchestration_id: "tab-a",
             role_index: 1,
             role_name: "coder",
@@ -175,7 +171,6 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
         &client,
         Role {
             command: "cat",
-            pane_id: "tab-b-orchestrator",
             orchestration_id: "tab-b",
             role_index: 0,
             role_name: "orchestrator",
@@ -192,9 +187,8 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
     // when the others are checked. Exactly one may win. A daemon that counted
     // only live panes as holders — not a start still in flight — admits several.
     let racing_title = "proj-orchestrator-3";
-    let pane_ids: Vec<String> = (0..8).map(|n| format!("race-{n}-orchestrator")).collect();
     let tab_ids: Vec<String> = (0..8).map(|n| format!("race-tab-{n}")).collect();
-    let starts = pane_ids.iter().zip(&tab_ids).map(|(pane_id, tab_id)| {
+    let starts = tab_ids.iter().map(|tab_id| {
         let client = DaemonClient::new(daemon.attach_path.clone());
         let cwd = cwd.clone();
         async move {
@@ -202,7 +196,6 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
                 &client,
                 Role {
                     command: "cat",
-                    pane_id,
                     orchestration_id: tab_id,
                     role_index: 0,
                     role_name: "orchestrator",
@@ -253,11 +246,10 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         "sh -c 'while [ ! -e {} ]; do sleep 0.05; done'",
         release.display()
     );
-    start_role(
+    let holder_pane = start_role(
         &client,
         Role {
             command: &holder_command,
-            pane_id: "unnamed-orchestrator",
             orchestration_id: "unnamed-tab",
             role_index: 0,
             role_name: "orchestrator",
@@ -273,7 +265,6 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         &client,
         Role {
             command: "cat",
-            pane_id: "typed-orchestrator",
             orchestration_id: "typed-tab",
             role_index: 0,
             role_name: "orchestrator",
@@ -291,7 +282,6 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         &client,
         Role {
             command: "cat",
-            pane_id: "elsewhere-orchestrator",
             orchestration_id: "elsewhere-tab",
             role_index: 0,
             role_name: "orchestrator",
@@ -312,7 +302,6 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         &client,
         Role {
             command: "cat",
-            pane_id: "alias-orchestrator",
             orchestration_id: "alias-tab",
             role_index: 0,
             role_name: "orchestrator",
@@ -332,7 +321,6 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         &client,
         Role {
             command: "cat",
-            pane_id: "control-byte-orchestrator",
             orchestration_id: "control-byte-tab",
             role_index: 0,
             role_name: "orchestrator",
@@ -351,7 +339,7 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         .await
         .expect("release the holder's stand-in");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while daemon.registry.has_live_pane("unnamed-orchestrator") {
+    while daemon.registry.has_live_pane(&holder_pane) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "precondition: the holder's stand-in never exited"
@@ -362,24 +350,25 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
     // runs on the holder's old pane id, while the holder's stale role-map entry
     // still maps that id to its orchestration. That is not the holder coming
     // back, and must not hold its title.
-    client
-        .start_agent(StartAgentOptions {
-            command: Some("cat".to_string()),
-            cwd: Some(cwd.clone()),
-            env: vec![(
-                DOT_AGENT_DECK_PANE_ID.to_string(),
-                "unnamed-orchestrator".to_string(),
-            )],
-            ..StartAgentOptions::default()
+    //
+    // Spawned into the registry directly, the way the daemon's own respawn
+    // reuses a pane: fork #365 (PRD #365 M2) makes `StartAgent` mint every pane
+    // id and refuse a `desktop-` one an exited agent still holds, so no start
+    // over the attach socket can put a second agent on an existing pane id.
+    daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), holder_pane.clone())],
+            ..SpawnOptions::default()
         })
-        .await
         .expect("a plain pane may reuse an exited pane's id");
 
     start_role(
         &client,
         Role {
             command: "cat",
-            pane_id: "typed-orchestrator",
             orchestration_id: "typed-tab",
             role_index: 0,
             role_name: "orchestrator",
@@ -445,7 +434,6 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         &client,
         Role {
             command: "cat",
-            pane_id: "after-spawn-orchestrator",
             orchestration_id: "after-spawn-tab",
             role_index: 0,
             role_name: "orchestrator",
@@ -476,7 +464,6 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         &client,
         Role {
             command: "cat",
-            pane_id: "after-spawn-orchestrator",
             orchestration_id: "after-spawn-tab",
             role_index: 0,
             role_name: "orchestrator",

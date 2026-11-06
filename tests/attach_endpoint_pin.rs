@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID};
+use dot_agent_deck::agent_pty::AgentPtyRegistry;
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::state::{AppState, SharedState};
@@ -113,18 +113,22 @@ async fn each_daemons_agents_are_pointed_at_its_own_attach_endpoint() {
     assert_ne!(first.attach_path, second.attach_path);
 
     let mut seen = Vec::new();
-    for (daemon, pane) in [(&first, "pin-first"), (&second, "pin-second")] {
+    for (daemon, name) in [(&first, "pin-first"), (&second, "pin-second")] {
         let out = daemon.dir.path().join("reported.txt");
         let command = reporting_command(&out);
-        DaemonClient::new(daemon.attach_path.clone())
-            .start_agent(StartAgentOptions {
+        // Fork #365 (PRD #365 M2): the daemon, not the caller, is authoritative
+        // for `pane_id`, so the respawn below targets the id the start reply
+        // carries; `name` is only what the agent is called.
+        let (_, pane) = DaemonClient::new(daemon.attach_path.clone())
+            .start_agent_with_pane_id(StartAgentOptions {
                 command: Some(command.clone()),
                 cwd: Some(daemon.dir.path().to_string_lossy().into_owned()),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                display_name: Some(name.to_string()),
                 ..StartAgentOptions::default()
             })
             .await
             .expect("start an agent through this daemon's attach socket");
+        let pane = pane.expect("the daemon must mint the agent's pane_id (PRD #365 M2)");
         seen.push((daemon, pane, out, command));
     }
     for (daemon, _, out, _) in &seen {

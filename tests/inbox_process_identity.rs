@@ -334,11 +334,23 @@ fn inbox_protocol_022_a_wrong_missing_or_earlier_capability_takes_nothing() {
     assert!(state_of(&daemon, &owner, &task).contains("queued"));
 
     // An earlier generation's capability, after its pane's agent was replaced.
-    let earlier = pane(&daemon, "capability-respawned", "exec /bin/cat");
+    // Fork #365 (PRD #365 M2, ruling 55 of the 2026-11-05 upstream merge): the
+    // daemon mints every pane id and strips a proposed one, so a successor can
+    // only be put on the SAME pane id through the one id it honours, a lone,
+    // unused `desktop-` id. This pane uses that shape so its replacement below
+    // proposes the id again and lands on it.
+    let earlier = pane(&daemon, "desktop-capability-respawned", "exec /bin/cat");
+    assert_eq!(
+        earlier.id, "desktop-capability-respawned",
+        "the daemon must honour a lone unused desktop- pane id"
+    );
     let stopped = attach(&daemon, json!({"op":"stop-agent", "id":earlier.agent}));
     assert_eq!(stopped["ok"], true, "stop the first generation: {stopped}");
     // Stop success says the agent has stopped; its handler can still hold
-    // the pane id while finishing cleanup after that reply (#1930).
+    // the pane id while finishing cleanup after that reply (#1930). Until it
+    // lets go the start is refused, by the registry as a duplicate while the
+    // cleanup holds the id, or by the daemon's own in-use check while the
+    // stopped agent's record is still listed.
     let deadline = std::time::Instant::now() + WAIT;
     let replacement = loop {
         let reply = attach(
@@ -347,7 +359,11 @@ fn inbox_protocol_022_a_wrong_missing_or_earlier_capability_takes_nothing() {
             "cwd":daemon.home, "rows":24, "cols":100,
             "env":[["DOT_AGENT_DECK_PANE_ID",earlier.id]], "display_name":earlier.id}),
         );
-        if reply["error"] != "Duplicate pane id: capability-respawned" {
+        let still_held = reply["error"].as_str().is_some_and(|error| {
+            error.contains("Duplicate pane id: desktop-capability-respawned")
+                || error.contains("desktop-capability-respawned` is already in use")
+        });
+        if !still_held {
             break reply;
         }
         assert!(
