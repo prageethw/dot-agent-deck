@@ -1162,7 +1162,7 @@ async fn daemon_status_007_orchestrator_observes_delegation_on_agentless_worker_
     let orch_agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some("cat"),
+            command: Some(&common::capability_export_command("cat")),
             cwd: Some(&cwd_str),
             env: vec![(
                 DOT_AGENT_DECK_PANE_ID.to_string(),
@@ -1173,9 +1173,17 @@ async fn daemon_status_007_orchestrator_observes_delegation_on_agentless_worker_
         .expect("spawn orchestrator stub");
     let mut idle = thinking_event(OBS_ORCH_PANE, &orch_agent_id, None);
     idle.event_type = EventType::Idle;
+    // Hook provenance is enforced (upstream PRD #1077): the daemon issued this
+    // pane a capability at spawn, so its status event must present it.
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&idle).expect("serialize orchestrator Idle event"),
+        &dot_agent_deck::event::agent_event_line(
+            &idle,
+            common::recorded_hook_capability(cwd.path(), &orch_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize orchestrator Idle event"),
     )
     .expect("write orchestrator Idle event");
     wait_for_live_session(
