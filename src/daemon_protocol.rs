@@ -736,10 +736,13 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// built since then reads a `kind` it does not know as `Unknown` instead; the
 /// 12 → 13 paragraph below relies on that.
 ///
-/// **12 → 13 (upstream sync merge, 2026-11-05).** PROVISIONAL: awaiting
-/// maintainer approval — this is a CLAUDE.md rule 12 / rule 25 always-ask item,
-/// and the cross-version manual test (a daemon built from the previous release
-/// under a branch TUI, and the reverse) is still owed.
+/// **12 → 13 (upstream sync merge, 2026-11-05).** The maintainer approved landing
+/// this bump on 2026-11-06 (answer "Approve 13" in the deck dialog); it is a
+/// CLAUDE.md rule 12 / rule 25 always-ask item. The approval does not stand in
+/// for the cross-version manual test (a daemon built from the previous release
+/// under a branch TUI, and the reverse): that is a separate step, and its
+/// result is recorded in the sync merge entry of
+/// `docs/develop/fork-sync-workflow.md`, not here.
 ///
 /// Two lines of history met here, and both had reached 12 independently, on
 /// different wires. Upstream's 12 is the "11 → 12 (PRD #1666 part 2)" paragraph
@@ -852,8 +855,9 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// the handshake reports and `daemon hello` prints — and, at the two sites
 /// above, what makes it *refused*.
 ///
-/// PROVISIONAL: awaiting maintainer approval (the "12 → 13" paragraph above). The
-/// note lives here and not as a trailing `//` comment on the constant's line:
+/// The maintainer approved the "12 → 13" bump (the paragraph above) on
+/// 2026-11-06. Any note about the value lives here and not as a trailing `//`
+/// comment on the constant's line:
 /// `.github/workflows/ci.yml`'s `cross-version` plan step reads this line with an
 /// end-anchored `sed` (`...= \([0-9]*\);$`), so anything after the `;` makes it
 /// report "could not read PROTOCOL_VERSION".
