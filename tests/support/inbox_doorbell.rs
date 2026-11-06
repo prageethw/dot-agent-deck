@@ -312,8 +312,16 @@ while True:
             .is_some()),
         "stand-in {name} must export its pid within {boot_budget:?}"
     );
+    // Fork #365 (PRD #365 M2): the daemon mints `pane_id` and strips the
+    // `DOT_AGENT_DECK_PANE_ID` proposed above; the token is issued for the
+    // minted id, so the pane is keyed by the reply's `pane_id` (`name` stays
+    // the display name).
+    let id = reply["pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("start-agent reply carries the daemon-minted pane_id: {reply}"))
+        .to_string();
     let pane = Pane {
-        id: name.into(),
+        id,
         agent,
         token,
         pid: std::fs::read_to_string(pid_path).unwrap().parse().unwrap(),

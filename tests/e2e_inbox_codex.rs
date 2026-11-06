@@ -144,8 +144,17 @@ while True:
             .unwrap()
             .block_on(common::recorded_hook_capability(&daemon.home, &agent))
             .unwrap();
+        // Fork #365 (PRD #365 M2): the daemon mints `pane_id` and strips the
+        // `DOT_AGENT_DECK_PANE_ID` proposed above; the token is issued for the
+        // minted id, so the pane is keyed by the reply's `pane_id`.
+        let id = reply["pane_id"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("start-agent reply carries the daemon-minted pane_id: {reply}")
+            })
+            .to_string();
         let pane = Pane {
-            id: "codex-inbox".into(),
+            id,
             agent,
             token,
             pid: std::fs::read_to_string(base.with_extension("pid"))

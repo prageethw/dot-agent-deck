@@ -93,8 +93,17 @@ fn pane(daemon: &DaemonProc, name: &str, command: &str) -> Pane {
         "stand-in pid export"
     );
     let pid = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+    // Fork #365 (PRD #365 M2): the daemon, not the client, is authoritative for
+    // `pane_id`. It strips the `DOT_AGENT_DECK_PANE_ID` proposed above and
+    // returns the id it minted, which is the one the hook capability token is
+    // issued for and the one the registry holds the agent under. Key the
+    // pane by that id, not by `name` (kept as the display name only).
+    let id = reply["pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("start-agent reply carries the daemon-minted pane_id: {reply}"))
+        .to_string();
     Pane {
-        id: name.into(),
+        id,
         agent,
         token,
         pid,

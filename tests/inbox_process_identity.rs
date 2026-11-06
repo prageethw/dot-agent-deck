@@ -66,11 +66,16 @@ fn spawned_pane(daemon: &DaemonProc, name: &str, reply: Value) -> Pane {
         .unwrap()
         .block_on(common::recorded_hook_capability(&daemon.home, &agent))
         .expect("stand-in capability");
-    Pane {
-        id: name.into(),
-        agent,
-        token,
-    }
+    // Fork #365 (PRD #365 M2): the daemon mints `pane_id` and strips the
+    // `DOT_AGENT_DECK_PANE_ID` proposed for `name`; the token is issued for the
+    // minted id, so the pane is keyed by the reply's `pane_id`.
+    let id = reply["pane_id"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("pane `{name}`: start-agent reply carries the daemon-minted pane_id: {reply}")
+        })
+        .to_string();
+    Pane { id, agent, token }
 }
 
 /// `inbox_list` answers metadata only, so the test process may ask it.
