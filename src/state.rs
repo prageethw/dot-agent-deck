@@ -9477,6 +9477,11 @@ impl AppState {
     /// Returns the id of the session that now stands for the pane: the
     /// pane-derived key in every case but one — when the pane is left to an
     /// early session naming a different agent, it is that session's own id.
+    ///
+    /// The card is learned from the stream open now, as
+    /// [`Self::insert_placeholder_session`] does; a caller that spawned or
+    /// attached the pane itself names the process that produced it through
+    /// [`Self::insert_placeholder_session_awaiting_report_learned`].
     pub fn insert_placeholder_session_awaiting_report(
         &mut self,
         pane_id: String,
@@ -9485,6 +9490,66 @@ impl AppState {
         agent_id: Option<String>,
         expects_agent_report: bool,
     ) -> String {
+        let learned_from = self.stream_incarnation.clone();
+        self.insert_placeholder_session_awaiting_report_learned(
+            pane_id,
+            cwd,
+            agent_type,
+            agent_id,
+            learned_from,
+            expects_agent_report,
+        )
+    }
+
+    /// The spawn-time constructor ([`Self::insert_placeholder_session_awaiting_report`])
+    /// for a card learned from the daemon process `learned_from` — the attach or
+    /// start that produced a pane this client started or attached itself (PRD
+    /// #1666 part 2, G-fix7), which is what every production spawn and restore
+    /// site names.
+    ///
+    /// Upstream-sync round 30 (CLAUDE.md rule 24): the two features this joins.
+    /// The fork's issue #806 reconciliation (the lone early session is ADOPTED
+    /// onto the pane key, YIELDED to, or left to the historical insert) and
+    /// upstream's G-fix7 stamping of the card with the process it was learned
+    /// from. The sync had resolved the three production sites in upstream's
+    /// favour — [`Self::insert_placeholder_session_learned`] plus an inline
+    /// `expects_agent_report` cue — which lost the reconciliation: a wrapper-first
+    /// early card kept the producer's `last_activity` (the adoption resets it so a
+    /// forged or skewed early frame cannot backdate a card), and an UNTAGGED early
+    /// frame, which upstream's same-agent reuse does not match, left two cards on
+    /// one pane (the issue #806 duplicate).
+    ///
+    /// When the placeholder is drawable now ([`Self::placeholder_drawable_now`],
+    /// the one predicate [`Self::insert_placeholder_session_learned`] decides on)
+    /// the early session decides the outcome exactly as it does for the plain
+    /// spawn-time constructor, and a minted placeholder is stamped `learned_from`.
+    /// An adopted card keeps the incarnation the EARLY session already carries:
+    /// the stream stamped it when the frame that created it was applied, which is
+    /// the process that actually told the deck about it.
+    ///
+    /// When it is not drawable — an attach answered by a process this stream is
+    /// not (yet) the deck's, or one already replaced — this is the learned
+    /// constructor's held/stale path verbatim: no card exists to reconcile, and
+    /// `expects_agent_report` is dropped with it, as the inline cue it replaces
+    /// found no card to arm there either.
+    pub fn insert_placeholder_session_awaiting_report_learned(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        learned_from: Incarnation,
+        expects_agent_report: bool,
+    ) -> String {
+        if !self.placeholder_drawable_now(&learned_from) {
+            return self.insert_placeholder_session_learned(
+                pane_id,
+                cwd,
+                agent_type,
+                agent_id,
+                learned_from,
+            );
+        }
         match self.early_pane_session(&pane_id, agent_id.as_deref()) {
             Some(EarlyPaneSession::Merges(early_id)) => self.adopt_early_pane_session(
                 early_id,
@@ -9492,16 +9557,18 @@ impl AppState {
                 cwd,
                 agent_type,
                 agent_id,
+                learned_from,
                 expects_agent_report,
             ),
             Some(EarlyPaneSession::Supersedes(early_id)) => {
                 self.yield_to_early_pane_session(early_id, &pane_id)
             }
-            None => self.insert_placeholder_session_inner(
+            None => self.mint_placeholder(
                 pane_id,
                 cwd,
                 agent_type,
                 agent_id,
+                learned_from,
                 expects_agent_report,
             ),
         }
@@ -9545,7 +9612,7 @@ impl AppState {
     /// still depend on which input arrived first.
     ///
     /// * the pane-derived key is already occupied. That is the same-key
-    ///   ordering, which [`Self::insert_placeholder_session_inner`] owns — a
+    ///   ordering, which [`Self::mint_placeholder`] owns — a
     ///   resolved entry is left alone (issue #724) and an unresolved one is
     ///   still armed (`dashboard/placeholder/007`/`008`). Those rules predate
     ///   this lookup and are unchanged by it, the order-dependence included: a
@@ -9610,7 +9677,7 @@ impl AppState {
     /// * the two timestamps, which the placeholder mints from the DECK's clock
     ///   and the event's session took from the PRODUCER's. `started_at` is the
     ///   pane's remembered start or the insert time, exactly as
-    ///   [`Self::insert_placeholder_session_inner`] derives it, and no event
+    ///   [`Self::mint_placeholder`] derives it, and no event
     ///   ever moves it. `last_activity` is the later of the insert time and the
     ///   newest event, which is what the high-water assignment in `apply_event`
     ///   makes of a placeholder born "now". Keeping the event's own values
@@ -9627,15 +9694,20 @@ impl AppState {
         cwd: Option<String>,
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
+        learned_from: Incarnation,
         expects_agent_report: bool,
     ) -> String {
         let session_id = placeholder_session_id(&pane_id);
+        // `early_id` was read off `self.sessions` by the caller under this same
+        // `&mut self`, so the session cannot have gone; if it somehow has, the
+        // historical insert is the fallback, stamped as the caller asked.
         let Some(mut session) = self.sessions.remove(&early_id) else {
-            return self.insert_placeholder_session_inner(
+            return self.mint_placeholder(
                 pane_id,
                 cwd,
                 agent_type,
                 agent_id,
+                learned_from,
                 expects_agent_report,
             );
         };
@@ -9698,33 +9770,18 @@ impl AppState {
         early_id
     }
 
-    /// The fork's entry to the placeholder constructor for the spawn-time
-    /// awaiting-report path (the early-pane reconciliation above): the card is
-    /// learned from the stream open now, which is what
-    /// [`Self::insert_placeholder_session`] does.
+    /// Whether a placeholder learned from `learned_from` is drawn now, rather
+    /// than held or dropped as stale ([`Self::insert_placeholder_session_learned`]).
+    /// One learned from the stream's own process, from no named process, or on a
+    /// daemon-side state that owns its panes, is drawn.
     ///
-    /// It enters [`Self::mint_placeholder`], BELOW [`Self::draw_placeholder`]'s
-    /// same-agent reuse (upstream PRD #1223), on purpose: this is reached only
-    /// when [`Self::early_pane_session`] declined to reconcile (an occupied pane
-    /// key, or more than one session on the pane), and in both shapes the
-    /// historical insert is the fork's pinned behaviour (issue #806).
-    fn insert_placeholder_session_inner(
-        &mut self,
-        pane_id: String,
-        cwd: Option<String>,
-        agent_type: Option<AgentType>,
-        agent_id: Option<String>,
-        expects_agent_report: bool,
-    ) -> String {
-        let learned_from = self.stream_incarnation.clone();
-        self.mint_placeholder(
-            pane_id,
-            cwd,
-            agent_type,
-            agent_id,
-            learned_from,
-            expects_agent_report,
-        )
+    /// The one predicate both learned constructors decide on, so the spawn-time
+    /// one ([`Self::insert_placeholder_session_awaiting_report_learned`]) can
+    /// never reconcile a card the plain one would have held.
+    fn placeholder_drawable_now(&self, learned_from: &Incarnation) -> bool {
+        self.agent_ownership.is_some()
+            || learned_from.is_unnamed()
+            || learned_from.same_process(&self.stream_incarnation)
     }
 
     /// [`Self::insert_placeholder_session`] for a card learned from the daemon
@@ -9753,10 +9810,7 @@ impl AppState {
         agent_id: Option<String>,
         learned_from: Incarnation,
     ) -> String {
-        if self.agent_ownership.is_some()
-            || learned_from.is_unnamed()
-            || learned_from.same_process(&self.stream_incarnation)
-        {
+        if self.placeholder_drawable_now(&learned_from) {
             return self.draw_placeholder(pane_id, cwd, agent_type, agent_id, learned_from, false);
         }
         let session_id = placeholder_session_id(&pane_id);
@@ -24038,6 +24092,225 @@ clear = false
                 "second".to_string()
             ],
             "and inserts it beside both sessions instead of guessing between them"
+        );
+    }
+
+    fn process(name: &str) -> Incarnation {
+        Incarnation::from(Some(name.to_string()))
+    }
+
+    /// A deck whose event stream is open on the daemon process `name`.
+    fn deck_streaming_from(name: &str) -> AppState {
+        let mut state = AppState::default();
+        state.learn_stream_incarnation(process(name));
+        state
+    }
+
+    /// Upstream-sync round 30 (CLAUDE.md rule 24): the fork's issue #806
+    /// reconciliation has to ride the LEARNED spawn-time constructor, because
+    /// that is the one every production spawn and restore site calls (it carries
+    /// upstream's G-fix7 attach stamp). An UNTAGGED early boot frame is where the
+    /// learned plain constructor falls short: upstream's same-agent reuse needs a
+    /// matching `Some(agent_id)`, finds none, and mints a placeholder BESIDE the
+    /// early card — two cards on one pane. The spawn-time one adopts it instead,
+    /// arms it, and resets its `last_activity` to the deck's clock so a skewed or
+    /// forged early frame cannot backdate the card; the adopted card keeps the
+    /// incarnation the EARLY session was stamped with (the stream that told the
+    /// deck about it), not the one the caller learned the pane from.
+    #[test]
+    fn the_learned_spawn_time_constructor_adopts_an_untagged_early_card() {
+        let inputs = EarlyInputs {
+            event_agent_id: None,
+            event_agent_type: AgentType::Codex,
+            event_is_wrapper_boot: true,
+            ..EarlyInputs::base()
+        };
+        let clock = EarlyClock::new(&inputs);
+        let hook_first = || {
+            let mut state = deck_streaming_from("p1");
+            state.apply_event(early_event(&inputs, &clock));
+            state.register_pane(EARLY_PANE.to_string());
+            assert_eq!(
+                state.sessions.keys().collect::<Vec<_>>(),
+                vec![EARLY_SESSION],
+                "setup: the untagged early frame created one session under the \
+                 producer's own key"
+            );
+            state
+        };
+        let on_pane = |state: &AppState| {
+            state
+                .sessions
+                .values()
+                .filter(|session| session.pane_id.as_deref() == Some(EARLY_PANE))
+                .count()
+        };
+
+        let mut plain = hook_first();
+        plain.insert_placeholder_session_learned(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-1".to_string()),
+            Incarnation::UNNAMED,
+        );
+        assert_eq!(
+            on_pane(&plain),
+            2,
+            "contrast: the plain learned constructor mints a placeholder beside \
+             an untagged early card, the issue #806 duplicate"
+        );
+
+        let mut spawn = hook_first();
+        let key = spawn.insert_placeholder_session_awaiting_report_learned(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-1".to_string()),
+            Incarnation::UNNAMED,
+            true,
+        );
+        assert_eq!(
+            key, EARLY_PANE_KEY,
+            "the early card now stands under the pane key"
+        );
+        assert_eq!(
+            spawn.sessions.keys().collect::<Vec<_>>(),
+            vec![EARLY_PANE_KEY],
+            "one card on the pane, and the producer's key is gone"
+        );
+        let card = &spawn.sessions[EARLY_PANE_KEY];
+        assert_eq!(
+            card.agent_id.as_deref(),
+            Some("d-1"),
+            "the untagged card takes the daemon's agent id"
+        );
+        assert!(
+            card.expects_agent_report,
+            "an unresolved wrapper-boot card is armed, as the placeholder-first \
+             order arms it: {card:#?}"
+        );
+        assert_eq!(
+            clock.classify(&inputs, card.last_activity),
+            Stamp::Deck,
+            "`last_activity` is the deck's clock, not the producer's stale stamp"
+        );
+        assert_eq!(
+            card.incarnation,
+            process("p1"),
+            "the adopted card keeps the incarnation the early session was \
+             stamped with, not the one the caller learned the pane from"
+        );
+        assert_eq!(
+            card.recent_events.len(),
+            1,
+            "what the early event recorded is kept: {card:#?}"
+        );
+    }
+
+    /// The learned spawn-time constructor stamps the card it mints with the
+    /// process the caller learned the pane from (G-fix6/G-fix7), where the thin
+    /// wrapper learns it from the stream open now.
+    #[test]
+    fn the_learned_spawn_time_constructor_stamps_the_card_it_mints() {
+        let mut learned = deck_streaming_from("p1");
+        learned.register_pane(EARLY_PANE.to_string());
+        let key = learned.insert_placeholder_session_awaiting_report_learned(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-1".to_string()),
+            Incarnation::UNNAMED,
+            true,
+        );
+        assert_eq!(key, EARLY_PANE_KEY);
+        let card = &learned.sessions[EARLY_PANE_KEY];
+        assert_eq!(
+            card.incarnation,
+            Incarnation::UNNAMED,
+            "the card is stamped with what the caller learned the pane from, \
+             not with the stream's process: {card:#?}"
+        );
+        assert!(card.expects_agent_report, "the flag is seeded on the card");
+
+        let mut wrapped = deck_streaming_from("p1");
+        wrapped.register_pane(EARLY_PANE.to_string());
+        wrapped.insert_placeholder_session_awaiting_report(
+            EARLY_PANE.to_string(),
+            Some("/spawn".to_string()),
+            None,
+            Some("d-1".to_string()),
+            true,
+        );
+        assert_eq!(
+            wrapped.sessions[EARLY_PANE_KEY].incarnation,
+            process("p1"),
+            "the wrapper learns the card from the stream open now"
+        );
+    }
+
+    /// A pane learned from a process the stream is not (yet) on, or one the deck
+    /// replaced, is the learned constructor's held or stale path verbatim: no card
+    /// is reconciled with an early session, none is drawn, and the awaiting-report
+    /// flag is dropped with it (the inline cue this seam replaced found no card to
+    /// arm there either).
+    #[test]
+    fn the_learned_spawn_time_constructor_holds_or_drops_a_card_the_plain_one_would() {
+        let early = |state: &mut AppState| {
+            let inputs = EarlyInputs::base();
+            let clock = EarlyClock::new(&inputs);
+            state.apply_event(early_event(&inputs, &clock));
+            state.register_pane(EARLY_PANE.to_string());
+        };
+        let spawn = |state: &mut AppState, from: Incarnation| {
+            state.insert_placeholder_session_awaiting_report_learned(
+                EARLY_PANE.to_string(),
+                Some("/spawn".to_string()),
+                None,
+                Some("d-1".to_string()),
+                from,
+                true,
+            )
+        };
+
+        // Held: learned from a named process the stream is not on.
+        let mut held = deck_streaming_from("p1");
+        early(&mut held);
+        let key = spawn(&mut held, process("p2"));
+        assert_eq!(key, EARLY_PANE_KEY, "the key is answered all the same");
+        assert_eq!(
+            held.sessions.keys().collect::<Vec<_>>(),
+            vec![EARLY_SESSION],
+            "the early session is left alone and nothing is drawn"
+        );
+        assert_eq!(held.held_placeholders.len(), 1, "the placeholder is held");
+
+        // Held, then the stream opens on that process: drawn WITHOUT the flag.
+        let mut drained = deck_streaming_from("p1");
+        drained.register_pane(EARLY_PANE.to_string());
+        spawn(&mut drained, process("p2"));
+        drained.learn_stream_incarnation(process("p2"));
+        let card = &drained.sessions[EARLY_PANE_KEY];
+        assert!(
+            !card.expects_agent_report,
+            "a held placeholder loses the flag, exactly as the inline cue did: {card:#?}"
+        );
+        assert_eq!(card.incarnation, process("p2"));
+
+        // Stale: learned from a process the deck has replaced.
+        let mut stale = deck_streaming_from("p1");
+        stale.learn_stream_incarnation(process("p3"));
+        early(&mut stale);
+        spawn(&mut stale, process("p1"));
+        assert_eq!(
+            stale.pending_restart_drops.len(),
+            1,
+            "a placeholder from a replaced process is queued for the restart notice"
+        );
+        assert!(
+            !stale.sessions.contains_key(EARLY_PANE_KEY),
+            "and not drawn: {:?}",
+            stale.sessions.keys().collect::<Vec<_>>()
         );
     }
 
