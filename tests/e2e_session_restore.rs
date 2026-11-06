@@ -1692,7 +1692,7 @@ fn restore_022_legacy_mode_snapshot_becomes_dashboard_card() {
             && grid
                 .lines()
                 .next()
-                .is_some_and(|header| header.contains("dot-agent-deck — 1 agent(s)"))
+                .is_some_and(|header| header.contains("worker-deck — 1 agent(s)"))
             && !grid.contains("legacy-ops")
     });
     let grid = deck.snapshot_grid();
@@ -1772,7 +1772,7 @@ fn restore_023_legacy_mode_daemon_agent_becomes_dashboard_card() {
             && grid
                 .lines()
                 .next()
-                .is_some_and(|header| header.contains("dot-agent-deck — 1 agent(s)"))
+                .is_some_and(|header| header.contains("worker-deck — 1 agent(s)"))
             && !grid.contains("legacy-ops")
     });
     let grid = deck.snapshot_grid();
@@ -1890,7 +1890,7 @@ fn restore_024_tokenless_orchestration_agent_becomes_dashboard_card() {
                 && grid
                     .lines()
                     .next()
-                    .is_some_and(|header| header.contains("dot-agent-deck — 1 agent(s)"))
+                    .is_some_and(|header| header.contains("worker-deck — 1 agent(s)"))
                 && !grid.contains("legacy-review")
         },
     );

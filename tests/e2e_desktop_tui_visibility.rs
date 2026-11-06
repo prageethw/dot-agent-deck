@@ -508,8 +508,15 @@ fn missing_roles(grid: &str) -> Vec<&'static str> {
 
 /// The single-tab dashboard has a session-count header, one bordered card per
 /// plain agent, and the command-mode dashboard controls along the bottom.
+///
+/// The product name in the header is this fork's `worker-deck` (fork-only,
+/// permanent rename). The header is compared with its trailing blanks trimmed:
+/// when the title shrinks from the empty state's longer wording, the blanks
+/// ratatui overwrites the leftover cells with are cells the terminal grid
+/// still reports as written, and they say nothing about the header's content.
 fn plain_dashboard_shows(grid: &str, labels: &[&str]) -> bool {
-    grid.lines().next() == Some(format!(" dot-agent-deck — {} agent(s)", labels.len()).as_str())
+    grid.lines().next().map(str::trim_end)
+        == Some(format!(" worker-deck — {} agent(s)", labels.len()).as_str())
         && labels.iter().all(|label| grid.contains(label))
         && grid.matches('┌').count() + grid.matches('┏').count() == labels.len()
         && grid.matches('└').count() + grid.matches('┗').count() == labels.len()
