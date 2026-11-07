@@ -36216,6 +36216,241 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #858: the 3-row Minimal tier must not leave a blank band.
+    //
+    // Upstream's Minimal tier (issue #1568) paints every card at a fixed 3 rows.
+    // Where the rows on offer are more than 3 per card but fewer than 4 per card
+    // that left 1..n-1 blank rows between the last card and the stats bar, which
+    // the fork's fit-all division (PRD fork#446 M1) never did: it deals the
+    // leftover rows over the cards. The tests below read the PAINTED column (the
+    // border corners and the stats-bar row), not which tier the layout code chose.
+    // -----------------------------------------------------------------------
+
+    /// The `(top_row, bottom_row)` of every card painted in the deck's first
+    /// column, read off the border corners in column 0 of the rendered text: a
+    /// card runs from a row starting `┌` (`┏` when selected) to the next row
+    /// starting `└` (`┗`). Measured from what reached the buffer, not asked of
+    /// the layout code.
+    fn painted_card_spans(rendered: &str) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut top = None;
+        for (y, line) in rendered.lines().enumerate() {
+            match line.chars().next() {
+                Some('┌' | '┏') => top = Some(y),
+                Some('└' | '┗') => {
+                    if let Some(t) = top.take() {
+                        spans.push((t, y));
+                    }
+                }
+                _ => {}
+            }
+        }
+        spans
+    }
+
+    /// Each painted card's height in rows, top to bottom — see
+    /// [`painted_card_spans`].
+    fn painted_card_heights(rendered: &str) -> Vec<usize> {
+        painted_card_spans(rendered)
+            .iter()
+            .map(|(top, bottom)| bottom - top + 1)
+            .collect()
+    }
+
+    /// How many rows sit blank between the last painted card and the stats bar
+    /// of a dashboard frame `frame_height` rows tall. The stats bar is the last
+    /// row of the dashboard area, which is the row above the 1-row hints bar —
+    /// `frame_height - 2` — exactly where `grid_012` reads it. `None` when no
+    /// card was painted at all.
+    fn blank_rows_above_stats_bar(rendered: &str, frame_height: usize) -> Option<usize> {
+        let (_, last_bottom) = *painted_card_spans(rendered).last()?;
+        Some((frame_height - 2).saturating_sub(last_bottom + 1))
+    }
+
+    /// Assert a dashboard frame painted all `n` roles with nothing scrolled away
+    /// (no `↑`/`↓` on the title row), its first column's cards at exactly
+    /// `heights`, and no blank row between the last card and the stats bar.
+    fn assert_deck_paints_full_column(
+        rendered: &str,
+        frame_height: usize,
+        n: usize,
+        heights: &[usize],
+    ) {
+        for i in 1..=n {
+            assert!(
+                rendered.contains(&format!("role{i}")),
+                "role{i} must be painted:\n{rendered}"
+            );
+        }
+        let title = rendered.lines().next().unwrap_or_default();
+        assert!(
+            !title.contains('↑') && !title.contains('↓'),
+            "no card may be scrolled away, got title {title:?}:\n{rendered}"
+        );
+        assert_eq!(
+            painted_card_heights(rendered),
+            heights,
+            "the first column's card heights:\n{rendered}"
+        );
+        assert_eq!(
+            blank_rows_above_stats_bar(rendered, frame_height),
+            Some(0),
+            "no blank row may sit between the last card and the stats bar:\n{rendered}"
+        );
+    }
+
+    /// Everything wrong with the painted sidebar column for `n` single-column
+    /// role cards given `avail` rows for cards (the title row, the stats-bar
+    /// row and the hints row add 3 to the frame height), as readable one-line
+    /// problems; empty when the column is exactly what the fork's division
+    /// paints. The expectation is the contract, restated from rendered rows:
+    /// no blank row before the stats bar, every card at least 3 rows, the
+    /// heights summing to `avail`, the leftover rows dealt to the first cards
+    /// as `even_row_heights` deals them, a 3-row card in the folded form (role
+    /// and `Dir:` on one row) and a taller card with `Dir:` on its own row.
+    /// Returns the rendered frame too, for the failure message.
+    fn sidebar_column_problems(n: usize, avail: usize) -> (Vec<String>, String) {
+        let frame_height = avail + 3;
+        let (rendered, _ui) = render_dashboard_grid(n, 39, frame_height as u16);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let spans = painted_card_spans(&rendered);
+        let heights = painted_card_heights(&rendered);
+        let expected: Vec<usize> = even_row_heights(n, avail as u16)
+            .unwrap_or_else(|| panic!("n={n} avail={avail}: at least one row per card"))
+            .into_iter()
+            .map(usize::from)
+            .collect();
+
+        let mut problems = Vec::new();
+        if heights.len() != n {
+            problems.push(format!("{} of {n} cards painted", heights.len()));
+        }
+        match blank_rows_above_stats_bar(&rendered, frame_height) {
+            Some(0) => {}
+            Some(blank) => problems.push(format!(
+                "{blank} blank row(s) between the last card and the stats bar"
+            )),
+            None => problems.push("no card painted".to_string()),
+        }
+        let stats_row = lines.get(frame_height - 2).copied().unwrap_or_default();
+        if !stats_row.trim_start().starts_with(&format!("{n} active")) {
+            problems.push(format!(
+                "the stats bar is not on row {} (found {stats_row:?})",
+                frame_height - 2
+            ));
+        }
+        if heights.iter().any(|&h| h < 3) {
+            problems.push("a card is shorter than 3 rows".to_string());
+        }
+        if heights.iter().sum::<usize>() != avail {
+            problems.push(format!(
+                "heights sum to {}, not the {avail} rows on offer",
+                heights.iter().sum::<usize>()
+            ));
+        }
+        if heights != expected {
+            problems.push(format!("heights are not the even division {expected:?}"));
+        }
+        for &(top, bottom) in &spans {
+            let card = &lines[top..=bottom];
+            // A card under 3 rows has no body row to inspect (and is already
+            // reported by the height checks above); skipping it keeps an
+            // out-of-range index from masking that report with a panic.
+            if card.len() < 3 {
+                continue;
+            }
+            let folded = card.len() == 3;
+            let ok = if folded {
+                card[1].contains("role") && card[1].contains("Dir:") && card[1].contains("tmp")
+            } else {
+                card[1].contains("role")
+                    && !card[1].contains("Dir:")
+                    && card[2].contains("Dir:")
+                    && card[2].contains("tmp")
+            };
+            if !ok {
+                problems.push(format!(
+                    "the {}-row card at rows {top}..={bottom} is not in its {} form: {card:?}",
+                    card.len(),
+                    if folded {
+                        "folded 3-row"
+                    } else {
+                        "Dir:-on-its-own-row"
+                    }
+                ));
+            }
+        }
+        (problems, rendered)
+    }
+
+    /// Scenario: Render a single-column sidebar of 6, 7, 8 and 11 role cards at
+    /// every height where the rows on offer are more than 3 per card but fewer
+    /// than 4 per card — the heights at which the 3-row Minimal tier is chosen
+    /// and used to leave a blank band above the stats bar. At each height the
+    /// column is full: no blank row sits between the last card and the stats
+    /// bar, no card is under 3 rows, the heights sum to the rows on offer with
+    /// the leftover rows going to the first cards, and a card dealt 4 rows keeps
+    /// its `Dir:` row apart while a 3-row card stays folded.
+    #[spec("dashboard/grid/014")]
+    #[test]
+    fn grid_014_minimal_tier_deals_leftover_rows_with_no_blank_band() {
+        let mut failures = Vec::new();
+        let mut first_frame = None;
+        let mut checked = 0usize;
+        for n in [6usize, 7, 8, 11] {
+            for avail in (3 * n + 1)..=(4 * n - 1) {
+                checked += 1;
+                let (problems, rendered) = sidebar_column_problems(n, avail);
+                if !problems.is_empty() {
+                    failures.push(format!("n={n} avail={avail}: {}", problems.join("; ")));
+                    if first_frame.is_none() {
+                        first_frame = Some(rendered);
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "BAND: {} of {checked} (cards, rows on offer) combinations strictly between 3 and 4 \
+             rows per card did not paint a full column:\n{}\nfirst failing frame:\n{}",
+            failures.len(),
+            failures.join("\n"),
+            first_frame.unwrap_or_default()
+        );
+    }
+
+    /// Scenario: Render the same single-column sidebar of 6, 7, 8 and 11 role
+    /// cards at exactly 3 rows per card (where the Minimal tier fits with no
+    /// leftover row) and at 4 rows per card up to just under Compact's 6 (where
+    /// the fork's own division deals the rows), and check the same full-column
+    /// contract as the band test. These heights were already correct, so they
+    /// pass before the band is fixed and show the failure is specific to the
+    /// rows strictly between 3 and 4 per card.
+    #[test]
+    fn grid_014_control_exact_fit_and_fork_division_leave_no_band() {
+        let mut failures = Vec::new();
+        for n in [6usize, 7, 8, 11] {
+            // 3n is Minimal's exact fit; 4n..6n-1 is the fork division (Compact,
+            // at 6 rows a card, fits from 6n and is not what this pins).
+            let rows = std::iter::once(3 * n).chain((4 * n)..=(6 * n - 1));
+            for avail in rows {
+                let (problems, rendered) = sidebar_column_problems(n, avail);
+                if !problems.is_empty() {
+                    failures.push(format!(
+                        "n={n} avail={avail}: {}\n{rendered}",
+                        problems.join("; ")
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "CONTROL: heights that never had a band must still paint a full column:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // PRD #76 M2.13: dashboard placeholder render-decision tests.
     //
     // `render_session_card` flips a single gate on `session.agent_type ==
@@ -43660,10 +43895,17 @@ mod tests {
 
     /// Issue #1568: Minimal is taken only when Compact fails at EVERY column
     /// count the width allows, so it replaces scrolling and never Compact.
+    ///
+    /// Issue #858: where Minimal is what the deck paints, the rows on offer
+    /// beyond 3 per card are dealt over the cards rather than left blank above
+    /// the stats bar. That is asserted on the painted frame (the fork's even
+    /// division, `even_row_heights`), not on the tier `choose_grid_layout`
+    /// returns, so it holds whichever of the chooser and the render site
+    /// spreads the rows.
     #[test]
     fn choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere() {
         // 90 columns allows two card columns. 25 rows: one column of Compact
-        // misses (35) but two fit (20). One column of Minimal (21) would fit too,
+        // misses (42) but two fit (24). One column of Minimal (21) would fit too,
         // and must not be preferred over the layout this deck already had.
         assert_eq!(
             choose_grid_layout(7, 90, 25),
@@ -43673,24 +43915,18 @@ mod tests {
             }
         );
 
-        // 79 columns holds one card column. 23 rows: Compact needs 35, Minimal 21.
-        assert_eq!(
-            choose_grid_layout(7, 79, 23),
-            GridLayout {
-                cols: 1,
-                density: CardDensity::Minimal
-            }
-        );
+        // 79 columns holds one card column. 23 rows: Compact needs 42, Minimal 21,
+        // so every card is painted rather than scrolled. The 2 rows beyond
+        // Minimal's 21 go to the first two cards, filling the column to the stats
+        // bar: 23 / 7 = 3 remainder 2.
+        let (rendered, _ui) = render_dashboard_grid(7, 79, 26);
+        assert_deck_paints_full_column(&rendered, 26, 7, &[4, 4, 3, 3, 3, 3, 3]);
 
-        // 90 columns, 14 rows: Compact needs 20 even at two columns; Minimal needs
-        // 21 at one column and 12 at two, so the deck widens to stay complete.
-        assert_eq!(
-            choose_grid_layout(7, 90, 14),
-            GridLayout {
-                cols: 2,
-                density: CardDensity::Minimal
-            }
-        );
+        // 90 columns, 14 rows: Compact needs 24 even at two columns; Minimal needs
+        // 21 at one column and 12 at two, so the deck widens to stay complete. Its
+        // four rows of cards share the 14 rows: 14 / 4 = 3 remainder 2.
+        let (rendered, _ui) = render_dashboard_grid(7, 90, 17);
+        assert_deck_paints_full_column(&rendered, 17, 7, &[4, 4, 3, 3]);
 
         // 79 columns, 20 rows: not even Minimal fits (21), so the deck scrolls at
         // Compact exactly as it did before Minimal existed.
@@ -43708,6 +43944,11 @@ mod tests {
     /// that division keeps every card's `Dir:` row apart. Where Minimal would fit
     /// but the division deals every card at least `MIN_UNFOLDED_CARD_ROWS`, the
     /// Compact fallback is returned and the render site divides.
+    ///
+    /// Issue #858: one row fewer and the division deals a card 3 rows, the folded
+    /// card; the painted frame is then the same division with the folded card at
+    /// the bottom and the column still full (see
+    /// `choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere`).
     #[test]
     fn choose_grid_layout_leaves_the_fork_division_where_it_keeps_dir_rows() {
         let fallback = GridLayout {
@@ -43720,24 +43961,16 @@ mod tests {
         // 28 rows is the first height that deals all seven cards four rows...
         assert_eq!(choose_grid_layout(7, 79, 28), fallback);
         // ...and 27 deals the last card three, which is where the fork's own card
-        // would fold `Dir:` too, so Minimal stands.
-        assert_eq!(
-            choose_grid_layout(7, 79, 27),
-            GridLayout {
-                cols: 1,
-                density: CardDensity::Minimal
-            }
-        );
+        // would fold `Dir:` too: six 4-row cards and one 3-row card, no blank row
+        // left above the stats bar.
+        let (rendered, _ui) = render_dashboard_grid(7, 79, 30);
+        assert_deck_paints_full_column(&rendered, 30, 7, &[4, 4, 4, 4, 4, 4, 3]);
         // The division runs at the WIDEST column count, not the one Minimal would
         // have fitted at: 90 columns widens to two, four rows of four.
         assert_eq!(choose_grid_layout(7, 90, 16), fallback);
-        assert_eq!(
-            choose_grid_layout(7, 90, 15),
-            GridLayout {
-                cols: 2,
-                density: CardDensity::Minimal
-            }
-        );
+        // One row fewer (15) deals the last of the four card rows 3 rows.
+        let (rendered, _ui) = render_dashboard_grid(7, 90, 18);
+        assert_deck_paints_full_column(&rendered, 18, 7, &[4, 4, 4, 3]);
         // The boundary is Minimal's own height plus the `Dir:` row it folds.
         assert_eq!(
             MIN_UNFOLDED_CARD_ROWS,
