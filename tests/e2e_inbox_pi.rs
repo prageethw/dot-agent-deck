@@ -19,7 +19,8 @@ use std::time::Duration;
 /// The not-started window these tests run the deck with.
 const WINDOW_MS: u64 = 2000;
 /// The start of the not-started reason, which the card's notice row shows
-/// (its headline is cut to `✉1` at this card width).
+/// (its headline rides the name row and is cut to `✉1` where that row is
+/// too narrow for the words).
 const LINE: &str = "the agent has been idle for a few";
 
 /// The `node` that can run the extension's TypeScript (23.6+), or `None`

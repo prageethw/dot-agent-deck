@@ -8179,7 +8179,7 @@ without depending on the config struct API.
 ##### orchestration/roles/002 — The live orchestration sidebar draws the orchestrator seat's card without an ORCHESTRATOR badge (fork preference, issue #859; reverses upstream's card badge from #1947 for the TUI only).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge`).
 - **Agent:** none; identity-recording Python probes standing in for interactive agents.
-- **Asserts:** at 220 and 120 terminal columns with the default sidebar width, a long start-role name, Working status and a queued inbox badge, the live orchestrator card names its role (a leading stretch of the long name, which the 40-column sidebar cuts with `…`) and shows Working and the queued inbox line, the worker card names its role, and no row of the sidebar contains the word ORCHESTRATOR. The wait settles on the drawn role names, status and inbox line before the absence is read, so the absence is not read off a frame the card has not reached.
+- **Asserts:** at 220 and 120 terminal columns with the default sidebar width, a long start-role name, Working status and a queued inbox badge, the live orchestrator card names its role (a leading stretch of the long name, which the 40-column sidebar cuts with `…`) and shows Working, never carries an inbox line in its top border, and shows the queued inbox line after the name at 220 columns (at 120 the long name fills the name row and keeps it, so the line is dropped there, issue #868), the worker card names its role, and no row of the sidebar contains the word ORCHESTRATOR. The wait settles on the drawn role names, status and, where it fits, the inbox line before the absence is read, so the absence is not read off a frame the card has not reached.
 - **Does not assert:** the `roles` command's ORCHESTRATOR column (`orchestration/roles/001`, which stays), the desktop app's badge, the daemon-side orchestrator lookup, pane-border titles, or card row accounting at each density (the L1 tests `a_role_card_names_its_role_and_never_says_orchestrator` and `a_card_keeps_its_dir_prompt_and_tool_rows_and_never_says_orchestrator` in `src/ui.rs` draw an ordinary card through `render_session_card` alone, and carry no catalog id).
 
 #### orchestration/address
@@ -14081,7 +14081,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/status/007 — A narrow card retains inbox badge, status and tools within its width budget.
 - **Layer:** L1 (`tests/render_dashboard.rs`), Compact 20-column TestBackend + insta.
 - **Agent:** none.
-- **Asserts:** ✉2, Thinking and 14 tools remain visible without exceeding 20 cells per row.
+- **Asserts:** the inbox line `✉2 queued` sits after the worker name on its row (issue #868) and the top border carries no ✉, while Thinking and 14 tools remain visible, without exceeding 20 cells per row.
 - **Does not assert:** desktop CSS layout.
 - **Platform coverage:** all.
 
@@ -14239,6 +14239,41 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** at 30×12, `i` opens Deck messages with the refusal's headline and, where the remedy does not fit, a closing `make the window taller to read the whole notice`; at 30×40 the whole notice shows and that line does not (PRD #1666 part 3, round 1); at smaller sizes down to 12×8, where the remedy does not fit, a shorter whole line (`make the window taller`, or `… taller`) still says so (round 2).
 - **Does not assert:** scrolling the notice, or the desktop tile, whose list scrolls.
+- **Platform coverage:** all.
+
+##### inbox/status/030 — A TUI card draws its inbox line after the worker's name, not in the title chip (fork preference, issue #868).
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record/resync seam, Normal density at 80 columns, agent-type badge off and on.
+- **Agent:** none.
+- **Asserts:** two queued messages render `api-svc  ✉2 queued` and a delivered one `api-svc  ✉ delivered` on the first body row, two spaces after the name, and flush left (`✉2 queued`) when the name is empty; the top border carries no ✉ and its right-hand chip is the status alone (` ● Thinking ┐`).
+- **Does not assert:** the words themselves (the shared `tests/fixtures/inbox-display.json`, `inbox/status/006` and `/010`), the desktop tile, or what a narrow card keeps (`inbox/status/032`).
+- **Platform coverage:** all.
+
+##### inbox/status/031 — The inbox line no longer shortens the card's title (fork preference, issue #868).
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render with the agent-type badge on and a known model, widths 21 to 80, plus one- and two-row cards.
+- **Agent:** none.
+- **Asserts:** the top border of a card with a delivered message is the same row as that of a card with an empty inbox at every width, so the whole `ClaudeCode (opus-4.7)` badge shows from 39 columns; `✉ delivered` is on the name row wherever 7 + 2 + 11 inner columns fit; a one-row and a two-row card draw no inbox line, and the two-row card's title is the same with and without one.
+- **Does not assert:** the name row at the other densities (`inbox/status/030`, `/033`) or any wording.
+- **Platform coverage:** all.
+
+##### inbox/status/032 — The inbox line degrades from words to count to nothing, and the name is never shrunk to make room (fork preference, issue #868).
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render at Compact density, widths on each side of every threshold; `card_inbox_line` boundary and display-width unit tests in `src/ui.rs` (not `#[spec]`-catalogued).
+- **Agent:** none.
+- **Asserts:** beside a 14-column name, two queued messages show `✉2 queued` from 27 columns, `✉2` from 20 and nothing at 19; a delivered line shows from 29 columns and drops straight to nothing at 28, having no shorter form; a 17-column name fills a 19-column card whole with no line, and an 18-column name is cut exactly as it is with an empty inbox.
+- **Does not assert:** the Minimal card, whose row also carries `Dir:` (`inbox/status/033`).
+- **Platform coverage:** all.
+
+##### inbox/status/033 — A three-row Minimal card orders its row: name, inbox line, then `Dir:` (fork preference, issue #868).
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render of the three-row Minimal card (issue #847's folded row), widths from roomy to tight.
+- **Agent:** none.
+- **Asserts:** the row reads `payments-agent  ✉2 queued  Dir: api-svc` and, as the card narrows, `Dir:` is ellipsized and then dropped before the words give way to `✉2`, which drops before the name is touched; an orphaned card's `Orphaned — delegation unavailable` takes `Dir:`'s place after the inbox line.
+- **Does not assert:** a Blocked reason's own truncation, or the taller cards (`inbox/status/030`).
+- **Platform coverage:** all.
+
+##### inbox/status/034 — A placeholder card draws no inbox line (fork preference, issue #868).
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render, Normal density at 80 columns.
+- **Agent:** none.
+- **Asserts:** a card with two queued messages whose agent has not identified itself reads `No agent`, shows its name alone on the name row and no ✉ anywhere; the same card as a Claude Code card shows `api-svc  ✉2 queued`.
+- **Does not assert:** the placeholder's other rows.
 - **Platform coverage:** all.
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.

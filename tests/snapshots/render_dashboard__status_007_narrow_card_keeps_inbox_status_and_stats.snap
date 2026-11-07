@@ -2,8 +2,8 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
-┌ 1  ● Thinking ✉2 ┐
-│api-svc           │
+┌ 1 ─── ● Thinking ┐
+│api-svc  ✉2 queued│
 │Dir:  api-svc     │
 │Prmt: move the st…│
 │                  │
