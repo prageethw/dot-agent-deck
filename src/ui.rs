@@ -43921,9 +43921,9 @@ mod tests {
     /// Issue #858: where Minimal is what the deck paints, the rows on offer
     /// beyond 3 per card are dealt over the cards rather than left blank above
     /// the stats bar. That is asserted on the painted frame (the fork's even
-    /// division, `even_row_heights`), not on the tier `choose_grid_layout`
-    /// returns, so it holds whichever of the chooser and the render site
-    /// spreads the rows.
+    /// division, `even_row_heights`), so it holds whichever of the chooser and
+    /// the render site spreads the rows; the tier `choose_grid_layout` returns
+    /// at those inputs is asserted directly alongside it.
     #[test]
     fn choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere() {
         // 90 columns allows two card columns. 25 rows: one column of Compact
@@ -43940,13 +43940,28 @@ mod tests {
         // 79 columns holds one card column. 23 rows: Compact needs 42, Minimal 21,
         // so every card is painted rather than scrolled. The 2 rows beyond
         // Minimal's 21 go to the first two cards, filling the column to the stats
-        // bar: 23 / 7 = 3 remainder 2.
+        // bar: 23 / 7 = 3 remainder 2. The tier itself is the chooser's own
+        // answer, asserted directly as well as through the painted frame.
+        assert_eq!(
+            choose_grid_layout(7, 79, 23),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Minimal
+            }
+        );
         let (rendered, _ui) = render_dashboard_grid(7, 79, 26);
         assert_deck_paints_full_column(&rendered, 26, 7, &[4, 4, 3, 3, 3, 3, 3]);
 
         // 90 columns, 14 rows: Compact needs 24 even at two columns; Minimal needs
         // 21 at one column and 12 at two, so the deck widens to stay complete. Its
         // four rows of cards share the 14 rows: 14 / 4 = 3 remainder 2.
+        assert_eq!(
+            choose_grid_layout(7, 90, 14),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Minimal
+            }
+        );
         let (rendered, _ui) = render_dashboard_grid(7, 90, 17);
         assert_deck_paints_full_column(&rendered, 17, 7, &[4, 4, 3, 3]);
 
@@ -43984,13 +43999,28 @@ mod tests {
         assert_eq!(choose_grid_layout(7, 79, 28), fallback);
         // ...and 27 deals the last card three, which is where the fork's own card
         // would fold `Dir:` too: six 4-row cards and one 3-row card, no blank row
-        // left above the stats bar.
+        // left above the stats bar. The chooser still takes Minimal here.
+        assert_eq!(
+            choose_grid_layout(7, 79, 27),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Minimal
+            }
+        );
         let (rendered, _ui) = render_dashboard_grid(7, 79, 30);
         assert_deck_paints_full_column(&rendered, 30, 7, &[4, 4, 4, 4, 4, 4, 3]);
         // The division runs at the WIDEST column count, not the one Minimal would
         // have fitted at: 90 columns widens to two, four rows of four.
         assert_eq!(choose_grid_layout(7, 90, 16), fallback);
-        // One row fewer (15) deals the last of the four card rows 3 rows.
+        // One row fewer (15) deals the last of the four card rows 3 rows, and the
+        // chooser takes Minimal at the two columns it fitted at.
+        assert_eq!(
+            choose_grid_layout(7, 90, 15),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Minimal
+            }
+        );
         let (rendered, _ui) = render_dashboard_grid(7, 90, 18);
         assert_deck_paints_full_column(&rendered, 18, 7, &[4, 4, 4, 3]);
         // The boundary is Minimal's own height plus the `Dir:` row it folds.

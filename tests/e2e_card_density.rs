@@ -3,7 +3,7 @@
 //! L2 (real-binary PTY) coverage for the dashboard's card density ladder.
 //!
 //! Issue #1568 added a 3-row Minimal density that the deck uses only when the
-//! 5-row Compact card cannot fit every card. The L1 tests in
+//! 6-row Compact card cannot fit every card. The L1 tests in
 //! `tests/render_dashboard.rs` pin the layout decision through the
 //! `render_card_grid_to_buffer` seam; this file proves the running binary makes
 //! the same decision in a real terminal, with cards that arrive over the hook
@@ -66,7 +66,7 @@ fn card_heights(grid: &str) -> Vec<usize> {
 }
 
 /// Scenario: Start the deck in a 79x30 terminal and send eight agents' session
-/// starts over the hook socket — more than the screen holds at the 5-row
+/// starts over the hook socket — more than the screen holds at the 6-row
 /// Compact card, but with more rows than eight 3-row Minimal cards need. Every
 /// one of the eight cards appears on screen, the spare rows are dealt to the
 /// first cards so the column runs straight to the stats bar with no blank band

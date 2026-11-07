@@ -581,7 +581,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/density/007 — At Minimal density a Blocked reason or `Orphaned` row takes the `Dir:` row's place (issue #1568).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, through `render_card_grid_to_buffer`).
 - **Agent:** none (seven synthetic role cards; the second Blocked on depleted credits, the third orphaned).
-- **Asserts:** on the 79x23 deck (exactly seven 3-row cards; at 25 rows the two spare rows would go to the first two cards, issue #858, and the Blocked card would no longer be a 3-row card) every card is 3 rows; the Blocked card keeps its `Blocked` badge on the top border and shows its `⚠ Credits …` reason as its middle row with no `Dir:`; the orphaned card shows `Orphaned — delegation unavailable` as its middle row with no `Dir:`; the other five cards keep `Dir:`.
+- **Asserts:** on the 79x23 deck (exactly seven 3-row cards; at 25 rows the two spare rows would go to the first two cards, issue #858, and the Blocked card would no longer be a 3-row card) every card is 3 rows; the Blocked card keeps its `Blocked` badge on the top border and shows its `⚠ Credits …` reason as its middle row with no `Dir:`; the orphaned card shows `Orphaned — delegation unavailable` as its middle row with no `Dir:`; the other five cards keep `Dir:`. The same status rows on a 4-row card are `dashboard/density/010`.
 - **Does not assert:** a card that is both Blocked and orphaned (at Minimal it shows the `Orphaned` row, the first status row — `fit_card_rows`' doc); Blocked text truncation or reset formatting (`status/badge/002`, `status/badge/003`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -598,6 +598,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** in a 79x30 terminal, which holds eight cards at the 3-row Minimal height but not at Compact's 6, all eight cards appear and the deck title carries no `↑`/`↓` marker. The rows beyond 3 per card (issue #858) are dealt to the first cards, so, measured from the drawn corners, no card is under 3 rows, heights never grow down the column and differ by at most one, the cards sit back to back, and the row directly under the last card is the stats bar (`8 active …`) with no blank band. A 3-row card folds its directory onto its role row (`Dir: <basename>`); a taller card keeps its role row to itself with `Dir:` on the row beneath; every card has its `Last:` counter.
 - **Does not assert:** the exact heights (they depend on how many rows the hints bar wraps to at 79 columns, so the contract is checked rather than a fixed split — the fixed split is `dashboard/density/006` and `dashboard/grid/014`); a real agent's card content (density selection does not depend on what reports the session); status rows at Minimal (`dashboard/density/007`).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, for the hook socket).
+
+##### dashboard/density/010 — A 4-row Minimal card shows its status row in place of `Dir:`, and a Blocked reason shares that row with the `Background:` line (issue #858).
+- **Layer:** L1 (ratatui `TestBackend`, through the real `render_card_grid` via `render_card_grid_to_buffer`; no snapshot, rendered rows only).
+- **Agent:** none (seven synthetic role cards; the first Idle and the second Blocked on a usage limit, each hydrated from a session snapshot carrying one background command that started 4 minutes before the render clock).
+- **Asserts:** on a 79x25 deck, two rows beyond the 21 that seven 3-row Minimal cards need, the card heights are `4,4,3,3,3,3,3`. Each of the two 4-row cards draws its role row alone and then exactly one status row, with no `Dir:` on any of its rows: the Idle card shows `Background: 1 command · 4m` (no `⚠`), and the Blocked card keeps its `Blocked` badge on the top border and shows `⚠ Usage limit reached · Background: 1 command · 4m` merged onto that one row, with its `Last:` / `Tools:` counters on the bottom border. The other five cards stay the 3-row folded form with `Dir: dot-agent-deck` beside the role.
+- **Does not assert:** the 3-row Blocked and orphaned cards (`dashboard/density/007`); the merge when the card is too narrow for both texts (`status/background/016`); a Blocked card with no background work or an orphaned one in the 4-row band; a snapshot of the frame.
+- **Platform coverage:** mac+linux+windows.
 
 #### dashboard/grid
 
