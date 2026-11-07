@@ -1494,25 +1494,33 @@ fn with_attached_tui(
         ),
     );
 
-    // `--experimental` engages PRD #393's command-entry lock, which drops every
-    // keystroke typed into a worker pane (issue #1456). Unlock it the TUI's own
-    // way, once, before the first command typed into a worker: the lock is
-    // deck-global for the life of this TUI.
-    if plan.experimental {
-        match unlock_worker_entry(tui, plan, ROLE_CODER, ev) {
-            Ok(note) => ev.step(note),
-            Err(e) => {
-                ev.step(format!(
-                    "could NOT confirm the command-entry unlock under `--experimental`; the \
-                     commands below may be refused by the lock, so a tell-3 or tell-4 failure in \
-                     this run may be the lock rather than the contract: {}",
-                    e.lines().next().unwrap_or_default()
-                ));
-                ev.excerpt(
-                    "the TUI when the command-entry unlock was not confirmed",
-                    tui.grid(),
-                );
-            }
+    // PRD #393's command-entry lock drops every keystroke typed into a worker
+    // pane (issue #1456). This fork's lock is always on (fork commit 6a01e106,
+    // issues #346 and #350 graduated it out of the experimental flag), so this
+    // runs in every run, `--experimental` or not: gating it on the flag left the
+    // `coder` and `reviewer` panes refusing every command a default run typed,
+    // and tells 3 and 4 failed on the lock rather than on the builds (issue
+    // #862). Unlock it the TUI's own way, once, before the first command typed
+    // into a worker: the lock is deck-global for the life of this TUI.
+    //
+    // Upstream's lock exists only under the flag, so a deck without it has
+    // nothing to toggle. That case is harmless, not fatal: the TUI's `Ctrl+E` is
+    // not bound there, `unlock_worker_entry` presses it once, sees no footer
+    // statement, and returns `Err`, which this arm records as a step and an
+    // excerpt before the run carries on (every later typing refocuses its pane).
+    match unlock_worker_entry(tui, plan, ROLE_CODER, ev) {
+        Ok(note) => ev.step(note),
+        Err(e) => {
+            ev.step(format!(
+                "could NOT confirm the command-entry unlock; the commands below may be refused \
+                 by the lock, so a tell-3 or tell-4 failure in this run may be the lock rather \
+                 than the contract (or this TUI build has no lock to unlock): {}",
+                e.lines().next().unwrap_or_default()
+            ));
+            ev.excerpt(
+                "the TUI when the command-entry unlock was not confirmed",
+                tui.grid(),
+            );
         }
     }
 
@@ -3184,10 +3192,14 @@ fn refused_by_lock(deck: &pty::PtyDeck) -> bool {
 /// Unlock command entry into worker panes, proving it by the footer, so the
 /// hook commands typed into a worker pane reach its shell (issue #1456).
 ///
-/// Under the experimental flag a deck starts with PRD #393's command-entry lock
-/// engaged: on an Orchestration tab it drops every keystroke typed into a
-/// focused pane other than the orchestrator's, painting [`ENTRY_REFUSED`]
-/// instead, so tell 4's `work-done` and `agent-event` never reached the daemon.
+/// A deck starts with PRD #393's command-entry lock engaged: on an Orchestration
+/// tab it drops every keystroke typed into a focused pane other than the
+/// orchestrator's, painting [`ENTRY_REFUSED`] instead, so tell 4's `work-done`
+/// and `agent-event` never reached the daemon. In this fork the lock is on in
+/// every build (fork commit 6a01e106, issues #346 and #350 graduated it out of
+/// the experimental flag), so the caller unlocks in every run; upstream's lock
+/// exists only under the flag, and a build without it has nothing to toggle
+/// (see the last paragraph).
 /// The unlock is the TUI's own, `Ctrl+D` then `Ctrl+E` — the chord that refusal
 /// names — rather than anything that steps around the TUI: `focus_role` puts
 /// the deck on the Orchestration tab (the only place `Ctrl+E` is bound),
@@ -3205,6 +3217,14 @@ fn refused_by_lock(deck: &pty::PtyDeck) -> bool {
 /// not, or `role` could not be focused: the caller records it and types anyway,
 /// so tell 4 fails on what the deck did with the input — [`ENTRY_REFUSED`] on
 /// screen says it was the lock — rather than on this step's guess.
+///
+/// On a TUI whose lock is not engaged because there is none to toggle (an
+/// upstream build with the flag off, where `Ctrl+E` is not bound) this does no
+/// harm: `focus_role` and [`ensure_command_mode`] are what every later typing
+/// does anyway, the lone `Ctrl+E` is ignored, the footer states nothing so no
+/// second press is sent, and after [`STEP_TIMEOUT`] this returns `Err` (the
+/// "may have no command-entry lock to toggle" case below), which the caller
+/// records without failing the run.
 pub(crate) fn unlock_worker_entry(
     deck: &pty::PtyDeck,
     plan: &Plan,
@@ -3248,9 +3268,9 @@ pub(crate) fn unlock_worker_entry(
     }
     focus_role(deck, plan, role, ev)?;
     Ok(format!(
-        "unlocked command entry into worker panes (PRD #393's lock, on under \
-         `--experimental`) with the TUI's own `Ctrl+D` then `Ctrl+E`: the footer read \
-         {ENTRY_UNLOCKED:?} after {presses} press(es), then `{role}` was focused again"
+        "unlocked command entry into worker panes (PRD #393's lock, always on in this fork) with \
+         the TUI's own `Ctrl+D` then `Ctrl+E`: the footer read {ENTRY_UNLOCKED:?} after \
+         {presses} press(es), then `{role}` was focused again"
     ))
 }
 
@@ -4001,7 +4021,7 @@ mod tests {
 
     /// The strings [`entry_lock`] and tell 4's refusal note read are the TUI's
     /// own, so a rename in `src/ui.rs` turns this red instead of leaving
-    /// `--experimental` runs to fail tell 4 again (issue #1456). This checks the
+    /// cross-version runs to fail tell 4 again (issue #1456). This checks the
     /// TUI in this tree, which is the branch side of a run; the previous
     /// release's TUI is whatever that release shipped.
     #[test]
@@ -4021,6 +4041,102 @@ mod tests {
         );
         assert_eq!(ENTRY_LOCKED, "Pane entry: locked");
         assert_eq!(ENTRY_UNLOCKED, "Pane entry: unlocked");
+    }
+
+    /// Scenario: A worker pane in this fork's TUI refuses typed input until someone presses `Ctrl+D` then `Ctrl+E`, because the command-entry lock is always on and no experimental flag sits in front of it. The cross-version harness has to press that chord before tells 3 and 4 type into the `coder` and `reviewer` panes in every run, `--experimental` or not, so this reads the TUI's lock and the harness's unlock from source and checks they are gated the same way.
+    ///
+    /// Not asserted: that tells 3 and 4 then pass. This pins only that the unlock is no longer conditional on the flag; the proof that the tells pass is the `cross-version` CI job. A sync that restores upstream's `--experimental` guard around the unlock turns this red (CLAUDE.md rule 24), unless the same sync also restores upstream's flag gate on the lock itself.
+    #[test]
+    fn the_worker_unlock_does_not_depend_on_the_experimental_flag() {
+        let ui = include_str!("../../../src/ui.rs");
+        let features = include_str!("../../../src/features.rs");
+        let harness = include_str!("inner.rs");
+
+        // Every needle that this file's own text could satisfy is split with
+        // `concat!`, because `harness` is this very file.
+
+        // What the TUI does: this fork's lock is on from the start with no
+        // feature-flag wrapper in front of it (fork #346); upstream's is behind
+        // `show_command_entry_lock()`.
+        let lock_is_flag_gated = features.contains(concat!("pub fn show_command_entry", "_lock"))
+            || ui.contains(concat!("show_command_entry", "_lock()"));
+        if !lock_is_flag_gated {
+            assert!(
+                ui.contains("command_entry_locked: true,"),
+                "src/ui.rs neither gates the command-entry lock on the experimental flag nor starts \
+                 the deck with it on, so this test no longer knows when a worker pane refuses input"
+            );
+        }
+
+        // What the harness does: is the call that unlocks worker panes inside an
+        // `if plan.experimental` guard? Look at the call's own line and at the
+        // nearest line of code above it (comments and blanks skipped).
+        let call = concat!("unlock_worker_entry(tui, ", "plan, ROLE_CODER, ev)");
+        let at = harness
+            .find(call)
+            .expect("the harness no longer unlocks worker-pane entry before tells 3 and 4");
+        let line_start = harness[..at].rfind('\n').map_or(0, |i| i + 1);
+        let same_line = &harness[line_start..at];
+        let previous_code_line = harness[..line_start]
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .unwrap_or_default();
+        let experimental = concat!("plan.", "experimental");
+        let unlock_is_flag_gated =
+            same_line.contains(experimental) || previous_code_line.contains(experimental);
+
+        assert_eq!(
+            unlock_is_flag_gated, lock_is_flag_gated,
+            "the harness's worker-pane unlock is gated on `--experimental`: {unlock_is_flag_gated} \
+             (the code line above its call reads {previous_code_line:?}), but the TUI's \
+             command-entry lock is gated on the experimental flag: {lock_is_flag_gated}. In this \
+             fork the lock is on in every build, and CI runs `cargo xver` without \
+             `--experimental`, so the TUI refuses every keystroke typed into the `coder` and \
+             `reviewer` panes and tells 3 and 4 cannot pass (issue #862)"
+        );
+    }
+
+    /// Scenario: The worker-pane unlock is the one step that lets tells 3 and 4 type into the `coder` and `reviewer` panes, so changing when it runs must not remove it or move it. This checks that it is still called once for the deck-global lock, ahead of the first command typed into a worker, that it still presses the TUI's own `Ctrl+E`, and that its note still goes into the run's evidence.
+    ///
+    /// Not asserted: when the unlock runs, which is `the_worker_unlock_does_not_depend_on_the_experimental_flag`'s question, or that the `--experimental` path still unlocks at run time.
+    #[test]
+    fn the_worker_unlock_is_still_wired_in_before_the_first_worker_command() {
+        let harness = include_str!("inner.rs");
+
+        // Split with `concat!` so this file's own text never satisfies a needle.
+        let call = concat!("unlock_worker_entry(tui, ", "plan, ROLE_CODER, ev)");
+        assert_eq!(
+            harness.matches(call).count(),
+            1,
+            "the harness is meant to unlock the deck-global command-entry lock exactly once, \
+             through the `coder` pane, before it types into any worker"
+        );
+
+        let unlock_at = harness.find(call).expect("counted above");
+        let first_worker_command = harness
+            .find(concat!("let coder_fetch = ", "fetch_in_pane("))
+            .expect("tell 3's first command typed into a worker pane is gone");
+        assert!(
+            unlock_at < first_worker_command,
+            "the unlock must run before the first command typed into a worker pane, or that \
+             command is refused by the lock"
+        );
+
+        assert!(
+            harness.contains(concat!("Ok(note) => ev.", "step(note)")),
+            "a confirmed unlock no longer records its note in the run's evidence"
+        );
+        assert!(
+            harness.contains(concat!("unlocked command entry into worker ", "panes")),
+            "the unlock's evidence note no longer says it unlocked command entry into worker panes, \
+             which is what a reader of the evidence file looks for"
+        );
+        assert!(
+            harness.contains("deck.send(b\"\\x05\")"),
+            "the unlock no longer presses the TUI's own `Ctrl+E`"
+        );
     }
 
     #[test]
