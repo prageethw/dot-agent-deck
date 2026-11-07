@@ -93,7 +93,7 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
-    Minimal, // 3 rows: role + Dir folded onto one content row, used only when Compact cannot fit every card (issue #1568)
+    Minimal, // 3 rows: role + Dir folded onto one content row, used only when Compact cannot fit every card (issue #1568); spare rows are dealt over the cards, never left blank (issue #858)
     Compact, // 6 rows: 1 prompt, 1 tool
     Normal,  // 9 rows: 1 prompt, 3 tools
     Spacious, // 11 rows: 3 prompts, 3 tools
@@ -300,6 +300,12 @@ fn fit_all_keeps_dir_rows(total_cards: usize, cols: usize, available_height: u16
 /// fork's own card would have to fold `Dir:` onto the role row too (issue #847).
 /// Where the division keeps the rows apart this returns the Compact fallback
 /// below, and the render site divides.
+///
+/// Issue #858: Minimal is a TIER, not a card height the column is stuck with.
+/// Where it is returned and the rows on offer exceed 3 per card, the render site
+/// deals the leftover rows over the cards with the same [`even_row_heights`]
+/// division (at the columns returned here), so the column fills to the stats bar
+/// instead of leaving a blank band. The tier chosen here is unchanged.
 ///
 /// When nothing fits, the layout the deck has always used is returned rather
 /// than the widest one, and the caller is left to signal the overflow. Narrowing
@@ -18927,6 +18933,22 @@ fn render_card_grid(
         if row_heights.is_some() {
             // Fewer rows fit doesn't mean the old scroll offset applies to
             // this row count — fit-all mode shows every row unconditionally.
+            ui.scroll_offset = 0;
+        }
+    } else if density == CardDensity::Minimal {
+        // Issue #858: upstream's Minimal tier paints every card at a fixed 3
+        // rows and leaves the rest of the column to the `Constraint::Min(0)`
+        // filler below, a blank band above the stats bar wherever the rows on
+        // offer are more than 3 per card. The fork's fit-all division never
+        // left one (PRD fork#446 M1), so deal the leftover rows the same way:
+        // `even_row_heights` at the columns Minimal fitted at, the first
+        // `available % rows` cards one row taller. Every height is at least 3
+        // because Minimal fitted, so no card shrinks below the folded form and
+        // a card dealt 4 or more rows keeps `Dir:` on its own row (that is
+        // `render_session_card`'s own `area.height == 3` fold). At exactly 3
+        // rows per card the division is all 3s, the layout it always had.
+        row_heights = even_row_heights(total_rows, available_for_cards);
+        if row_heights.is_some() {
             ui.scroll_offset = 0;
         }
     }
