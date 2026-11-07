@@ -19415,8 +19415,30 @@ mod spawn_tests {
             "exited entry must still be in registry — lazily pruned, not actively reaped"
         );
 
+        // Poll, never assert once. The reader thread publishes `exited`
+        // (which is what drops `live_count()` to 0 above) BEFORE it releases
+        // the claim: between the two it still runs `await_replacement`,
+        // `signal_agent_exit`, the `agent_exited` telemetry hook and the
+        // delegation sweep, and only then calls `release_orchestration_name`.
+        // So the prerequisites above can hold while the claim is still held,
+        // and a single immediate attempt lands in that window on a slow
+        // runner (macOS CI, CI run 12). The release itself is unconditional
+        // once that thread gets there, so a bounded wait is the right shape;
+        // if the claim is NEVER released the deadline passes and the test
+        // still fails with the message below.
+        let release_deadline =
+            tokio::time::Instant::now() + crate::test_budget::load_scaled(Duration::from_secs(5));
+        let released = loop {
+            if registry.claim_orchestration_name(NAME, Some(DIR), "new-claimant-after-crash") {
+                break true;
+            }
+            if tokio::time::Instant::now() >= release_deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
         assert!(
-            registry.claim_orchestration_name(NAME, Some(DIR), "new-claimant-after-crash"),
+            released,
             "a claim confirmed onto a pane whose process then exited on its own, with no \
              StopAgent ever sent, must be released once the daemon observes the exit — \
              otherwise the name is squatted for the daemon's entire remaining lifetime"
