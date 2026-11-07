@@ -3789,6 +3789,23 @@ fn idle_worker_044_pi_clear_true_delegation_stays_armed_after_the_replacement_ac
     });
 }
 
+/// Poll `settled` every 20 ms until it holds or the load-scaled budget (5 s base,
+/// the same ceiling [`IdleHarness::wait_for_task_acknowledged`] uses) runs out;
+/// whether it held. Returns the moment the condition holds, so a fast box pays
+/// nothing for the wider ceiling on a contended one.
+async fn wait_until_settled(settled: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + common::load_scaled(Duration::from_secs(5));
+    loop {
+        if settled() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Scenario: Delegate twice to one live worker pane with no work-done between (the second delegation supersedes the first), then send ONE work-done and read the pane's outstanding-delegation snapshot, the field the deck's `Idle (delegated)` badge and tab-bar idle count are built from. A control worker delegated once and completed once must already read as cleared; the twice-delegated worker must read as cleared too, because its single completion answered the worker's whole outstanding work.
 #[spec("scheduler/idle-worker/037")]
 #[test]
@@ -3804,15 +3821,62 @@ fn idle_worker_037_one_work_done_clears_a_twice_delegated_pane() {
         let mut twice_broadcasts = harness.event_tx.subscribe();
         let control_pane = worker_pane("control-worker");
         let twice_pane = worker_pane("twice-delegated-worker");
+        // `handle_delegate` arms a delegation's idle-worker record and its
+        // commission synchronously, but POSTS the task from a spawned dispatch,
+        // and two spawned dispatches to one pane take the pane's order lock in
+        // whichever order their threads reach it. Reversed, the first-issued
+        // task posts SECOND, supersedes the newer one and retires the newer
+        // one's record, leaving the pane owing nothing: a pane that fails the
+        // precondition below no matter how long it waits. So the test waits on
+        // what the dispatches DO, never on a fixed sleep, and lets the first
+        // twice-delegated task post before it issues the second, which is the
+        // order a real `delegate` produces (the daemon's reply waits for the
+        // post).
+        let open_tasks = |pane: &str| harness.registry.inbox().open_tasks_of(pane).len();
+        let commissions_owed = |pane: &str| {
+            harness
+                .registry
+                .delegation_watch_snapshot(pane)
+                .delegation_commission
+                .map_or(0, |commission| commission.outstanding)
+        };
+
         // Control: one delegation, one completion.
         harness.delegate(&["control-worker"]).await;
         // Twice-delegated: second delegation lands before any completion.
         harness.delegate(&["twice-delegated-worker"]).await;
+        assert!(
+            wait_until_settled(|| open_tasks(&twice_pane) == 1).await,
+            "precondition: the first delegation's task never reached {twice_pane}'s inbox"
+        );
         harness.delegate(&["twice-delegated-worker"]).await;
 
-        // Let both dispatches settle, then pin the preconditions: both panes
-        // owe a delegation before any completion.
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        // Both dispatches must have run to their post before the completions
+        // are sent. The control's task is posted when its pane holds one open
+        // task. The twice-delegated pane has had BOTH delegations processed
+        // only once the second post superseded the first: both commissions are
+        // armed synchronously (two owed), and the ledger falls to one only when
+        // that supersession retires the first task's own commission. One
+        // delegation alone leaves two owed, so this cannot be satisfied early
+        // by the first.
+        assert!(
+            wait_until_settled(|| open_tasks(&control_pane) == 1).await,
+            "precondition: the control delegation's task never reached {control_pane}'s inbox"
+        );
+        assert!(
+            wait_until_settled(
+                || open_tasks(&twice_pane) == 1 && commissions_owed(&twice_pane) == 1
+            )
+            .await,
+            "precondition: the second delegation's task never superseded the first on \
+             {twice_pane}; open tasks = {}, commissions owed = {}, watches = {:?}",
+            open_tasks(&twice_pane),
+            commissions_owed(&twice_pane),
+            harness.registry.delegation_watch_snapshot(&twice_pane)
+        );
+
+        // Pin the preconditions: both panes owe a delegation before any
+        // completion.
         for pane in [&control_pane, &twice_pane] {
             assert!(
                 harness
