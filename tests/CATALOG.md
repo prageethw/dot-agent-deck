@@ -8166,7 +8166,7 @@ without depending on the config struct API.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge`).
 - **Agent:** none; identity-recording Python probes standing in for interactive agents.
 - **Asserts:** at 220 and 120 terminal columns with the default sidebar width, a long start-role name, Working status and a queued inbox badge, the live orchestrator card names its role (a leading stretch of the long name, which the 40-column sidebar cuts with `…`) and shows Working and the queued inbox line, the worker card names its role, and no row of the sidebar contains the word ORCHESTRATOR. The wait settles on the drawn role names, status and inbox line before the absence is read, so the absence is not read off a frame the card has not reached.
-- **Does not assert:** the `roles` command's ORCHESTRATOR column (`orchestration/roles/001`, which stays), the desktop app's badge, the daemon-side orchestrator lookup, pane-border titles, or card row accounting at each density (the L1 tests `an_orchestrator_seat_card_never_says_orchestrator` and `an_orchestrator_seat_card_costs_no_row_the_other_cards_do_not` in `src/ui.rs`, which carry no catalog id).
+- **Does not assert:** the `roles` command's ORCHESTRATOR column (`orchestration/roles/001`, which stays), the desktop app's badge, the daemon-side orchestrator lookup, pane-border titles, or card row accounting at each density (the L1 tests `a_role_card_names_its_role_and_never_says_orchestrator` and `a_card_keeps_its_dir_prompt_and_tool_rows_and_never_says_orchestrator` in `src/ui.rs` draw an ordinary card through `render_session_card` alone, and carry no catalog id).
 
 #### orchestration/address
 

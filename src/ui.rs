@@ -42606,19 +42606,15 @@ mod tests {
         }
     }
 
-    /// Draw one card exactly as the deck draws it — `render_session_card` into a
-    /// `width`-wide buffer of `density`'s own height — and return its rows as
-    /// text. `_seat` is whether the card is an orchestrator seat's: it once
-    /// reached `render_session_card`, which no longer takes it (the seat card is
-    /// every card), so it is ignored here and the orchestrator-card tests keep
-    /// asking the question through this one helper.
-    fn seat_card_text(
+    /// Draw one card exactly as the deck draws it: `render_session_card` into a
+    /// `width`-wide buffer of `density`'s own height, returning its rows as
+    /// text.
+    fn card_text(
         session: &SessionState,
         name: &str,
         width: u16,
         density: CardDensity,
         now: DateTime<Utc>,
-        _seat: bool,
     ) -> String {
         let name = name.to_string();
         let backend = ratatui::backend::TestBackend::new(width, density.card_height());
@@ -42645,11 +42641,11 @@ mod tests {
         buffer_to_string(terminal.backend().buffer())
     }
 
-    /// An idle session in `/work/seat-project`, its clock fixed to `now` so two
-    /// draws of it are cell-for-cell comparable (`Last:` reads `2h` in both).
-    fn idle_seat_session(now: DateTime<Utc>) -> SessionState {
+    /// An idle session in `/work/card-project`, its clock fixed to `now` so
+    /// `Last:` reads `2h` on every draw of it.
+    fn idle_card_session(now: DateTime<Utc>) -> SessionState {
         let mut session = make_session(SessionStatus::Idle);
-        session.cwd = Some("/work/seat-project".to_string());
+        session.cwd = Some("/work/card-project".to_string());
         session.started_at = now - chrono::Duration::hours(2);
         session.last_activity = now - chrono::Duration::hours(2);
         session
@@ -42658,8 +42654,8 @@ mod tests {
     /// The same session mid-run, carrying every row a card can: Working, one
     /// message queued, a prompt, one tool call and a tool count. A row a card
     /// loses is then a row missing from the drawn text.
-    fn busy_seat_session(now: DateTime<Utc>) -> SessionState {
-        let mut session = idle_seat_session(now);
+    fn busy_card_session(now: DateTime<Utc>) -> SessionState {
+        let mut session = idle_card_session(now);
         session.status = SessionStatus::Working;
         session.tool_count = 7;
         session.last_user_prompt = Some("plan the release".to_string());
@@ -42691,26 +42687,25 @@ mod tests {
         session
     }
 
-    /// Scenario: Draw the card of an orchestration's orchestrator seat across every width from a 20-column sliver to 80 columns while it is Working with one message queued and a very long role name, then idle at 74 and 40 columns. The card names the role on its first body row and keeps its status word and inbox line in the title row, and `ORCHESTRATOR` appears nowhere on it, neither at the end of the title nor on a row of its own.
+    /// Scenario: Draw a card named like an orchestrator role across every width from a 20-column sliver to 80 columns while it is Working with one message queued and a very long role name, then idle at 74 and 40 columns. The card names the role on its first body row, keeps its status word and inbox line in the title row, and `ORCHESTRATOR` appears nowhere on it. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
     #[test]
-    fn an_orchestrator_seat_card_never_says_orchestrator() {
+    fn a_role_card_names_its_role_and_never_says_orchestrator() {
         let now = Utc::now();
-        // The idle seat at a wide card (74 columns) and at a 40-column
-        // sidebar card, whose long role name must not be cut to make room for
-        // anything (CI red on PR #1956: a sidebar card read `ClaudeCode · c…`).
-        // The fork's identity is on a row of its own, so the name stays whole.
-        let idle = idle_seat_session(now);
+        // The idle card at a wide width (74 columns) and at a 40-column
+        // sidebar width, whose long role name must not be cut: the role is on a
+        // row of its own, so the title row never carries an ellipsis.
+        let idle = idle_card_session(now);
         for (name, width) in [("lead", 74u16), ("coordinator", 40)] {
-            let seat = seat_card_text(&idle, name, width, CardDensity::Compact, now, true);
-            let title = seat.lines().next().unwrap();
-            assert!(!title.contains('…'), "{width}: {seat}");
+            let card = card_text(&idle, name, width, CardDensity::Compact, now);
+            let title = card.lines().next().unwrap();
+            assert!(!title.contains('…'), "{width}: {card}");
             assert!(
-                seat.lines().nth(1).is_some_and(|row| row.contains(name)),
-                "{width}: the role name is whole on the first body row: {seat}"
+                card.lines().nth(1).is_some_and(|row| row.contains(name)),
+                "{width}: the role name is whole on the first body row: {card}"
             );
             assert!(
-                !seat.contains("ORCHESTRATOR"),
-                "{width}: the seat's card says ORCHESTRATOR: {seat}"
+                !card.contains("ORCHESTRATOR"),
+                "{width}: the card says ORCHESTRATOR: {card}"
             );
         }
 
@@ -42724,10 +42719,10 @@ mod tests {
         // count `✉1` below that, so `queued` is asserted from 40 (the first
         // width of the 40-column sidebar scenario, one column inside the
         // threshold) and the count at every width.
-        let busy = busy_seat_session(now);
+        let busy = busy_card_session(now);
         let long = "orchestrator-with-a-very-long-role-name";
         for width in 20..=80u16 {
-            let card = seat_card_text(&busy, long, width, CardDensity::Compact, now, true);
+            let card = card_text(&busy, long, width, CardDensity::Compact, now);
             let title = card.lines().next().unwrap();
             assert!(title.contains("Working"), "{width}: {card}");
             assert!(title.contains("✉1"), "{width}: {card}");
@@ -42746,45 +42741,39 @@ mod tests {
             // The symptom itself: the word, anywhere on the card.
             assert!(
                 !card.contains("ORCHESTRATOR"),
-                "{width}: the seat's card says ORCHESTRATOR: {card}"
+                "{width}: the card says ORCHESTRATOR: {card}"
             );
-            // And the title row is the one every other card draws.
-            let plain = seat_card_text(&busy, long, width, CardDensity::Compact, now, false);
-            assert_eq!(title, plain.lines().next().unwrap(), "{width}: {card}");
         }
     }
 
-    /// Scenario: Draw the same session as an orchestrator seat and as any other pane, at every card density and every width from 20 to 100 columns, once idle and once mid-run with a prompt, a tool call, a directory and a queued message. The seat's card is cell-for-cell the other pane's card, so nothing was merely hidden and no `Prmt:`, tool or `Dir:` row is pushed out to make room for a seat marker; a 24-column mid-run Compact card still shows all three rows, and a 20-column Minimal card keeps its `Dir:`.
+    /// Scenario: Draw a session at every card density and every width from 20 to 100 columns, once idle and once mid-run with a prompt, a tool call, a directory and a queued message. `ORCHESTRATOR` appears on none of those cards; a 24-column mid-run Compact card shows its `Dir:`, `Prmt:` and tool rows, and a 20-column Minimal card keeps its `Dir:` on the role row. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
     #[test]
-    fn an_orchestrator_seat_card_costs_no_row_the_other_cards_do_not() {
+    fn a_card_keeps_its_dir_prompt_and_tool_rows_and_never_says_orchestrator() {
         let now = Utc::now();
-        let idle = idle_seat_session(now);
-        let busy = busy_seat_session(now);
+        let idle = idle_card_session(now);
+        let busy = busy_card_session(now);
 
-        // Anchors first: the cards compared below are rich enough that a row
-        // lost to a seat marker would be visible as a row missing. A 24-column
-        // Compact card has inner height 4 — role, `Dir:`, prompt, tool — so a
-        // fifth row for a marker used to cost it its prompt. A Minimal card has
-        // one content row, the role with `Dir:` folded onto it, and a marker row
-        // used to take `Dir:`'s place.
-        let compact = seat_card_text(&busy, "lead", 24, CardDensity::Compact, now, true);
+        // Anchors first, on the two cards with the least room. A 24-column
+        // Compact card has inner height 4 (role, `Dir:`, prompt, tool), so a
+        // fifth row, such as a marker row, would cost it its prompt. A Minimal
+        // card has one content row, the role with `Dir:` folded onto it, and a
+        // marker row would take `Dir:`'s place.
+        let compact = card_text(&busy, "lead", 24, CardDensity::Compact, now);
         for row in ["Dir:", "Prmt:", "Bash"] {
             assert!(
                 compact.contains(row),
-                "the seat's 24-column Compact card keeps its {row} row: {compact}"
+                "the 24-column Compact card keeps its {row} row: {compact}"
             );
         }
-        let minimal = seat_card_text(&idle, "lead", 20, CardDensity::Minimal, now, true);
+        let minimal = card_text(&idle, "lead", 20, CardDensity::Minimal, now);
         assert!(
             minimal
                 .lines()
                 .nth(1)
                 .is_some_and(|row| row.contains("Dir:")),
-            "the seat's 20-column Minimal card keeps its Dir: on the role row: {minimal}"
+            "the 20-column Minimal card keeps its Dir: on the role row: {minimal}"
         );
 
-        let mut checked = 0usize;
-        let mut differing = Vec::new();
         for density in [
             CardDensity::Minimal,
             CardDensity::Compact,
@@ -42793,23 +42782,14 @@ mod tests {
         ] {
             for (kind, session) in [("idle", &idle), ("mid-run", &busy)] {
                 for width in 20..=100u16 {
-                    let seat = seat_card_text(session, "lead", width, density, now, true);
-                    let plain = seat_card_text(session, "lead", width, density, now, false);
-                    checked += 1;
-                    if seat != plain {
-                        differing.push(format!(
-                            "{density:?}, {kind}, {width} columns\nas the seat:\n{seat}\nas any other pane:\n{plain}"
-                        ));
-                    }
+                    let card = card_text(session, "lead", width, density, now);
+                    assert!(
+                        !card.contains("ORCHESTRATOR"),
+                        "{density:?}, {kind}, {width} columns: the card says ORCHESTRATOR: {card}"
+                    );
                 }
             }
         }
-        assert!(
-            differing.is_empty(),
-            "{} of {checked} seat cards differ from the same pane's ordinary card; the first:\n{}",
-            differing.len(),
-            differing.first().map(String::as_str).unwrap_or_default()
-        );
     }
 
     /// An OpenCode card carrying the daemon's agent notice `notice` (beside a

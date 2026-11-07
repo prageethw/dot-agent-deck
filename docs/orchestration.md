@@ -835,7 +835,7 @@ A standalone agent shows `-` for its orchestration and role. The ORCHESTRATION c
 | `--name <name>` | Lists only the standalone agents with that name, the ones `inbox send --name <name>` would choose between. |
 | `--pane <pane>` | Lists only the standalone agent in that pane, or the whole orchestration whose orchestrator is in it. |
 
-You can see the orchestrator in the desktop app too: its row carries an `ORCHESTRATOR` badge. The TUI draws no badge, so the orchestrator's card there looks like every other role's card, and `roles` is where to look to tell which agent it is.
+You can see the orchestrator in the desktop app too: its row carries an `ORCHESTRATOR` badge. The TUI draws no badge, so the orchestrator's card there is laid out like every other role's card. To tell which agent it is, use `roles` (its `ORCHESTRATOR` column) or `daemon status` (it marks the role `(orchestrator)`).
 
 ### Send a message
 
