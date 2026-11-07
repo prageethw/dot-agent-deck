@@ -8162,11 +8162,11 @@ without depending on the config struct API.
 - **Asserts:** text headers and seat markers, standalone dashes, JSON keys and values, folder filtering and its intersection with the orchestration name across two same-named teams in distinct folders.
 - **Does not assert:** real-agent decisions or old-daemon compatibility.
 
-##### orchestration/roles/002 — The live orchestration sidebar marks the orchestrator seat.
-- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_roles_002_sidebar_marks_only_orchestrator`).
+##### orchestration/roles/002 — The live orchestration sidebar draws the orchestrator seat's card without an ORCHESTRATOR badge (fork preference, issue #859; reverses upstream's card badge from #1947 for the TUI only).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge`).
 - **Agent:** none; identity-recording Python probes standing in for interactive agents.
-- **Asserts:** at 220 and 120 terminal columns with the default sidebar width, a long start-role name, Working status and a queued inbox badge, the live orchestrator card carries the full ORCHESTRATOR word and the worker card does not.
-- **Does not assert:** desktop rendering or pane-border titles.
+- **Asserts:** at 220 and 120 terminal columns with the default sidebar width, a long start-role name, Working status and a queued inbox badge, the live orchestrator card names its role (a leading stretch of the long name, which the 40-column sidebar cuts with `…`) and shows Working and the queued inbox line, the worker card names its role, and no row of the sidebar contains the word ORCHESTRATOR. The wait settles on the drawn role names, status and inbox line before the absence is read, so the absence is not read off a frame the card has not reached.
+- **Does not assert:** the `roles` command's ORCHESTRATOR column (`orchestration/roles/001`, which stays), the desktop app's badge, the daemon-side orchestrator lookup, pane-border titles, or card row accounting at each density (the L1 tests `an_orchestrator_seat_card_never_says_orchestrator` and `an_orchestrator_seat_card_costs_no_row_the_other_cards_do_not` in `src/ui.rs`, which carry no catalog id).
 
 #### orchestration/address
 
