@@ -1494,25 +1494,33 @@ fn with_attached_tui(
         ),
     );
 
-    // `--experimental` engages PRD #393's command-entry lock, which drops every
-    // keystroke typed into a worker pane (issue #1456). Unlock it the TUI's own
-    // way, once, before the first command typed into a worker: the lock is
-    // deck-global for the life of this TUI.
-    if plan.experimental {
-        match unlock_worker_entry(tui, plan, ROLE_CODER, ev) {
-            Ok(note) => ev.step(note),
-            Err(e) => {
-                ev.step(format!(
-                    "could NOT confirm the command-entry unlock under `--experimental`; the \
-                     commands below may be refused by the lock, so a tell-3 or tell-4 failure in \
-                     this run may be the lock rather than the contract: {}",
-                    e.lines().next().unwrap_or_default()
-                ));
-                ev.excerpt(
-                    "the TUI when the command-entry unlock was not confirmed",
-                    tui.grid(),
-                );
-            }
+    // PRD #393's command-entry lock drops every keystroke typed into a worker
+    // pane (issue #1456). This fork's lock is always on (fork commit 6a01e106,
+    // issues #346 and #350 graduated it out of the experimental flag), so this
+    // runs in every run, `--experimental` or not: gating it on the flag left the
+    // `coder` and `reviewer` panes refusing every command a default run typed,
+    // and tells 3 and 4 failed on the lock rather than on the builds (issue
+    // #862). Unlock it the TUI's own way, once, before the first command typed
+    // into a worker: the lock is deck-global for the life of this TUI.
+    //
+    // Upstream's lock exists only under the flag, so a deck without it has
+    // nothing to toggle. That case is harmless, not fatal: the TUI's `Ctrl+E` is
+    // not bound there, `unlock_worker_entry` presses it once, sees no footer
+    // statement, and returns `Err`, which this arm records as a step and an
+    // excerpt before the run carries on (every later typing refocuses its pane).
+    match unlock_worker_entry(tui, plan, ROLE_CODER, ev) {
+        Ok(note) => ev.step(note),
+        Err(e) => {
+            ev.step(format!(
+                "could NOT confirm the command-entry unlock; the commands below may be refused \
+                 by the lock, so a tell-3 or tell-4 failure in this run may be the lock rather \
+                 than the contract (or this TUI build has no lock to unlock): {}",
+                e.lines().next().unwrap_or_default()
+            ));
+            ev.excerpt(
+                "the TUI when the command-entry unlock was not confirmed",
+                tui.grid(),
+            );
         }
     }
 
@@ -3184,10 +3192,14 @@ fn refused_by_lock(deck: &pty::PtyDeck) -> bool {
 /// Unlock command entry into worker panes, proving it by the footer, so the
 /// hook commands typed into a worker pane reach its shell (issue #1456).
 ///
-/// Under the experimental flag a deck starts with PRD #393's command-entry lock
-/// engaged: on an Orchestration tab it drops every keystroke typed into a
-/// focused pane other than the orchestrator's, painting [`ENTRY_REFUSED`]
-/// instead, so tell 4's `work-done` and `agent-event` never reached the daemon.
+/// A deck starts with PRD #393's command-entry lock engaged: on an Orchestration
+/// tab it drops every keystroke typed into a focused pane other than the
+/// orchestrator's, painting [`ENTRY_REFUSED`] instead, so tell 4's `work-done`
+/// and `agent-event` never reached the daemon. In this fork the lock is on in
+/// every build (fork commit 6a01e106, issues #346 and #350 graduated it out of
+/// the experimental flag), so the caller unlocks in every run; upstream's lock
+/// exists only under the flag, and a build without it has nothing to toggle
+/// (see the last paragraph).
 /// The unlock is the TUI's own, `Ctrl+D` then `Ctrl+E` — the chord that refusal
 /// names — rather than anything that steps around the TUI: `focus_role` puts
 /// the deck on the Orchestration tab (the only place `Ctrl+E` is bound),
@@ -3205,6 +3217,14 @@ fn refused_by_lock(deck: &pty::PtyDeck) -> bool {
 /// not, or `role` could not be focused: the caller records it and types anyway,
 /// so tell 4 fails on what the deck did with the input — [`ENTRY_REFUSED`] on
 /// screen says it was the lock — rather than on this step's guess.
+///
+/// On a TUI whose lock is not engaged because there is none to toggle (an
+/// upstream build with the flag off, where `Ctrl+E` is not bound) this does no
+/// harm: `focus_role` and [`ensure_command_mode`] are what every later typing
+/// does anyway, the lone `Ctrl+E` is ignored, the footer states nothing so no
+/// second press is sent, and after [`STEP_TIMEOUT`] this returns `Err` (the
+/// "may have no command-entry lock to toggle" case below), which the caller
+/// records without failing the run.
 pub(crate) fn unlock_worker_entry(
     deck: &pty::PtyDeck,
     plan: &Plan,
@@ -3248,9 +3268,9 @@ pub(crate) fn unlock_worker_entry(
     }
     focus_role(deck, plan, role, ev)?;
     Ok(format!(
-        "unlocked command entry into worker panes (PRD #393's lock, on under \
-         `--experimental`) with the TUI's own `Ctrl+D` then `Ctrl+E`: the footer read \
-         {ENTRY_UNLOCKED:?} after {presses} press(es), then `{role}` was focused again"
+        "unlocked command entry into worker panes (PRD #393's lock, always on in this fork) with \
+         the TUI's own `Ctrl+D` then `Ctrl+E`: the footer read {ENTRY_UNLOCKED:?} after \
+         {presses} press(es), then `{role}` was focused again"
     ))
 }
 
@@ -4001,7 +4021,7 @@ mod tests {
 
     /// The strings [`entry_lock`] and tell 4's refusal note read are the TUI's
     /// own, so a rename in `src/ui.rs` turns this red instead of leaving
-    /// `--experimental` runs to fail tell 4 again (issue #1456). This checks the
+    /// cross-version runs to fail tell 4 again (issue #1456). This checks the
     /// TUI in this tree, which is the branch side of a run; the previous
     /// release's TUI is whatever that release shipped.
     #[test]
