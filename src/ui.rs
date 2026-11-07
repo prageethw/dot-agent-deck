@@ -18888,10 +18888,6 @@ fn render_card_grid(
     observing_panes: &HashSet<String>,
     // Issue #413: handed to every card's `Last:` field — see `format_elapsed`.
     now: DateTime<Utc>,
-    // Issue #1947: the orchestrator seats, whose cards carry the ORCHESTRATOR
-    // badge. The live deck passes `AppState::orchestrator_pane_ids`; the L1
-    // seams pass `None`, so their snapshots do not move.
-    orchestrator_panes: Option<&HashSet<String>>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -19095,9 +19091,6 @@ fn render_card_grid(
                     observing_panes,
                 ),
                 now,
-                session.pane_id.as_deref().is_some_and(|pane_id| {
-                    orchestrator_panes.is_some_and(|panes| panes.contains(pane_id))
-                }),
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -19511,7 +19504,6 @@ fn render_frame(
             tick,
             &observing_panes,
             wall_now,
-            Some(&state.orchestrator_pane_ids),
         );
         render_stats_bar(frame, &state.aggregate_stats(), stats_area);
     }
@@ -25160,10 +25152,6 @@ fn render_session_card(
     // against. Passed in, never read here, so a card renders as a pure function
     // of its inputs — see `format_elapsed`.
     now: DateTime<Utc>,
-    // Issue #1947: this pane is its orchestration's orchestrator seat — the
-    // agent `inbox send` messages — so its title carries an ORCHESTRATOR
-    // badge, as the desktop's tile does. Only the live card grid sets it.
-    is_orchestrator: bool,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -25449,24 +25437,6 @@ fn render_session_card(
     // today (ASCII labels, and `flash_dot`'s `●` is ambiguous-width, so one
     // column), so the budget is unchanged and no card snapshot moves.
     let max_title = (area.width as usize).saturating_sub(badge_width + 2);
-    // Issue #1947: the orchestrator seat's ORCHESTRATOR badge — the desktop
-    // tile's word — ends the title when the whole title still fits beside it.
-    // Every title segment ends with a space, so the badge needs none of its
-    // own. Where it does not fit (a sidebar card), the badge takes a row of
-    // its own below instead, so neither the type and role name nor the word
-    // is cut to make room for the other.
-    let title_width: usize = title_segments
-        .iter()
-        .map(|(text, _)| unicode_width::UnicodeWidthStr::width(text.as_str()))
-        .sum();
-    let seat_in_title = is_orchestrator
-        && title_width + unicode_width::UnicodeWidthStr::width(CARD_ORCHESTRATOR_BADGE)
-            <= max_title;
-    let seat_row = is_orchestrator && !seat_in_title;
-    let mut title_segments = title_segments;
-    if seat_in_title {
-        title_segments.push((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold));
-    }
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
@@ -25780,9 +25750,8 @@ fn render_session_card(
     // The rows the agent notice may take: what the card has left after its
     // tools and every other status row, between one and
     // [`CARD_AGENT_NOTICE_ROWS`].
-    let other_rows = attention.len().saturating_sub(1)
-        + usize::from(background.is_some() && !shares_row)
-        + usize::from(seat_row);
+    let other_rows =
+        attention.len().saturating_sub(1) + usize::from(background.is_some() && !shares_row);
     let notice_rows = (inner.height as usize)
         .saturating_sub(density.max_tools() + other_rows)
         .clamp(1, CARD_AGENT_NOTICE_ROWS);
@@ -25807,11 +25776,6 @@ fn render_session_card(
             status_lines.push(plain((text, text_primary())));
         }
         None => status_lines.extend(attention.flat_map(|(i, item)| wrapped(i, item))),
-    }
-    // Issue #1947: the ORCHESTRATOR badge the title had no room for, after the
-    // attention rows, so at Minimal density a reason keeps the one row.
-    if seat_row {
-        status_lines.push(plain((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold)));
     }
 
     let prompts = if density.max_prompts() == 0 {
@@ -25927,10 +25891,6 @@ fn render_session_card(
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
 }
-
-/// Issue #1947: the orchestrator seat's card badge, at the end of its title or
-/// on a row of its own ([`render_session_card`]).
-const CARD_ORCHESTRATOR_BADGE: &str = "ORCHESTRATOR";
 
 /// PRD #2050: the most rows a card gives the daemon's agent notice, which
 /// leads with what to do (`crate::agent_notice`), so its first two rows carry
@@ -26933,7 +26893,6 @@ pub fn render_card_with_declared_agent_to_buffer(
                 // delegated to.
                 false,
                 now,
-                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -27020,7 +26979,6 @@ pub fn render_dashboard_cards_to_buffer(
                         &observing_panes,
                     ),
                     now,
-                    false,
                 );
             }
         })
@@ -27176,7 +27134,6 @@ fn render_card_grid_seam(
                 0,
                 observing_panes,
                 now,
-                None,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -42651,15 +42608,17 @@ mod tests {
 
     /// Draw one card exactly as the deck draws it — `render_session_card` into a
     /// `width`-wide buffer of `density`'s own height — and return its rows as
-    /// text. `seat` is the card's orchestrator-seat flag, the one input the
-    /// orchestrator-card tests vary, so they all reach it through this helper.
+    /// text. `_seat` is whether the card is an orchestrator seat's: it once
+    /// reached `render_session_card`, which no longer takes it (the seat card is
+    /// every card), so it is ignored here and the orchestrator-card tests keep
+    /// asking the question through this one helper.
     fn seat_card_text(
         session: &SessionState,
         name: &str,
         width: u16,
         density: CardDensity,
         now: DateTime<Utc>,
-        seat: bool,
+        _seat: bool,
     ) -> String {
         let name = name.to_string();
         let backend = ratatui::backend::TestBackend::new(width, density.card_height());
@@ -42680,7 +42639,6 @@ mod tests {
                     false,
                     false,
                     now,
-                    seat,
                 );
             })
             .unwrap();
@@ -42896,7 +42854,6 @@ mod tests {
                     false,
                     false,
                     Utc::now(),
-                    false,
                 );
             })
             .unwrap();

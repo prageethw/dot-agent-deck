@@ -76,7 +76,7 @@ The orchestrator and the workers hand tasks and reports to each other through fi
 
 A new tab opens with one pane per role. The role cards are in the left sidebar, and the orchestrator's pane is focused.
 
-![The demo-loop orchestration tab with both roles at work: the tab bar shows Dashboard and demo-loop, two role cards are stacked in the left sidebar, planner (Claude Code, reading src/checkout/flow.ts, Last: 2s) and builder (Codex, editing src/checkout/RetryPayment.tsx, Last: 3s), both Working, and the orchestrator role, planner, carries the ORCHESTRATOR badge on its card and is selected with its pane active on the right](/img/orchestration-tui.png)
+![The demo-loop orchestration tab with both roles at work: the tab bar shows Dashboard and demo-loop, two role cards are stacked in the left sidebar, planner (Claude Code, reading src/checkout/flow.ts, Last: 2s) and builder (Codex, editing src/checkout/RetryPayment.tsx, Last: 3s), both Working, and the orchestrator role, planner, is selected with its pane active on the right](/img/orchestration-tui.png)
 
 **Desktop:**
 
@@ -529,7 +529,7 @@ Long turns affect delivery the same way in the TUI and the desktop app:
 
 **TUI:**
 
-![Planner and builder working in demo-loop, each with one queued inbox message beside its role card, the planner's card carrying the ORCHESTRATOR badge](/img/agent-messaging-tui.png)
+![Planner and builder working in demo-loop, each with one queued inbox message beside its role card](/img/agent-messaging-tui.png)
 
 **Desktop:**
 
@@ -835,7 +835,7 @@ A standalone agent shows `-` for its orchestration and role. The ORCHESTRATION c
 | `--name <name>` | Lists only the standalone agents with that name, the ones `inbox send --name <name>` would choose between. |
 | `--pane <pane>` | Lists only the standalone agent in that pane, or the whole orchestration whose orchestrator is in it. |
 
-You can see the orchestrator in the clients too: in the TUI its card in the orchestration tab's sidebar carries an `ORCHESTRATOR` badge, and in the desktop app its row carries the same badge. When a TUI sidebar card is too narrow for the badge beside the agent's type and name, the badge moves to a line of its own on the card.
+You can see the orchestrator in the desktop app too: its row carries an `ORCHESTRATOR` badge. The TUI draws no badge, so the orchestrator's card there looks like every other role's card, and `roles` is where to look to tell which agent it is.
 
 ### Send a message
 
