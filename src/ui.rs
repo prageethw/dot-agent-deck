@@ -18888,10 +18888,6 @@ fn render_card_grid(
     observing_panes: &HashSet<String>,
     // Issue #413: handed to every card's `Last:` field — see `format_elapsed`.
     now: DateTime<Utc>,
-    // Issue #1947: the orchestrator seats, whose cards carry the ORCHESTRATOR
-    // badge. The live deck passes `AppState::orchestrator_pane_ids`; the L1
-    // seams pass `None`, so their snapshots do not move.
-    orchestrator_panes: Option<&HashSet<String>>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -19095,9 +19091,6 @@ fn render_card_grid(
                     observing_panes,
                 ),
                 now,
-                session.pane_id.as_deref().is_some_and(|pane_id| {
-                    orchestrator_panes.is_some_and(|panes| panes.contains(pane_id))
-                }),
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -19511,7 +19504,6 @@ fn render_frame(
             tick,
             &observing_panes,
             wall_now,
-            Some(&state.orchestrator_pane_ids),
         );
         render_stats_bar(frame, &state.aggregate_stats(), stats_area);
     }
@@ -25160,10 +25152,6 @@ fn render_session_card(
     // against. Passed in, never read here, so a card renders as a pure function
     // of its inputs — see `format_elapsed`.
     now: DateTime<Utc>,
-    // Issue #1947: this pane is its orchestration's orchestrator seat — the
-    // agent `inbox send` messages — so its title carries an ORCHESTRATOR
-    // badge, as the desktop's tile does. Only the live card grid sets it.
-    is_orchestrator: bool,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -25449,24 +25437,6 @@ fn render_session_card(
     // today (ASCII labels, and `flash_dot`'s `●` is ambiguous-width, so one
     // column), so the budget is unchanged and no card snapshot moves.
     let max_title = (area.width as usize).saturating_sub(badge_width + 2);
-    // Issue #1947: the orchestrator seat's ORCHESTRATOR badge — the desktop
-    // tile's word — ends the title when the whole title still fits beside it.
-    // Every title segment ends with a space, so the badge needs none of its
-    // own. Where it does not fit (a sidebar card), the badge takes a row of
-    // its own below instead, so neither the type and role name nor the word
-    // is cut to make room for the other.
-    let title_width: usize = title_segments
-        .iter()
-        .map(|(text, _)| unicode_width::UnicodeWidthStr::width(text.as_str()))
-        .sum();
-    let seat_in_title = is_orchestrator
-        && title_width + unicode_width::UnicodeWidthStr::width(CARD_ORCHESTRATOR_BADGE)
-            <= max_title;
-    let seat_row = is_orchestrator && !seat_in_title;
-    let mut title_segments = title_segments;
-    if seat_in_title {
-        title_segments.push((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold));
-    }
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
@@ -25780,9 +25750,8 @@ fn render_session_card(
     // The rows the agent notice may take: what the card has left after its
     // tools and every other status row, between one and
     // [`CARD_AGENT_NOTICE_ROWS`].
-    let other_rows = attention.len().saturating_sub(1)
-        + usize::from(background.is_some() && !shares_row)
-        + usize::from(seat_row);
+    let other_rows =
+        attention.len().saturating_sub(1) + usize::from(background.is_some() && !shares_row);
     let notice_rows = (inner.height as usize)
         .saturating_sub(density.max_tools() + other_rows)
         .clamp(1, CARD_AGENT_NOTICE_ROWS);
@@ -25807,11 +25776,6 @@ fn render_session_card(
             status_lines.push(plain((text, text_primary())));
         }
         None => status_lines.extend(attention.flat_map(|(i, item)| wrapped(i, item))),
-    }
-    // Issue #1947: the ORCHESTRATOR badge the title had no room for, after the
-    // attention rows, so at Minimal density a reason keeps the one row.
-    if seat_row {
-        status_lines.push(plain((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold)));
     }
 
     let prompts = if density.max_prompts() == 0 {
@@ -25927,10 +25891,6 @@ fn render_session_card(
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
 }
-
-/// Issue #1947: the orchestrator seat's card badge, at the end of its title or
-/// on a row of its own ([`render_session_card`]).
-const CARD_ORCHESTRATOR_BADGE: &str = "ORCHESTRATOR";
 
 /// PRD #2050: the most rows a card gives the daemon's agent notice, which
 /// leads with what to do (`crate::agent_notice`), so its first two rows carry
@@ -26933,7 +26893,6 @@ pub fn render_card_with_declared_agent_to_buffer(
                 // delegated to.
                 false,
                 now,
-                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -27020,7 +26979,6 @@ pub fn render_dashboard_cards_to_buffer(
                         &observing_panes,
                     ),
                     now,
-                    false,
                 );
             }
         })
@@ -27176,7 +27134,6 @@ fn render_card_grid_seam(
                 0,
                 observing_panes,
                 now,
-                None,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -42649,153 +42606,190 @@ mod tests {
         }
     }
 
-    /// Issue #1947: the orchestrator seat's card says so in its title; any
-    /// other card does not. At about 40 columns — a 120-column terminal's
-    /// default sidebar — with a long role name, Working status and a queued
-    /// message, the whole word stays and the name is what gets cut (A3).
-    #[test]
-    fn an_orchestrator_card_carries_the_orchestrator_badge() {
-        let render = |session: &SessionState, name: &str, width: u16, is_orchestrator: bool| {
-            let name = name.to_string();
-            let backend = ratatui::backend::TestBackend::new(width, 6);
-            let mut terminal = ratatui::Terminal::new(backend).unwrap();
-            terminal
-                .draw(|frame| {
-                    render_session_card(
-                        frame,
-                        frame.area(),
-                        session,
-                        0,
-                        false,
-                        Some(&name),
-                        Some(1),
-                        CardDensity::Compact,
-                        UiMode::Normal,
-                        None,
-                        false,
-                        false,
-                        Utc::now(),
-                        is_orchestrator,
-                    );
-                })
-                .unwrap();
-            buffer_to_string(terminal.backend().buffer())
-        };
-        // Upstream-sync round 29: upstream's title reads `<type> · <name> ` and its
-        // assertions cut the NAME to make room for the word. The fork's card puts
-        // the identity on a row of its own and leaves the type badge off by
-        // default (PRD fork#405 M1, fork #339; the fork tip's
-        // `render_dashboard__pane_004_card_title_row` snapshot pins the same
-        // layout), so the title is just ` 1 ` and the word almost always fits
-        // beside it. What this test pins is therefore the word's placement, not
-        // which of two title segments loses: the seat's card says
-        // ORCHESTRATOR once, whole, in the title or (where the title has no
-        // room) on a row of its own; any other card never does; the name stays
-        // whole on its own row.
-        let idle = make_session(SessionStatus::Idle);
-        let seat = render(&idle, "lead", 74, true);
-        let title = seat.lines().next().unwrap();
-        assert!(title.contains("ORCHESTRATOR"), "{seat}");
-        assert!(
-            seat.lines().nth(1).is_some_and(|row| row.contains("lead")),
-            "the name is on the first body row: {seat}"
-        );
-        assert!(!render(&idle, "lead", 74, false).contains("ORCHESTRATOR"));
+    /// Draw one card exactly as the deck draws it: `render_session_card` into a
+    /// `width`-wide buffer of `density`'s own height, returning its rows as
+    /// text.
+    fn card_text(
+        session: &SessionState,
+        name: &str,
+        width: u16,
+        density: CardDensity,
+        now: DateTime<Utc>,
+    ) -> String {
+        let name = name.to_string();
+        let backend = ratatui::backend::TestBackend::new(width, density.card_height());
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_card(
+                    frame,
+                    frame.area(),
+                    session,
+                    0,
+                    false,
+                    Some(&name),
+                    Some(1),
+                    density,
+                    UiMode::Normal,
+                    None,
+                    false,
+                    false,
+                    now,
+                );
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+    }
 
-        let mut busy = make_session(SessionStatus::Working);
+    /// An idle session in `/work/card-project`, its clock fixed to `now` so
+    /// `Last:` reads `2h` on every draw of it.
+    fn idle_card_session(now: DateTime<Utc>) -> SessionState {
+        let mut session = make_session(SessionStatus::Idle);
+        session.cwd = Some("/work/card-project".to_string());
+        session.started_at = now - chrono::Duration::hours(2);
+        session.last_activity = now - chrono::Duration::hours(2);
+        session
+    }
+
+    /// The same session mid-run, carrying every row a card can: Working, one
+    /// message queued, a prompt, one tool call and a tool count. A row a card
+    /// loses is then a row missing from the drawn text.
+    fn busy_card_session(now: DateTime<Utc>) -> SessionState {
+        let mut session = idle_card_session(now);
+        session.status = SessionStatus::Working;
+        session.tool_count = 7;
+        session.last_user_prompt = Some("plan the release".to_string());
         let inbox = crate::inbox_display::CardInbox {
             pending: 1,
             ..Default::default()
         };
-        let queued: AgentEvent = serde_json::from_value(serde_json::json!({
-            "session_id": "",
-            "agent_type": "claude_code",
-            "event_type": "notification",
-            "timestamp": Utc::now(),
-            "metadata": { crate::inbox_display::CARD_INBOX_METADATA_KEY: inbox.encode() },
-        }))
-        .unwrap();
-        busy.recent_events.push_back(queued);
-        let long = "orchestrator-with-a-very-long-role-name";
-        // Upstream pinned three widths (40, 41, 44) at which its title had room for
-        // the type, the name OR the word. The fork's title carries neither type
-        // nor name, so the width at which the word stops fitting beside the
-        // status badge and the queued-message badge is a different one; sweep
-        // the widths instead of restating a hand-computed threshold. At every
-        // width the word is drawn once and whole, a title that has no room for it
-        // is exactly the title the non-seat card draws, and the sweep must see
-        // BOTH placements or it proves nothing.
-        let (mut in_title, mut own_row) = (false, false);
-        for width in 20..=80u16 {
-            let card = render(&busy, long, width, true);
-            let plain = render(&busy, long, width, false);
+        for event in [
+            serde_json::json!({
+                "session_id": "",
+                "agent_type": "claude_code",
+                "event_type": "tool_start",
+                "tool_name": "Bash",
+                "tool_detail": "cargo build",
+                "timestamp": now,
+            }),
+            serde_json::json!({
+                "session_id": "",
+                "agent_type": "claude_code",
+                "event_type": "notification",
+                "timestamp": now,
+                "metadata": { crate::inbox_display::CARD_INBOX_METADATA_KEY: inbox.encode() },
+            }),
+        ] {
+            session
+                .recent_events
+                .push_back(serde_json::from_value::<AgentEvent>(event).unwrap());
+        }
+        session
+    }
+
+    /// Scenario: Draw a card named like an orchestrator role across every width from a 20-column sliver to 80 columns while it is Working with one message queued and a very long role name, then idle at 74 and 40 columns. The card names the role on its first body row, keeps its status word and inbox line in the title row, and `ORCHESTRATOR` appears nowhere on it. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
+    #[test]
+    fn a_role_card_names_its_role_and_never_says_orchestrator() {
+        let now = Utc::now();
+        // The idle card at a wide width (74 columns) and at a 40-column
+        // sidebar width, whose long role name must not be cut: the role is on a
+        // row of its own, so the title row never carries an ellipsis.
+        let idle = idle_card_session(now);
+        for (name, width) in [("lead", 74u16), ("coordinator", 40)] {
+            let card = card_text(&idle, name, width, CardDensity::Compact, now);
             let title = card.lines().next().unwrap();
-            // Upstream pinned that the status word and the queued-message badge
-            // survive beside the seat word at its three widths; the fork's title
-            // row (index, then the word where it fits, the status badge and the
-            // inbox line flush right) keeps that guarantee, so it is pinned at
-            // every width. `max_title` is what is left once the right-hand badge
-            // is paid for, so the word can take room only from the left, and the
-            // status word is never cut. The inbox line is the whole `✉1 queued`
-            // from 39 columns (`card_inbox_badge`: status 11 + line 10 + the two
-            // border cells + the 16 title columns it keeps for the words) and the
-            // bare count `✉1` below that, so `queued` is asserted from 40 (the
-            // first width of the issue's 40-column scenario, one column inside
-            // the threshold) and the count at every width.
+            assert!(!title.contains('…'), "{width}: {card}");
+            assert!(
+                card.lines().nth(1).is_some_and(|row| row.contains(name)),
+                "{width}: the role name is whole on the first body row: {card}"
+            );
+            assert!(
+                !card.contains("ORCHESTRATOR"),
+                "{width}: the card says ORCHESTRATOR: {card}"
+            );
+        }
+
+        // Working, one message queued, a long role name, at every width. The
+        // status word and the inbox line stay in the title row at every
+        // width: `max_title` is what is left once the right-hand badge is paid
+        // for, so the title can only give up room on the left and the status
+        // word is never cut. The inbox line is the whole `✉1 queued` from 39
+        // columns (`card_inbox_badge`: status 11 + line 10 + the two border
+        // cells + the 16 title columns it keeps for the words) and the bare
+        // count `✉1` below that, so `queued` is asserted from 40 (the first
+        // width of the 40-column sidebar scenario, one column inside the
+        // threshold) and the count at every width.
+        let busy = busy_card_session(now);
+        let long = "orchestrator-with-a-very-long-role-name";
+        for width in 20..=80u16 {
+            let card = card_text(&busy, long, width, CardDensity::Compact, now);
+            let title = card.lines().next().unwrap();
             assert!(title.contains("Working"), "{width}: {card}");
             assert!(title.contains("✉1"), "{width}: {card}");
             if width >= 40 {
                 assert!(title.contains("queued"), "{width}: {card}");
             }
-            assert_eq!(
+            // The role name is on the first body row. At 20 columns that row is
+            // 18 wide and the name is cut with `…`, so assert its leading word,
+            // which every width in the sweep keeps whole.
+            assert!(
                 card.lines()
-                    .filter(|line| line.contains("ORCHESTRATOR"))
-                    .count(),
-                1,
-                "{width}: the word is drawn once, whole: {card}"
+                    .nth(1)
+                    .is_some_and(|row| row.contains("orchestrator")),
+                "{width}: the role name is on the first body row: {card}"
             );
-            if title.contains("ORCHESTRATOR") {
-                in_title = true;
-            } else {
-                own_row = true;
-                // The title has no room for the word, so it takes a row of its
-                // own, whole, and the title cuts only what it cut before.
-                assert_eq!(title, plain.lines().next().unwrap(), "{width}: {card}");
-                assert_eq!(
-                    card.lines()
-                        .filter(|line| line.contains("│ORCHESTRATOR "))
-                        .count(),
-                    1,
-                    "{width}: {card}"
-                );
-            }
-            assert!(!plain.contains("ORCHESTRATOR"), "{width}: {plain}");
+            // The symptom itself: the word, anywhere on the card.
+            assert!(
+                !card.contains("ORCHESTRATOR"),
+                "{width}: the card says ORCHESTRATOR: {card}"
+            );
         }
+    }
+
+    /// Scenario: Draw a session at every card density and every width from 20 to 100 columns, once idle and once mid-run with a prompt, a tool call, a directory and a queued message. `ORCHESTRATOR` appears on none of those cards; a 24-column mid-run Compact card shows its `Dir:`, `Prmt:` and tool rows, and a 20-column Minimal card keeps its `Dir:` on the role row. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
+    #[test]
+    fn a_card_keeps_its_dir_prompt_and_tool_rows_and_never_says_orchestrator() {
+        let now = Utc::now();
+        let idle = idle_card_session(now);
+        let busy = busy_card_session(now);
+
+        // Anchors first, on the two cards with the least room. A 24-column
+        // Compact card has inner height 4 (role, `Dir:`, prompt, tool), so a
+        // fifth row, such as a marker row, would cost it its prompt. A Minimal
+        // card has one content row, the role with `Dir:` folded onto it, and a
+        // marker row would take `Dir:`'s place.
+        let compact = card_text(&busy, "lead", 24, CardDensity::Compact, now);
+        for row in ["Dir:", "Prmt:", "Bash"] {
+            assert!(
+                compact.contains(row),
+                "the 24-column Compact card keeps its {row} row: {compact}"
+            );
+        }
+        let minimal = card_text(&idle, "lead", 20, CardDensity::Minimal, now);
         assert!(
-            in_title && own_row,
-            "the sweep must reach the word in the title (in_title={in_title}) and on a row of \
-             its own (own_row={own_row})"
+            minimal
+                .lines()
+                .nth(1)
+                .is_some_and(|row| row.contains("Dir:")),
+            "the 20-column Minimal card keeps its Dir: on the role row: {minimal}"
         );
 
-        // CI red on PR #1956: a 40-column sidebar card must not cut the role name
-        // to fit the word. Under the fork's layout the name is on its own row, so
-        // it stays whole whichever way the word is placed.
-        let card = render(&idle, "coordinator", 40, true);
-        let title = card.lines().next().unwrap();
-        assert!(!title.contains('…'), "{card}");
-        assert!(
-            card.lines()
-                .nth(1)
-                .is_some_and(|row| row.contains("coordinator")),
-            "{card}"
-        );
-        assert_eq!(
-            card.lines()
-                .filter(|line| line.contains("ORCHESTRATOR"))
-                .count(),
-            1,
-            "{card}"
-        );
+        for density in [
+            CardDensity::Minimal,
+            CardDensity::Compact,
+            CardDensity::Normal,
+            CardDensity::Spacious,
+        ] {
+            for (kind, session) in [("idle", &idle), ("mid-run", &busy)] {
+                for width in 20..=100u16 {
+                    let card = card_text(session, "lead", width, density, now);
+                    assert!(
+                        !card.contains("ORCHESTRATOR"),
+                        "{density:?}, {kind}, {width} columns: the card says ORCHESTRATOR: {card}"
+                    );
+                }
+            }
+        }
     }
 
     /// An OpenCode card carrying the daemon's agent notice `notice` (beside a
@@ -42840,7 +42834,6 @@ mod tests {
                     false,
                     false,
                     Utc::now(),
-                    false,
                 );
             })
             .unwrap();
