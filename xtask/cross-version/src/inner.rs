@@ -4023,6 +4023,102 @@ mod tests {
         assert_eq!(ENTRY_UNLOCKED, "Pane entry: unlocked");
     }
 
+    /// Scenario: A worker pane in this fork's TUI refuses typed input until someone presses `Ctrl+D` then `Ctrl+E`, because the command-entry lock is always on and no experimental flag sits in front of it. The cross-version harness has to press that chord before tells 3 and 4 type into the `coder` and `reviewer` panes in every run, `--experimental` or not, so this reads the TUI's lock and the harness's unlock from source and checks they are gated the same way.
+    ///
+    /// Not asserted: that tells 3 and 4 then pass. This pins only that the unlock is no longer conditional on the flag; the proof that the tells pass is the `cross-version` CI job. A sync that restores upstream's `--experimental` guard around the unlock turns this red (CLAUDE.md rule 24), unless the same sync also restores upstream's flag gate on the lock itself.
+    #[test]
+    fn the_worker_unlock_does_not_depend_on_the_experimental_flag() {
+        let ui = include_str!("../../../src/ui.rs");
+        let features = include_str!("../../../src/features.rs");
+        let harness = include_str!("inner.rs");
+
+        // Every needle that this file's own text could satisfy is split with
+        // `concat!`, because `harness` is this very file.
+
+        // What the TUI does: this fork's lock is on from the start with no
+        // feature-flag wrapper in front of it (fork #346); upstream's is behind
+        // `show_command_entry_lock()`.
+        let lock_is_flag_gated = features.contains(concat!("pub fn show_command_entry", "_lock"))
+            || ui.contains(concat!("show_command_entry", "_lock()"));
+        if !lock_is_flag_gated {
+            assert!(
+                ui.contains("command_entry_locked: true,"),
+                "src/ui.rs neither gates the command-entry lock on the experimental flag nor starts \
+                 the deck with it on, so this test no longer knows when a worker pane refuses input"
+            );
+        }
+
+        // What the harness does: is the call that unlocks worker panes inside an
+        // `if plan.experimental` guard? Look at the call's own line and at the
+        // nearest line of code above it (comments and blanks skipped).
+        let call = concat!("unlock_worker_entry(tui, ", "plan, ROLE_CODER, ev)");
+        let at = harness
+            .find(call)
+            .expect("the harness no longer unlocks worker-pane entry before tells 3 and 4");
+        let line_start = harness[..at].rfind('\n').map_or(0, |i| i + 1);
+        let same_line = &harness[line_start..at];
+        let previous_code_line = harness[..line_start]
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .unwrap_or_default();
+        let experimental = concat!("plan.", "experimental");
+        let unlock_is_flag_gated =
+            same_line.contains(experimental) || previous_code_line.contains(experimental);
+
+        assert_eq!(
+            unlock_is_flag_gated, lock_is_flag_gated,
+            "the harness's worker-pane unlock is gated on `--experimental`: {unlock_is_flag_gated} \
+             (the code line above its call reads {previous_code_line:?}), but the TUI's \
+             command-entry lock is gated on the experimental flag: {lock_is_flag_gated}. In this \
+             fork the lock is on in every build, and CI runs `cargo xver` without \
+             `--experimental`, so the TUI refuses every keystroke typed into the `coder` and \
+             `reviewer` panes and tells 3 and 4 cannot pass (issue #862)"
+        );
+    }
+
+    /// Scenario: The worker-pane unlock is the one step that lets tells 3 and 4 type into the `coder` and `reviewer` panes, so changing when it runs must not remove it or move it. This checks that it is still called once for the deck-global lock, ahead of the first command typed into a worker, that it still presses the TUI's own `Ctrl+E`, and that its note still goes into the run's evidence.
+    ///
+    /// Not asserted: when the unlock runs, which is `the_worker_unlock_does_not_depend_on_the_experimental_flag`'s question, or that the `--experimental` path still unlocks at run time.
+    #[test]
+    fn the_worker_unlock_is_still_wired_in_before_the_first_worker_command() {
+        let harness = include_str!("inner.rs");
+
+        // Split with `concat!` so this file's own text never satisfies a needle.
+        let call = concat!("unlock_worker_entry(tui, ", "plan, ROLE_CODER, ev)");
+        assert_eq!(
+            harness.matches(call).count(),
+            1,
+            "the harness is meant to unlock the deck-global command-entry lock exactly once, \
+             through the `coder` pane, before it types into any worker"
+        );
+
+        let unlock_at = harness.find(call).expect("counted above");
+        let first_worker_command = harness
+            .find(concat!("let coder_fetch = ", "fetch_in_pane("))
+            .expect("tell 3's first command typed into a worker pane is gone");
+        assert!(
+            unlock_at < first_worker_command,
+            "the unlock must run before the first command typed into a worker pane, or that \
+             command is refused by the lock"
+        );
+
+        assert!(
+            harness.contains(concat!("Ok(note) => ev.", "step(note)")),
+            "a confirmed unlock no longer records its note in the run's evidence"
+        );
+        assert!(
+            harness.contains(concat!("unlocked command entry into worker ", "panes")),
+            "the unlock's evidence note no longer says it unlocked command entry into worker panes, \
+             which is what a reader of the evidence file looks for"
+        );
+        assert!(
+            harness.contains("deck.send(b\"\\x05\")"),
+            "the unlock no longer presses the TUI's own `Ctrl+E`"
+        );
+    }
+
     #[test]
     fn footer_mode_takes_the_command_button_bar_without_a_chip() {
         let older = grid_with_footer("[Dashboard Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W]");
