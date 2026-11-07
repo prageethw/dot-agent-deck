@@ -93,7 +93,7 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
-    Minimal, // 3 rows: role + Dir folded onto one content row, used only when Compact cannot fit every card (issue #1568)
+    Minimal, // 3 rows: role + Dir folded onto one content row, used only when Compact cannot fit every card (issue #1568); spare rows are dealt over the cards, never left blank (issue #858)
     Compact, // 6 rows: 1 prompt, 1 tool
     Normal,  // 9 rows: 1 prompt, 3 tools
     Spacious, // 11 rows: 3 prompts, 3 tools
@@ -300,6 +300,12 @@ fn fit_all_keeps_dir_rows(total_cards: usize, cols: usize, available_height: u16
 /// fork's own card would have to fold `Dir:` onto the role row too (issue #847).
 /// Where the division keeps the rows apart this returns the Compact fallback
 /// below, and the render site divides.
+///
+/// Issue #858: Minimal is a TIER, not a card height the column is stuck with.
+/// Where it is returned and the rows on offer exceed 3 per card, the render site
+/// deals the leftover rows over the cards with the same [`even_row_heights`]
+/// division (at the columns returned here), so the column fills to the stats bar
+/// instead of leaving a blank band. The tier chosen here is unchanged.
 ///
 /// When nothing fits, the layout the deck has always used is returned rather
 /// than the widest one, and the caller is left to signal the overflow. Narrowing
@@ -18888,10 +18894,6 @@ fn render_card_grid(
     observing_panes: &HashSet<String>,
     // Issue #413: handed to every card's `Last:` field — see `format_elapsed`.
     now: DateTime<Utc>,
-    // Issue #1947: the orchestrator seats, whose cards carry the ORCHESTRATOR
-    // badge. The live deck passes `AppState::orchestrator_pane_ids`; the L1
-    // seams pass `None`, so their snapshots do not move.
-    orchestrator_panes: Option<&HashSet<String>>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -18927,6 +18929,22 @@ fn render_card_grid(
         if row_heights.is_some() {
             // Fewer rows fit doesn't mean the old scroll offset applies to
             // this row count — fit-all mode shows every row unconditionally.
+            ui.scroll_offset = 0;
+        }
+    } else if density == CardDensity::Minimal {
+        // Issue #858: upstream's Minimal tier paints every card at a fixed 3
+        // rows and leaves the rest of the column to the `Constraint::Min(0)`
+        // filler below, a blank band above the stats bar wherever the rows on
+        // offer are more than 3 per card. The fork's fit-all division never
+        // left one (PRD fork#446 M1), so deal the leftover rows the same way:
+        // `even_row_heights` at the columns Minimal fitted at, the first
+        // `available % rows` cards one row taller. Every height is at least 3
+        // because Minimal fitted, so no card shrinks below the folded form and
+        // a card dealt 4 or more rows keeps `Dir:` on its own row (that is
+        // `render_session_card`'s own `area.height == 3` fold). At exactly 3
+        // rows per card the division is all 3s, the layout it always had.
+        row_heights = even_row_heights(total_rows, available_for_cards);
+        if row_heights.is_some() {
             ui.scroll_offset = 0;
         }
     }
@@ -19095,9 +19113,6 @@ fn render_card_grid(
                     observing_panes,
                 ),
                 now,
-                session.pane_id.as_deref().is_some_and(|pane_id| {
-                    orchestrator_panes.is_some_and(|panes| panes.contains(pane_id))
-                }),
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -19511,7 +19526,6 @@ fn render_frame(
             tick,
             &observing_panes,
             wall_now,
-            Some(&state.orchestrator_pane_ids),
         );
         render_stats_bar(frame, &state.aggregate_stats(), stats_area);
     }
@@ -25160,10 +25174,6 @@ fn render_session_card(
     // against. Passed in, never read here, so a card renders as a pure function
     // of its inputs — see `format_elapsed`.
     now: DateTime<Utc>,
-    // Issue #1947: this pane is its orchestration's orchestrator seat — the
-    // agent `inbox send` messages — so its title carries an ORCHESTRATOR
-    // badge, as the desktop's tile does. Only the live card grid sets it.
-    is_orchestrator: bool,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -25449,24 +25459,6 @@ fn render_session_card(
     // today (ASCII labels, and `flash_dot`'s `●` is ambiguous-width, so one
     // column), so the budget is unchanged and no card snapshot moves.
     let max_title = (area.width as usize).saturating_sub(badge_width + 2);
-    // Issue #1947: the orchestrator seat's ORCHESTRATOR badge — the desktop
-    // tile's word — ends the title when the whole title still fits beside it.
-    // Every title segment ends with a space, so the badge needs none of its
-    // own. Where it does not fit (a sidebar card), the badge takes a row of
-    // its own below instead, so neither the type and role name nor the word
-    // is cut to make room for the other.
-    let title_width: usize = title_segments
-        .iter()
-        .map(|(text, _)| unicode_width::UnicodeWidthStr::width(text.as_str()))
-        .sum();
-    let seat_in_title = is_orchestrator
-        && title_width + unicode_width::UnicodeWidthStr::width(CARD_ORCHESTRATOR_BADGE)
-            <= max_title;
-    let seat_row = is_orchestrator && !seat_in_title;
-    let mut title_segments = title_segments;
-    if seat_in_title {
-        title_segments.push((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold));
-    }
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
@@ -25780,9 +25772,8 @@ fn render_session_card(
     // The rows the agent notice may take: what the card has left after its
     // tools and every other status row, between one and
     // [`CARD_AGENT_NOTICE_ROWS`].
-    let other_rows = attention.len().saturating_sub(1)
-        + usize::from(background.is_some() && !shares_row)
-        + usize::from(seat_row);
+    let other_rows =
+        attention.len().saturating_sub(1) + usize::from(background.is_some() && !shares_row);
     let notice_rows = (inner.height as usize)
         .saturating_sub(density.max_tools() + other_rows)
         .clamp(1, CARD_AGENT_NOTICE_ROWS);
@@ -25807,11 +25798,6 @@ fn render_session_card(
             status_lines.push(plain((text, text_primary())));
         }
         None => status_lines.extend(attention.flat_map(|(i, item)| wrapped(i, item))),
-    }
-    // Issue #1947: the ORCHESTRATOR badge the title had no room for, after the
-    // attention rows, so at Minimal density a reason keeps the one row.
-    if seat_row {
-        status_lines.push(plain((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold)));
     }
 
     let prompts = if density.max_prompts() == 0 {
@@ -25927,10 +25913,6 @@ fn render_session_card(
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
 }
-
-/// Issue #1947: the orchestrator seat's card badge, at the end of its title or
-/// on a row of its own ([`render_session_card`]).
-const CARD_ORCHESTRATOR_BADGE: &str = "ORCHESTRATOR";
 
 /// PRD #2050: the most rows a card gives the daemon's agent notice, which
 /// leads with what to do (`crate::agent_notice`), so its first two rows carry
@@ -26933,7 +26915,6 @@ pub fn render_card_with_declared_agent_to_buffer(
                 // delegated to.
                 false,
                 now,
-                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -27020,7 +27001,6 @@ pub fn render_dashboard_cards_to_buffer(
                         &observing_panes,
                     ),
                     now,
-                    false,
                 );
             }
         })
@@ -27176,7 +27156,6 @@ fn render_card_grid_seam(
                 0,
                 observing_panes,
                 now,
-                None,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -36216,6 +36195,241 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #858: the 3-row Minimal tier must not leave a blank band.
+    //
+    // Upstream's Minimal tier (issue #1568) paints every card at a fixed 3 rows.
+    // Where the rows on offer are more than 3 per card but fewer than 4 per card
+    // that left 1..n-1 blank rows between the last card and the stats bar, which
+    // the fork's fit-all division (PRD fork#446 M1) never did: it deals the
+    // leftover rows over the cards. The tests below read the PAINTED column (the
+    // border corners and the stats-bar row), not which tier the layout code chose.
+    // -----------------------------------------------------------------------
+
+    /// The `(top_row, bottom_row)` of every card painted in the deck's first
+    /// column, read off the border corners in column 0 of the rendered text: a
+    /// card runs from a row starting `┌` (`┏` when selected) to the next row
+    /// starting `└` (`┗`). Measured from what reached the buffer, not asked of
+    /// the layout code.
+    fn painted_card_spans(rendered: &str) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut top = None;
+        for (y, line) in rendered.lines().enumerate() {
+            match line.chars().next() {
+                Some('┌' | '┏') => top = Some(y),
+                Some('└' | '┗') => {
+                    if let Some(t) = top.take() {
+                        spans.push((t, y));
+                    }
+                }
+                _ => {}
+            }
+        }
+        spans
+    }
+
+    /// Each painted card's height in rows, top to bottom — see
+    /// [`painted_card_spans`].
+    fn painted_card_heights(rendered: &str) -> Vec<usize> {
+        painted_card_spans(rendered)
+            .iter()
+            .map(|(top, bottom)| bottom - top + 1)
+            .collect()
+    }
+
+    /// How many rows sit blank between the last painted card and the stats bar
+    /// of a dashboard frame `frame_height` rows tall. The stats bar is the last
+    /// row of the dashboard area, which is the row above the 1-row hints bar —
+    /// `frame_height - 2` — exactly where `grid_012` reads it. `None` when no
+    /// card was painted at all.
+    fn blank_rows_above_stats_bar(rendered: &str, frame_height: usize) -> Option<usize> {
+        let (_, last_bottom) = *painted_card_spans(rendered).last()?;
+        Some((frame_height - 2).saturating_sub(last_bottom + 1))
+    }
+
+    /// Assert a dashboard frame painted all `n` roles with nothing scrolled away
+    /// (no `↑`/`↓` on the title row), its first column's cards at exactly
+    /// `heights`, and no blank row between the last card and the stats bar.
+    fn assert_deck_paints_full_column(
+        rendered: &str,
+        frame_height: usize,
+        n: usize,
+        heights: &[usize],
+    ) {
+        for i in 1..=n {
+            assert!(
+                rendered.contains(&format!("role{i}")),
+                "role{i} must be painted:\n{rendered}"
+            );
+        }
+        let title = rendered.lines().next().unwrap_or_default();
+        assert!(
+            !title.contains('↑') && !title.contains('↓'),
+            "no card may be scrolled away, got title {title:?}:\n{rendered}"
+        );
+        assert_eq!(
+            painted_card_heights(rendered),
+            heights,
+            "the first column's card heights:\n{rendered}"
+        );
+        assert_eq!(
+            blank_rows_above_stats_bar(rendered, frame_height),
+            Some(0),
+            "no blank row may sit between the last card and the stats bar:\n{rendered}"
+        );
+    }
+
+    /// Everything wrong with the painted sidebar column for `n` single-column
+    /// role cards given `avail` rows for cards (the title row, the stats-bar
+    /// row and the hints row add 3 to the frame height), as readable one-line
+    /// problems; empty when the column is exactly what the fork's division
+    /// paints. The expectation is the contract, restated from rendered rows:
+    /// no blank row before the stats bar, every card at least 3 rows, the
+    /// heights summing to `avail`, the leftover rows dealt to the first cards
+    /// as `even_row_heights` deals them, a 3-row card in the folded form (role
+    /// and `Dir:` on one row) and a taller card with `Dir:` on its own row.
+    /// Returns the rendered frame too, for the failure message.
+    fn sidebar_column_problems(n: usize, avail: usize) -> (Vec<String>, String) {
+        let frame_height = avail + 3;
+        let (rendered, _ui) = render_dashboard_grid(n, 39, frame_height as u16);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let spans = painted_card_spans(&rendered);
+        let heights = painted_card_heights(&rendered);
+        let expected: Vec<usize> = even_row_heights(n, avail as u16)
+            .unwrap_or_else(|| panic!("n={n} avail={avail}: at least one row per card"))
+            .into_iter()
+            .map(usize::from)
+            .collect();
+
+        let mut problems = Vec::new();
+        if heights.len() != n {
+            problems.push(format!("{} of {n} cards painted", heights.len()));
+        }
+        match blank_rows_above_stats_bar(&rendered, frame_height) {
+            Some(0) => {}
+            Some(blank) => problems.push(format!(
+                "{blank} blank row(s) between the last card and the stats bar"
+            )),
+            None => problems.push("no card painted".to_string()),
+        }
+        let stats_row = lines.get(frame_height - 2).copied().unwrap_or_default();
+        if !stats_row.trim_start().starts_with(&format!("{n} active")) {
+            problems.push(format!(
+                "the stats bar is not on row {} (found {stats_row:?})",
+                frame_height - 2
+            ));
+        }
+        if heights.iter().any(|&h| h < 3) {
+            problems.push("a card is shorter than 3 rows".to_string());
+        }
+        if heights.iter().sum::<usize>() != avail {
+            problems.push(format!(
+                "heights sum to {}, not the {avail} rows on offer",
+                heights.iter().sum::<usize>()
+            ));
+        }
+        if heights != expected {
+            problems.push(format!("heights are not the even division {expected:?}"));
+        }
+        for &(top, bottom) in &spans {
+            let card = &lines[top..=bottom];
+            // A card under 3 rows has no body row to inspect (and is already
+            // reported by the height checks above); skipping it keeps an
+            // out-of-range index from masking that report with a panic.
+            if card.len() < 3 {
+                continue;
+            }
+            let folded = card.len() == 3;
+            let ok = if folded {
+                card[1].contains("role") && card[1].contains("Dir:") && card[1].contains("tmp")
+            } else {
+                card[1].contains("role")
+                    && !card[1].contains("Dir:")
+                    && card[2].contains("Dir:")
+                    && card[2].contains("tmp")
+            };
+            if !ok {
+                problems.push(format!(
+                    "the {}-row card at rows {top}..={bottom} is not in its {} form: {card:?}",
+                    card.len(),
+                    if folded {
+                        "folded 3-row"
+                    } else {
+                        "Dir:-on-its-own-row"
+                    }
+                ));
+            }
+        }
+        (problems, rendered)
+    }
+
+    /// Scenario: Render a single-column sidebar of 6, 7, 8 and 11 role cards at
+    /// every height where the rows on offer are more than 3 per card but fewer
+    /// than 4 per card — the heights at which the 3-row Minimal tier is chosen
+    /// and used to leave a blank band above the stats bar. At each height the
+    /// column is full: no blank row sits between the last card and the stats
+    /// bar, no card is under 3 rows, the heights sum to the rows on offer with
+    /// the leftover rows going to the first cards, and a card dealt 4 rows keeps
+    /// its `Dir:` row apart while a 3-row card stays folded.
+    #[spec("dashboard/grid/014")]
+    #[test]
+    fn grid_014_minimal_tier_deals_leftover_rows_with_no_blank_band() {
+        let mut failures = Vec::new();
+        let mut first_frame = None;
+        let mut checked = 0usize;
+        for n in [6usize, 7, 8, 11] {
+            for avail in (3 * n + 1)..=(4 * n - 1) {
+                checked += 1;
+                let (problems, rendered) = sidebar_column_problems(n, avail);
+                if !problems.is_empty() {
+                    failures.push(format!("n={n} avail={avail}: {}", problems.join("; ")));
+                    if first_frame.is_none() {
+                        first_frame = Some(rendered);
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "BAND: {} of {checked} (cards, rows on offer) combinations strictly between 3 and 4 \
+             rows per card did not paint a full column:\n{}\nfirst failing frame:\n{}",
+            failures.len(),
+            failures.join("\n"),
+            first_frame.unwrap_or_default()
+        );
+    }
+
+    /// Scenario: Render the same single-column sidebar of 6, 7, 8 and 11 role
+    /// cards at exactly 3 rows per card (where the Minimal tier fits with no
+    /// leftover row) and at 4 rows per card up to just under Compact's 6 (where
+    /// the fork's own division deals the rows), and check the same full-column
+    /// contract as the band test. These heights were already correct, so they
+    /// pass before the band is fixed and show the failure is specific to the
+    /// rows strictly between 3 and 4 per card.
+    #[test]
+    fn grid_014_control_exact_fit_and_fork_division_leave_no_band() {
+        let mut failures = Vec::new();
+        for n in [6usize, 7, 8, 11] {
+            // 3n is Minimal's exact fit; 4n..6n-1 is the fork division (Compact,
+            // at 6 rows a card, fits from 6n and is not what this pins).
+            let rows = std::iter::once(3 * n).chain((4 * n)..=(6 * n - 1));
+            for avail in rows {
+                let (problems, rendered) = sidebar_column_problems(n, avail);
+                if !problems.is_empty() {
+                    failures.push(format!(
+                        "n={n} avail={avail}: {}\n{rendered}",
+                        problems.join("; ")
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "CONTROL: heights that never had a band must still paint a full column:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // PRD #76 M2.13: dashboard placeholder render-decision tests.
     //
     // `render_session_card` flips a single gate on `session.agent_type ==
@@ -42649,153 +42863,190 @@ mod tests {
         }
     }
 
-    /// Issue #1947: the orchestrator seat's card says so in its title; any
-    /// other card does not. At about 40 columns — a 120-column terminal's
-    /// default sidebar — with a long role name, Working status and a queued
-    /// message, the whole word stays and the name is what gets cut (A3).
-    #[test]
-    fn an_orchestrator_card_carries_the_orchestrator_badge() {
-        let render = |session: &SessionState, name: &str, width: u16, is_orchestrator: bool| {
-            let name = name.to_string();
-            let backend = ratatui::backend::TestBackend::new(width, 6);
-            let mut terminal = ratatui::Terminal::new(backend).unwrap();
-            terminal
-                .draw(|frame| {
-                    render_session_card(
-                        frame,
-                        frame.area(),
-                        session,
-                        0,
-                        false,
-                        Some(&name),
-                        Some(1),
-                        CardDensity::Compact,
-                        UiMode::Normal,
-                        None,
-                        false,
-                        false,
-                        Utc::now(),
-                        is_orchestrator,
-                    );
-                })
-                .unwrap();
-            buffer_to_string(terminal.backend().buffer())
-        };
-        // Upstream-sync round 29: upstream's title reads `<type> · <name> ` and its
-        // assertions cut the NAME to make room for the word. The fork's card puts
-        // the identity on a row of its own and leaves the type badge off by
-        // default (PRD fork#405 M1, fork #339; the fork tip's
-        // `render_dashboard__pane_004_card_title_row` snapshot pins the same
-        // layout), so the title is just ` 1 ` and the word almost always fits
-        // beside it. What this test pins is therefore the word's placement, not
-        // which of two title segments loses: the seat's card says
-        // ORCHESTRATOR once, whole, in the title or (where the title has no
-        // room) on a row of its own; any other card never does; the name stays
-        // whole on its own row.
-        let idle = make_session(SessionStatus::Idle);
-        let seat = render(&idle, "lead", 74, true);
-        let title = seat.lines().next().unwrap();
-        assert!(title.contains("ORCHESTRATOR"), "{seat}");
-        assert!(
-            seat.lines().nth(1).is_some_and(|row| row.contains("lead")),
-            "the name is on the first body row: {seat}"
-        );
-        assert!(!render(&idle, "lead", 74, false).contains("ORCHESTRATOR"));
+    /// Draw one card exactly as the deck draws it: `render_session_card` into a
+    /// `width`-wide buffer of `density`'s own height, returning its rows as
+    /// text.
+    fn card_text(
+        session: &SessionState,
+        name: &str,
+        width: u16,
+        density: CardDensity,
+        now: DateTime<Utc>,
+    ) -> String {
+        let name = name.to_string();
+        let backend = ratatui::backend::TestBackend::new(width, density.card_height());
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_card(
+                    frame,
+                    frame.area(),
+                    session,
+                    0,
+                    false,
+                    Some(&name),
+                    Some(1),
+                    density,
+                    UiMode::Normal,
+                    None,
+                    false,
+                    false,
+                    now,
+                );
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+    }
 
-        let mut busy = make_session(SessionStatus::Working);
+    /// An idle session in `/work/card-project`, its clock fixed to `now` so
+    /// `Last:` reads `2h` on every draw of it.
+    fn idle_card_session(now: DateTime<Utc>) -> SessionState {
+        let mut session = make_session(SessionStatus::Idle);
+        session.cwd = Some("/work/card-project".to_string());
+        session.started_at = now - chrono::Duration::hours(2);
+        session.last_activity = now - chrono::Duration::hours(2);
+        session
+    }
+
+    /// The same session mid-run, carrying every row a card can: Working, one
+    /// message queued, a prompt, one tool call and a tool count. A row a card
+    /// loses is then a row missing from the drawn text.
+    fn busy_card_session(now: DateTime<Utc>) -> SessionState {
+        let mut session = idle_card_session(now);
+        session.status = SessionStatus::Working;
+        session.tool_count = 7;
+        session.last_user_prompt = Some("plan the release".to_string());
         let inbox = crate::inbox_display::CardInbox {
             pending: 1,
             ..Default::default()
         };
-        let queued: AgentEvent = serde_json::from_value(serde_json::json!({
-            "session_id": "",
-            "agent_type": "claude_code",
-            "event_type": "notification",
-            "timestamp": Utc::now(),
-            "metadata": { crate::inbox_display::CARD_INBOX_METADATA_KEY: inbox.encode() },
-        }))
-        .unwrap();
-        busy.recent_events.push_back(queued);
-        let long = "orchestrator-with-a-very-long-role-name";
-        // Upstream pinned three widths (40, 41, 44) at which its title had room for
-        // the type, the name OR the word. The fork's title carries neither type
-        // nor name, so the width at which the word stops fitting beside the
-        // status badge and the queued-message badge is a different one; sweep
-        // the widths instead of restating a hand-computed threshold. At every
-        // width the word is drawn once and whole, a title that has no room for it
-        // is exactly the title the non-seat card draws, and the sweep must see
-        // BOTH placements or it proves nothing.
-        let (mut in_title, mut own_row) = (false, false);
-        for width in 20..=80u16 {
-            let card = render(&busy, long, width, true);
-            let plain = render(&busy, long, width, false);
+        for event in [
+            serde_json::json!({
+                "session_id": "",
+                "agent_type": "claude_code",
+                "event_type": "tool_start",
+                "tool_name": "Bash",
+                "tool_detail": "cargo build",
+                "timestamp": now,
+            }),
+            serde_json::json!({
+                "session_id": "",
+                "agent_type": "claude_code",
+                "event_type": "notification",
+                "timestamp": now,
+                "metadata": { crate::inbox_display::CARD_INBOX_METADATA_KEY: inbox.encode() },
+            }),
+        ] {
+            session
+                .recent_events
+                .push_back(serde_json::from_value::<AgentEvent>(event).unwrap());
+        }
+        session
+    }
+
+    /// Scenario: Draw a card named like an orchestrator role across every width from a 20-column sliver to 80 columns while it is Working with one message queued and a very long role name, then idle at 74 and 40 columns. The card names the role on its first body row, keeps its status word and inbox line in the title row, and `ORCHESTRATOR` appears nowhere on it. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
+    #[test]
+    fn a_role_card_names_its_role_and_never_says_orchestrator() {
+        let now = Utc::now();
+        // The idle card at a wide width (74 columns) and at a 40-column
+        // sidebar width, whose long role name must not be cut: the role is on a
+        // row of its own, so the title row never carries an ellipsis.
+        let idle = idle_card_session(now);
+        for (name, width) in [("lead", 74u16), ("coordinator", 40)] {
+            let card = card_text(&idle, name, width, CardDensity::Compact, now);
             let title = card.lines().next().unwrap();
-            // Upstream pinned that the status word and the queued-message badge
-            // survive beside the seat word at its three widths; the fork's title
-            // row (index, then the word where it fits, the status badge and the
-            // inbox line flush right) keeps that guarantee, so it is pinned at
-            // every width. `max_title` is what is left once the right-hand badge
-            // is paid for, so the word can take room only from the left, and the
-            // status word is never cut. The inbox line is the whole `✉1 queued`
-            // from 39 columns (`card_inbox_badge`: status 11 + line 10 + the two
-            // border cells + the 16 title columns it keeps for the words) and the
-            // bare count `✉1` below that, so `queued` is asserted from 40 (the
-            // first width of the issue's 40-column scenario, one column inside
-            // the threshold) and the count at every width.
+            assert!(!title.contains('…'), "{width}: {card}");
+            assert!(
+                card.lines().nth(1).is_some_and(|row| row.contains(name)),
+                "{width}: the role name is whole on the first body row: {card}"
+            );
+            assert!(
+                !card.contains("ORCHESTRATOR"),
+                "{width}: the card says ORCHESTRATOR: {card}"
+            );
+        }
+
+        // Working, one message queued, a long role name, at every width. The
+        // status word and the inbox line stay in the title row at every
+        // width: `max_title` is what is left once the right-hand badge is paid
+        // for, so the title can only give up room on the left and the status
+        // word is never cut. The inbox line is the whole `✉1 queued` from 39
+        // columns (`card_inbox_badge`: status 11 + line 10 + the two border
+        // cells + the 16 title columns it keeps for the words) and the bare
+        // count `✉1` below that, so `queued` is asserted from 40 (the first
+        // width of the 40-column sidebar scenario, one column inside the
+        // threshold) and the count at every width.
+        let busy = busy_card_session(now);
+        let long = "orchestrator-with-a-very-long-role-name";
+        for width in 20..=80u16 {
+            let card = card_text(&busy, long, width, CardDensity::Compact, now);
+            let title = card.lines().next().unwrap();
             assert!(title.contains("Working"), "{width}: {card}");
             assert!(title.contains("✉1"), "{width}: {card}");
             if width >= 40 {
                 assert!(title.contains("queued"), "{width}: {card}");
             }
-            assert_eq!(
+            // The role name is on the first body row. At 20 columns that row is
+            // 18 wide and the name is cut with `…`, so assert its leading word,
+            // which every width in the sweep keeps whole.
+            assert!(
                 card.lines()
-                    .filter(|line| line.contains("ORCHESTRATOR"))
-                    .count(),
-                1,
-                "{width}: the word is drawn once, whole: {card}"
+                    .nth(1)
+                    .is_some_and(|row| row.contains("orchestrator")),
+                "{width}: the role name is on the first body row: {card}"
             );
-            if title.contains("ORCHESTRATOR") {
-                in_title = true;
-            } else {
-                own_row = true;
-                // The title has no room for the word, so it takes a row of its
-                // own, whole, and the title cuts only what it cut before.
-                assert_eq!(title, plain.lines().next().unwrap(), "{width}: {card}");
-                assert_eq!(
-                    card.lines()
-                        .filter(|line| line.contains("│ORCHESTRATOR "))
-                        .count(),
-                    1,
-                    "{width}: {card}"
-                );
-            }
-            assert!(!plain.contains("ORCHESTRATOR"), "{width}: {plain}");
+            // The symptom itself: the word, anywhere on the card.
+            assert!(
+                !card.contains("ORCHESTRATOR"),
+                "{width}: the card says ORCHESTRATOR: {card}"
+            );
         }
+    }
+
+    /// Scenario: Draw a session at every card density and every width from 20 to 100 columns, once idle and once mid-run with a prompt, a tool call, a directory and a queued message. `ORCHESTRATOR` appears on none of those cards; a 24-column mid-run Compact card shows its `Dir:`, `Prmt:` and tool rows, and a 20-column Minimal card keeps its `Dir:` on the role row. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
+    #[test]
+    fn a_card_keeps_its_dir_prompt_and_tool_rows_and_never_says_orchestrator() {
+        let now = Utc::now();
+        let idle = idle_card_session(now);
+        let busy = busy_card_session(now);
+
+        // Anchors first, on the two cards with the least room. A 24-column
+        // Compact card has inner height 4 (role, `Dir:`, prompt, tool), so a
+        // fifth row, such as a marker row, would cost it its prompt. A Minimal
+        // card has one content row, the role with `Dir:` folded onto it, and a
+        // marker row would take `Dir:`'s place.
+        let compact = card_text(&busy, "lead", 24, CardDensity::Compact, now);
+        for row in ["Dir:", "Prmt:", "Bash"] {
+            assert!(
+                compact.contains(row),
+                "the 24-column Compact card keeps its {row} row: {compact}"
+            );
+        }
+        let minimal = card_text(&idle, "lead", 20, CardDensity::Minimal, now);
         assert!(
-            in_title && own_row,
-            "the sweep must reach the word in the title (in_title={in_title}) and on a row of \
-             its own (own_row={own_row})"
+            minimal
+                .lines()
+                .nth(1)
+                .is_some_and(|row| row.contains("Dir:")),
+            "the 20-column Minimal card keeps its Dir: on the role row: {minimal}"
         );
 
-        // CI red on PR #1956: a 40-column sidebar card must not cut the role name
-        // to fit the word. Under the fork's layout the name is on its own row, so
-        // it stays whole whichever way the word is placed.
-        let card = render(&idle, "coordinator", 40, true);
-        let title = card.lines().next().unwrap();
-        assert!(!title.contains('…'), "{card}");
-        assert!(
-            card.lines()
-                .nth(1)
-                .is_some_and(|row| row.contains("coordinator")),
-            "{card}"
-        );
-        assert_eq!(
-            card.lines()
-                .filter(|line| line.contains("ORCHESTRATOR"))
-                .count(),
-            1,
-            "{card}"
-        );
+        for density in [
+            CardDensity::Minimal,
+            CardDensity::Compact,
+            CardDensity::Normal,
+            CardDensity::Spacious,
+        ] {
+            for (kind, session) in [("idle", &idle), ("mid-run", &busy)] {
+                for width in 20..=100u16 {
+                    let card = card_text(session, "lead", width, density, now);
+                    assert!(
+                        !card.contains("ORCHESTRATOR"),
+                        "{density:?}, {kind}, {width} columns: the card says ORCHESTRATOR: {card}"
+                    );
+                }
+            }
+        }
     }
 
     /// An OpenCode card carrying the daemon's agent notice `notice` (beside a
@@ -42840,7 +43091,6 @@ mod tests {
                     false,
                     false,
                     Utc::now(),
-                    false,
                 );
             })
             .unwrap();
@@ -43660,10 +43910,17 @@ mod tests {
 
     /// Issue #1568: Minimal is taken only when Compact fails at EVERY column
     /// count the width allows, so it replaces scrolling and never Compact.
+    ///
+    /// Issue #858: where Minimal is what the deck paints, the rows on offer
+    /// beyond 3 per card are dealt over the cards rather than left blank above
+    /// the stats bar. That is asserted on the painted frame (the fork's even
+    /// division, `even_row_heights`), so it holds whichever of the chooser and
+    /// the render site spreads the rows; the tier `choose_grid_layout` returns
+    /// at those inputs is asserted directly alongside it.
     #[test]
     fn choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere() {
         // 90 columns allows two card columns. 25 rows: one column of Compact
-        // misses (35) but two fit (20). One column of Minimal (21) would fit too,
+        // misses (42) but two fit (24). One column of Minimal (21) would fit too,
         // and must not be preferred over the layout this deck already had.
         assert_eq!(
             choose_grid_layout(7, 90, 25),
@@ -43673,7 +43930,11 @@ mod tests {
             }
         );
 
-        // 79 columns holds one card column. 23 rows: Compact needs 35, Minimal 21.
+        // 79 columns holds one card column. 23 rows: Compact needs 42, Minimal 21,
+        // so every card is painted rather than scrolled. The 2 rows beyond
+        // Minimal's 21 go to the first two cards, filling the column to the stats
+        // bar: 23 / 7 = 3 remainder 2. The tier itself is the chooser's own
+        // answer, asserted directly as well as through the painted frame.
         assert_eq!(
             choose_grid_layout(7, 79, 23),
             GridLayout {
@@ -43681,9 +43942,12 @@ mod tests {
                 density: CardDensity::Minimal
             }
         );
+        let (rendered, _ui) = render_dashboard_grid(7, 79, 26);
+        assert_deck_paints_full_column(&rendered, 26, 7, &[4, 4, 3, 3, 3, 3, 3]);
 
-        // 90 columns, 14 rows: Compact needs 20 even at two columns; Minimal needs
-        // 21 at one column and 12 at two, so the deck widens to stay complete.
+        // 90 columns, 14 rows: Compact needs 24 even at two columns; Minimal needs
+        // 21 at one column and 12 at two, so the deck widens to stay complete. Its
+        // four rows of cards share the 14 rows: 14 / 4 = 3 remainder 2.
         assert_eq!(
             choose_grid_layout(7, 90, 14),
             GridLayout {
@@ -43691,6 +43955,8 @@ mod tests {
                 density: CardDensity::Minimal
             }
         );
+        let (rendered, _ui) = render_dashboard_grid(7, 90, 17);
+        assert_deck_paints_full_column(&rendered, 17, 7, &[4, 4, 3, 3]);
 
         // 79 columns, 20 rows: not even Minimal fits (21), so the deck scrolls at
         // Compact exactly as it did before Minimal existed.
@@ -43708,6 +43974,11 @@ mod tests {
     /// that division keeps every card's `Dir:` row apart. Where Minimal would fit
     /// but the division deals every card at least `MIN_UNFOLDED_CARD_ROWS`, the
     /// Compact fallback is returned and the render site divides.
+    ///
+    /// Issue #858: one row fewer and the division deals a card 3 rows, the folded
+    /// card; the painted frame is then the same division with the folded card at
+    /// the bottom and the column still full (see
+    /// `choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere`).
     #[test]
     fn choose_grid_layout_leaves_the_fork_division_where_it_keeps_dir_rows() {
         let fallback = GridLayout {
@@ -43720,7 +43991,8 @@ mod tests {
         // 28 rows is the first height that deals all seven cards four rows...
         assert_eq!(choose_grid_layout(7, 79, 28), fallback);
         // ...and 27 deals the last card three, which is where the fork's own card
-        // would fold `Dir:` too, so Minimal stands.
+        // would fold `Dir:` too: six 4-row cards and one 3-row card, no blank row
+        // left above the stats bar. The chooser still takes Minimal here.
         assert_eq!(
             choose_grid_layout(7, 79, 27),
             GridLayout {
@@ -43728,9 +44000,13 @@ mod tests {
                 density: CardDensity::Minimal
             }
         );
+        let (rendered, _ui) = render_dashboard_grid(7, 79, 30);
+        assert_deck_paints_full_column(&rendered, 30, 7, &[4, 4, 4, 4, 4, 4, 3]);
         // The division runs at the WIDEST column count, not the one Minimal would
         // have fitted at: 90 columns widens to two, four rows of four.
         assert_eq!(choose_grid_layout(7, 90, 16), fallback);
+        // One row fewer (15) deals the last of the four card rows 3 rows, and the
+        // chooser takes Minimal at the two columns it fitted at.
         assert_eq!(
             choose_grid_layout(7, 90, 15),
             GridLayout {
@@ -43738,6 +44014,8 @@ mod tests {
                 density: CardDensity::Minimal
             }
         );
+        let (rendered, _ui) = render_dashboard_grid(7, 90, 18);
+        assert_deck_paints_full_column(&rendered, 18, 7, &[4, 4, 4, 3]);
         // The boundary is Minimal's own height plus the `Dir:` row it folds.
         assert_eq!(
             MIN_UNFOLDED_CARD_ROWS,

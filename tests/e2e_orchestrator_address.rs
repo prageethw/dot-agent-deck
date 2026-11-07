@@ -472,12 +472,16 @@ fn orchestration_roles_001_lists_seats_and_filters() {
     }
 }
 
-/// Scenario: Open a two-role orchestration with a long start-role name, Working status and a queued inbox at both 220 and 120 terminal columns using the default sidebar width. The orchestrator's live card shows the full ORCHESTRATOR word while the worker's card carries none.
+/// Scenario: Open a two-role orchestration with a long start-role name, Working status and a queued inbox at both 220 and 120 terminal columns using the default sidebar width. The orchestrator's live card names its role and shows its Working status and queued inbox line, the worker's card names its role, and no row of the sidebar carries an ORCHESTRATOR badge.
 #[spec("orchestration/roles/002")]
 #[test]
-fn orchestration_roles_002_sidebar_marks_only_orchestrator() {
+fn orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge() {
+    // The seat's role name is long on purpose: at 120 columns the 40-column
+    // sidebar cuts it with `…`, so assert on a leading stretch of it.
+    const LEADER: &str = "orchestrator-with-a-very-long-role-name";
+    const LEADER_SHOWN: &str = "orchestrator-with-a-very";
     for cols in [120, 220] {
-        let fixture = AddressDeck::with_sidebar(cols, "orchestrator-with-a-very-long-role-name");
+        let fixture = AddressDeck::with_sidebar(cols, LEADER);
         fixture.deck.send_keys(b"\x0e");
         fixture.deck.send_keys(b" ");
         fixture.deck.wait_for_string("No mode");
@@ -486,38 +490,39 @@ fn orchestration_roles_002_sidebar_marks_only_orchestrator() {
         fixture.deck.send_keys(b"\r");
         assert!(common::wait_until(WAIT, || fixture.records().len() == 2));
         let sidebar_width = usize::from(cols) * 34 / 100;
-        fixture
-            .deck
-            .wait_until_grid("orchestrator card badge", |grid| {
-                let sidebar: Vec<String> = grid
-                    .lines()
-                    .map(|line| line.chars().take(sidebar_width).collect())
-                    .collect();
-                let worker = sidebar
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, line)| line.starts_with(['┏', '┌']))
-                    .nth(1)
-                    .map(|(index, _)| index);
-                worker.is_some_and(|worker| {
+        let sidebar_of = |grid: &str| -> Vec<String> {
+            grid.lines()
+                .map(|line| line.chars().take(sidebar_width).collect())
+                .collect()
+        };
+        let card_tops = |sidebar: &[String]| -> Vec<usize> {
+            sidebar
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.starts_with(['┏', '┌']))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        // Wait for the whole card to be drawn (role names, status and inbox
+        // line), so the absence of a badge below is read off a settled card and
+        // not off a frame the card has not reached yet.
+        fixture.deck.wait_until_grid(
+            "both role cards with the leader Working and queued",
+            |grid| {
+                let sidebar = sidebar_of(grid);
+                let tops = card_tops(&sidebar);
+                tops.get(1).is_some_and(|&worker| {
                     let leader = sidebar[..worker].join("\n");
-                    leader.contains("ORCHESTRATOR")
+                    leader.contains(LEADER_SHOWN)
                         && leader.contains("Working")
                         && leader.contains("queued")
-                        && sidebar.join("\n").matches("ORCHESTRATOR").count() == 1
+                        && sidebar[worker..].join("\n").contains("worker")
                 })
-            });
+            },
+        );
         let grid = fixture.deck.snapshot_grid();
-        let sidebar: Vec<String> = grid
-            .lines()
-            .map(|line| line.chars().take(sidebar_width).collect())
-            .collect();
-        let cards: Vec<_> = sidebar
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.starts_with(['┏', '┌']))
-            .map(|(index, _)| index)
-            .collect();
+        let sidebar = sidebar_of(&grid);
+        let cards = card_tops(&sidebar);
         assert_eq!(
             cards.len(),
             2,
@@ -526,18 +531,18 @@ fn orchestration_roles_002_sidebar_marks_only_orchestrator() {
         let (leader, worker) = (cards[0], cards[1]);
         let leader_card = sidebar[leader..worker].join("\n");
         assert!(
-            leader_card.contains("Working") && leader_card.contains("queued"),
-            "expected Working status and queued inbox at {cols} columns\n{grid}"
+            leader_card.contains(LEADER_SHOWN)
+                && leader_card.contains("Working")
+                && leader_card.contains("queued"),
+            "the orchestrator's card names its role and shows Working and queued at {cols} columns\n{grid}"
         );
         assert!(
-            sidebar[leader..worker]
-                .iter()
-                .any(|l| l.contains("ORCHESTRATOR")),
-            "badge belongs on the orchestrator card\n{grid}"
+            sidebar[worker..].iter().any(|l| l.contains("worker")),
+            "the worker's card names its role at {cols} columns\n{grid}"
         );
         assert!(
-            !sidebar[worker..].iter().any(|l| l.contains("ORCHESTRATOR")),
-            "worker must not have the badge\n{grid}"
+            !sidebar.iter().any(|l| l.contains("ORCHESTRATOR")),
+            "no sidebar card carries an ORCHESTRATOR badge at {cols} columns\n{grid}"
         );
     }
 }

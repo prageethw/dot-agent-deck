@@ -8305,13 +8305,17 @@ fn card_rows<'a>(rendered: &'a str, name: &str) -> Vec<&'a str> {
 }
 
 /// Scenario: Render the seven-role orchestration into a 79-column deck — one
-/// column, since 79 columns cannot hold two cards — that is 25 rows tall, too
+/// column, since 79 columns cannot hold two cards — that is 23 rows tall, too
 /// short for seven 6-row Compact cards (the fork's Compact card carries the
-/// identity row, so it is one taller than upstream's 5). Every card is drawn at
-/// 3 rows with its status on the top border, its role and `Dir:` folded onto
-/// the one body row, and `Last:` / `Tools:` counters on the bottom border, and
-/// nothing scrolls. A 44-row control deck, where Compact fits, still draws every
-/// card at Compact's 6 rows.
+/// identity row, so it is one taller than upstream's 5) and exactly tall enough
+/// for seven 3-row Minimal ones. Every card is drawn at 3 rows with its status
+/// on the top border, its role and `Dir:` folded onto the one body row, and
+/// `Last:` / `Tools:` counters on the bottom border, and nothing scrolls. A
+/// 44-row control deck, where Compact fits, still draws every card at Compact's
+/// 6 rows. A 25-row deck, two rows more than Minimal needs, deals those two rows
+/// to the first two cards (4,4,3,3,3,3,3) rather than leaving a blank band above
+/// the stats bar (issue #858); the 4-row cards keep `Dir:` on its own row and the
+/// 3-row cards stay folded.
 #[spec("dashboard/density/006")]
 #[test]
 fn density_006_minimal_cards_replace_scrolling_when_compact_cannot_fit() {
@@ -8337,8 +8341,11 @@ fn density_006_minimal_cards_replace_scrolling_when_compact_cannot_fit() {
     );
     insta::assert_snapshot!("density_006_compact_control", control);
 
-    // 25 rows leaves 23: seven Compact cards need 42, seven Minimal cards 21.
-    let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
+    // 23 rows leaves 21: seven Compact cards need 42, seven Minimal cards exactly
+    // 21, so there is no leftover row to deal and every card is 3 rows. (This was
+    // 25 rows until issue #858: two spare rows over Minimal's 21 are dealt over
+    // the cards below, not left blank, so the 3-row snapshot needs the exact fit.)
+    let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 23);
     let rendered = buffer_to_text(&buffer);
     let title = rendered.lines().next().expect("a rendered title row");
 
@@ -8375,13 +8382,65 @@ fn density_006_minimal_cards_replace_scrolling_when_compact_cannot_fit() {
         );
     }
     insta::assert_snapshot!("density_006_minimal", rendered);
+
+    // Issue #858: 25 rows leaves 23, two more than seven Minimal cards need. The
+    // two spare rows are dealt to the first two cards the way the fork's even
+    // division deals them (23 / 7 = 3 remainder 2), so the column runs to the
+    // stats-bar row with no blank band: the first two cards are 4 rows, the rest 3.
+    let (band_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
+    let band = buffer_to_text(&band_buffer);
+    let expected_rows = [4usize, 4, 3, 3, 3, 3, 3];
+    assert_eq!(
+        single_column_card_heights(&band),
+        expected_rows.to_vec(),
+        "the 2 rows beyond Minimal's 21 must go to the first two cards, not to a blank band:\n{band}"
+    );
+    assert!(
+        !band.lines().next().unwrap_or_default().contains('↓'),
+        "no card may be hidden:\n{band}"
+    );
+    // Row 0 is the title and rows 1..=23 are the cards; row 24 is the stats-bar
+    // row this seam reserves but does not draw. The last card's bottom border
+    // sits on row 23, directly above it, with no blank row between.
+    let last_card_row = band.lines().nth(23).unwrap_or_default();
+    assert!(
+        last_card_row.starts_with('└') || last_card_row.starts_with('┗'),
+        "the last card's bottom border must be the row above the stats bar, got {last_card_row:?}:\n{band}"
+    );
+    for (role, rows) in REPORTED_ROLES.iter().zip(expected_rows) {
+        let card = card_rows(&band, role);
+        assert_eq!(card.len(), rows, "{role}: expected {rows} rows:\n{band}");
+        assert!(
+            card[0].contains("Idle"),
+            "{role}: the top border keeps the status badge:\n{band}"
+        );
+        assert!(
+            card[rows - 1].contains("Last:") && card[rows - 1].contains("Tools:"),
+            "{role}: the bottom border keeps its counters:\n{band}"
+        );
+        if rows == 3 {
+            assert!(
+                card[1].contains(role) && card[1].contains("Dir: dot-agent-deck"),
+                "{role}: a 3-row card stays folded, role and Dir: on one row:\n{band}"
+            );
+        } else {
+            assert!(
+                card[1].contains(role) && !card[1].contains("Dir:"),
+                "{role}: a card dealt 4 rows keeps its role row to itself:\n{band}"
+            );
+            assert!(
+                card[2].contains("Dir:") && card[2].contains("dot-agent-deck"),
+                "{role}: a card dealt 4 rows keeps its Dir: row apart:\n{band}"
+            );
+        }
+    }
 }
 
-/// Scenario: Render the seven-role deck at the Minimal height with the second
-/// role Blocked on depleted credits and the third orphaned. Each of those two
-/// cards shows its status row where the `Dir:` row would be, because a 3-row
-/// card has no spare row and the status matters more than the directory; the
-/// other five cards keep their `Dir:` row.
+/// Scenario: Render the seven-role deck at the Minimal height (a 79x23 deck,
+/// exactly seven 3-row cards) with the second role Blocked on depleted credits
+/// and the third orphaned. Each of those two cards shows its status row where
+/// the `Dir:` row would be, because a 3-row card has no spare row and the status
+/// matters more than the directory; the other five cards keep their `Dir:` row.
 #[spec("dashboard/density/007")]
 #[test]
 fn density_007_minimal_status_row_takes_the_dir_rows_place() {
@@ -8396,7 +8455,10 @@ fn density_007_minimal_status_row_takes_the_dir_rows_place() {
     sessions[2].orchestration_orphaned = true;
     let cards = as_cards(&sessions);
 
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
+    // 23 rows leaves 21, exactly seven Minimal cards. At 25 rows (until issue
+    // #858) the two spare rows are now dealt to the first two cards, which would
+    // make the Blocked card a 4-row card and leave the 3-row fold unexercised.
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 23);
     let rendered = buffer_to_text(&buffer);
     assert_eq!(
         single_column_card_heights(&rendered),
@@ -8435,6 +8497,119 @@ fn density_007_minimal_status_row_takes_the_dir_rows_place() {
         );
     }
     insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Render the seven-role deck into a 79x25 deck, two rows beyond the 21
+/// that seven 3-row Minimal cards need, so the first two cards are dealt a fourth
+/// row (issue #858). The first card is Idle with a background command left running
+/// and the second is Blocked on a usage limit with the same background command.
+/// Each 4-row card draws its role row and then ONE status row in the place of its
+/// `Dir:` row: the Idle card its `Background:` line, the Blocked card its reason
+/// and the `Background:` line merged onto the one row after ` · `. The five 3-row
+/// cards stay folded with `Dir:` beside the role.
+#[spec("dashboard/density/010")]
+#[test]
+fn density_010_four_row_minimal_card_shows_its_status_row_in_place_of_dir() {
+    let now = render_now();
+    let hydrate = |snapshot: serde_json::Value, role: &str| -> SessionState {
+        let snapshot: SessionSnapshot = serde_json::from_value(snapshot).unwrap();
+        let mut state = AppState::default();
+        state.register_pane(format!("pane-{role}"));
+        state.seed_hydrated_session(
+            format!("pane-{role}"),
+            None,
+            None,
+            None,
+            Some(&snapshot),
+            None,
+        );
+        let mut session = state.sessions.values().next().unwrap().clone();
+        session.display_name = Some(role.to_string());
+        session.cwd = Some("/home/dev/dot-agent-deck".to_string());
+        session
+    };
+    let background = serde_json::json!({
+        "commands": 1, "subagents": 0, "since_ms": now.timestamp_millis() - 240_000,
+    });
+
+    let mut sessions = reported_role_sessions();
+    sessions[0] = hydrate(
+        serde_json::json!({
+            "status": "Idle", "agent_type": "claude_code", "tool_count": 0,
+            "last_activity_ms": now.timestamp_millis(),
+            "background": background, "background_revision": 1,
+        }),
+        REPORTED_ROLES[0],
+    );
+    sessions[1] = hydrate(
+        serde_json::json!({
+            "status": "Blocked", "agent_type": "claude_code", "tool_count": 0,
+            "last_activity_ms": now.timestamp_millis(),
+            "blocked": {"kind": "usage_limit", "detected_at_ms": now.timestamp_millis()},
+            "background": background, "background_revision": 1,
+        }),
+        REPORTED_ROLES[1],
+    );
+    let cards = as_cards(&sessions);
+
+    // 25 rows leaves 23: seven Minimal cards need 21, so the two spare rows go to
+    // the first two cards (23 / 7 = 3 remainder 2) and those two cards are 4 rows.
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
+    let rendered = buffer_to_text(&buffer);
+    assert_eq!(
+        single_column_card_heights(&rendered),
+        vec![4, 4, 3, 3, 3, 3, 3],
+        "the fixture must put the two status cards in the 4-row Minimal band:\n{rendered}"
+    );
+
+    // A 4-row card has two inner rows: the role row and one more. The status row
+    // takes that one, so `Dir:` has no room (`fit_card_rows`: a status row is
+    // never shed, `Dir:` is the first thing that is).
+    let idle = card_rows(&rendered, REPORTED_ROLES[0]);
+    assert_eq!(idle.len(), 4, "a 4-row card:\n{rendered}");
+    assert!(
+        idle[1].contains(REPORTED_ROLES[0]) && !idle[1].contains("Dir:"),
+        "the role row stands alone on a 4-row card:\n{rendered}"
+    );
+    assert!(
+        idle[2].contains("Background: 1 command · 4m") && !idle[2].contains('⚠'),
+        "the Background line takes the Dir row's place on an Idle card:\n{rendered}"
+    );
+    assert!(
+        idle.iter().all(|row| !row.contains("Dir:")),
+        "no row of the card shows Dir:\n{rendered}"
+    );
+
+    let blocked = card_rows(&rendered, REPORTED_ROLES[1]);
+    assert_eq!(blocked.len(), 4, "a 4-row card:\n{rendered}");
+    assert!(
+        blocked[0].contains("Blocked"),
+        "the Blocked badge stays on the top border:\n{rendered}"
+    );
+    assert!(
+        blocked[1].contains(REPORTED_ROLES[1]) && !blocked[1].contains("Dir:"),
+        "the role row stands alone on a 4-row card:\n{rendered}"
+    );
+    assert!(
+        blocked[2].contains("⚠ Usage limit reached · Background: 1 command · 4m"),
+        "the reason and the Background line share the one status row:\n{rendered}"
+    );
+    assert!(
+        blocked.iter().all(|row| !row.contains("Dir:")),
+        "no row of the card shows Dir:\n{rendered}"
+    );
+    assert!(
+        blocked[3].contains("Last:") && blocked[3].contains("Tools:"),
+        "the bottom border keeps its counters:\n{rendered}"
+    );
+
+    // The other five cards are the 3-row folded form, unchanged by the two above.
+    for role in REPORTED_ROLES.iter().skip(2) {
+        assert!(
+            card_rows(&rendered, role)[1].contains("Dir: dot-agent-deck"),
+            "{role}: a 3-row card keeps Dir: folded beside its role:\n{rendered}"
+        );
+    }
 }
 
 /// Scenario: Render the seven-role deck into a 79x20 deck, too short for seven
