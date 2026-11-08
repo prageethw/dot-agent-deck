@@ -8179,7 +8179,7 @@ without depending on the config struct API.
 ##### orchestration/roles/002 — The live orchestration sidebar draws the orchestrator seat's card without an ORCHESTRATOR badge (fork preference, issue #859; reverses upstream's card badge from #1947 for the TUI only).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge`).
 - **Agent:** none; identity-recording Python probes standing in for interactive agents.
-- **Asserts:** with a long start-role name, Working status and a queued inbox badge, at 220 terminal columns with the default sidebar width and then, on the same deck, at 120, the live orchestrator card names its role (a leading stretch of the long name, which the 40-column sidebar cuts with `…`), shows Working and never carries an inbox line in its top border; it shows the queued inbox line after the name at 220 columns, and at 120 the long name fills the name row and keeps it, so the card carries no inbox line at all (issue #868). The 120-column absence is read only after the 220-column pass has seen `queued` on that same card, and after the wait for the 120-column redraw (the name cut with `…`), so it cannot pass before the inbox state reached the card or off the previous width's frame. The worker card names its role, and no row of the sidebar contains the word ORCHESTRATOR.
+- **Asserts:** with a long start-role name, Working status and a queued inbox badge, at 220 terminal columns with the default sidebar width and then, on the same deck, at 120, the live orchestrator card names its role (a leading stretch of the long name), shows Working and never carries an inbox line in its top border; it shows the queued inbox line after the name at 220 columns, and at 120 the whole name fills the name row of the narrower card against its right border and keeps it, so the card carries no inbox line at all (issue #868). The 120-column absence is read only after the 220-column pass has seen `queued` on that same card, and after the wait for the 120-column redraw (a name row on which the whole name is followed at once by the card's right border, which the 220-column layout cannot show because the cell after the name there is a space), so it cannot pass before the inbox state reached the card or off the previous width's frame. The worker card names its role, and no row of the sidebar contains the word ORCHESTRATOR.
 - **Does not assert:** the `roles` command's ORCHESTRATOR column (`orchestration/roles/001`, which stays), the desktop app's badge, the daemon-side orchestrator lookup, pane-border titles, or card row accounting at each density (the L1 tests `a_role_card_names_its_role_and_never_says_orchestrator` and `a_card_keeps_its_dir_prompt_and_tool_rows_and_never_says_orchestrator` in `src/ui.rs` draw an ordinary card through `render_session_card` alone, and carry no catalog id).
 
 #### orchestration/address
@@ -14280,7 +14280,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render of the three-row Minimal card (issue #847's folded row) that is orphaned, with two messages queued.
 - **Agent:** none.
 - **Asserts:** beside a 14-column name the `Orphaned — delegation unavailable` reason (33 columns) is shown whole from 51 columns, which is the exact room it needs alone, and the inbox line is dropped (no bare count either) at 61 columns and below, where line and reason together do not fit whole; at 31 columns the row is `payments-agent  Orphaned — d…` where the line used to leave it `O…`; at 20 columns, where the bare `✉2` fits the row, the reason still takes the room and reads `O…`; the same card with no reason keeps `payments-agent  ✉2 queued`.
-- **Does not assert:** a Blocked or background-work reason (the same row, the same rule), or the cards taller than three rows, where the reason has a row of its own.
+- **Does not assert:** a Blocked reason or a delivery failure (the same row, the same rule; `inbox/status/037` pins an inbox notice and the reason merged with background work), background work alone, which does not outrank the line (`inbox/status/037`), or the cards taller than three rows, where the reason has a row of its own.
 - **Platform coverage:** all.
 
 ##### inbox/status/036 — A reason that fits whole beside the inbox line keeps both on the three-row card (fork preference, issue #868).
@@ -14288,6 +14288,13 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Agent:** none.
 - **Asserts:** with a 14-column and a 4-column name, the row reads name, `✉2 queued`, then the whole `Orphaned — delegation unavailable` from the exact fit (62 and 52 columns wide) up, and one column narrower (61 and 51) the line goes and the reason stays whole.
 - **Does not assert:** the reason cut short (`inbox/status/035`), or the row without a reason (`inbox/status/033`).
+- **Platform coverage:** all.
+
+##### inbox/status/037 — Background work does not outrank the inbox line on the three-row card (fork preference, issue #868).
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render of the three-row Minimal card (issue #847's folded row), Idle, with one background command left running (`Background: 1 command · 4m`, 26 columns).
+- **Agent:** none.
+- **Asserts:** with two messages queued beside a 14-column name, the row reads `payments-agent  ✉2 queued  Background: 1 command · 4m` from 55 columns, the background row is cut with `…` at 54 and to `B…` at 31 while the line stays; with a stalled wake the whole `✉1 waiting to wake: send it a prompt` stays beside `lead` and the background row follows it whole at 72 columns and cut at 71, and beside the 14-column name the bare `✉1` takes the line's place and the background row keeps the 20 columns left; the same card orphaned (the reason merged with the background line, 62 columns) keeps the line at 91 columns and drops it at 90, and a card with an inbox notice (84 columns) does the same at 106 and 105.
+- **Does not assert:** the reason's own cut (`inbox/status/035`), or the taller cards, where the status row has a row of its own.
 - **Platform coverage:** all.
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.

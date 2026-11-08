@@ -797,6 +797,24 @@ fn status_012_card_says_a_stalled_wake_and_what_to_do() {
 /// items, the integration notice, failed receipts, paused hand-outs) beside
 /// one fetched message, rendered at the Normal density's 80 columns.
 fn inbox_notice_card(notices: serde_json::Value) -> String {
+    let session = inbox_notice_session(notices);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    buffer_to_text(&buffer)
+}
+
+/// The session behind [`inbox_notice_card`]: `notices` beside one fetched
+/// message, hydrated through the daemon's record/resync seam.
+fn inbox_notice_session(notices: serde_json::Value) -> SessionState {
     let session = card_stats_session("/home/dev/api-svc");
     let mut inbox = serde_json::json!({
         "queued": 0, "fetched": 1, "undeliverable": 0,
@@ -815,19 +833,7 @@ fn inbox_notice_card(notices: serde_json::Value) -> String {
     state.register_pane("pane-card-stats".to_string());
     state.sessions.insert(session.session_id.clone(), session);
     state.resync_after_event_gap(&[record]);
-    let session = state.sessions.remove("sess-card-stats").unwrap();
-    let buffer = render_card_to_buffer(
-        &session,
-        Some("api-svc"),
-        Some(1),
-        CardDensityKind::Normal,
-        0,
-        render_now(),
-        false,
-        80,
-        CardDensityKind::Normal.rendered_height(),
-    );
-    buffer_to_text(&buffer)
+    state.sessions.remove("sess-card-stats").unwrap()
 }
 
 fn attention_item(id: &str, kind: &str) -> serde_json::Value {
@@ -1590,6 +1596,150 @@ fn status_036_reason_that_fits_whole_keeps_the_inbox_line_beside_it() {
             card_row_inner(&buffer, 1),
             expected,
             "{name:?} at {width} columns:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+}
+
+/// `session` with one background command left running four minutes before
+/// `render_now()`, as the daemon's aggregate reaches a card: an event carrying
+/// it at revision 1, which the card reads as `Background: 1 command · 4m` (26
+/// columns).
+fn with_background_command(mut session: SessionState) -> SessionState {
+    let event: AgentEvent = serde_json::from_value(serde_json::json!({
+        "session_id": session.session_id,
+        "agent_type": "claude_code",
+        "event_type": "notification",
+        "timestamp": render_now(),
+        "background": {
+            "commands": 1,
+            "subagents": 0,
+            "since_ms": render_now().timestamp_millis() - 240_000
+        },
+        "background_revision": 1,
+    }))
+    .expect("an event carrying the daemon's background aggregate");
+    session.recent_events.push_back(event);
+    session
+}
+
+/// Scenario: Draw a three-row Minimal card that is Idle with an inbox line (two messages queued, or one stalled wake) and one background command left running, whose `Background: 1 command · 4m` row is the only status row. Background work does not outrank the inbox line: the row reads name, inbox line, then the background row in what is left, cut with `…` as it would be anyway, and an inbox line too long for the name row gives way to its bare count while the background row keeps the rest. The same card orphaned, where the status row is the reason merged with the background line, or carrying an inbox notice, drops the inbox line from the width at which the whole row no longer fits after it.
+#[spec("inbox/status/037")]
+#[test]
+fn status_037_background_work_does_not_outrank_the_inbox_line() {
+    let mut queued = inbox_card_session(1, 1, false);
+    queued.status = SessionStatus::Idle;
+    let queued = with_background_command(queued);
+    // 14 + 2 + 9 = 25 inner columns for the name and `✉2 queued`, then the
+    // 2-column gap and the 26-column background row: 53 whole.
+    for (width, expected) in [
+        (55, "payments-agent  ✉2 queued  Background: 1 command · 4m"),
+        (54, "payments-agent  ✉2 queued  Background: 1 command · …"),
+        (31, "payments-agent  ✉2 queued  B…"),
+    ] {
+        let buffer = inbox_row_card(
+            &queued,
+            Some("payments-agent"),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            buffer.area().height,
+            3,
+            "the Minimal card is three rows tall"
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns, two queued:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+
+    let mut stalled = inbox_card_session_with(1, 0, false, true);
+    stalled.status = SessionStatus::Idle;
+    let stalled = with_background_command(stalled);
+    // `✉1 waiting to wake: send it a prompt` is 36 columns: 4 + 2 + 36 + 2 + 26
+    // = 70 whole beside `lead`. Beside the 14-column name it does not fit a
+    // 40-column row, so the bare `✉1` takes its place and the background row
+    // keeps the 20 columns that are left.
+    for (name, width, expected) in [
+        (
+            "lead",
+            72,
+            "lead  ✉1 waiting to wake: send it a prompt  Background: 1 command · 4m",
+        ),
+        (
+            "lead",
+            71,
+            "lead  ✉1 waiting to wake: send it a prompt  Background: 1 command · …",
+        ),
+        (
+            "payments-agent",
+            42,
+            "payments-agent  ✉1  Background: 1 comma…",
+        ),
+    ] {
+        let buffer = inbox_row_card(&stalled, Some(name), CardDensityKind::Minimal, width, false);
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{name:?} at {width} columns, a stalled wake:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+
+    // A reason is another matter: its row is the reason merged with the
+    // background line (33 + 3 + 26 = 62 columns), and it outranks the line.
+    let mut orphaned = inbox_card_session(1, 1, false);
+    orphaned.status = SessionStatus::Idle;
+    orphaned.orchestration_orphaned = true;
+    let orphaned = with_background_command(orphaned);
+    for (width, expected) in [
+        (
+            91,
+            "payments-agent  ✉2 queued  Orphaned — delegation unavailable · Background: 1 command · 4m",
+        ),
+        (
+            90,
+            "payments-agent  Orphaned — delegation unavailable · Background: 1 command · 4m",
+        ),
+    ] {
+        let buffer = inbox_row_card(
+            &orphaned,
+            Some("payments-agent"),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns, orphaned:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+
+    // So does an inbox notice (84 columns here): 7 + 2 + 9 + 2 + 84 = 104.
+    let words = inbox_display_words();
+    let notice = words["notArmed"].as_str().unwrap();
+    let noticed = inbox_notice_session(serde_json::json!({ "integration": "not_armed" }));
+    for (width, expected) in [
+        (106, format!("api-svc  ✉1 queued  {notice}")),
+        (105, format!("api-svc  {notice}")),
+    ] {
+        let buffer = inbox_row_card(
+            &noticed,
+            Some("api-svc"),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns, an inbox notice:\n{}",
             buffer_to_text(&buffer)
         );
     }

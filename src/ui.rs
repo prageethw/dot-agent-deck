@@ -25759,6 +25759,15 @@ fn render_session_card(
     let plain = |(text, style): (String, Style)| {
         Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
     };
+    // Whether the FIRST status row is one of the attention rows above (a
+    // reason, a delivery failure, an inbox notice) rather than the background
+    // line standing alone: with no attention row the first row can only be
+    // `Background:`, since `status_lines` is built from the attention rows, with
+    // the background line merged into the first of them (`shares_row`) or after
+    // them. Read here, before `attention` is consumed. The 3-row fold below
+    // needs it: a row that tells the user something is wrong outranks the inbox
+    // line, background work does not (issue #868).
+    let first_row_is_attention = !attention.is_empty();
     let shares_row = density == CardDensity::Minimal && !attention.is_empty();
     // The rows the agent notice may take: what the card has left after its
     // tools and every other status row, between one and
@@ -25858,17 +25867,22 @@ fn render_session_card(
     let fold_dir = area.height == 3;
     const FOLD_GAP: &str = "  ";
     // That status row is taken out of the plain rows here, ahead of the inbox
-    // decision, because it outranks the inbox line (issue #868): the line is
-    // drawn only where the reason still fits whole after it, and is dropped
-    // outright (no bare count either) where it would cut the reason short, so
-    // the reason keeps the room it has with no inbox at all.
-    let folded_reason = if fold_dir && !status_lines.is_empty() {
+    // decision. When it is an attention row (a Blocked or orphaned reason, a
+    // delivery failure, an inbox notice, including the reason's combined
+    // `reason · background` row) it outranks the inbox line (issue #868): the
+    // line is drawn only where the row still fits whole after it, and is
+    // dropped outright (no bare count either) where it would cut the row
+    // short, so the row keeps the room it has with no inbox at all. A
+    // `Background:` row standing alone does not outrank the line: the order
+    // stays name, inbox line, then that row in what is left, cut as it always
+    // was.
+    let folded_row = if fold_dir && !status_lines.is_empty() {
         Some(status_lines.remove(0))
     } else {
         None
     };
-    let inbox_line = match (&folded_reason, inbox_line) {
-        (Some(reason), Some(line)) => {
+    let inbox_line = match (&folded_row, inbox_line) {
+        (Some(reason), Some(line)) if first_row_is_attention => {
             let gap_w = if used > 0 {
                 unicode_width::UnicodeWidthStr::width(CARD_INBOX_GAP)
             } else {
@@ -25908,7 +25922,7 @@ fn render_session_card(
     }
     if fold_dir {
         let remaining = w.saturating_sub(used);
-        match folded_reason {
+        match folded_row {
             None => {
                 const FOLD_LABEL: &str = "  Dir: ";
                 let label_w = unicode_width::UnicodeWidthStr::width(FOLD_LABEL);
