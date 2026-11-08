@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status** *(2026-11-07)*: **In progress.** PR [#869](https://github.com/prageethw/dot-agent-deck/pull/869) on branch `feat/inbox-line-name-row-868`. First push `79e44f57`: `test` 9425/9425 and every e2e shard green; `build-release` red on `work-type-check` R4 (this file was missing). `reviewer` and `auditor` have both returned on `79e44f57`; their findings are being resolved in one fix round.
+**Status** *(2026-11-07)*: **In progress.** PR [#869](https://github.com/prageethw/dot-agent-deck/pull/869) on branch `feat/inbox-line-name-row-868`. First push `79e44f57`: `test` 9425/9425 and every e2e shard green; `build-release` red on `work-type-check` R4 (this file was missing). `reviewer` and `auditor` have both returned on `79e44f57`; their findings are resolved in one fix round (the 3-row reason rule below, the docs wording, a timing fix in `orchestration/roles/002`, and this file).
 
 **Fork-only?** **Yes, as a layout preference.** Upstream still draws the inbox line in the card's top-right chip; the fork already moved the worker's identity onto its own body row (fork#405), so the name row is the natural home for the line here. Carried as a **PERMANENT** row in [`fork-sync-workflow.md`](../docs/develop/fork-sync-workflow.md). Whether to offer it upstream is the maintainer's call after it merges; nothing is filed yet.
 
@@ -27,12 +27,22 @@ The inbox line moves onto the worker-name row, directly after the name, separate
 
 - The words are unchanged: `inbox_display::CardInbox::full_text` and `short_text` stay the single source, so the desktop tile and `tests/fixtures/inbox-display.json` are untouched.
 - The line degrades as the row narrows: the full text, then the bare `✉N` count, then nothing. Width is measured in display columns, not characters.
-- The 3-row Minimal card, whose single role row also carries `Dir:` (issue #847) or a status reason, spends the row in the order name, inbox line, then `Dir:` or the reason.
+- The 3-row Minimal card, whose single role row also carries `Dir:` (issue #847) or a status reason, spends the row in the order name, inbox line, then `Dir:`. When the card has a status reason (Blocked, orphaned, a delivery failure), the reason outranks the inbox line: the line is drawn only if the reason still fits whole after it, and is dropped otherwise, so a reason is never cut short to make room for a delivery receipt.
 - No card gains or loses a row. The 1-row tier is unchanged. The 2-row tier did not draw the inbox line before and does not now; its title is simply no longer shortened by a line it never drew.
+
+## Known limits
+
+Decided with the maintainer on 2026-11-07 and recorded here rather than fixed in this change.
+
+- **The name never shrinks, so a long name hides the line.** On the default 40-column card (38 columns inside the border) the line needs `name + 2 + text` columns. A name over 34 columns shows nothing, not even the pending count, and a name over 25 columns loses `✉ delivered`, which has no short form. Shipped role names are 12 columns or shorter; only a long pane rename reaches this.
+- **The long states do not fit a 40-column card at all.** `✉ may not have reached the agent` (32 columns) is one column too wide beside a 5-column name, and `✉2 waiting to wake: send it a prompt` (36 columns) falls back to `✉2`, which reads the same as queued. This is not a regression: the old title chip had less room still, and uncertain now shows where it used to vanish.
+- **The bare count `✉2` is ambiguous** between queued and stalled; `CardInbox::short_text` is the pending count only.
+
+The fix for the second and third is a one-word set for the card line, tracked as [#870](https://github.com/prageethw/dot-agent-deck/issues/870), which changes the shared wording in both clients and so is its own change after this one merges. This change deliberately does not add a count to the title chip as a fallback: a bare count there is the same ambiguity, and it would split the line across two places again.
 
 ## Out of scope
 
-- Any change to the inbox wording, its states, or the notice row beneath the card.
+- Any change to the inbox wording, its states, or the notice row beneath the card (the one-word set is [#870](https://github.com/prageethw/dot-agent-deck/issues/870)).
 - The desktop app.
 - The `(delegated)` status suffix, which lengthens the status label itself and is a separate surface.
 - The two documentation-site screenshots that still show the old placement: tracked by [#863](https://github.com/prageethw/dot-agent-deck/issues/863).
