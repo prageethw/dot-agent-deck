@@ -4,11 +4,11 @@
 
 **Priority**: Medium
 
-**Status** *(2026-11-07)*: **In progress.** PR [#869](https://github.com/prageethw/dot-agent-deck/pull/869) on branch `feat/inbox-line-name-row-868`. First push `79e44f57`: `test` 9425/9425 and every e2e shard green; `build-release` red on `work-type-check` R4 (this file was missing). `reviewer` and `auditor` returned on `79e44f57`; the first fix round (`3f55ca3b`) added the 3-row reason rule, this file and a rewritten `orchestration/roles/002`, whose redraw wait then failed in e2e shard 2 (a 39-column name fits whole at 120 columns, so the `…` it waited for never appears). A second fix round corrects that wait, keeps background work from outranking the inbox line, and states the limits below in terms of the card's inner width.
+**Status** *(2026-11-08)*: **Complete.** PR [#869](https://github.com/prageethw/dot-agent-deck/pull/869) merged as `e1926774` (squash, 2026-11-08) and closed issue #868. The branch `feat/inbox-line-name-row-868` had six commits and its final head was `92cb3f8a`: CI `test` 9428/9428, `build-macos` 9048/9048, the four e2e shards plus `e2e (version)` and the full e2e job 10183 tests, all passed; `reviewer` approved and `auditor` found it clean in their third round on that head. Two earlier heads were red and are superseded: `79e44f57` (`build-release` failed `work-type-check` R4 for want of this file) and `3f55ca3b` (`orchestration/roles/002` failed because its redraw wait looked for a `…` that a 39-column name never shows at 120 columns). CI on `main` at `e1926774` was green too.
 
-**Fork-only?** **Yes, as a layout preference.** Upstream still draws the inbox line in the card's top-right chip; the fork already moved the worker's identity onto its own body row (fork#405), so the name row is the natural home for the line here. Carried as a **PERMANENT** row in [`fork-sync-workflow.md`](../docs/develop/fork-sync-workflow.md). Whether to offer it upstream is the maintainer's call after it merges; nothing is filed yet.
+**Fork-only?** **Yes, as a layout preference.** When this was written upstream drew the inbox line in the card's top-right chip, and the fork had already moved the worker's identity onto its own body row (fork#405), so the name row was the natural home for the line here. Carried as a **PERMANENT** row in [`fork-sync-workflow.md`](../../docs/develop/fork-sync-workflow.md). **It was offered upstream as a different implementation, and upstream merged that.** This layout cannot be ported, because upstream's title carries the worker's name and it has no name row, so the offer was a fresh implementation of the same idea for upstream's layout: issue [vfarcic/dot-agent-deck#2143](https://github.com/vfarcic/dot-agent-deck/issues/2143), PR [vfarcic/dot-agent-deck#2145](https://github.com/vfarcic/dot-agent-deck/pull/2145), squash `5464223d`, merged by the maintainer on 2026-11-08 after Qodo, Greptile and upstream's review bot found nothing. Upstream keeps the line in the chip while the whole title fits beside it and otherwise moves it to the right end of the `Dir:` row, so on the next sync it conflicts with this PRD's placement in `render_session_card`. The fork keeps the name row; the PERMANENT row in `fork-sync-workflow.md` says how to resolve it and which catalog ids to renumber.
 
-**Why a PRD for a card-layout change.** `work-type-check` R4 requires a `prds/` file behind any `.feature.md` fragment, and the fragment suffix is correct: this changes user-visible behaviour, so it is `prd`-type work under [`work-types.md`](../docs/develop/work-types.md), not `bug` or `chore`. The document is short because the change is small.
+**Why a PRD for a card-layout change.** `work-type-check` R4 requires a `prds/` file behind any `.feature.md` fragment, and the fragment suffix is correct: this changes user-visible behaviour, so it is `prd`-type work under [`work-types.md`](../../docs/develop/work-types.md), not `bug` or `chore`. The document is short because the change is small.
 
 ---
 
@@ -51,5 +51,13 @@ The fix for the second and third is a one-word set for the card line, tracked as
 
 - **M1: Implementation.** `render_session_card` draws the inbox line on the name row; `max_title` no longer subtracts any inbox width; L1 tests and five insta snapshots pin the new placement; docs reworded. **Done in `79e44f57`.**
 - **M2: Sync protection.** PERMANENT row and register row in `fork-sync-workflow.md`. **Done in `79e44f57`.**
-- **M3: Review.** `reviewer` and `auditor` on `79e44f57`. **Returned; findings in one fix round.**
-- **M4: Merge.** CLAUDE.md rule 25's checklist on the final head SHA, then a squash merge pinned to it.
+- **M3: Review.** `reviewer` and `auditor`, three rounds, each on the head it names. **Done: approve and clean on `92cb3f8a`.**
+- **M4: Merge.** CLAUDE.md rule 25's checklist on the final head SHA, then a squash merge pinned to it. **Done: `e1926774`, with the merge report on the PR.**
+- **M5: Offer upstream.** A fresh implementation for upstream's layout, from issue vfarcic/dot-agent-deck#2143. **Done: merged upstream as `5464223d` (PR #2145), 2026-11-08.**
+
+## Follow-ups
+
+- [#870](https://github.com/prageethw/dot-agent-deck/issues/870): one word per state on the card line, so every state fits a 40-column card. Changes the shared wording in both clients.
+- [#872](https://github.com/prageethw/dot-agent-deck/issues/872): decide whether the name row needs the protection upstream's #2145 gave its `Dir:` row against a name that imitates the line.
+- [#863](https://github.com/prageethw/dot-agent-deck/issues/863): regenerate the two documentation-site screenshots that still show the old placement.
+- [#871](https://github.com/prageethw/dot-agent-deck/issues/871): this status, and the sync rows in `fork-sync-workflow.md`, brought up to date with upstream's #2145.
