@@ -472,7 +472,7 @@ fn orchestration_roles_001_lists_seats_and_filters() {
     }
 }
 
-/// Scenario: Open a two-role orchestration with a long start-role name, Working status and a queued inbox at both 220 and 120 terminal columns using the default sidebar width. The orchestrator's live card names its role and shows its Working status, never carries an inbox line in its top border, and shows the queued inbox line after the role name where the name row has room for it (220 columns; at 120 the long name fills the row and keeps it), the worker's card names its role, and no row of the sidebar carries an ORCHESTRATOR badge.
+/// Scenario: Open a two-role orchestration with a long start-role name and Working status at 220 terminal columns using the default sidebar width, where the orchestrator's live card shows the queued inbox line after the role name, then shrink the same deck to 120 columns, where the long name fills the sidebar's name row and keeps it. At both widths the orchestrator's card names its role, shows Working and carries no inbox line in its top border, the worker's card names its role, and no row of the sidebar carries an ORCHESTRATOR badge; at 120 columns the card shows no inbox line anywhere, which is only read after the queued line was seen on that same card at 220.
 #[spec("orchestration/roles/002")]
 #[test]
 fn orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge() {
@@ -481,18 +481,31 @@ fn orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge() {
     const LEADER: &str = "orchestrator-with-a-very-long-role-name";
     const LEADER_SHOWN: &str = "orchestrator-with-a-very";
     // Issue #868: the inbox line follows the role name on the name row and the
-    // name keeps its room, so the 39-column name fills the 40-column sidebar's
-    // 38 inner columns at 120 and the line is dropped there, while at 220 the
-    // name, the gap and `✉1 queued` all fit.
-    for (cols, inbox_fits) in [(120, false), (220, true)] {
-        let fixture = AddressDeck::with_sidebar(cols, LEADER);
-        fixture.deck.send_keys(b"\x0e");
-        fixture.deck.send_keys(b" ");
-        fixture.deck.wait_for_string("No mode");
-        fixture.deck.send_keys(b"\x1b[C");
-        fixture.deck.send_keys(b"\r");
-        fixture.deck.send_keys(b"\r");
-        assert!(common::wait_until(WAIT, || fixture.records().len() == 2));
+    // name keeps its room, so at 220 the name, the gap and `✉1 queued` all fit,
+    // while the 39-column name fills the 40-column sidebar's 38 inner columns at
+    // 120 and the line is dropped there.
+    //
+    // ONE deck, widest first, so the absence at 120 columns cannot pass
+    // vacuously. The 220-column pass waits for `queued` on the orchestrator's
+    // card, which is the TUI having applied the daemon's inbox state to that
+    // card (the stand-in reports Working, so nothing wakes it and the queued
+    // startup remit stays queued). Only then is the same deck, and so the same
+    // card and state, shrunk to 120, and the 120-column pass waits for the
+    // redraw (the long name cut with `…`, which no cell of the 220-column
+    // layout can show inside the first 40 columns) before it reads the absence
+    // off the card.
+    let mut fixture = AddressDeck::with_sidebar(220, LEADER);
+    fixture.deck.send_keys(b"\x0e");
+    fixture.deck.send_keys(b" ");
+    fixture.deck.wait_for_string("No mode");
+    fixture.deck.send_keys(b"\x1b[C");
+    fixture.deck.send_keys(b"\r");
+    fixture.deck.send_keys(b"\r");
+    assert!(common::wait_until(WAIT, || fixture.records().len() == 2));
+    for (cols, inbox_fits) in [(220u16, true), (120u16, false)] {
+        if cols == 120 {
+            fixture.deck.resize(cols, 60);
+        }
         let sidebar_width = usize::from(cols) * 34 / 100;
         let sidebar_of = |grid: &str| -> Vec<String> {
             grid.lines()
@@ -507,11 +520,13 @@ fn orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge() {
                 .map(|(index, _)| index)
                 .collect()
         };
-        // Wait for the whole card to be drawn (role names, status and, where
-        // it fits, the inbox line), so the absence of a badge below is read off
-        // a settled card and not off a frame the card has not reached yet.
+        // Wait for the whole card to be drawn at this width (role names, status
+        // and either the inbox line or, where the name fills the row, the cut
+        // name), so the absence of a badge below is read off a settled card and
+        // not off a frame the card has not reached yet, or off the previous
+        // width's frame.
         fixture.deck.wait_until_grid(
-            "both role cards with the leader Working and, where it fits, queued",
+            "both role cards with the leader Working and queued (220) or its name cut (120)",
             |grid| {
                 let sidebar = sidebar_of(grid);
                 let tops = card_tops(&sidebar);
@@ -519,7 +534,13 @@ fn orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge() {
                     let leader = sidebar[..worker].join("\n");
                     leader.contains(LEADER_SHOWN)
                         && leader.contains("Working")
-                        && (!inbox_fits || leader.contains("queued"))
+                        && if inbox_fits {
+                            leader.contains("queued")
+                        } else {
+                            leader
+                                .lines()
+                                .any(|row| row.contains(LEADER_SHOWN) && row.contains('…'))
+                        }
                         && sidebar[worker..].join("\n").contains("worker")
                 })
             },
@@ -535,11 +556,8 @@ fn orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge() {
         let (leader, worker) = (cards[0], cards[1]);
         let leader_card = sidebar[leader..worker].join("\n");
         assert!(
-            leader_card.contains(LEADER_SHOWN)
-                && leader_card.contains("Working")
-                && (!inbox_fits || leader_card.contains("queued")),
-            "the orchestrator's card names its role and shows Working{} at {cols} columns\n{grid}",
-            if inbox_fits { " and queued" } else { "" }
+            leader_card.contains(LEADER_SHOWN) && leader_card.contains("Working"),
+            "the orchestrator's card names its role and shows Working at {cols} columns\n{grid}"
         );
         // The inbox line is on the name row, never in the top border beside the
         // status (issue #868), at either width.
@@ -547,6 +565,19 @@ fn orchestration_roles_002_sidebar_cards_carry_no_orchestrator_badge() {
             !sidebar[leader].contains('✉'),
             "the orchestrator's top border carries an inbox line at {cols} columns\n{grid}"
         );
+        if inbox_fits {
+            assert!(
+                leader_card.contains("✉1 queued"),
+                "the orchestrator's card shows its queued inbox line after the role name at {cols} columns\n{grid}"
+            );
+        } else {
+            // Read only now: the 220-column pass above saw the queued line on
+            // this same card, so its absence is the name keeping its room.
+            assert!(
+                !leader_card.contains('✉') && !leader_card.contains("queued"),
+                "the long role name keeps its row, so the orchestrator's card carries no inbox line at {cols} columns\n{grid}"
+            );
+        }
         assert!(
             sidebar[worker..].iter().any(|l| l.contains("worker")),
             "the worker's card names its role at {cols} columns\n{grid}"

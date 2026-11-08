@@ -25854,8 +25854,41 @@ fn render_session_card(
     // room for the label plus one cell. Issue #1568: a status row (Blocked,
     // orphaned, a delivery failure, background work) matters more than the
     // directory, so on that one row it takes `Dir:`'s place after the role and
-    // the inbox line, which are kept.
+    // the inbox line.
     let fold_dir = area.height == 3;
+    const FOLD_GAP: &str = "  ";
+    // That status row is taken out of the plain rows here, ahead of the inbox
+    // decision, because it outranks the inbox line (issue #868): the line is
+    // drawn only where the reason still fits whole after it, and is dropped
+    // outright (no bare count either) where it would cut the reason short, so
+    // the reason keeps the room it has with no inbox at all.
+    let folded_reason = if fold_dir && !status_lines.is_empty() {
+        Some(status_lines.remove(0))
+    } else {
+        None
+    };
+    let inbox_line = match (&folded_reason, inbox_line) {
+        (Some(reason), Some(line)) => {
+            let gap_w = if used > 0 {
+                unicode_width::UnicodeWidthStr::width(CARD_INBOX_GAP)
+            } else {
+                0
+            };
+            let reason_w: usize = reason
+                .spans
+                .iter()
+                .map(|span| unicode_width::UnicodeWidthStr::width(&*span.content))
+                .sum();
+            let whole = used
+                + gap_w
+                + unicode_width::UnicodeWidthStr::width(line.as_str())
+                + unicode_width::UnicodeWidthStr::width(FOLD_GAP)
+                + reason_w
+                <= w;
+            whole.then_some(line)
+        }
+        (_, line) => line,
+    };
     let mut role_spans: Vec<Span<'_>> = Vec::new();
     if !role_part.is_empty() {
         role_spans.push(Span::styled(
@@ -25875,26 +25908,27 @@ fn render_session_card(
     }
     if fold_dir {
         let remaining = w.saturating_sub(used);
-        if status_lines.is_empty() {
-            const FOLD_LABEL: &str = "  Dir: ";
-            let label_w = unicode_width::UnicodeWidthStr::width(FOLD_LABEL);
-            if remaining > label_w {
-                role_spans.push(Span::styled(FOLD_LABEL, text_primary()));
-                let dir = truncate_with_ellipsis(cwd_display.as_ref(), remaining - label_w);
-                role_spans.push(Span::raw(dir));
+        match folded_reason {
+            None => {
+                const FOLD_LABEL: &str = "  Dir: ";
+                let label_w = unicode_width::UnicodeWidthStr::width(FOLD_LABEL);
+                if remaining > label_w {
+                    role_spans.push(Span::styled(FOLD_LABEL, text_primary()));
+                    let dir = truncate_with_ellipsis(cwd_display.as_ref(), remaining - label_w);
+                    role_spans.push(Span::raw(dir));
+                }
             }
-        } else {
-            const FOLD_GAP: &str = "  ";
-            let gap_w = unicode_width::UnicodeWidthStr::width(FOLD_GAP);
-            let reason = status_lines.remove(0);
-            if remaining > gap_w {
-                role_spans.push(Span::raw(FOLD_GAP));
-                let segments = reason
-                    .spans
-                    .into_iter()
-                    .map(|span| (span.content.into_owned(), span.style))
-                    .collect();
-                role_spans.extend(truncate_styled_segments(segments, remaining - gap_w));
+            Some(reason) => {
+                let gap_w = unicode_width::UnicodeWidthStr::width(FOLD_GAP);
+                if remaining > gap_w {
+                    role_spans.push(Span::raw(FOLD_GAP));
+                    let segments = reason
+                        .spans
+                        .into_iter()
+                        .map(|span| (span.content.into_owned(), span.style))
+                        .collect();
+                    role_spans.extend(truncate_styled_segments(segments, remaining - gap_w));
+                }
             }
         }
     }

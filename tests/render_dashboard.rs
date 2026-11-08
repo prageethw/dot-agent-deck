@@ -1468,7 +1468,7 @@ fn status_032_inbox_line_degrades_without_shrinking_the_name() {
     assert_eq!(card_row_inner(&alone, 1), card_row_inner(&cut, 1));
 }
 
-/// Scenario: Draw a three-row Minimal card, whose single row holds the worker name and the `Dir:`, with two messages queued at the widths from roomy to tight. The row reads name, inbox line, then `Dir:`, and as the card narrows `Dir:` drops first (ellipsized before it goes), then the whole words give way to `✉2`, then the count goes, and the name is never cut; an orphaned card's `Orphaned` reason takes `Dir:`'s place after the inbox line.
+/// Scenario: Draw a three-row Minimal card, whose single row holds the worker name and the `Dir:`, with two messages queued at the widths from roomy to tight. The row reads name, inbox line, then `Dir:`, and as the card narrows `Dir:` drops first (ellipsized before it goes), then the whole words give way to `✉2`, then the count goes, and the name is never cut. A card with a status reason is the next two tests.
 #[spec("inbox/status/033")]
 #[test]
 fn status_033_minimal_card_orders_name_inbox_line_then_dir() {
@@ -1498,15 +1498,101 @@ fn status_033_minimal_card_orders_name_inbox_line_then_dir() {
             buffer_to_text(&buffer)
         );
     }
-    let mut orphaned = inbox_card_session(1, 1, false);
-    orphaned.orchestration_orphaned = true;
-    let buffer = inbox_row_card(&orphaned, Some(name), CardDensityKind::Minimal, 70, false);
-    assert_eq!(
-        card_row_inner(&buffer, 1),
-        "payments-agent  ✉2 queued  Orphaned — delegation unavailable",
-        "{}",
-        buffer_to_text(&buffer)
-    );
+}
+
+/// An orphaned card with two messages queued, whose `Orphaned — delegation
+/// unavailable` reason (33 columns) is the status row a three-row card folds
+/// onto its name row.
+fn orphaned_inbox_card_session() -> SessionState {
+    let mut session = inbox_card_session(1, 1, false);
+    session.orchestration_orphaned = true;
+    session
+}
+
+/// Scenario: Draw a three-row Minimal card that is orphaned and has two messages queued, beside a 14-column worker name, at widths where the whole `Orphaned — delegation unavailable` reason does not fit after the name and the inbox line. The status reason outranks the inbox line: the line is dropped outright, with no bare count in its place, and the reason is cut exactly as it would be with an empty inbox (`payments-agent  Orphaned — d…` at 31 columns, where the line used to leave it `O…`), and shows whole as soon as the row has room for it alone. The same card without a reason keeps the line.
+#[spec("inbox/status/035")]
+#[test]
+fn status_035_reason_outranks_the_inbox_line_on_the_minimal_card() {
+    let orphaned = orphaned_inbox_card_session();
+    let name = "payments-agent";
+    // 14 + 2 + 9 + 2 + 33 = 60 inner columns hold name, line and reason whole,
+    // so one column fewer (61 columns wide) drops the line; the reason alone
+    // needs 14 + 2 + 33 = 49.
+    for (width, expected) in [
+        (61, "payments-agent  Orphaned — delegation unavailable"),
+        (51, "payments-agent  Orphaned — delegation unavailable"),
+        (31, "payments-agent  Orphaned — d…"),
+        // The bare count fits the 18 inner columns, but the reason comes first.
+        (20, "payments-agent  O…"),
+    ] {
+        let buffer = inbox_row_card(
+            &orphaned,
+            Some(name),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            buffer.area().height,
+            3,
+            "the Minimal card is three rows tall"
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+    // The same card with no status reason keeps the line at 31 columns, and
+    // `Dir:` is the one that drops.
+    let queued = inbox_card_session(1, 1, false);
+    let buffer = inbox_row_card(&queued, Some(name), CardDensityKind::Minimal, 31, false);
+    assert_eq!(card_row_inner(&buffer, 1), "payments-agent  ✉2 queued");
+}
+
+/// Scenario: Draw the same orphaned three-row Minimal card with two messages queued at widths where the whole `Orphaned — delegation unavailable` reason still fits after the worker name and the inbox line, for a 14-column and a 4-column name, and one column below each. Both stay on the row, name then inbox line then reason, from the exact fit (name + 2 + `✉2 queued` + 2 + 33 inner columns) up, and one column narrower the inbox line goes and the reason stays whole.
+#[spec("inbox/status/036")]
+#[test]
+fn status_036_reason_that_fits_whole_keeps_the_inbox_line_beside_it() {
+    let orphaned = orphaned_inbox_card_session();
+    for (name, width, expected) in [
+        (
+            "payments-agent",
+            70,
+            "payments-agent  ✉2 queued  Orphaned — delegation unavailable",
+        ),
+        (
+            "payments-agent",
+            62,
+            "payments-agent  ✉2 queued  Orphaned — delegation unavailable",
+        ),
+        (
+            "payments-agent",
+            61,
+            "payments-agent  Orphaned — delegation unavailable",
+        ),
+        (
+            "lead",
+            52,
+            "lead  ✉2 queued  Orphaned — delegation unavailable",
+        ),
+        ("lead", 51, "lead  Orphaned — delegation unavailable"),
+    ] {
+        let buffer = inbox_row_card(
+            &orphaned,
+            Some(name),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{name:?} at {width} columns:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
 }
 
 /// Scenario: Draw a card with two messages queued whose agent has not identified itself, so it is the empty placeholder, at the Normal density's 80 columns, beside the same card once it is a Claude Code card. The placeholder shows its name and no inbox line anywhere; the Claude Code card shows the line after its name.
