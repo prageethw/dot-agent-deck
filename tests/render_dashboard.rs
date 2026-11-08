@@ -797,6 +797,24 @@ fn status_012_card_says_a_stalled_wake_and_what_to_do() {
 /// items, the integration notice, failed receipts, paused hand-outs) beside
 /// one fetched message, rendered at the Normal density's 80 columns.
 fn inbox_notice_card(notices: serde_json::Value) -> String {
+    let session = inbox_notice_session(notices);
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    buffer_to_text(&buffer)
+}
+
+/// The session behind [`inbox_notice_card`]: `notices` beside one fetched
+/// message, hydrated through the daemon's record/resync seam.
+fn inbox_notice_session(notices: serde_json::Value) -> SessionState {
     let session = card_stats_session("/home/dev/api-svc");
     let mut inbox = serde_json::json!({
         "queued": 0, "fetched": 1, "undeliverable": 0,
@@ -815,19 +833,7 @@ fn inbox_notice_card(notices: serde_json::Value) -> String {
     state.register_pane("pane-card-stats".to_string());
     state.sessions.insert(session.session_id.clone(), session);
     state.resync_after_event_gap(&[record]);
-    let session = state.sessions.remove("sess-card-stats").unwrap();
-    let buffer = render_card_to_buffer(
-        &session,
-        Some("api-svc"),
-        Some(1),
-        CardDensityKind::Normal,
-        0,
-        render_now(),
-        false,
-        80,
-        CardDensityKind::Normal.rendered_height(),
-    );
-    buffer_to_text(&buffer)
+    state.sessions.remove("sess-card-stats").unwrap()
 }
 
 fn attention_item(id: &str, kind: &str) -> serde_json::Value {
@@ -1059,7 +1065,7 @@ fn status_023_card_says_a_message_may_not_have_reached_the_agent() {
     );
 }
 
-/// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must fit beside Thinking without removing the tools counter or overrunning either border.
+/// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The inbox line sits after the worker's name on its row, the status keeps the whole top-right chip beside the title, and neither the tools counter nor either border is overrun.
 #[spec("inbox/status/007")]
 #[test]
 fn status_007_narrow_card_keeps_inbox_status_and_stats() {
@@ -1079,6 +1085,19 @@ fn status_007_narrow_card_keeps_inbox_status_and_stats() {
     assert!(
         rendered.contains("✉2"),
         "narrow card lost its inbox badge:\n{rendered}"
+    );
+    // Issue #868: the line is on the name row, after the name (7 + 2 + 9 fills
+    // the 18 inner columns exactly), not in the top border beside the status.
+    let mut rows = rendered.lines();
+    let title = rows.next().unwrap();
+    let name_row = rows.next().unwrap();
+    assert!(
+        name_row.contains("api-svc  ✉2 queued"),
+        "the inbox line follows the worker's name:\n{rendered}"
+    );
+    assert!(
+        !title.contains('✉'),
+        "the top border carries no inbox line:\n{rendered}"
     );
     assert!(
         rendered.contains("Thinking"),
@@ -1240,6 +1259,520 @@ fn status_010_card_uses_shared_delivered_word_after_ack() {
     assert!(
         !rendered.contains("✉0"),
         "an empty inbox must not show a pending count:\n{rendered}"
+    );
+}
+
+/// One card as the deck draws it, `width` columns wide at `density`'s own
+/// height, with the agent-type badge `badge` (issue #868's tests).
+fn inbox_row_card(
+    session: &SessionState,
+    name: Option<&str>,
+    density: CardDensityKind,
+    width: u16,
+    badge: bool,
+) -> ratatui::buffer::Buffer {
+    render_card_for_mode_to_buffer(
+        session,
+        name,
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        UiMode::Normal,
+        width,
+        density.rendered_height(),
+        badge,
+    )
+}
+
+/// What a bordered card draws between its two border columns on row `y`,
+/// trailing blanks trimmed.
+fn card_row_inner(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    let row: Vec<char> = row_text(buffer, y).chars().collect();
+    row[1..row.len() - 1]
+        .iter()
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+/// Scenario: Draw a card with two messages queued, one with a delivered message and one with no worker name, at the Normal density's 80 columns with the agent-type badge off and on. The inbox line sits on the first body row directly after the worker's name, two spaces after it and flush left when the name is empty, and the top border carries the title and the status with no envelope in it.
+#[spec("inbox/status/030")]
+#[test]
+fn status_030_card_draws_the_inbox_line_after_the_worker_name() {
+    let queued = inbox_card_session(1, 1, false);
+    let delivered = inbox_card_session(0, 0, true);
+    for badge in [false, true] {
+        for (session, name, expected) in [
+            (&queued, "api-svc", "api-svc  ✉2 queued"),
+            (&delivered, "api-svc", "api-svc  ✉ delivered"),
+            (&queued, "", "✉2 queued"),
+        ] {
+            let buffer = inbox_row_card(session, Some(name), CardDensityKind::Normal, 80, badge);
+            let rendered = buffer_to_text(&buffer);
+            assert_eq!(
+                card_row_inner(&buffer, 1),
+                expected,
+                "agent badge {badge}, name {name:?}: the inbox line follows the name:\n{rendered}"
+            );
+            let title = row_text(&buffer, 0);
+            assert!(
+                !title.contains('✉'),
+                "agent badge {badge}: the top border carries no inbox line:\n{rendered}"
+            );
+            assert!(
+                title.ends_with(" ● Thinking ┐"),
+                "agent badge {badge}: the top-right chip is the status alone:\n{rendered}"
+            );
+        }
+    }
+}
+
+/// Scenario: Draw the same Thinking card with the agent-type badge on and a known model, once with a delivered message and once with an empty inbox, at every width from 21 to 80 columns. The top border is the same row in both, so a delivered line never shortens the title, and from 39 columns it holds the whole `ClaudeCode (opus-4.7)` badge; the delivered card says `✉ delivered` on its name row wherever the row has room for it. Cards one and two rows tall draw no inbox line, and the two-row card's title is the same with and without one.
+#[spec("inbox/status/031")]
+#[test]
+fn status_031_inbox_line_does_not_shorten_the_title() {
+    let mut delivered = inbox_card_session(0, 0, true);
+    delivered.model = Some("opus-4.7".into());
+    let mut empty = inbox_card_session(0, 0, false);
+    empty.model = Some("opus-4.7".into());
+    for width in 21..=80u16 {
+        let with = inbox_row_card(
+            &delivered,
+            Some("api-svc"),
+            CardDensityKind::Normal,
+            width,
+            true,
+        );
+        let without = inbox_row_card(
+            &empty,
+            Some("api-svc"),
+            CardDensityKind::Normal,
+            width,
+            true,
+        );
+        let rendered = buffer_to_text(&with);
+        assert_eq!(
+            row_text(&with, 0),
+            row_text(&without, 0),
+            "{width} columns: a delivered line changed the top border:\n{rendered}"
+        );
+        if width >= 39 {
+            assert!(
+                row_text(&with, 0).contains("ClaudeCode (opus-4.7)"),
+                "{width} columns: the whole badge fits beside the status:\n{rendered}"
+            );
+        }
+        // The name row holds `api-svc`, the gap and `✉ delivered`: 7 + 2 + 11
+        // inner columns, plus the two border cells.
+        assert_eq!(
+            card_row_inner(&with, 1).contains("✉ delivered"),
+            width >= 22,
+            "{width} columns: the delivered line is drawn where the name row has room:\n{rendered}"
+        );
+    }
+    for height in [1, 2] {
+        let draw = |session: &SessionState| {
+            render_card_for_mode_to_buffer(
+                session,
+                Some("api-svc"),
+                Some(1),
+                CardDensityKind::Compact,
+                0,
+                render_now(),
+                false,
+                UiMode::Normal,
+                44,
+                height,
+                true,
+            )
+        };
+        let with = draw(&delivered);
+        assert!(
+            !buffer_to_text(&with).contains('✉'),
+            "a {height}-row card draws no inbox line:\n{}",
+            buffer_to_text(&with)
+        );
+        if height == 2 {
+            assert_eq!(
+                row_text(&with, 0),
+                row_text(&draw(&empty), 0),
+                "the 2-row card's title is the same with and without a delivered line"
+            );
+        }
+    }
+}
+
+/// Scenario: Draw a Compact card with two messages queued beside a 14-column worker name at the widths around each threshold, then a delivered card, then names as wide as the row. The name row shows the name whole and, after it, the whole `✉2 queued` while all of it fits, the bare `✉2` where only that fits and nothing below that; a delivered line has no bare form and drops straight to nothing; and a name that fills the row is never cut to make room.
+#[spec("inbox/status/032")]
+#[test]
+fn status_032_inbox_line_degrades_without_shrinking_the_name() {
+    let queued = inbox_card_session(1, 1, false);
+    let delivered = inbox_card_session(0, 0, true);
+    let name = "payments-agent";
+    // 14 + 2 + 9 = 25 inner columns for the words, 14 + 2 + 2 = 18 for the
+    // count, plus the two border cells.
+    for (width, expected) in [
+        (40, "payments-agent  ✉2 queued"),
+        (27, "payments-agent  ✉2 queued"),
+        (26, "payments-agent  ✉2"),
+        (20, "payments-agent  ✉2"),
+        (19, "payments-agent"),
+    ] {
+        let buffer = inbox_row_card(&queued, Some(name), CardDensityKind::Compact, width, false);
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns, two queued:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+    // 14 + 2 + 11 = 27 inner columns, and `✉ delivered` has no shorter form.
+    for (width, expected) in [(29, "payments-agent  ✉ delivered"), (28, "payments-agent")] {
+        let buffer = inbox_row_card(
+            &delivered,
+            Some(name),
+            CardDensityKind::Compact,
+            width,
+            false,
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns, delivered:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+    // A name as wide as the 17 inner columns is drawn whole and the line is
+    // dropped; one column wider is cut with `…` exactly as it is with an empty
+    // inbox, never cut further to make room.
+    let whole = inbox_row_card(
+        &queued,
+        Some("payments-agent-v2"),
+        CardDensityKind::Compact,
+        19,
+        false,
+    );
+    assert_eq!(card_row_inner(&whole, 1), "payments-agent-v2");
+    let cut = inbox_row_card(
+        &queued,
+        Some("payments-agent-v22"),
+        CardDensityKind::Compact,
+        19,
+        false,
+    );
+    assert_eq!(card_row_inner(&cut, 1), "payments-agent-v…");
+    let no_inbox = inbox_card_session(0, 0, false);
+    let alone = inbox_row_card(
+        &no_inbox,
+        Some("payments-agent-v22"),
+        CardDensityKind::Compact,
+        19,
+        false,
+    );
+    assert_eq!(card_row_inner(&alone, 1), card_row_inner(&cut, 1));
+}
+
+/// Scenario: Draw a three-row Minimal card, whose single row holds the worker name and the `Dir:`, with two messages queued at the widths from roomy to tight. The row reads name, inbox line, then `Dir:`, and as the card narrows `Dir:` drops first (ellipsized before it goes), then the whole words give way to `✉2`, then the count goes, and the name is never cut. A card with a status reason is the next two tests.
+#[spec("inbox/status/033")]
+#[test]
+fn status_033_minimal_card_orders_name_inbox_line_then_dir() {
+    let queued = inbox_card_session(1, 1, false);
+    let name = "payments-agent";
+    // 14 + 2 + 9 = 25 inner columns for the words; `  Dir: ` is 7 more and
+    // needs at least one column after it.
+    for (width, expected) in [
+        (41, "payments-agent  ✉2 queued  Dir: api-svc"),
+        (35, "payments-agent  ✉2 queued  Dir: …"),
+        (34, "payments-agent  ✉2 queued"),
+        (27, "payments-agent  ✉2 queued"),
+        (26, "payments-agent  ✉2"),
+        (20, "payments-agent  ✉2"),
+        (19, "payments-agent"),
+    ] {
+        let buffer = inbox_row_card(&queued, Some(name), CardDensityKind::Minimal, width, false);
+        assert_eq!(
+            buffer.area().height,
+            3,
+            "the Minimal card is three rows tall"
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+}
+
+/// An orphaned card with two messages queued, whose `Orphaned — delegation
+/// unavailable` reason (33 columns) is the status row a three-row card folds
+/// onto its name row.
+fn orphaned_inbox_card_session() -> SessionState {
+    let mut session = inbox_card_session(1, 1, false);
+    session.orchestration_orphaned = true;
+    session
+}
+
+/// Scenario: Draw a three-row Minimal card that is orphaned and has two messages queued, beside a 14-column worker name, at widths where the whole `Orphaned — delegation unavailable` reason does not fit after the name and the inbox line. The status reason outranks the inbox line: the line is dropped outright, with no bare count in its place, and the reason is cut exactly as it would be with an empty inbox (`payments-agent  Orphaned — d…` at 31 columns, where the line used to leave it `O…`), and shows whole as soon as the row has room for it alone. The same card without a reason keeps the line.
+#[spec("inbox/status/035")]
+#[test]
+fn status_035_reason_outranks_the_inbox_line_on_the_minimal_card() {
+    let orphaned = orphaned_inbox_card_session();
+    let name = "payments-agent";
+    // 14 + 2 + 9 + 2 + 33 = 60 inner columns hold name, line and reason whole,
+    // so one column fewer (61 columns wide) drops the line; the reason alone
+    // needs 14 + 2 + 33 = 49.
+    for (width, expected) in [
+        (61, "payments-agent  Orphaned — delegation unavailable"),
+        (51, "payments-agent  Orphaned — delegation unavailable"),
+        (31, "payments-agent  Orphaned — d…"),
+        // The bare count fits the 18 inner columns, but the reason comes first.
+        (20, "payments-agent  O…"),
+    ] {
+        let buffer = inbox_row_card(
+            &orphaned,
+            Some(name),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            buffer.area().height,
+            3,
+            "the Minimal card is three rows tall"
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+    // The same card with no status reason keeps the line at 31 columns, and
+    // `Dir:` is the one that drops.
+    let queued = inbox_card_session(1, 1, false);
+    let buffer = inbox_row_card(&queued, Some(name), CardDensityKind::Minimal, 31, false);
+    assert_eq!(card_row_inner(&buffer, 1), "payments-agent  ✉2 queued");
+}
+
+/// Scenario: Draw the same orphaned three-row Minimal card with two messages queued at widths where the whole `Orphaned — delegation unavailable` reason still fits after the worker name and the inbox line, for a 14-column and a 4-column name, and one column below each. Both stay on the row, name then inbox line then reason, from the exact fit (name + 2 + `✉2 queued` + 2 + 33 inner columns) up, and one column narrower the inbox line goes and the reason stays whole.
+#[spec("inbox/status/036")]
+#[test]
+fn status_036_reason_that_fits_whole_keeps_the_inbox_line_beside_it() {
+    let orphaned = orphaned_inbox_card_session();
+    for (name, width, expected) in [
+        (
+            "payments-agent",
+            70,
+            "payments-agent  ✉2 queued  Orphaned — delegation unavailable",
+        ),
+        (
+            "payments-agent",
+            62,
+            "payments-agent  ✉2 queued  Orphaned — delegation unavailable",
+        ),
+        (
+            "payments-agent",
+            61,
+            "payments-agent  Orphaned — delegation unavailable",
+        ),
+        (
+            "lead",
+            52,
+            "lead  ✉2 queued  Orphaned — delegation unavailable",
+        ),
+        ("lead", 51, "lead  Orphaned — delegation unavailable"),
+    ] {
+        let buffer = inbox_row_card(
+            &orphaned,
+            Some(name),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{name:?} at {width} columns:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+}
+
+/// `session` with one background command left running four minutes before
+/// `render_now()`, as the daemon's aggregate reaches a card: an event carrying
+/// it at revision 1, which the card reads as `Background: 1 command · 4m` (26
+/// columns).
+fn with_background_command(mut session: SessionState) -> SessionState {
+    let event: AgentEvent = serde_json::from_value(serde_json::json!({
+        "session_id": session.session_id,
+        "agent_type": "claude_code",
+        "event_type": "notification",
+        "timestamp": render_now(),
+        "background": {
+            "commands": 1,
+            "subagents": 0,
+            "since_ms": render_now().timestamp_millis() - 240_000
+        },
+        "background_revision": 1,
+    }))
+    .expect("an event carrying the daemon's background aggregate");
+    session.recent_events.push_back(event);
+    session
+}
+
+/// Scenario: Draw a three-row Minimal card that is Idle with an inbox line (two messages queued, or one stalled wake) and one background command left running, whose `Background: 1 command · 4m` row is the only status row. Background work does not outrank the inbox line: the row reads name, inbox line, then the background row in what is left, cut with `…` as it would be anyway, and an inbox line too long for the name row gives way to its bare count while the background row keeps the rest. The same card orphaned, where the status row is the reason merged with the background line, or carrying an inbox notice, drops the inbox line from the width at which the whole row no longer fits after it.
+#[spec("inbox/status/037")]
+#[test]
+fn status_037_background_work_does_not_outrank_the_inbox_line() {
+    let mut queued = inbox_card_session(1, 1, false);
+    queued.status = SessionStatus::Idle;
+    let queued = with_background_command(queued);
+    // 14 + 2 + 9 = 25 inner columns for the name and `✉2 queued`, then the
+    // 2-column gap and the 26-column background row: 53 whole.
+    for (width, expected) in [
+        (55, "payments-agent  ✉2 queued  Background: 1 command · 4m"),
+        (54, "payments-agent  ✉2 queued  Background: 1 command · …"),
+        (31, "payments-agent  ✉2 queued  B…"),
+    ] {
+        let buffer = inbox_row_card(
+            &queued,
+            Some("payments-agent"),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            buffer.area().height,
+            3,
+            "the Minimal card is three rows tall"
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns, two queued:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+
+    let mut stalled = inbox_card_session_with(1, 0, false, true);
+    stalled.status = SessionStatus::Idle;
+    let stalled = with_background_command(stalled);
+    // `✉1 waiting to wake: send it a prompt` is 36 columns: 4 + 2 + 36 + 2 + 26
+    // = 70 whole beside `lead`. Beside the 14-column name it does not fit a
+    // 40-column row, so the bare `✉1` takes its place and the background row
+    // keeps the 20 columns that are left.
+    for (name, width, expected) in [
+        (
+            "lead",
+            72,
+            "lead  ✉1 waiting to wake: send it a prompt  Background: 1 command · 4m",
+        ),
+        (
+            "lead",
+            71,
+            "lead  ✉1 waiting to wake: send it a prompt  Background: 1 command · …",
+        ),
+        (
+            "payments-agent",
+            42,
+            "payments-agent  ✉1  Background: 1 comma…",
+        ),
+    ] {
+        let buffer = inbox_row_card(&stalled, Some(name), CardDensityKind::Minimal, width, false);
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{name:?} at {width} columns, a stalled wake:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+
+    // A reason is another matter: its row is the reason merged with the
+    // background line (33 + 3 + 26 = 62 columns), and it outranks the line.
+    let mut orphaned = inbox_card_session(1, 1, false);
+    orphaned.status = SessionStatus::Idle;
+    orphaned.orchestration_orphaned = true;
+    let orphaned = with_background_command(orphaned);
+    for (width, expected) in [
+        (
+            91,
+            "payments-agent  ✉2 queued  Orphaned — delegation unavailable · Background: 1 command · 4m",
+        ),
+        (
+            90,
+            "payments-agent  Orphaned — delegation unavailable · Background: 1 command · 4m",
+        ),
+    ] {
+        let buffer = inbox_row_card(
+            &orphaned,
+            Some("payments-agent"),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns, orphaned:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+
+    // So does an inbox notice (84 columns here): 7 + 2 + 9 + 2 + 84 = 104.
+    let words = inbox_display_words();
+    let notice = words["notArmed"].as_str().unwrap();
+    let noticed = inbox_notice_session(serde_json::json!({ "integration": "not_armed" }));
+    for (width, expected) in [
+        (106, format!("api-svc  ✉1 queued  {notice}")),
+        (105, format!("api-svc  {notice}")),
+    ] {
+        let buffer = inbox_row_card(
+            &noticed,
+            Some("api-svc"),
+            CardDensityKind::Minimal,
+            width,
+            false,
+        );
+        assert_eq!(
+            card_row_inner(&buffer, 1),
+            expected,
+            "{width} columns, an inbox notice:\n{}",
+            buffer_to_text(&buffer)
+        );
+    }
+}
+
+/// Scenario: Draw a card with two messages queued whose agent has not identified itself, so it is the empty placeholder, at the Normal density's 80 columns, beside the same card once it is a Claude Code card. The placeholder shows its name and no inbox line anywhere; the Claude Code card shows the line after its name.
+#[spec("inbox/status/034")]
+#[test]
+fn status_034_placeholder_card_draws_no_inbox_line() {
+    let mut placeholder = inbox_card_session(1, 1, false);
+    placeholder.agent_type = AgentType::None;
+    let buffer = inbox_row_card(
+        &placeholder,
+        Some("api-svc"),
+        CardDensityKind::Normal,
+        80,
+        false,
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(rendered.contains("No agent"), "{rendered}");
+    assert!(
+        !rendered.contains('✉'),
+        "a placeholder card draws no inbox line:\n{rendered}"
+    );
+    assert_eq!(card_row_inner(&buffer, 1), "api-svc", "{rendered}");
+
+    let typed = inbox_card_session(1, 1, false);
+    let buffer = inbox_row_card(&typed, Some("api-svc"), CardDensityKind::Normal, 80, false);
+    assert_eq!(
+        card_row_inner(&buffer, 1),
+        "api-svc  ✉2 queued",
+        "{}",
+        buffer_to_text(&buffer)
     );
 }
 

@@ -2,8 +2,8 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
-┌ 1 ───────────────────────────────────────────────────── ● Thinking ✉2 queued ┐
-│api-svc                                                                       │
+┌ 1 ─────────────────────────────────────────────────────────────── ● Thinking ┐
+│api-svc  ✉2 queued                                                            │
 │Dir:  api-svc                                                                 │
 │Messages can't reach this agent: its connection to the deck was refused (an a…│
 │Prmt: move the stats into the border                                          │

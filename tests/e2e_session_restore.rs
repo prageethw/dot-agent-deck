@@ -731,8 +731,9 @@ fn restore_011_saved_start_role_index_is_honored_over_config_default() {
         .launch_with_fixture("minimal");
 
     // The orchestration tab rebuilds: both roles are registered and the tab is
-    // drawn. Read from the daemon rather than the cards, because the coder card
-    // shortens its title to make room for its `✉1 queued` inbox line.
+    // drawn. Read from the daemon rather than the cards, so the wait does not
+    // depend on what a card has room to draw (its `✉1 queued` inbox line, for
+    // one) at the width it is drawn.
     let rebuilt = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
         let attach = deck.attach_socket_path();
         role_pane(attach, "orchestrator").is_some()

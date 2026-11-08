@@ -2,8 +2,8 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
-┌ 1 ────────────────────────────────────────── ● Thinking ✉ delivery uncertain ┐
-│api-svc                                                                       │
+┌ 1 ─────────────────────────────────────────────────────────────── ● Thinking ┐
+│api-svc  ✉ delivery uncertain                                                 │
 │Dir:  api-svc                                                                 │
 │a deck message may or may not have reached this agent. Retry sends it again m…│
 │Prmt: move the stats into the border                                          │

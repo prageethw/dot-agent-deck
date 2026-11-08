@@ -25436,21 +25436,15 @@ fn render_session_card(
 
     let dot = flash_dot(&session.status, tick);
     let status_text = format!(" {} {} ", dot, status_label);
-    // PRD #1666 §2.8: the inbox line rides the status badge — `✉2 queued` /
-    // `✉ delivered` where the title keeps room, the pending count alone on a
-    // narrow card, and nothing where even that does not fit.
-    let inbox_text = if is_placeholder {
-        None
-    } else {
-        session
-            .card_inbox()
-            .and_then(|inbox| card_inbox_badge(&inbox, &status_text, area.width as usize))
-    };
-    let badge_width = unicode_width::UnicodeWidthStr::width(status_text.as_str())
-        + inbox_text
-            .as_deref()
-            .map(unicode_width::UnicodeWidthStr::width)
-            .unwrap_or(0);
+    // Issue #868: the right-hand chip is the status ALONE. The inbox line
+    // (PRD #1666 §2.8: `✉2 queued`, `✉ delivered`, ...) used to ride it and
+    // cost the title up to a dozen columns, which cut the shortcut number and
+    // the agent badge with `…` as soon as a message was delivered. It is drawn
+    // on the worker-name row instead (see `card_inbox_line`), so the title
+    // keeps the whole width it has when nothing is in the inbox. The 1- and
+    // 2-row tiers still draw no inbox line, as before; what changes for them
+    // is that their title no longer pays for a line they never drew.
+    let badge_width = unicode_width::UnicodeWidthStr::width(status_text.as_str());
     // What is left of the card's width once the right-hand status badge and the
     // two border cells are paid for. Issue #357: this is a COLUMN budget — both
     // terms it subtracts are cells on the same row — and `truncate_styled_segments`
@@ -25603,13 +25597,10 @@ fn render_session_card(
         .border_style(border_style)
         .title(Line::from(title_spans))
         .title_alignment(ratatui::layout::Alignment::Left)
-        .title({
-            let mut badge = vec![Span::styled(status_text, status_style)];
-            if let Some(inbox) = inbox_text {
-                badge.push(Span::styled(inbox, text_primary()));
-            }
-            Line::from(badge).alignment(ratatui::layout::Alignment::Right)
-        });
+        .title(
+            Line::from(Span::styled(status_text, status_style))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
     if let Some(badge) = pr_badge {
         block = block.title_bottom(Line::from(badge).alignment(ratatui::layout::Alignment::Left));
     }
@@ -25768,6 +25759,15 @@ fn render_session_card(
     let plain = |(text, style): (String, Style)| {
         Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
     };
+    // Whether the FIRST status row is one of the attention rows above (a
+    // reason, a delivery failure, an inbox notice) rather than the background
+    // line standing alone: with no attention row the first row can only be
+    // `Background:`, since `status_lines` is built from the attention rows, with
+    // the background line merged into the first of them (`shares_row`) or after
+    // them. Read here, before `attention` is consumed. The 3-row fold below
+    // needs it: a row that tells the user something is wrong outranks the inbox
+    // line, background work does not (issue #868).
+    let first_row_is_attention = !attention.is_empty();
     let shares_row = density == CardDensity::Minimal && !attention.is_empty();
     // The rows the agent notice may take: what the card has left after its
     // tools and every other status row, between one and
@@ -25844,44 +25844,105 @@ fn render_session_card(
     // unconditionally (even when empty, as `Line::from("")`) so the emitted line
     // count never diverges from what `card_height()` reserves.
     let role_part = truncate_with_ellipsis(role_name_text, w);
+    // Issue #868: the inbox line follows the name on this row. The name is
+    // measured first, whole, and never shrunk to make room: the line takes only
+    // what is left of the row and degrades to the bare count, then to nothing.
+    // Suppressed on a placeholder card exactly as it was in the title chip.
+    let mut used = unicode_width::UnicodeWidthStr::width(role_part.as_str());
+    let inbox_line = if is_placeholder {
+        None
+    } else {
+        session
+            .card_inbox()
+            .and_then(|inbox| card_inbox_line(&inbox, used, w))
+    };
     // Issue #847: a 3-row card has a single inner row, so the separate `Dir:`
     // row would be clipped. Fold it onto the role row instead: role keeps
-    // priority, `Dir:` takes whatever width remains (ellipsized), and is
-    // dropped only when there is no room for the label plus one cell. Issue
-    // #1568: a status row (Blocked, orphaned, a delivery failure, background
-    // work) matters more than the directory, so on that one row it takes
-    // `Dir:`'s place after the role, which is kept.
+    // priority, then the inbox line (issue #868), then `Dir:`, which takes
+    // whatever width remains (ellipsized) and is dropped only when there is no
+    // room for the label plus one cell. Issue #1568: a status row (Blocked,
+    // orphaned, a delivery failure, background work) matters more than the
+    // directory, so on that one row it takes `Dir:`'s place after the role and
+    // the inbox line.
     let fold_dir = area.height == 3;
+    const FOLD_GAP: &str = "  ";
+    // That status row is taken out of the plain rows here, ahead of the inbox
+    // decision. When it is an attention row (a Blocked or orphaned reason, a
+    // delivery failure, an inbox notice, including the reason's combined
+    // `reason · background` row) it outranks the inbox line (issue #868): the
+    // line is drawn only where the row still fits whole after it, and is
+    // dropped outright (no bare count either) where it would cut the row
+    // short, so the row keeps the room it has with no inbox at all. A
+    // `Background:` row standing alone does not outrank the line: the order
+    // stays name, inbox line, then that row in what is left, cut as it always
+    // was.
+    let folded_row = if fold_dir && !status_lines.is_empty() {
+        Some(status_lines.remove(0))
+    } else {
+        None
+    };
+    let inbox_line = match (&folded_row, inbox_line) {
+        (Some(reason), Some(line)) if first_row_is_attention => {
+            let gap_w = if used > 0 {
+                unicode_width::UnicodeWidthStr::width(CARD_INBOX_GAP)
+            } else {
+                0
+            };
+            let reason_w: usize = reason
+                .spans
+                .iter()
+                .map(|span| unicode_width::UnicodeWidthStr::width(&*span.content))
+                .sum();
+            let whole = used
+                + gap_w
+                + unicode_width::UnicodeWidthStr::width(line.as_str())
+                + unicode_width::UnicodeWidthStr::width(FOLD_GAP)
+                + reason_w
+                <= w;
+            whole.then_some(line)
+        }
+        (_, line) => line,
+    };
     let mut role_spans: Vec<Span<'_>> = Vec::new();
-    let used = unicode_width::UnicodeWidthStr::width(role_part.as_str());
     if !role_part.is_empty() {
         role_spans.push(Span::styled(
             role_part,
             Style::default().fg(palette::ROLE_NAME),
         ));
     }
+    if let Some(line) = inbox_line {
+        // No leading gap when the name is empty: the line then starts flush
+        // left on the row.
+        if used > 0 {
+            role_spans.push(Span::raw(CARD_INBOX_GAP));
+            used += unicode_width::UnicodeWidthStr::width(CARD_INBOX_GAP);
+        }
+        used += unicode_width::UnicodeWidthStr::width(line.as_str());
+        role_spans.push(Span::styled(line, text_primary()));
+    }
     if fold_dir {
         let remaining = w.saturating_sub(used);
-        if status_lines.is_empty() {
-            const FOLD_LABEL: &str = "  Dir: ";
-            let label_w = unicode_width::UnicodeWidthStr::width(FOLD_LABEL);
-            if remaining > label_w {
-                role_spans.push(Span::styled(FOLD_LABEL, text_primary()));
-                let dir = truncate_with_ellipsis(cwd_display.as_ref(), remaining - label_w);
-                role_spans.push(Span::raw(dir));
+        match folded_row {
+            None => {
+                const FOLD_LABEL: &str = "  Dir: ";
+                let label_w = unicode_width::UnicodeWidthStr::width(FOLD_LABEL);
+                if remaining > label_w {
+                    role_spans.push(Span::styled(FOLD_LABEL, text_primary()));
+                    let dir = truncate_with_ellipsis(cwd_display.as_ref(), remaining - label_w);
+                    role_spans.push(Span::raw(dir));
+                }
             }
-        } else {
-            const FOLD_GAP: &str = "  ";
-            let gap_w = unicode_width::UnicodeWidthStr::width(FOLD_GAP);
-            let reason = status_lines.remove(0);
-            if remaining > gap_w {
-                role_spans.push(Span::raw(FOLD_GAP));
-                let segments = reason
-                    .spans
-                    .into_iter()
-                    .map(|span| (span.content.into_owned(), span.style))
-                    .collect();
-                role_spans.extend(truncate_styled_segments(segments, remaining - gap_w));
+            Some(reason) => {
+                let gap_w = unicode_width::UnicodeWidthStr::width(FOLD_GAP);
+                if remaining > gap_w {
+                    role_spans.push(Span::raw(FOLD_GAP));
+                    let segments = reason
+                        .spans
+                        .into_iter()
+                        .map(|span| (span.content.into_owned(), span.style))
+                        .collect();
+                    role_spans.extend(truncate_styled_segments(segments, remaining - gap_w));
+                }
             }
         }
     }
@@ -25931,32 +25992,35 @@ fn card_wrapped_rows(text: &str, width: usize, max_rows: usize) -> Vec<String> {
     rows
 }
 
-/// Title columns a card keeps before its inbox line gives up its words for
-/// the bare count ([`card_inbox_badge`]).
-const CARD_TITLE_MIN_FOR_INBOX_WORDS: usize = 16;
+/// The gap between the worker's name and the inbox line after it on the
+/// name row.
+const CARD_INBOX_GAP: &str = "  ";
 
-/// PRD #1666 §2.8: the inbox text a card of `width` columns appends to its
-/// status badge, trailing space included — the full line where the title keeps
-/// [`CARD_TITLE_MIN_FOR_INBOX_WORDS`] columns, the pending count alone where
-/// only that fits, else nothing.
-fn card_inbox_badge(
+/// PRD #1666 §2.8, issue #868: the inbox text a card draws after the worker's
+/// name on its name row — the full line (`✉2 queued`, `✉ delivered`) where the
+/// row still has room for it after the name and the two-column gap, the pending
+/// count alone (`✉2`) where only that fits, else nothing.
+///
+/// `name_width` is the DISPLAY width of the name as drawn and `row_width` the
+/// row's inner width, both in columns (`unicode_width`, not `char` counts). The
+/// name is never shrunk to make room, so it is the caller's whole, already
+/// truncated name; an empty name takes no gap.
+fn card_inbox_line(
     inbox: &crate::inbox_display::CardInbox,
-    status_text: &str,
-    width: usize,
+    name_width: usize,
+    row_width: usize,
 ) -> Option<String> {
-    let status = unicode_width::UnicodeWidthStr::width(status_text);
-    let fits = |text: &str, title: usize| {
-        status + unicode_width::UnicodeWidthStr::width(text) + 2 + title <= width
+    let gap = if name_width == 0 {
+        0
+    } else {
+        unicode_width::UnicodeWidthStr::width(CARD_INBOX_GAP)
     };
-    if let Some(full) = inbox.full_text().map(|text| format!("{text} "))
-        && fits(&full, CARD_TITLE_MIN_FOR_INBOX_WORDS)
-    {
-        return Some(full);
-    }
+    let fits =
+        |text: &str| name_width + gap + unicode_width::UnicodeWidthStr::width(text) <= row_width;
     inbox
-        .short_text()
-        .map(|text| format!("{text} "))
-        .filter(|short| fits(short, 0))
+        .full_text()
+        .filter(|full| fits(full))
+        .or_else(|| inbox.short_text().filter(|short| fits(short)))
 }
 
 /// Issue #1678: a Minimal card's one content row when it has both a status
@@ -42944,7 +43008,7 @@ mod tests {
         session
     }
 
-    /// Scenario: Draw a card named like an orchestrator role across every width from a 20-column sliver to 80 columns while it is Working with one message queued and a very long role name, then idle at 74 and 40 columns. The card names the role on its first body row, keeps its status word and inbox line in the title row, and `ORCHESTRATOR` appears nowhere on it. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
+    /// Scenario: Draw a card named like an orchestrator role across every width from a 20-column sliver to 80 columns while it is Working with one message queued and a very long role name, then idle at 74 and 40 columns. The card names the role on its first body row, keeps its status word alone in the title row with the inbox line after the name on the first body row only where the name leaves it room (the whole name always first), and `ORCHESTRATOR` appears nowhere on it. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
     #[test]
     fn a_role_card_names_its_role_and_never_says_orchestrator() {
         let now = Utc::now();
@@ -42967,25 +43031,38 @@ mod tests {
         }
 
         // Working, one message queued, a long role name, at every width. The
-        // status word and the inbox line stay in the title row at every
-        // width: `max_title` is what is left once the right-hand badge is paid
-        // for, so the title can only give up room on the left and the status
-        // word is never cut. The inbox line is the whole `✉1 queued` from 39
-        // columns (`card_inbox_badge`: status 11 + line 10 + the two border
-        // cells + the 16 title columns it keeps for the words) and the bare
-        // count `✉1` below that, so `queued` is asserted from 40 (the first
-        // width of the 40-column sidebar scenario, one column inside the
-        // threshold) and the count at every width.
+        // title row carries the status word alone at every width (issue #868:
+        // the inbox line no longer rides it): `max_title` is what is left once
+        // the right-hand status is paid for, so the title can only give up room
+        // on the left and the status word is never cut. The inbox line is on
+        // the role row, after the name, and only where the row has room for the
+        // whole name, the two-column gap and the line: the bare count `✉1` from
+        // name + 2 + 2 columns (plus the two border cells), the whole `✉1
+        // queued` from name + 2 + 9 columns, and nothing below that, since the
+        // name never shrinks to make room for it.
         let busy = busy_card_session(now);
         let long = "orchestrator-with-a-very-long-role-name";
+        let name_columns = unicode_width::UnicodeWidthStr::width(long);
+        let count_from = (name_columns + 2 + 2 + 2) as u16;
+        let words_from =
+            (name_columns + 2 + unicode_width::UnicodeWidthStr::width("✉1 queued") + 2) as u16;
         for width in 20..=80u16 {
             let card = card_text(&busy, long, width, CardDensity::Compact, now);
             let title = card.lines().next().unwrap();
             assert!(title.contains("Working"), "{width}: {card}");
-            assert!(title.contains("✉1"), "{width}: {card}");
-            if width >= 40 {
-                assert!(title.contains("queued"), "{width}: {card}");
-            }
+            assert!(!title.contains('✉'), "{width}: {card}");
+            assert!(!title.contains('…'), "{width}: {card}");
+            let role_row = card.lines().nth(1).unwrap();
+            assert_eq!(
+                role_row.contains("✉1"),
+                width >= count_from,
+                "{width}: the count is drawn from {count_from} columns: {card}"
+            );
+            assert_eq!(
+                role_row.contains("queued"),
+                width >= words_from,
+                "{width}: the words are drawn from {words_from} columns: {card}"
+            );
             // The role name is on the first body row. At 20 columns that row is
             // 18 wide and the name is cut with `…`, so assert its leading word,
             // which every width in the sweep keeps whole.
@@ -43001,6 +43078,65 @@ mod tests {
                 "{width}: the card says ORCHESTRATOR: {card}"
             );
         }
+    }
+
+    /// Scenario: Ask the inbox line's fit rule about a name 7 columns wide on rows of every width around its thresholds, for a card with two messages queued, a delivered one and an empty one. The line is the whole words where the name, a two-column gap and the words fit the row, the bare count where only the count fits, and nothing below that; a delivered line has no bare form, an empty name takes no gap, and an empty inbox says nothing at any width.
+    #[test]
+    fn the_inbox_line_degrades_from_words_to_count_to_nothing_by_row_width() {
+        use crate::inbox_display::CardInbox;
+        let queued = CardInbox {
+            pending: 2,
+            ..Default::default()
+        };
+        let delivered = CardInbox {
+            delivered: true,
+            ..Default::default()
+        };
+        // `✉2 queued` is 9 columns: the name (7) + the gap (2) + 9 = 18.
+        assert_eq!(
+            card_inbox_line(&queued, 7, 80).as_deref(),
+            Some("✉2 queued")
+        );
+        assert_eq!(
+            card_inbox_line(&queued, 7, 18).as_deref(),
+            Some("✉2 queued")
+        );
+        // One column short of the words, the count alone: 7 + 2 + 2 = 11.
+        assert_eq!(card_inbox_line(&queued, 7, 17).as_deref(), Some("✉2"));
+        assert_eq!(card_inbox_line(&queued, 7, 11).as_deref(), Some("✉2"));
+        assert_eq!(card_inbox_line(&queued, 7, 10), None);
+        assert_eq!(card_inbox_line(&queued, 7, 0), None);
+        // `✉ delivered` is 11 columns and has no shorter form: 7 + 2 + 11 = 20.
+        assert_eq!(
+            card_inbox_line(&delivered, 7, 20).as_deref(),
+            Some("✉ delivered")
+        );
+        assert_eq!(card_inbox_line(&delivered, 7, 19), None);
+        // A name already as wide as the row leaves no room at all.
+        assert_eq!(card_inbox_line(&queued, 18, 18), None);
+        assert_eq!(card_inbox_line(&delivered, 18, 18), None);
+        // An empty name takes no gap, so the line starts flush left.
+        assert_eq!(card_inbox_line(&queued, 0, 9).as_deref(), Some("✉2 queued"));
+        assert_eq!(card_inbox_line(&queued, 0, 8).as_deref(), Some("✉2"));
+        assert_eq!(card_inbox_line(&queued, 0, 1), None);
+        // Nothing in the inbox, nothing to say.
+        assert_eq!(card_inbox_line(&CardInbox::default(), 7, 80), None);
+    }
+
+    /// Scenario: Draw a Working card with one message queued whose role name is three double-width characters, six columns, at 18 and at 19 columns in Compact density. At 19 columns the name row has room for the name, the gap and the whole `✉1 queued`, and at 18 it has room for the bare `✉1` only, where counting characters instead of display columns would have drawn the words.
+    #[test]
+    fn a_cards_inbox_line_is_measured_in_columns_not_characters() {
+        let now = Utc::now();
+        let busy = busy_card_session(now);
+        let name = "日本語";
+        assert_eq!(unicode_width::UnicodeWidthStr::width(name), 6);
+        let roomy = card_text(&busy, name, 19, CardDensity::Compact, now);
+        let roomy_row = roomy.lines().nth(1).unwrap();
+        assert!(roomy_row.contains("✉1 queued"), "{roomy}");
+        let tight = card_text(&busy, name, 18, CardDensity::Compact, now);
+        let tight_row = tight.lines().nth(1).unwrap();
+        assert!(tight_row.contains("✉1"), "{tight}");
+        assert!(!tight_row.contains("queued"), "{tight}");
     }
 
     /// Scenario: Draw a session at every card density and every width from 20 to 100 columns, once idle and once mid-run with a prompt, a tool call, a directory and a queued message. `ORCHESTRATOR` appears on none of those cards; a 24-column mid-run Compact card shows its `Dir:`, `Prmt:` and tool rows, and a 20-column Minimal card keeps its `Dir:` on the role row. This draws the card through `render_session_card` only: it cannot tell whether the live deck marks a pane as an orchestrator's, which `orchestration/roles/002` covers through the real binary.
